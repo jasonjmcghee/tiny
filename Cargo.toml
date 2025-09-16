@@ -1,0 +1,97 @@
+[package]
+name = "tiny-editor"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "tiny-editor"
+path = "src/main.rs"
+
+[dependencies]
+# Graphics and windowing
+# wgpu = { path = "/Users/jason/tools/wgpu/wgpu", features = ["metal"] }
+wgpu = { version = "26.0.1", features = ["metal"] }
+bytemuck = { version = "1", features = ["derive"] }
+winit = "0.30"
+
+# Text rendering
+fontdue = "0.9"
+swash = "0.2.5"
+
+# Core data structures
+parking_lot = "0.12"
+memchr = "2.7"  # For fast newline counting in rope
+lazy_static = "1.4"  # For global statics
+arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
+
+# Syntax highlighting
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+
+# LSP support
+tower-lsp = "0.20"  # LSP server framework
+lsp-types = "0.97"
+
+# System integration
+arboard = "3.4"  # Clipboard support
+pollster = "0.3"  # Async executor for main
+
+# Async runtime for LSP
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+simdutf8 = "0.1.5"
+bytecount = "0.6.9"
+
+[dev-dependencies]
+criterion = "0.7"  # Benchmarking
+proptest = "1.6"   # Property testing
+pollster = "0.3"   # Async executor for examples
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1  # Faster compilation, still decent perf
+
+[[bench]]
+name = "tree_bench"
+harness = false
+
+[[example]]
+name = "minimal_typing"
+path = "examples/minimal_typing.rs"
+
+[[example]]
+name = "debug_font"
+path = "examples/debug_font.rs"
+
+[[example]]
+name = "debug_widget"
+path = "examples/debug_widget.rs"
+
+[[example]]
+name = "debug_pipeline"
+path = "examples/debug_pipeline.rs"
+
+[[example]]
+name = "debug_gpu"
+path = "examples/debug_gpu.rs"
+
+[[example]]
+name = "debug_coordinates"
+path = "examples/debug_coordinates.rs"
+
+[[example]]
+name = "single_char"
+path = "examples/single_char.rs"
+
+[[example]]
+name = "atlas_debug"
+path = "examples/atlas_debug.rs"
+
+[[example]]
+name = "rect_test"
+path = "examples/rect_test.rs"
