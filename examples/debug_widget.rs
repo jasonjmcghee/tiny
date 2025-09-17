@@ -3,9 +3,9 @@
 use tiny_editor::{
     font::SharedFontSystem,
     widget::text,
-    tree::{PaintContext, Point},
+    tree::PaintContext,
     render::RenderOp,
-    coordinates::{Viewport, LogicalSize},
+    coordinates::{Viewport, LayoutPos},
 };
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ fn main() {
     println!("=============================");
 
     let font_system = Arc::new(SharedFontSystem::new());
-    let viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 1.0);
+    let viewport = Viewport::new(800.0, 600.0, 1.0);
 
     // Test 1: Single character widget
     println!("\n--- Single Character Widget ---");
@@ -22,7 +22,9 @@ fn main() {
 
     let mut commands = Vec::new();
     let mut ctx = PaintContext {
-        position: Point { x: 10.0, y: 20.0 },
+        layout_pos: LayoutPos { x: 10.0, y: 20.0 },
+        view_pos: Some(viewport.layout_to_view(LayoutPos { x: 10.0, y: 20.0 })),
+        doc_pos: None,
         commands: &mut commands,
         text_styles: None,
         font_system: Some(&font_system),
@@ -51,7 +53,9 @@ fn main() {
 
     let mut commands = Vec::new();
     let mut ctx = PaintContext {
-        position: Point { x: 0.0, y: 0.0 },
+        layout_pos: LayoutPos { x: 0.0, y: 0.0 },
+        view_pos: Some(viewport.layout_to_view(LayoutPos { x: 0.0, y: 0.0 })),
+        doc_pos: None,
         commands: &mut commands,
         text_styles: None,
         font_system: Some(&font_system),
@@ -91,7 +95,9 @@ fn main() {
 
     let mut commands = Vec::new();
     let mut ctx = PaintContext {
-        position: Point { x: 50.0, y: 100.0 },
+        layout_pos: LayoutPos { x: 50.0, y: 100.0 },
+        view_pos: Some(viewport.layout_to_view(LayoutPos { x: 50.0, y: 100.0 })),
+        doc_pos: None,
         commands: &mut commands,
         text_styles: None,
         font_system: Some(&font_system),

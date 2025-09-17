@@ -5,6 +5,8 @@
 use crate::render::{BatchedDraw, GlyphInstance, RectInstance};
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
+#[allow(unused)]
+use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
 
 /// Vertex data for rectangles
 #[repr(C)]
@@ -383,17 +385,19 @@ impl GpuRenderer {
         }
     }
 
-    /// Execute batched draw commands
-    pub unsafe fn render(&mut self, batches: &[BatchedDraw], logical_viewport: (f32, f32)) {
-        println!("GPU::render called with {} batches, logical viewport: {:.0}x{:.0}",
-                 batches.len(), logical_viewport.0, logical_viewport.1);
+    /// Execute batched draw commands (transforms view → physical)
+    pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &crate::coordinates::Viewport) {
+        println!("GPU::render called with {} batches, viewport: logical={:.0}x{:.0}, scale={:.1}",
+                 batches.len(), viewport.logical_size.width, viewport.logical_size.height, viewport.scale_factor);
 
         // Update uniform buffer with LOGICAL viewport size (not physical)
+        // Shaders will normalize using these logical dimensions
         let uniforms = ShaderUniforms {
-            viewport_size: [logical_viewport.0, logical_viewport.1],
+            viewport_size: [viewport.logical_size.width, viewport.logical_size.height],
             _padding: [0.0, 0.0],
         };
-        println!("  Sending viewport_size [{:.0}, {:.0}] to shaders", logical_viewport.0, logical_viewport.1);
+        println!("  Sending logical viewport_size [{:.0}, {:.0}] to shaders",
+                 viewport.logical_size.width, viewport.logical_size.height);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
@@ -439,25 +443,31 @@ impl GpuRenderer {
                 occlusion_query_set: None,
             });
 
-            // Process each batch
+            // Process each batch (transform view → physical)
             for batch in batches {
                 match batch {
                     BatchedDraw::RectBatch { instances } => {
                         if !instances.is_empty() {
-                            self.draw_rects(&mut render_pass, instances);
+                            self.draw_rects(&mut render_pass, instances, viewport.scale_factor);
                         }
                     }
                     BatchedDraw::GlyphBatch { instances, .. } => {
                         if !instances.is_empty() {
-                            self.draw_glyphs(&mut render_pass, instances);
+                            self.draw_glyphs(&mut render_pass, instances, viewport.scale_factor);
                         }
                     }
                     BatchedDraw::SetClip(rect) => {
+                        // Transform clip rect from view to physical
+                        let physical_x = (rect.x * viewport.scale_factor) as u32;
+                        let physical_y = (rect.y * viewport.scale_factor) as u32;
+                        let physical_width = (rect.width * viewport.scale_factor) as u32;
+                        let physical_height = (rect.height * viewport.scale_factor) as u32;
+
                         render_pass.set_scissor_rect(
-                            rect.x as u32,
-                            rect.y as u32,
-                            rect.width as u32,
-                            rect.height as u32,
+                            physical_x,
+                            physical_y,
+                            physical_width,
+                            physical_height,
                         );
                     }
                 }
@@ -468,24 +478,33 @@ impl GpuRenderer {
         output.present();
     }
 
-    fn draw_rects(&self, render_pass: &mut wgpu::RenderPass, instances: &[RectInstance]) {
+    fn draw_rects(&self, render_pass: &mut wgpu::RenderPass, instances: &[RectInstance], scale_factor: f32) {
         if instances.is_empty() {
             return;
         }
 
-        println!("GPU: draw_rects called with {} rectangles", instances.len());
+        println!("GPU: draw_rects called with {} rectangles, scale={:.1}", instances.len(), scale_factor);
 
-        // Generate vertices for rectangles
+        // Generate vertices for rectangles (transform view → physical)
         let mut vertices = Vec::new();
         for (i, rect) in instances.iter().enumerate() {
-            println!("  Rect {}: ({:.1}, {:.1}) {}x{} color=0x{:08X}",
-                     i, rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height, rect.color);
+            // Apply scale factor to transform from view to physical coordinates
+            let physical_x = rect.rect.x * scale_factor;
+            let physical_y = rect.rect.y * scale_factor;
+            let physical_width = rect.rect.width * scale_factor;
+            let physical_height = rect.rect.height * scale_factor;
 
-            // Two triangles for each rectangle
-            let x1 = rect.rect.x;
-            let y1 = rect.rect.y;
-            let x2 = rect.rect.x + rect.rect.width;
-            let y2 = rect.rect.y + rect.rect.height;
+            if i == 0 {
+                println!("  First rect: view=({:.1}, {:.1}) {}x{} → physical=({:.1}, {:.1}) {}x{}",
+                         rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height,
+                         physical_x, physical_y, physical_width, physical_height);
+            }
+
+            // Two triangles for each rectangle (in physical coordinates)
+            let x1 = physical_x;
+            let y1 = physical_y;
+            let x2 = physical_x + physical_width;
+            let y2 = physical_y + physical_height;
 
             // Triangle 1
             vertices.push(RectVertex {
@@ -535,39 +554,40 @@ impl GpuRenderer {
         println!("  Draw call completed with {} vertices", vertices.len());
     }
 
-    fn draw_glyphs(&self, render_pass: &mut wgpu::RenderPass, instances: &[GlyphInstance]) {
+    fn draw_glyphs(&self, render_pass: &mut wgpu::RenderPass, instances: &[GlyphInstance], scale_factor: f32) {
         if instances.is_empty() {
             return;
         }
 
-        println!("GPU: draw_glyphs called with {} glyphs", instances.len());
+        println!("GPU: draw_glyphs called with {} glyphs, scale={:.1}", instances.len(), scale_factor);
 
-        // Generate vertices for glyphs using actual texture coordinates
+        // Generate vertices for glyphs (transform view → physical)
         let mut vertices = Vec::new();
         for (i, glyph) in instances.iter().enumerate() {
-            if i == 0 {
-                println!("  First glyph: pos=({:.1}, {:.1}), tex=[{:.3}, {:.3}, {:.3}, {:.3}]",
-                         glyph.x, glyph.y, glyph.tex_coords[0], glyph.tex_coords[1],
-                         glyph.tex_coords[2], glyph.tex_coords[3]);
-            }
-            if i == 1 {
-                println!("  Second glyph: pos=({:.1}, {:.1})", glyph.x, glyph.y);
-            }
-            if i == 2 {
-                println!("  Third glyph: pos=({:.1}, {:.1})", glyph.x, glyph.y);
-            }
-
             // Calculate glyph size from texture coordinates
             // Assuming atlas is 2048x2048
             let atlas_size = 2048.0;
-            let width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * atlas_size;
-            let height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * atlas_size;
+            let glyph_width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * atlas_size;
+            let glyph_height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * atlas_size;
 
-            // Quad for each glyph
-            let x1 = glyph.x;
-            let y1 = glyph.y;
-            let x2 = glyph.x + width;
-            let y2 = glyph.y + height;
+            // Apply scale factor to transform from view to physical coordinates
+            let physical_x = glyph.x * scale_factor;
+            let physical_y = glyph.y * scale_factor;
+            let physical_width = glyph_width * scale_factor;
+            let physical_height = glyph_height * scale_factor;
+
+            if i == 0 {
+                println!("  First glyph: view=({:.1}, {:.1}) → physical=({:.1}, {:.1}), size={:.1}x{:.1}",
+                         glyph.x, glyph.y, physical_x, physical_y, physical_width, physical_height);
+                println!("    Tex coords: [{:.3}, {:.3}, {:.3}, {:.3}]",
+                         glyph.tex_coords[0], glyph.tex_coords[1], glyph.tex_coords[2], glyph.tex_coords[3]);
+            }
+
+            // Quad for each glyph (in physical coordinates)
+            let x1 = physical_x;
+            let y1 = physical_y;
+            let x2 = physical_x + physical_width;
+            let y2 = physical_y + physical_height;
 
             // Extract texture coordinates from glyph
             let u0 = glyph.tex_coords[0];

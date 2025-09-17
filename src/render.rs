@@ -2,12 +2,13 @@
 //!
 //! Widgets emit commands, renderer batches and optimizes them for GPU
 
-use crate::coordinates::{DocPos, Viewport};
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, Viewport};
 use crate::tree::{Node, Point, Rect, Span, Tree, Widget};
 use std::sync::Arc;
+#[allow(unused)]
+use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
 
 // === Render Commands ===
-
 /// High-level rendering operations
 #[derive(Clone, Debug)]
 pub enum RenderOp {
@@ -92,15 +93,13 @@ struct Transform {
 
 impl Renderer {
     pub fn new(size: (f32, f32), scale_factor: f32) -> Self {
-        use crate::coordinates::LogicalSize;
-
         Self {
             commands: Vec::with_capacity(1000),
             clip_stack: Vec::new(),
             transform: Transform { x: 0.0, y: 0.0 },
             text_styles: None,
             font_system: None,
-            viewport: Viewport::new(LogicalSize { width: size.0, height: size.1 }, scale_factor),
+            viewport: Viewport::new(size.0, size.1, scale_factor),
             current_doc_pos: DocPos::default(),
         }
     }
@@ -125,12 +124,10 @@ impl Renderer {
 
     /// Update viewport size
     pub fn update_viewport(&mut self, width: f32, height: f32, scale_factor: f32) {
-        use crate::coordinates::LogicalSize;
-        self.viewport.resize(LogicalSize { width, height }, scale_factor);
+        self.viewport.resize(width, height, scale_factor);
     }
 
-    /// Get reference to viewport (for testing)
-    #[cfg(test)]
+    /// Get reference to viewport
     pub fn viewport(&self) -> &Viewport {
         &self.viewport
     }
@@ -179,16 +176,17 @@ impl Renderer {
 
                 // Render the coalesced text as a single unit
                 if !coalesced_text.is_empty() {
-                    let line_y = (self.current_doc_pos.line as f32) * self.viewport.line_height;
+                    // Use viewport to transform document position to layout position
+                    let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
                     let text = std::str::from_utf8(&coalesced_text).unwrap_or("");
 
-                    println!("  Rendering coalesced text ({} bytes) at pixel pos: (0.0, {:.1})",
-                             coalesced_text.len(), line_y);
+                    println!("  Rendering coalesced text ({} bytes) at layout pos: ({:.1}, {:.1})",
+                             coalesced_text.len(), layout_pos.x, layout_pos.y);
                     println!("    First 100 chars: '{}'",
                              text.chars().take(100).collect::<String>());
 
-                    self.render_text(&coalesced_text, 0.0, line_y);
-                    self.current_doc_pos.byte += coalesced_text.len();
+                    self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
+                    self.current_doc_pos.byte_offset += coalesced_text.len();
                     self.current_doc_pos.line += total_lines;
                 }
 
@@ -201,27 +199,27 @@ impl Renderer {
 
                         }
                         Span::Widget(widget) => {
-                            let line_y = (self.current_doc_pos.line as f32) * self.viewport.line_height;
-                            // For now, widgets render at position 0
-                            self.render_widget(widget.as_ref(), 0.0, line_y);
+                            let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
+                            self.render_widget(widget.as_ref(), layout_pos.x, layout_pos.y);
                         }
                         Span::Selection {
                             range,
                             id: _,
                             is_cursor,
                         } => {
-                            // For cursor/selection, we need to calculate the x position based on byte offset
-                            // This is simplified - real implementation would measure text up to cursor position
-                            let line_y = (self.current_doc_pos.line as f32) * self.viewport.line_height;
+                            // Calculate position based on byte offset in document
+                            let cursor_doc_pos = DocPos {
+                                byte_offset: range.start,
+                                line: self.current_doc_pos.line,
+                                column: 0, // Would need to calculate actual column from byte offset
+                            };
+                            let layout_pos = self.viewport.doc_to_layout(cursor_doc_pos);
 
                             if *is_cursor {
-                                // For now, render cursor at byte offset position
-                                // TODO: Calculate actual x position from byte offset in coalesced text
-                                let cursor_x = 0.0; // Would calculate from range.start
-                                self.render_cursor(cursor_x, line_y);
+                                self.render_cursor(layout_pos.x, layout_pos.y);
                             } else {
                                 // Render selection
-                                self.render_selection(range.clone(), 0.0, line_y);
+                                self.render_selection(range.clone(), layout_pos.x, layout_pos.y);
                             }
                         }
                     }
@@ -256,9 +254,27 @@ impl Renderer {
 
     /// Render widget
     fn render_widget(&mut self, widget: &dyn Widget, x: f32, y: f32) {
-        // Create paint context
+        let layout_pos = LayoutPos { x, y };
+        let view_pos = self.viewport.layout_to_view(layout_pos);
+
+        // Only render if visible
+        let widget_size = widget.measure();
+        let widget_rect = LayoutRect {
+            x: layout_pos.x,
+            y: layout_pos.y,
+            width: widget_size.0,
+            height: widget_size.1,
+        };
+
+        if !self.viewport.is_visible(widget_rect) {
+            return; // Skip off-screen widgets
+        }
+
+        // Create paint context with proper coordinate info
         let mut paint_ctx = crate::tree::PaintContext {
-            position: Point { x, y },
+            layout_pos,
+            view_pos: Some(view_pos),
+            doc_pos: Some(self.current_doc_pos),
             commands: &mut self.commands,
             text_styles: self.text_styles.as_deref(),
             font_system: self.font_system.as_ref(),
@@ -276,7 +292,7 @@ impl Renderer {
                 x,
                 y,
                 width: 2.0,
-                height: 20.0,
+                height: self.viewport.metrics.line_height,
             },
             color: 0xFFFFFFFF,
         });
@@ -291,7 +307,7 @@ impl Renderer {
                 x,
                 y,
                 width,
-                height: 20.0,
+                height: self.viewport.metrics.line_height,
             },
             color: 0x4080FF80,
         });
@@ -314,7 +330,7 @@ impl Renderer {
             || b.y + b.height < a.y)
     }
 
-    /// Batch commands for efficient GPU submission
+    /// Batch commands for efficient GPU submission (transforms layout → view space)
     fn batch_commands(&self) -> Vec<BatchedDraw> {
         let mut batches = Vec::new();
         let mut current_glyphs = Vec::new();
@@ -323,8 +339,16 @@ impl Renderer {
         for cmd in &self.commands {
             match cmd {
                 RenderOp::Glyphs { glyphs, .. } => {
-                    // Add to glyph batch
-                    current_glyphs.extend_from_slice(glyphs);
+                    // Transform glyphs from layout to view space
+                    for glyph in glyphs.iter() {
+                        let layout_pos = LayoutPos { x: glyph.x, y: glyph.y };
+                        let view_pos = self.viewport.layout_to_view(layout_pos);
+
+                        let mut transformed_glyph = *glyph;
+                        transformed_glyph.x = view_pos.x;
+                        transformed_glyph.y = view_pos.y;
+                        current_glyphs.push(transformed_glyph);
+                    }
                 }
                 RenderOp::Rect { rect, color } => {
                     // Flush glyphs if any
@@ -334,16 +358,44 @@ impl Renderer {
                             texture: 0,
                         });
                     }
-                    // Add to rect batch
+                    // Transform rect from layout to view space
+                    let layout_rect = LayoutRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    };
+                    let view_rect = self.viewport.layout_rect_to_view(layout_rect);
+
                     current_rects.push(RectInstance {
-                        rect: *rect,
+                        rect: Rect {
+                            x: view_rect.x,
+                            y: view_rect.y,
+                            width: view_rect.width,
+                            height: view_rect.height,
+                        },
                         color: *color,
                     });
                 }
                 RenderOp::PushClip(rect) => {
                     // Flush current batches
                     Self::flush_batches(&mut batches, &mut current_glyphs, &mut current_rects);
-                    batches.push(BatchedDraw::SetClip(*rect));
+
+                    // Transform clip rect to view space
+                    let layout_rect = LayoutRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    };
+                    let view_rect = self.viewport.layout_rect_to_view(layout_rect);
+
+                    batches.push(BatchedDraw::SetClip(Rect {
+                        x: view_rect.x,
+                        y: view_rect.y,
+                        width: view_rect.width,
+                        height: view_rect.height,
+                    }));
                 }
                 _ => {}
             }

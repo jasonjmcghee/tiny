@@ -88,12 +88,13 @@ pub enum Severity {
 
 impl Widget for TextWidget {
     fn measure(&self) -> (f32, f32) {
-        // For now, estimate based on text length
-        // Real measurement happens during paint when we have font system access
+        // This is a fallback - ideally widget would have access to viewport metrics
+        // during measure, but for now we estimate
         let text = std::str::from_utf8(&self.text).unwrap_or("");
         let char_count = text.chars().count();
-        let estimated_width = char_count as f32 * 8.0; // ~8px per char
-        let estimated_height = 20.0; // Single line height
+        // Use reasonable defaults that will be corrected during paint
+        let estimated_width = char_count as f32 * 8.4; // Approximate monospace width
+        let estimated_height = 19.6; // 14pt * 1.4 line height
         (estimated_width, estimated_height)
     }
 
@@ -123,22 +124,15 @@ impl Widget for TextWidget {
             }
         };
 
-        // Layout text - keep it simple
-        let font_size = 13.0;
-        println!("    Font layout: font_size={:.1}", font_size);
-        let layout = font_system.layout_text_scaled(text, font_size, ctx.viewport.scale_factor);
+        // Use font size from viewport metrics
+        let font_size = ctx.viewport.metrics.font_size;
+        let scale_factor = ctx.viewport.scale_factor;
 
-        // Convert to GPU instances
+        // Layout text at physical size for crisp rendering
+        let layout = font_system.layout_text_scaled(text, font_size, scale_factor);
+
+        // Convert to GPU instances in LAYOUT space
         let mut glyph_instances = Vec::with_capacity(layout.glyphs.len());
-        let base_x = ctx.position.x;
-        let base_y = ctx.position.y;
-
-        println!(
-            "    TextWidget.paint: base=({:.1}, {:.1}), {} glyphs from font",
-            base_x,
-            base_y,
-            layout.glyphs.len()
-        );
 
         // Track byte position for text effects
         let mut byte_pos = 0;
@@ -160,26 +154,20 @@ impl Widget for TextWidget {
                 byte_pos += char_bytes;
             }
 
-            // Font system works in logical coordinates
-            let final_x = base_x + glyph.x;
-            let final_y = base_y + glyph.y;
-
-            if byte_pos == 0 {
-                // Debug first glyph only
-                println!("      First glyph '{}': font_pos=({:.1}, {:.1}) + base=({:.1}, {:.1}) = final=({:.1}, {:.1})",
-                         glyph.char, glyph.x, glyph.y, base_x, base_y, final_x, final_y);
-            }
+            // Position in layout space (glyphs are already in logical coordinates)
+            let glyph_x = ctx.layout_pos.x + glyph.x;
+            let glyph_y = ctx.layout_pos.y + glyph.y;
 
             glyph_instances.push(GlyphInstance {
                 glyph_id: 0, // Not used anymore
-                x: final_x,
-                y: final_y,
+                x: glyph_x,
+                y: glyph_y,
                 color,
                 tex_coords: glyph.tex_coords,
             });
         }
 
-        // Emit render command
+        // Emit render command in LAYOUT space
         if !glyph_instances.is_empty() {
             ctx.commands.push(RenderOp::Glyphs {
                 glyphs: Arc::from(glyph_instances.into_boxed_slice()),
@@ -195,7 +183,7 @@ impl Widget for TextWidget {
 
 impl Widget for CursorWidget {
     fn measure(&self) -> (f32, f32) {
-        (self.style.width, 20.0) // Fixed height cursor
+        (self.style.width, 19.6) // Use standard line height (14pt * 1.4)
     }
 
     fn z_index(&self) -> i32 {
@@ -214,12 +202,15 @@ impl Widget for CursorWidget {
         let alpha = ((self.blink_phase * 2.0).sin() * 0.5 + 0.5).max(0.3);
         let color = (self.style.color & 0x00FFFFFF) | (((alpha * 255.0) as u32) << 24);
 
+        // Use line height from viewport metrics
+        let line_height = ctx.viewport.metrics.line_height;
+
         ctx.commands.push(RenderOp::Rect {
             rect: Rect {
-                x: ctx.position.x,
-                y: ctx.position.y,
+                x: ctx.layout_pos.x,
+                y: ctx.layout_pos.y,
                 width: self.style.width,
-                height: 20.0,
+                height: line_height,
             },
             color,
         });
@@ -251,12 +242,12 @@ impl Widget for SelectionWidget {
         // TODO: Calculate actual bounds based on text range
         // For now, draw a simple rectangle
         let width = 100.0; // Would be calculated from text metrics
-        let height = 20.0;
+        let height = ctx.viewport.metrics.line_height;
 
         ctx.commands.push(RenderOp::Rect {
             rect: Rect {
-                x: ctx.position.x,
-                y: ctx.position.y,
+                x: ctx.layout_pos.x,
+                y: ctx.layout_pos.y,
                 width,
                 height,
             },
@@ -331,20 +322,21 @@ impl Widget for DiagnosticWidget {
         // Draw wavy underline
         let width = 100.0; // TODO: Calculate from text range
         let segments = (width / 4.0) as i32;
+        let base_y = ctx.layout_pos.y + ctx.viewport.metrics.line_height - 2.0; // Position at bottom of line
 
         for i in 0..segments {
-            let x1 = ctx.position.x + (i as f32) * 4.0;
-            let x2 = ctx.position.x + ((i + 1) as f32) * 4.0;
+            let x1 = ctx.layout_pos.x + (i as f32) * 4.0;
+            let x2 = ctx.layout_pos.x + ((i + 1) as f32) * 4.0;
             let y_offset = if i % 2 == 0 { 0.0 } else { 1.0 };
 
             ctx.commands.push(RenderOp::Line {
                 from: Point {
                     x: x1,
-                    y: ctx.position.y + y_offset,
+                    y: base_y + y_offset,
                 },
                 to: Point {
                     x: x2,
-                    y: ctx.position.y + 1.0 - y_offset,
+                    y: base_y + 1.0 - y_offset,
                 },
                 color,
                 width: 1.0,
@@ -430,7 +422,7 @@ pub fn diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinates::{LogicalSize, Viewport};
+    use crate::coordinates::{LayoutPos, Viewport};
     use crate::font::SharedFontSystem;
     use crate::render::RenderOp;
     use crate::tree::{PaintContext, Point};
@@ -440,12 +432,14 @@ mod tests {
     fn test_text_widget_paint() {
         let widget = text("X");
         let font_system = Arc::new(SharedFontSystem::new());
-        let mut viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 1.0);
+        let mut viewport = Viewport::new(800.0, 600.0, 1.0);
         viewport.set_font_system(font_system.clone());
 
         let mut commands = Vec::new();
         let mut ctx = PaintContext {
-            position: Point { x: 10.0, y: 20.0 },
+            layout_pos: LayoutPos { x: 10.0, y: 20.0 },
+            view_pos: None,
+            doc_pos: None,
             commands: &mut commands,
             text_styles: None,
             font_system: Some(&font_system),
@@ -477,10 +471,12 @@ mod tests {
             blink_phase: 0.0,
         };
 
-        let viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 1.0);
+        let viewport = Viewport::new(800.0, 600.0, 1.0);
         let mut commands = Vec::new();
         let mut ctx = PaintContext {
-            position: Point { x: 50.0, y: 100.0 },
+            layout_pos: LayoutPos { x: 50.0, y: 100.0 },
+            view_pos: None,
+            doc_pos: None,
             commands: &mut commands,
             text_styles: None,
             font_system: None,
@@ -495,7 +491,7 @@ mod tests {
                 assert_eq!(rect.x, 50.0);
                 assert_eq!(rect.y, 100.0);
                 assert_eq!(rect.width, 2.0);
-                assert_eq!(rect.height, 20.0); // line_height
+                assert_eq!(rect.height, 19.6); // line_height (14.0 * 1.4)
                 assert_eq!(*color, 0x7FFF0000); // 50% opacity red
             }
             _ => panic!("Expected Rect command"),

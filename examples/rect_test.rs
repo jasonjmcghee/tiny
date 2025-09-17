@@ -4,6 +4,7 @@
 
 use tiny_editor::{
     app::{AppLogic, TinyApp},
+    coordinates::LayoutPos,
     render::RenderOp,
     tree::{Doc, PaintContext, Point, Rect, Widget},
 };
@@ -31,12 +32,12 @@ impl Widget for TestRect {
     }
 
     fn paint(&self, ctx: &mut PaintContext<'_>) {
-        println!("TestRect::paint at ({:.1}, {:.1})", ctx.position.x, ctx.position.y);
+        println!("TestRect::paint at ({:.1}, {:.1})", ctx.layout_pos.x, ctx.layout_pos.y);
 
         ctx.commands.push(RenderOp::Rect {
             rect: Rect {
-                x: ctx.position.x,
-                y: ctx.position.y,
+                x: ctx.layout_pos.x,
+                y: ctx.layout_pos.y,
                 width: self.width,
                 height: self.height,
             },

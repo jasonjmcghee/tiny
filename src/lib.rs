@@ -4,6 +4,9 @@
 
 extern crate lazy_static;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod coordinates; // Coordinate system abstraction
 pub mod font;
 pub mod gpu;

@@ -3,10 +3,10 @@
 //! Everything is a span in a B-tree with summed metadata for O(log n) queries.
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
+use crossbeam::queue::SegQueue;
 use simdutf8::basic::from_utf8;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Maximum spans per leaf node (tuned for cache line)
@@ -24,8 +24,10 @@ const FLUSH_THRESHOLD: usize = 16;
 pub struct Doc {
     /// Current immutable snapshot for readers (lock-free!)
     snapshot: ArcSwap<Tree>,
-    /// Buffered edits waiting to be applied
-    pending: Mutex<Vec<Edit>>,
+    /// Buffered edits waiting to be applied (lock-free!)
+    pending: SegQueue<Edit>,
+    /// Approximate count of pending edits for auto-flush
+    pending_count: AtomicUsize,
     /// Monotonic version counter
     version: AtomicU64,
 }
@@ -127,15 +129,19 @@ pub trait Widget: Send + Sync {
 
 /// Context passed to widgets during painting
 pub struct PaintContext<'a> {
-    /// Position of this widget
-    pub position: Point,
-    /// Current commands being built
+    /// Widget's position in layout space (pre-scroll)
+    pub layout_pos: crate::coordinates::LayoutPos,
+    /// Widget's position in view space (post-scroll, None if off-screen)
+    pub view_pos: Option<crate::coordinates::ViewPos>,
+    /// Document position (if widget is text-related)
+    pub doc_pos: Option<crate::coordinates::DocPos>,
+    /// Current commands being built (widgets emit in LAYOUT space)
     pub commands: &'a mut Vec<crate::render::RenderOp>,
     /// Text style provider for syntax highlighting
     pub text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
     /// Font system for text layout and rasterization (shared reference)
     pub font_system: Option<&'a std::sync::Arc<crate::font::SharedFontSystem>>,
-    /// Viewport for coordinate transformations and scale factor
+    /// Viewport for all coordinate transformations and metrics
     pub viewport: &'a crate::coordinates::Viewport,
 }
 
@@ -146,7 +152,8 @@ impl Doc {
     pub fn new() -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(Tree::new()),
-            pending: Mutex::new(Vec::new()),
+            pending: SegQueue::new(),
+            pending_count: AtomicUsize::new(0),
             version: AtomicU64::new(0),
         }
     }
@@ -155,7 +162,8 @@ impl Doc {
     pub fn from_str(text: &str) -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(Tree::from_str(text)),
-            pending: Mutex::new(Vec::new()),
+            pending: SegQueue::new(),
+            pending_count: AtomicUsize::new(0),
             version: AtomicU64::new(0),
         }
     }
@@ -167,26 +175,29 @@ impl Doc {
 
     /// Buffer an edit
     pub fn edit(&self, edit: Edit) {
-        let mut pending = self.pending.lock();
-        pending.push(edit);
+        self.pending.push(edit);
+        let count = self.pending_count.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Auto-flush if too many pending
-        if pending.len() >= FLUSH_THRESHOLD {
-            drop(pending); // Release lock before flush
+        if count >= FLUSH_THRESHOLD {
             self.flush();
         }
     }
 
     /// Apply all pending edits
     pub fn flush(&self) {
-        let edits: Vec<Edit> = {
-            let mut pending = self.pending.lock();
-            pending.drain(..).collect()
-        };
+        // Collect all pending edits
+        let mut edits = Vec::new();
+        while let Some(edit) = self.pending.pop() {
+            edits.push(edit);
+        }
 
         if edits.is_empty() {
             return;
         }
+
+        // Reset the pending count
+        self.pending_count.store(0, Ordering::Relaxed);
 
         // Create new tree with edits applied
         let current = self.snapshot.load();

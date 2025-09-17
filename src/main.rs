@@ -222,7 +222,9 @@ fn main() {
 
                     // Execute on GPU with logical viewport dimensions
                     unsafe {
-                        renderer.render(&batches, (logical_width, logical_height));
+                        // Create viewport for GPU rendering
+                        let viewport = tiny_editor::coordinates::Viewport::new(logical_width, logical_height, scale_factor);
+                        renderer.render(&batches, &viewport);
                     }
                 }
             }

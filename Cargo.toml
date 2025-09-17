@@ -25,6 +25,7 @@ parking_lot = "0.12"
 memchr = "2.7"  # For fast newline counting in rope
 lazy_static = "1.4"  # For global statics
 arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
+crossbeam = "0.8"  # Lock-free data structures
 
 # Syntax highlighting
 tree-sitter = "0.25"
@@ -42,6 +43,7 @@ pollster = "0.3"  # Async executor for main
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 simdutf8 = "0.1.5"
 bytecount = "0.6.9"
+mimalloc = "0.1.48"
 
 [dev-dependencies]
 criterion = "0.7"  # Benchmarking

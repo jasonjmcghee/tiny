@@ -1,36 +1,75 @@
-//! Coordinate system abstraction for clean separation of concerns
+//! Coordinate system transformation hub - THE single source of truth
 //!
-//! Three distinct coordinate systems:
-//! 1. Document space: lines, columns, byte offsets (what editor thinks in)
-//! 2. Logical space: DPI-independent pixels (what UI uses)
-//! 3. Physical space: actual device pixels (what GPU renders)
+//! Four distinct coordinate spaces with explicit transformations:
+//! 1. Document space: bytes, lines, columns (what editor manipulates)
+//! 2. Layout space: logical pixels, pre-scroll (where widgets live)
+//! 3. View space: logical pixels, post-scroll (what's visible)
+//! 4. Physical space: device pixels (what GPU renders)
 
-/// Position in document space (what the editor uses)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use std::sync::Arc;
+
+// === Document Space ===
+
+/// Position in document (text/editing operations)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DocPos {
+    /// Byte offset in the document
+    pub byte_offset: usize,
     /// Line number (0-indexed)
     pub line: u32,
-    /// Column number (0-indexed, in characters not bytes)
-    pub col: u32,
-    /// Byte offset in the document
-    pub byte: usize,
+    /// Visual column (0-indexed, accounts for tabs)
+    pub column: u32,
 }
 
-/// Position in logical pixel space (DPI-independent)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LogicalPos {
+// === Layout Space (pre-scroll) ===
+
+/// Position in layout space - where things are before scrolling
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LayoutPos {
     pub x: f32,
     pub y: f32,
 }
 
-/// Size in logical pixels
+/// Size in layout space
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LogicalSize {
+pub struct LayoutSize {
     pub width: f32,
     pub height: f32,
 }
 
-/// Position in physical pixel space (device pixels)
+/// Rectangle in layout space
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+// === View Space (post-scroll) ===
+
+/// Position in view space - layout minus scroll offset
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewPos {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Size in view space (same as layout size)
+pub type ViewSize = LayoutSize;
+
+/// Rectangle in view space
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+// === Physical Space (device pixels) ===
+
+/// Position in physical pixels
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PhysicalPos {
     pub x: f32,
@@ -44,226 +83,322 @@ pub struct PhysicalSize {
     pub height: u32,
 }
 
-/// Viewport manages the transformation between coordinate systems
+// === Text Metrics (single source of truth) ===
+
+/// All text measurement configuration in one place
+#[derive(Clone)]
+pub struct TextMetrics {
+    /// Base font size in logical pixels
+    pub font_size: f32,
+    /// Line height in logical pixels
+    pub line_height: f32,
+    /// Average space width in logical pixels (at base font size)
+    pub space_width: f32,
+    /// Number of spaces per tab
+    pub tab_stops: u32,
+}
+
+impl TextMetrics {
+    pub fn new(font_size: f32) -> Self {
+        Self {
+            font_size,
+            line_height: font_size * 1.4,  // Standard line height multiplier
+            space_width: font_size * 0.6,  // Approximate for monospace
+            tab_stops: 4,
+        }
+    }
+
+    /// Get tab width in logical pixels
+    pub fn tab_width(&self) -> f32 {
+        self.space_width * self.tab_stops as f32
+    }
+
+    /// Calculate column position for a character position in a line
+    pub fn byte_to_column(&self, line_text: &str, byte_in_line: usize) -> u32 {
+        let mut column = 0;
+        let mut byte_pos = 0;
+
+        for ch in line_text.chars() {
+            if byte_pos >= byte_in_line {
+                break;
+            }
+            if ch == '\t' {
+                // Tab advances to next tab stop
+                column = ((column / self.tab_stops) + 1) * self.tab_stops;
+            } else {
+                column += 1;
+            }
+            byte_pos += ch.len_utf8();
+        }
+        column
+    }
+
+    /// Calculate x position for a column
+    pub fn column_to_x(&self, column: u32) -> f32 {
+        column as f32 * self.space_width
+    }
+}
+
+// === THE Viewport - Central transformation hub ===
+
+/// Manages all coordinate transformations
 #[derive(Clone)]
 pub struct Viewport {
-    /// HiDPI scale factor (logical pixels to physical pixels)
+    // === Scroll state ===
+    /// Current scroll position in layout space
+    pub scroll: LayoutPos,
+
+    // === Window dimensions ===
+    /// Logical size (DPI-independent)
+    pub logical_size: LayoutSize,
+    /// Physical size (device pixels)
+    pub physical_size: PhysicalSize,
+    /// HiDPI scale factor
     pub scale_factor: f32,
 
-    /// Current scroll position in document space
-    pub scroll: DocPos,
+    // === Text metrics ===
+    pub metrics: TextMetrics,
 
-    /// Visible range of lines
-    pub visible_lines: std::ops::Range<u32>,
-
-    /// Window size in logical pixels
-    pub logical_size: LogicalSize,
-
-    /// Window size in physical pixels
-    pub physical_size: PhysicalSize,
-
-    /// Font metrics for text positioning
-    pub line_height: f32,  // in logical pixels
-    pub char_width: f32,   // average char width in logical pixels
-
-    /// Font system for accurate text measurements
-    pub font_system: Option<std::sync::Arc<crate::font::SharedFontSystem>>,
-
-    /// Cache of text measurements for performance
-    text_cache: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, f32>>>,
+    // === Optional font system for accurate measurement ===
+    font_system: Option<Arc<crate::font::SharedFontSystem>>,
 }
 
 impl Viewport {
-    /// Create a new viewport
-    pub fn new(logical_size: LogicalSize, scale_factor: f32) -> Self {
+    /// Create new viewport with metrics
+    pub fn new(logical_width: f32, logical_height: f32, scale_factor: f32) -> Self {
         let physical_size = PhysicalSize {
-            width: (logical_size.width * scale_factor) as u32,
-            height: (logical_size.height * scale_factor) as u32,
+            width: (logical_width * scale_factor) as u32,
+            height: (logical_height * scale_factor) as u32,
         };
 
         Self {
-            scale_factor,
-            scroll: DocPos { line: 0, col: 0, byte: 0 },
-            visible_lines: 0..((logical_size.height / 20.0) as u32), // Assuming 20px line height
-            logical_size,
+            scroll: LayoutPos { x: 0.0, y: 0.0 },
+            logical_size: LayoutSize {
+                width: logical_width,
+                height: logical_height,
+            },
             physical_size,
-            line_height: 20.0,
-            char_width: 8.0,
+            scale_factor,
+            metrics: TextMetrics::new(14.0), // Default 14pt font
             font_system: None,
-            text_cache: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
-    /// Set font system for accurate text measurements
-    pub fn set_font_system(&mut self, font_system: std::sync::Arc<crate::font::SharedFontSystem>) {
+    /// Set font system for accurate text measurement
+    pub fn set_font_system(&mut self, font_system: Arc<crate::font::SharedFontSystem>) {
         self.font_system = Some(font_system.clone());
 
-        // Line height multiplier
-        const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
-        const FONT_SIZE: f32 = 13.0;
-
-        self.line_height = FONT_SIZE * LINE_HEIGHT_MULTIPLIER * self.scale_factor;
-
-        // Measure average character width
-        let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        let layout = font_system.layout_text_scaled(chars, FONT_SIZE, self.scale_factor);
-        self.char_width = layout.width / chars.len() as f32;
-
-        // Clear cache when font changes
-        self.text_cache.lock().clear();
+        // Update metrics based on actual font measurements
+        let test_layout = font_system.layout_text_scaled(" ", self.metrics.font_size, self.scale_factor);
+        if !test_layout.glyphs.is_empty() {
+            self.metrics.space_width = test_layout.width;
+        }
     }
 
-    /// Update viewport size (e.g., on window resize)
-    pub fn resize(&mut self, logical_size: LogicalSize, scale_factor: f32) {
-        self.logical_size = logical_size;
+    /// Update viewport on window resize
+    pub fn resize(&mut self, logical_width: f32, logical_height: f32, scale_factor: f32) {
+        self.logical_size = LayoutSize {
+            width: logical_width,
+            height: logical_height,
+        };
         self.scale_factor = scale_factor;
         self.physical_size = PhysicalSize {
-            width: (logical_size.width * scale_factor) as u32,
-            height: (logical_size.height * scale_factor) as u32,
+            width: (logical_width * scale_factor) as u32,
+            height: (logical_height * scale_factor) as u32,
         };
-
-        // Update visible lines
-        let visible_line_count = (logical_size.height / self.line_height) as u32;
-        self.visible_lines = self.scroll.line..self.scroll.line + visible_line_count;
     }
 
-    /// Convert document position to logical position
-    pub fn doc_to_logical(&self, pos: DocPos) -> LogicalPos {
-        // For now, still use hardcoded metrics for compatibility
-        // This will be replaced when we integrate with actual document text
-        LogicalPos {
-            x: (pos.col as f32) * self.char_width - (self.scroll.col as f32) * self.char_width,
-            y: (pos.line as f32) * self.line_height - (self.scroll.line as f32) * self.line_height,
+    // === Forward Transformations (Doc → Layout → View → Physical) ===
+
+    /// Document position to layout position
+    pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
+        LayoutPos {
+            x: self.metrics.column_to_x(pos.column),
+            y: pos.line as f32 * self.metrics.line_height,
         }
     }
 
-    /// Convert document position to logical position with actual text
-    pub fn doc_to_logical_with_text(&self, pos: DocPos, line_text: &str) -> LogicalPos {
+    /// Document position to layout with actual text (more accurate)
+    pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
         let x = if let Some(font_system) = &self.font_system {
-            // Measure actual text up to column position
-            if pos.col > 0 && pos.col <= line_text.chars().count() as u32 {
-                let prefix: String = line_text.chars().take(pos.col as usize).collect();
-
-                // Check cache first
-                let cache_key = format!("{}:{}", pos.line, prefix);
-                if let Some(&cached_x) = self.text_cache.lock().get(&cache_key) {
-                    cached_x - (self.scroll.col as f32) * self.char_width
-                } else {
-                    // Measure the text
-                    let layout = font_system.layout_text_scaled(&prefix, 14.0, self.scale_factor);
-                    let x = layout.width;
-
-                    // Cache the measurement
-                    self.text_cache.lock().insert(cache_key, x);
-                    x - (self.scroll.col as f32) * self.char_width
-                }
+            // Measure actual text up to column
+            let byte_in_line = self.column_to_byte_in_line(line_text, pos.column);
+            if byte_in_line > 0 {
+                let prefix: String = line_text.chars().take(byte_in_line).collect();
+                let layout = font_system.layout_text_scaled(&prefix, self.metrics.font_size, self.scale_factor);
+                layout.width
             } else {
-                // Fallback to estimated position
-                (pos.col as f32) * self.char_width - (self.scroll.col as f32) * self.char_width
+                0.0
             }
         } else {
-            // No font system, use hardcoded metrics
-            (pos.col as f32) * self.char_width - (self.scroll.col as f32) * self.char_width
+            // Fallback to column-based positioning
+            self.metrics.column_to_x(pos.column)
         };
 
-        LogicalPos {
+        LayoutPos {
             x,
-            y: (pos.line as f32) * self.line_height - (self.scroll.line as f32) * self.line_height,
+            y: pos.line as f32 * self.metrics.line_height,
         }
     }
 
-    /// Measure text width using font system
-    pub fn measure_text(&self, text: &str) -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
-
-        if let Some(font_system) = &self.font_system {
-            let layout = font_system.layout_text_scaled(text, 14.0, self.scale_factor);
-            layout.width
-        } else {
-            // Fallback to character count
-            let mut width = 0.0;
-            for ch in text.chars() {
-                if ch == '\t' {
-                    width += self.char_width * 4.0; // Tab is 4 spaces
-                } else {
-                    width += self.char_width;
-                }
-            }
-            width
+    /// Layout position to view position (apply scroll)
+    pub fn layout_to_view(&self, pos: LayoutPos) -> ViewPos {
+        ViewPos {
+            x: pos.x - self.scroll.x,
+            y: pos.y - self.scroll.y,
         }
     }
 
-    /// Convert logical position to physical position
-    pub fn logical_to_physical(&self, pos: LogicalPos) -> PhysicalPos {
+    /// View position to physical position (apply scale factor)
+    pub fn view_to_physical(&self, pos: ViewPos) -> PhysicalPos {
         PhysicalPos {
             x: pos.x * self.scale_factor,
             y: pos.y * self.scale_factor,
         }
     }
 
-    /// Convert document position directly to physical position
-    pub fn doc_to_physical(&self, pos: DocPos) -> PhysicalPos {
-        self.logical_to_physical(self.doc_to_logical(pos))
+    /// Combined: Document to view position
+    pub fn doc_to_view(&self, pos: DocPos) -> ViewPos {
+        self.layout_to_view(self.doc_to_layout(pos))
     }
 
-    /// Convert physical position to logical position
-    pub fn physical_to_logical(&self, pos: PhysicalPos) -> LogicalPos {
-        LogicalPos {
+    /// Combined: Document to physical position
+    pub fn doc_to_physical(&self, pos: DocPos) -> PhysicalPos {
+        self.view_to_physical(self.doc_to_view(pos))
+    }
+
+    /// Combined: Layout to physical position
+    pub fn layout_to_physical(&self, pos: LayoutPos) -> PhysicalPos {
+        self.view_to_physical(self.layout_to_view(pos))
+    }
+
+    // === Reverse Transformations (Physical → View → Layout → Doc) ===
+
+    /// Physical position to view position
+    pub fn physical_to_view(&self, pos: PhysicalPos) -> ViewPos {
+        ViewPos {
             x: pos.x / self.scale_factor,
             y: pos.y / self.scale_factor,
         }
     }
 
-    /// Convert logical position to document position (approximate)
-    pub fn logical_to_doc(&self, pos: LogicalPos) -> DocPos {
-        let line = ((pos.y / self.line_height) + self.scroll.line as f32) as u32;
-        let col = ((pos.x / self.char_width) + self.scroll.col as f32) as u32;
+    /// View position to layout position (unapply scroll)
+    pub fn view_to_layout(&self, pos: ViewPos) -> LayoutPos {
+        LayoutPos {
+            x: pos.x + self.scroll.x,
+            y: pos.y + self.scroll.y,
+        }
+    }
+
+    /// Layout position to document position (approximate)
+    pub fn layout_to_doc(&self, pos: LayoutPos) -> DocPos {
+        let line = (pos.y / self.metrics.line_height) as u32;
+        let column = (pos.x / self.metrics.space_width) as u32;
 
         DocPos {
+            byte_offset: 0, // Would need document access for accurate byte offset
             line,
-            col,
-            byte: 0, // Would need document access to calculate actual byte offset
+            column,
         }
     }
 
-    /// Check if a document position is visible
-    pub fn is_visible(&self, pos: DocPos) -> bool {
-        self.visible_lines.contains(&pos.line)
+    /// Combined: Physical to layout position
+    pub fn physical_to_layout(&self, pos: PhysicalPos) -> LayoutPos {
+        self.view_to_layout(self.physical_to_view(pos))
     }
 
-    /// Scroll to make a document position visible
-    pub fn ensure_visible(&mut self, pos: DocPos) {
-        if pos.line < self.visible_lines.start {
-            // Scroll up
-            self.scroll.line = pos.line;
-        } else if pos.line >= self.visible_lines.end {
-            // Scroll down
-            let visible_count = self.visible_lines.end - self.visible_lines.start;
-            self.scroll.line = pos.line.saturating_sub(visible_count - 1);
+    /// Combined: Physical to document position
+    pub fn physical_to_doc(&self, pos: PhysicalPos) -> DocPos {
+        self.layout_to_doc(self.physical_to_layout(pos))
+    }
+
+    // === Rectangle Transformations ===
+
+    /// Transform layout rectangle to view rectangle
+    pub fn layout_rect_to_view(&self, rect: LayoutRect) -> ViewRect {
+        ViewRect {
+            x: rect.x - self.scroll.x,
+            y: rect.y - self.scroll.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+
+    /// Check if layout rectangle is visible in view
+    pub fn is_visible(&self, rect: LayoutRect) -> bool {
+        let view_rect = self.layout_rect_to_view(rect);
+        view_rect.x < self.logical_size.width
+            && view_rect.x + view_rect.width > 0.0
+            && view_rect.y < self.logical_size.height
+            && view_rect.y + view_rect.height > 0.0
+    }
+
+    // === Scrolling ===
+
+    /// Scroll to make a layout position visible
+    pub fn ensure_visible(&mut self, pos: LayoutPos) {
+        // Horizontal scrolling
+        if pos.x < self.scroll.x {
+            self.scroll.x = pos.x;
+        } else if pos.x > self.scroll.x + self.logical_size.width {
+            self.scroll.x = pos.x - self.logical_size.width + 50.0; // Leave some margin
         }
 
-        // Update visible range
-        let visible_count = (self.logical_size.height / self.line_height) as u32;
-        self.visible_lines = self.scroll.line..self.scroll.line + visible_count;
+        // Vertical scrolling
+        if pos.y < self.scroll.y {
+            self.scroll.y = pos.y;
+        } else if pos.y + self.metrics.line_height > self.scroll.y + self.logical_size.height {
+            self.scroll.y = pos.y + self.metrics.line_height - self.logical_size.height;
+        }
+    }
+
+    /// Get visible line range
+    pub fn visible_lines(&self) -> std::ops::Range<u32> {
+        let first_line = (self.scroll.y / self.metrics.line_height) as u32;
+        let last_line = ((self.scroll.y + self.logical_size.height) / self.metrics.line_height) as u32 + 1;
+        first_line..last_line
+    }
+
+    // === Helpers ===
+
+    fn column_to_byte_in_line(&self, line_text: &str, target_column: u32) -> usize {
+        let mut column = 0;
+        let mut byte_pos = 0;
+
+        for ch in line_text.chars() {
+            if column >= target_column {
+                break;
+            }
+            if ch == '\t' {
+                column = ((column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
+            } else {
+                column += 1;
+            }
+            if column <= target_column {
+                byte_pos += ch.len_utf8();
+            }
+        }
+        byte_pos
     }
 }
 
-/// Glyph metrics in logical space
-#[derive(Debug, Clone, Copy)]
-pub struct GlyphMetrics {
-    /// Position relative to baseline
-    pub offset: LogicalPos,
-    /// Size of the glyph
-    pub size: LogicalSize,
-    /// Advance to next glyph
-    pub advance: f32,
+// === Convenience Implementations ===
+
+impl LayoutRect {
+    pub fn contains(&self, pos: LayoutPos) -> bool {
+        pos.x >= self.x
+            && pos.x <= self.x + self.width
+            && pos.y >= self.y
+            && pos.y <= self.y + self.height
+    }
 }
 
-impl Default for DocPos {
-    fn default() -> Self {
-        Self { line: 0, col: 0, byte: 0 }
+impl ViewRect {
+    pub fn contains(&self, pos: ViewPos) -> bool {
+        pos.x >= self.x
+            && pos.x <= self.x + self.width
+            && pos.y >= self.y
+            && pos.y <= self.y + self.height
     }
 }
 
@@ -273,138 +408,72 @@ mod tests {
 
     #[test]
     fn test_coordinate_transformations() {
-        let viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 1.0);
+        let mut viewport = Viewport::new(800.0, 600.0, 2.0); // 2x scale (retina)
 
-        // Doc to Logical
+        // Doc → Layout → View → Physical
         let doc_pos = DocPos {
+            byte_offset: 0,
             line: 5,
-            col: 10,
-            byte: 0,
+            column: 10,
         };
-        let logical = viewport.doc_to_logical(doc_pos);
-        assert_eq!(logical.x, 10.0 * viewport.char_width);
-        assert_eq!(logical.y, 5.0 * viewport.line_height);
 
-        // Logical to Physical (no scaling)
-        let physical = viewport.logical_to_physical(logical);
-        assert_eq!(physical.x, logical.x);
-        assert_eq!(physical.y, logical.y);
+        let layout_pos = viewport.doc_to_layout(doc_pos);
+        assert_eq!(layout_pos.x, 10.0 * viewport.metrics.space_width);
+        assert_eq!(layout_pos.y, 5.0 * viewport.metrics.line_height);
+
+        let view_pos = viewport.layout_to_view(layout_pos);
+        assert_eq!(view_pos.x, layout_pos.x); // No scroll initially
+        assert_eq!(view_pos.y, layout_pos.y);
+
+        let physical_pos = viewport.view_to_physical(view_pos);
+        assert_eq!(physical_pos.x, view_pos.x * 2.0); // 2x scale
+        assert_eq!(physical_pos.y, view_pos.y * 2.0);
     }
 
     #[test]
-    fn test_scale_factor_conversions() {
-        let viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 2.0); // Retina
+    fn test_scrolling() {
+        let mut viewport = Viewport::new(800.0, 600.0, 1.0);
+        viewport.scroll = LayoutPos { x: 100.0, y: 200.0 };
 
-        let doc_pos = DocPos {
-            line: 1,
-            col: 3,
-            byte: 0,
-        };
+        let layout_pos = LayoutPos { x: 150.0, y: 250.0 };
+        let view_pos = viewport.layout_to_view(layout_pos);
 
-        let logical = viewport.doc_to_logical(doc_pos);
-        let physical = viewport.logical_to_physical(logical);
-
-        // Logical coordinates independent of scale
-        assert_eq!(logical.x, 3.0 * viewport.char_width);
-        assert_eq!(logical.y, 1.0 * viewport.line_height);
-
-        // Physical coordinates scaled by 2x
-        assert_eq!(physical.x, logical.x * 2.0);
-        assert_eq!(physical.y, logical.y * 2.0);
+        assert_eq!(view_pos.x, 50.0); // 150 - 100 scroll
+        assert_eq!(view_pos.y, 50.0); // 250 - 200 scroll
     }
 
     #[test]
-    fn test_roundtrip_conversion() {
-        let viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 1.5);
+    fn test_visibility_check() {
+        let mut viewport = Viewport::new(800.0, 600.0, 1.0);
+        viewport.scroll = LayoutPos { x: 100.0, y: 100.0 };
 
-        let original = DocPos {
-            line: 7,
-            col: 15,
-            byte: 0,
+        // Visible rectangle
+        let visible_rect = LayoutRect {
+            x: 150.0,
+            y: 150.0,
+            width: 100.0,
+            height: 100.0,
         };
+        assert!(viewport.is_visible(visible_rect));
 
-        // Full roundtrip
-        let logical = viewport.doc_to_logical(original);
-        let physical = viewport.logical_to_physical(logical);
-        let back_logical = viewport.physical_to_logical(physical);
-        let back_doc = viewport.logical_to_doc(back_logical);
-
-        // Should return to exact same position
-        assert_eq!(original.line, back_doc.line);
-        assert_eq!(original.col, back_doc.col);
-
-        // Logical coordinates should match (within floating point precision)
-        assert!((logical.x - back_logical.x).abs() < 0.01);
-        assert!((logical.y - back_logical.y).abs() < 0.01);
+        // Off-screen rectangle
+        let offscreen_rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 50.0,
+            height: 50.0,
+        };
+        assert!(!viewport.is_visible(offscreen_rect));
     }
 
     #[test]
-    fn test_viewport_scrolling() {
-        let mut viewport = Viewport::new(LogicalSize { width: 800.0, height: 400.0 }, 1.0); // 20 lines visible
+    fn test_tab_handling() {
+        let metrics = TextMetrics::new(14.0);
 
-        // Initially see lines 0-19
-        assert_eq!(viewport.visible_lines, 0..20);
-
-        // Scroll to make line 50 visible
-        viewport.ensure_visible(DocPos {
-            line: 50,
-            col: 0,
-            byte: 0,
-        });
-
-        assert!(viewport.visible_lines.contains(&50));
-        assert_eq!(viewport.scroll.line, 31); // Scrolled to show lines 31-50
-
-        // Scroll with horizontal offset
-        viewport.ensure_visible(DocPos {
-            line: 50,
-            col: 100,
-            byte: 0,
-        });
-
-        // Horizontal scrolling - implementation may vary
-        assert!(viewport.scroll.col <= 100); // Should have scrolled to show column 100
-    }
-
-    #[test]
-    fn test_viewport_resize() {
-        let mut viewport = Viewport::new(LogicalSize { width: 400.0, height: 300.0 }, 1.0);
-
-        let initial_visible = viewport.visible_lines.clone();
-
-        // Resize to larger
-        viewport.resize(LogicalSize { width: 800.0, height: 600.0 }, 1.0);
-
-        // Should see more lines
-        assert!(viewport.visible_lines.len() > initial_visible.len());
-
-        // Physical size should update
-        assert_eq!(viewport.physical_size.width, 800);
-        assert_eq!(viewport.physical_size.height, 600);
-    }
-
-    #[test]
-    fn test_doc_position_with_scroll() {
-        let mut viewport = Viewport::new(LogicalSize { width: 800.0, height: 600.0 }, 1.0);
-
-        // Set scroll offset
-        viewport.scroll = DocPos {
-            line: 10,
-            col: 5,
-            byte: 0,
-        };
-
-        // Position relative to scroll
-        let doc_pos = DocPos {
-            line: 12,
-            col: 8,
-            byte: 0,
-        };
-
-        let logical = viewport.doc_to_logical(doc_pos);
-
-        // Should be offset by scroll amount
-        assert_eq!(logical.x, (8 - 5) as f32 * viewport.char_width);
-        assert_eq!(logical.y, (12 - 10) as f32 * viewport.line_height);
+        // Tab should advance to next tab stop
+        assert_eq!(metrics.byte_to_column("hello\tworld", 6), 8); // After tab
+        assert_eq!(metrics.byte_to_column("\t\t", 0), 0); // Start
+        assert_eq!(metrics.byte_to_column("\t\t", 1), 4); // After first tab
+        assert_eq!(metrics.byte_to_column("\t\t", 2), 8); // After second tab
     }
 }
