@@ -2,7 +2,7 @@
 //!
 //! Text rendering uses the consolidated FontSystem from font.rs
 
-use crate::coordinates::{LogicalPixels, LogicalSize, PhysicalPos};
+use crate::coordinates::{LogicalPixels, LogicalSize};
 use crate::tree::{Point, Widget};
 use std::sync::Arc;
 
@@ -155,19 +155,18 @@ impl Widget for TextWidget {
             }
 
             // Glyphs from font system are in physical pixels relative to (0,0)
-            // We need to position them at the layout position
-            // But since GlyphInstance uses PhysicalPos, we need to convert layout to physical
-            // The scroll transformation will happen later in the renderer
-            let layout_pos_physical_x = ctx.layout_pos.x.0 * ctx.viewport.scale_factor;
-            let layout_pos_physical_y = ctx.layout_pos.y.0 * ctx.viewport.scale_factor;
-            let glyph_pos = PhysicalPos::new(
-                layout_pos_physical_x + glyph.pos.x.0,
-                layout_pos_physical_y + glyph.pos.y.0,
+            // But we want to emit them in layout space for consistent transformation
+            // Convert glyph position to logical and add layout position
+            let glyph_logical_x = glyph.pos.x.0 / ctx.viewport.scale_factor;
+            let glyph_logical_y = glyph.pos.y.0 / ctx.viewport.scale_factor;
+            let glyph_pos = crate::coordinates::LayoutPos::new(
+                ctx.layout_pos.x.0 + glyph_logical_x,
+                ctx.layout_pos.y.0 + glyph_logical_y,
             );
 
             glyph_instances.push(GlyphInstance {
                 glyph_id: 0, // Not used anymore
-                pos: glyph_pos,
+                pos: glyph_pos,  // Now in layout space (logical pixels)
                 color,
                 tex_coords: glyph.tex_coords,
             });

@@ -352,22 +352,24 @@ impl SharedFontSystem {
     }
 }
 
-/// Convert layout to GPU instances
+/// Convert layout to GPU instances (now in layout space)
 pub fn layout_to_instances(
     layout: &TextLayout,
     offset_x: f32,
     offset_y: f32,
     scale_factor: f32,
 ) -> Vec<GlyphInstance> {
+    use crate::coordinates::LayoutPos;
     layout
         .glyphs
         .iter()
         .map(|g| {
+            // Convert physical pixels to logical for layout space
             GlyphInstance {
                 glyph_id: 0, // Not used anymore
-                pos: PhysicalPos::new(
-                    (g.pos.x.0 + offset_x) * scale_factor,
-                    (g.pos.y.0 + offset_y) * scale_factor,
+                pos: LayoutPos::new(
+                    g.pos.x.0 / scale_factor + offset_x,
+                    g.pos.y.0 / scale_factor + offset_y,
                 ),
                 color: g.color,
                 tex_coords: g.tex_coords,

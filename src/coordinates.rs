@@ -316,6 +316,10 @@ pub struct Viewport {
     // === Text metrics ===
     pub metrics: TextMetrics,
 
+    // === Document margin ===
+    /// Margin for document content (left, top)
+    pub margin: LayoutPos,
+
     // === Optional font system for accurate measurement ===
     font_system: Option<Arc<crate::font::SharedFontSystem>>,
 }
@@ -333,21 +337,27 @@ impl Viewport {
             logical_size: LogicalSize::new(logical_width, logical_height),
             physical_size,
             scale_factor,
-            metrics: TextMetrics::new(14.0), // Default 14pt font
+            metrics: TextMetrics::new(13.0), // Default 14pt font
+            margin: LayoutPos::new(4.0, 4.0), // 4px margin left and top
             font_system: None,
         }
     }
 
     /// Set font system for accurate text measurement
     pub fn set_font_system(&mut self, font_system: Arc<crate::font::SharedFontSystem>) {
-        self.font_system = Some(font_system.clone());
-
-        // Update metrics based on actual font measurements
-        let test_layout = font_system.layout_text_scaled(" ", self.metrics.font_size, self.scale_factor);
-        if !test_layout.glyphs.is_empty() {
-            // Convert from physical pixels back to logical pixels
-            self.metrics.space_width = test_layout.width / self.scale_factor;
+        // Cache the actual metrics from the font system once
+        let line_layout = font_system.layout_text_scaled("A\nB", self.metrics.font_size, self.scale_factor);
+        if line_layout.glyphs.len() >= 2 {
+            self.metrics.line_height = (line_layout.glyphs[1].pos.y.0 - line_layout.glyphs[0].pos.y.0) / self.scale_factor;
         }
+
+        // Get actual character width for monospace font
+        let char_layout = font_system.layout_text_scaled("A", self.metrics.font_size, self.scale_factor);
+        if char_layout.width > 0.0 {
+            self.metrics.space_width = char_layout.width / self.scale_factor;
+        }
+
+        self.font_system = Some(font_system);
     }
 
     /// Update viewport on window resize
@@ -364,21 +374,25 @@ impl Viewport {
 
     /// Document position to layout position
     pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
+        // Use cached metrics (updated from font system if available)
+        // Add margin to position
         LayoutPos::new(
-            self.metrics.column_to_x(pos.column),
-            pos.line as f32 * self.metrics.line_height,
+            self.margin.x.0 + self.metrics.column_to_x(pos.column),
+            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
         )
     }
 
     /// Document position to layout with actual text (more accurate)
     pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
         let x = if let Some(font_system) = &self.font_system {
-            // Measure actual text up to column
+            // Convert column to byte position in line
             let byte_in_line = self.column_to_byte_in_line(line_text, pos.column);
-            if byte_in_line > 0 {
-                let prefix: String = line_text.chars().take(byte_in_line).collect();
-                let layout = font_system.layout_text_scaled(&prefix, self.metrics.font_size, self.scale_factor);
-                layout.width
+            if byte_in_line > 0 && byte_in_line <= line_text.len() {
+                // Measure the actual text up to the byte position
+                let prefix = &line_text[..byte_in_line];
+                let layout = font_system.layout_text_scaled(prefix, self.metrics.font_size, self.scale_factor);
+                // Convert from physical pixels back to logical
+                layout.width / self.scale_factor
             } else {
                 0.0
             }
@@ -387,9 +401,10 @@ impl Viewport {
             self.metrics.column_to_x(pos.column)
         };
 
+        // Add margin to the position
         LayoutPos::new(
-            x,
-            pos.line as f32 * self.metrics.line_height,
+            self.margin.x.0 + x,
+            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
         )
     }
 
@@ -444,8 +459,12 @@ impl Viewport {
 
     /// Layout position to document position (approximate)
     pub fn layout_to_doc(&self, pos: LayoutPos) -> DocPos {
-        let line = (pos.y.0 / self.metrics.line_height) as u32;
-        let column = (pos.x.0 / self.metrics.space_width) as u32;
+        // Subtract margin to get document position
+        let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
+        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
+
+        let line = (doc_y / self.metrics.line_height) as u32;
+        let column = (doc_x / self.metrics.space_width) as u32;
 
         DocPos {
             byte_offset: 0, // Would need document access for accurate byte offset
@@ -456,7 +475,11 @@ impl Viewport {
 
     /// Layout position to document position using font system's binary search hit testing
     pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &crate::tree::Tree) -> DocPos {
-        let line = (pos.y.0 / self.metrics.line_height) as u32;
+        // Subtract margin to get document position
+        let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
+        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
+
+        let line = (doc_y / self.metrics.line_height) as u32;
 
         let column = if let Some(font_system) = &self.font_system {
             // Get the line text and use font system's accurate hit testing
@@ -464,13 +487,13 @@ impl Viewport {
                 let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
                 let line_text = tree.get_text_slice(line_start..line_end);
 
-                font_system.hit_test_line(&line_text, self.metrics.font_size, self.scale_factor, pos.x.0)
+                font_system.hit_test_line(&line_text, self.metrics.font_size, self.scale_factor, doc_x)
             } else {
                 0
             }
         } else {
             // Fallback to space-width estimation
-            (pos.x.0 / self.metrics.space_width) as u32
+            (doc_x / self.metrics.space_width) as u32
         };
 
         DocPos {

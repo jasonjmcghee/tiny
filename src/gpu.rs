@@ -562,7 +562,7 @@ impl GpuRenderer {
 
         println!("GPU: draw_glyphs called with {} glyphs, scale={:.1}", instances.len(), scale_factor);
 
-        // Generate vertices for glyphs (already in physical coordinates from font system)
+        // Generate vertices for glyphs (already in physical coordinates after transformation)
         let mut vertices = Vec::new();
         for (i, glyph) in instances.iter().enumerate() {
             // Calculate glyph size from texture coordinates
@@ -571,8 +571,7 @@ impl GpuRenderer {
             let glyph_width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * atlas_size;
             let glyph_height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * atlas_size;
 
-            // Glyph positions and dimensions are already in physical pixels from font system
-            // No need to apply scale factor
+            // Glyph positions are in physical pixels (transformed by renderer)
             let physical_x = glyph.pos.x.0;
             let physical_y = glyph.pos.y.0;
             let physical_width = glyph_width;

@@ -171,7 +171,7 @@ impl Editor {
 
     /// Render to GPU commands
     pub fn render(&mut self, viewport: Rect) -> Vec<BatchedDraw> {
-        self.renderer.render(&self.doc.read(), viewport)
+        self.renderer.render(&self.doc.read(), viewport, self.input.selections())
     }
 
     /// Get text content

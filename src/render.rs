@@ -34,11 +34,11 @@ pub enum RenderOp {
     Custom { pipeline: u32, data: Arc<[u8]> },
 }
 
-/// Single glyph instance (in physical pixels)
+/// Single glyph instance (in layout space, logical pixels)
 #[derive(Clone, Debug)]
 pub struct GlyphInstance {
     pub glyph_id: u16,
-    pub pos: PhysicalPos,  // Physical pixel position
+    pub pos: LayoutPos,  // Layout space position (logical pixels)
     pub color: u32,
     pub tex_coords: [f32; 4], // [u0, v0, u1, v1] in atlas
 }
@@ -137,7 +137,7 @@ impl Renderer {
     }
 
     /// Render tree to commands
-    pub fn render(&mut self, tree: &Tree, viewport: Rect) -> Vec<BatchedDraw> {
+    pub fn render(&mut self, tree: &Tree, viewport: Rect, selections: &[crate::input::Selection]) -> Vec<BatchedDraw> {
         println!("Renderer::render called with viewport: {:?}", viewport);
 
         // Clear previous frame
@@ -152,7 +152,10 @@ impl Renderer {
         self.current_doc_pos = DocPos::default();
 
         // Walk visible tree portion
-        self.walk_node(&tree.root, viewport);
+        self.walk_node_with_tree(&tree.root, viewport, Some(tree));
+
+        // Render selections and cursors as overlays
+        self.render_selections(selections, tree);
 
         println!("Generated {} render commands", self.commands.len());
 
@@ -162,6 +165,11 @@ impl Renderer {
 
     /// Walk tree node, emitting commands
     fn walk_node(&mut self, node: &Node, clip: Rect) {
+        self.walk_node_with_tree(node, clip, None);
+    }
+
+    /// Walk tree node with tree reference for cursor positioning
+    fn walk_node_with_tree(&mut self, node: &Node, clip: Rect, tree: Option<&Tree>) {
         match node {
             Node::Leaf { spans, .. } => {
                 println!("Walking leaf with {} spans", spans.len());
@@ -213,26 +221,6 @@ impl Renderer {
                             let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
                             self.render_widget(widget.as_ref(), layout_pos.x, layout_pos.y);
                         }
-                        Span::Selection {
-                            range,
-                            id: _,
-                            is_cursor,
-                        } => {
-                            // Calculate position based on byte offset in document
-                            let cursor_doc_pos = DocPos {
-                                byte_offset: range.start,
-                                line: self.current_doc_pos.line,
-                                column: 0, // Would need to calculate actual column from byte offset
-                            };
-                            let layout_pos = self.viewport.doc_to_layout(cursor_doc_pos);
-
-                            if *is_cursor {
-                                self.render_cursor(layout_pos.x, layout_pos.y);
-                            } else {
-                                // Render selection
-                                self.render_selection(range.clone(), layout_pos.x, layout_pos.y);
-                            }
-                        }
                     }
                 }
 
@@ -242,7 +230,7 @@ impl Renderer {
                     // Check if child is visible
                     let child_bounds = self.get_node_bounds(child);
                     if Self::rects_intersect(&child_bounds, &clip) {
-                        self.walk_node(child, clip);
+                        self.walk_node_with_tree(child, clip, tree);
                     }
                 }
             }
@@ -298,9 +286,11 @@ impl Renderer {
 
     /// Render cursor
     fn render_cursor(&mut self, x: LogicalPixels, y: LogicalPixels) {
+        // x, y are already in layout space, create rect in layout coordinates
+        // Shift cursor 2px to the left for better alignment
         self.commands.push(RenderOp::Rect {
             rect: Rect {
-                x,
+                x: x - 2.0,
                 y,
                 width: LogicalPixels(2.0),
                 height: LogicalPixels(self.viewport.metrics.line_height),
@@ -309,10 +299,42 @@ impl Renderer {
         });
     }
 
+    /// Render all selections and cursors as overlays
+    fn render_selections(&mut self, selections: &[crate::input::Selection], tree: &Tree) {
+        for selection in selections {
+            if selection.is_cursor() {
+                // Get the line text for accurate cursor positioning
+                let line_text = if let Some(line_start) = tree.line_to_byte(selection.cursor.line) {
+                    let line_end = tree.line_to_byte(selection.cursor.line + 1).unwrap_or(tree.byte_count());
+                    tree.get_text_slice(line_start..line_end)
+                } else {
+                    String::new()
+                };
+
+                // Use accurate text-based positioning
+                let layout_pos = self.viewport.doc_to_layout_with_text(selection.cursor, &line_text);
+                println!("CURSOR DEBUG: DocPos=({}, {}), LayoutPos=({:.1}, {:.1}), scroll=({:.1}, {:.1}), line_height={:.1}",
+                         selection.cursor.line, selection.cursor.column,
+                         layout_pos.x.0, layout_pos.y.0,
+                         self.viewport.scroll.x.0, self.viewport.scroll.y.0,
+                         self.viewport.metrics.line_height);
+                self.render_cursor(layout_pos.x, layout_pos.y);
+            } else {
+                // Render selection highlight
+                let start_pos = self.viewport.doc_to_layout(selection.anchor);
+                let end_pos = self.viewport.doc_to_layout(selection.cursor);
+                self.render_selection_range(start_pos, end_pos);
+            }
+        }
+    }
+
     /// Render selection highlight
-    fn render_selection(&mut self, _range: std::ops::Range<usize>, x: LogicalPixels, y: LogicalPixels) {
-        // Calculate selection bounds
-        let width = LogicalPixels(100.0); // Would calculate from text
+    fn render_selection_range(&mut self, start: LayoutPos, end: LayoutPos) {
+        // Simple single-line selection for now
+        let x = LogicalPixels(start.x.0.min(end.x.0));
+        let y = LogicalPixels(start.y.0.min(end.y.0));
+        let width = LogicalPixels((end.x.0 - start.x.0).abs());
+
         self.commands.push(RenderOp::Rect {
             rect: Rect {
                 x,
@@ -350,14 +372,20 @@ impl Renderer {
         for cmd in &self.commands {
             match cmd {
                 RenderOp::Glyphs { glyphs, .. } => {
-                    // Transform glyphs from layout to view space
+                    // Transform glyphs from layout to view space (apply scroll)
                     for glyph in glyphs.iter() {
-                        // Glyphs are in physical pixels but at layout position
-                        // We need to apply scroll offset
-                        let mut transformed_glyph = glyph.clone();
-                        // Apply scroll offset (viewport.scroll is in logical pixels, need to scale)
-                        transformed_glyph.pos.x.0 -= self.viewport.scroll.x.0 * self.viewport.scale_factor;
-                        transformed_glyph.pos.y.0 -= self.viewport.scroll.y.0 * self.viewport.scale_factor;
+                        // Glyphs are now in layout space (logical pixels)
+                        // Apply scroll to get view position
+                        let view_pos = self.viewport.layout_to_view(glyph.pos);
+                        // Then convert to physical pixels for GPU
+                        let physical_pos = self.viewport.view_to_physical(view_pos);
+
+                        let transformed_glyph = GlyphInstance {
+                            glyph_id: glyph.glyph_id,
+                            pos: LayoutPos::new(physical_pos.x.0, physical_pos.y.0), // Store as physical for GPU
+                            color: glyph.color,
+                            tex_coords: glyph.tex_coords,
+                        };
                         current_glyphs.push(transformed_glyph);
                     }
                 }

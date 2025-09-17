@@ -47,19 +47,13 @@ pub enum Node {
     Internal { children: Vec<Node>, sums: Sums },
 }
 
-/// Content spans - text, widgets, or selections
+/// Content spans - text or widgets
 #[derive(Clone)]
 pub enum Span {
     /// Raw UTF-8 text bytes with cached line count
     Text { bytes: Arc<[u8]>, lines: u32 },
     /// Any visual widget
     Widget(Arc<dyn Widget>),
-    /// Selection/cursor highlight
-    Selection {
-        range: Range<usize>,
-        id: u32,
-        is_cursor: bool,
-    },
 }
 
 /// Aggregated metadata for O(log n) queries
@@ -483,9 +477,6 @@ impl Tree {
                     );
                     sums.max_z = sums.max_z.max(w.z_index());
                 }
-                Span::Selection { range, .. } => {
-                    sums.bytes = sums.bytes.max(range.end);
-                }
             }
         }
 
@@ -521,7 +512,6 @@ impl Tree {
         match span {
             Span::Text { bytes, .. } => bytes.len(),
             Span::Widget(_) => 0,
-            Span::Selection { .. } => 0,
         }
     }
 
@@ -784,7 +774,8 @@ mod tests {
     fn test_widget_insertion() {
         let doc = Doc::from_str("Text");
 
-        // Insert cursor widget (doesn't affect text content)
+        // Insert a widget (doesn't affect text content)
+        // Using cursor widget as an example, though cursors are now rendered as overlays
         doc.edit(Edit::Insert {
             pos: 2,
             content: Content::Widget(crate::widget::cursor()),

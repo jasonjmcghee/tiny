@@ -54,6 +54,11 @@ pub trait AppLogic {
         None
     }
 
+    /// Get current selections for rendering
+    fn selections(&self) -> &[crate::input::Selection] {
+        &[] // Default to no selections
+    }
+
     /// Called after setup is complete
     fn on_ready(&mut self) {}
 
@@ -304,7 +309,8 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Generate render commands
             let doc = self.logic.doc();
-            let batches = cpu_renderer.render(&doc.read(), viewport);
+            let selections = self.logic.selections();
+            let batches = cpu_renderer.render(&doc.read(), viewport, selections);
 
             // Upload atlas (in case new glyphs were rasterized)
             if let Some(font_system) = &self.font_system {
@@ -387,6 +393,10 @@ impl AppLogic for EditorLogic {
 
     fn get_cursor_doc_pos(&self) -> Option<DocPos> {
         Some(self.input.primary_cursor_doc_pos(&self.doc))
+    }
+
+    fn selections(&self) -> &[crate::input::Selection] {
+        self.input.selections()
     }
 }
 

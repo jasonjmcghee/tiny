@@ -3,7 +3,6 @@
 //! Handles keyboard, mouse, and multi-cursor selections
 
 use crate::tree::{Content, Doc, Edit, Point};
-use crate::widget;
 use crate::coordinates::{DocPos, Viewport};
 use std::ops::Range;
 use winit::event::{ElementState, KeyEvent, MouseButton};
@@ -59,6 +58,8 @@ pub struct InputHandler {
     next_id: u32,
     /// Clipboard contents
     clipboard: Option<String>,
+    /// Goal column for vertical navigation (None means use current column)
+    goal_column: Option<u32>,
 }
 
 impl InputHandler {
@@ -71,6 +72,7 @@ impl InputHandler {
             }],
             next_id: 1,
             clipboard: None,
+            goal_column: None,
         }
     }
 
@@ -83,6 +85,7 @@ impl InputHandler {
         match &event.logical_key {
             Key::Character(ch) => {
                 // Type character at all cursors
+                self.goal_column = None;  // Reset goal column when typing
                 for sel in &self.selections {
                     if !sel.is_cursor() {
                         // Delete selection first
@@ -168,6 +171,7 @@ impl InputHandler {
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 // Move left in document space
+                self.goal_column = None;  // Reset goal column for horizontal movement
                 for sel in &mut self.selections {
                     if sel.cursor.column > 0 {
                         sel.cursor.column -= 1;
@@ -188,6 +192,7 @@ impl InputHandler {
             }
             Key::Named(NamedKey::ArrowRight) => {
                 // Move right in document space
+                self.goal_column = None;  // Reset goal column for horizontal movement
                 for sel in &mut self.selections {
                     let tree = doc.read();
                     // Get current line info
@@ -217,16 +222,23 @@ impl InputHandler {
             }
             Key::Named(NamedKey::ArrowUp) => {
                 // Move up in document space
+                // Set goal column if not already set
+                if self.goal_column.is_none() && !self.selections.is_empty() {
+                    self.goal_column = Some(self.selections[0].cursor.column);
+                }
+
                 for sel in &mut self.selections {
                     if sel.cursor.line > 0 {
                         sel.cursor.line -= 1;
-                        // Keep same column, but clamp to line length
+                        // Use goal column but clamp to line length
                         let tree = doc.read();
                         if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                             let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                             let line_text = tree.get_text_slice(line_start..line_end);
                             let line_length = line_text.chars().count() as u32;
-                            sel.cursor.column = sel.cursor.column.min(line_length);
+                            // Use goal column if set, otherwise current column
+                            let target_column = self.goal_column.unwrap_or(sel.cursor.column);
+                            sel.cursor.column = target_column.min(line_length);
                         }
                     }
                     if !event.repeat {
@@ -236,17 +248,26 @@ impl InputHandler {
             }
             Key::Named(NamedKey::ArrowDown) => {
                 // Move down in document space
+                // Set goal column if not already set
+                if self.goal_column.is_none() && !self.selections.is_empty() {
+                    self.goal_column = Some(self.selections[0].cursor.column);
+                }
+
                 for sel in &mut self.selections {
                     let tree = doc.read();
+                    println!("ARROW_DOWN: current_line={}, total_lines={}", sel.cursor.line, tree.line_count());
                     // Check if next line exists
                     if tree.line_to_byte(sel.cursor.line + 1).is_some() {
                         sel.cursor.line += 1;
-                        // Keep same column, but clamp to line length
+                        println!("  -> moved to line {}", sel.cursor.line);
+                        // Use goal column but clamp to line length
                         if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                             let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                             let line_text = tree.get_text_slice(line_start..line_end);
                             let line_length = line_text.chars().count() as u32;
-                            sel.cursor.column = sel.cursor.column.min(line_length);
+                            // Use goal column if set, otherwise current column
+                            let target_column = self.goal_column.unwrap_or(sel.cursor.column);
+                            sel.cursor.column = target_column.min(line_length);
                         }
                     }
                     if !event.repeat {
@@ -256,6 +277,7 @@ impl InputHandler {
             }
             Key::Named(NamedKey::Home) => {
                 // Move to line start
+                self.goal_column = None;  // Reset goal column
                 for sel in &mut self.selections {
                     sel.cursor.column = 0;
                     if !event.repeat {
@@ -265,6 +287,7 @@ impl InputHandler {
             }
             Key::Named(NamedKey::End) => {
                 // Move to line end
+                self.goal_column = None;  // Reset goal column
                 for sel in &mut self.selections {
                     let tree = doc.read();
                     if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
@@ -331,18 +354,23 @@ impl InputHandler {
             }
             Key::Named(NamedKey::PageUp) => {
                 // Move cursor up by viewport height worth of lines
-                // This is simplified - would use actual viewport metrics
+                // Set goal column if not already set
+                if self.goal_column.is_none() && !self.selections.is_empty() {
+                    self.goal_column = Some(self.selections[0].cursor.column);
+                }
+
                 for sel in &mut self.selections {
                     // Move up approximately 20 lines (would use viewport)
                     sel.cursor.line = sel.cursor.line.saturating_sub(20);
 
-                    // Clamp column to line length
+                    // Use goal column but clamp to line length
                     let tree = doc.read();
                     if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                         let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                         let line_text = tree.get_text_slice(line_start..line_end);
                         let line_length = line_text.chars().count() as u32;
-                        sel.cursor.column = sel.cursor.column.min(line_length);
+                        let target_column = self.goal_column.unwrap_or(sel.cursor.column);
+                        sel.cursor.column = target_column.min(line_length);
                     } else {
                         sel.cursor.column = 0;
                     }
@@ -354,18 +382,24 @@ impl InputHandler {
             }
             Key::Named(NamedKey::PageDown) => {
                 // Move cursor down by viewport height worth of lines
+                // Set goal column if not already set
+                if self.goal_column.is_none() && !self.selections.is_empty() {
+                    self.goal_column = Some(self.selections[0].cursor.column);
+                }
+
                 for sel in &mut self.selections {
                     let tree = doc.read();
                     let total_lines = tree.line_count();
                     // Move down approximately 20 lines (would use viewport)
                     sel.cursor.line = (sel.cursor.line + 20).min(total_lines.saturating_sub(1));
 
-                    // Clamp column to line length
+                    // Use goal column but clamp to line length
                     if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                         let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                         let line_text = tree.get_text_slice(line_start..line_end);
                         let line_length = line_text.chars().count() as u32;
-                        sel.cursor.column = sel.cursor.column.min(line_length);
+                        let target_column = self.goal_column.unwrap_or(sel.cursor.column);
+                        sel.cursor.column = target_column.min(line_length);
                     } else {
                         sel.cursor.column = 0;
                     }
@@ -415,6 +449,9 @@ impl InputHandler {
         if button != MouseButton::Left {
             return false;
         }
+
+        // Reset goal column when clicking
+        self.goal_column = None;
 
         // Convert click position to document coordinates using viewport and tree
         // The pos is already window-relative logical pixels, so we need to add scroll offset
@@ -489,30 +526,8 @@ impl InputHandler {
     }
 
     /// Update selection widgets in tree
-    fn update_selection_widgets(&self, doc: &Doc) {
-        // Remove old selection widgets and add new ones
-        // This is simplified - in real implementation we'd track widget IDs
-
-        for sel in &self.selections {
-            if sel.is_cursor() {
-                // Insert cursor widget
-                let tree = doc.read();
-                let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
-                doc.edit(Edit::Insert {
-                    pos: cursor_byte,
-                    content: Content::Widget(widget::cursor()),
-                });
-            } else {
-                // Insert selection widget
-                let byte_range = sel.byte_range(doc);
-                doc.edit(Edit::Insert {
-                    pos: byte_range.start,
-                    content: Content::Widget(widget::selection(byte_range)),
-                });
-            }
-        }
-
-        doc.flush();
+    fn update_selection_widgets(&self, _doc: &Doc) {
+        // No-op: selections are now rendered as overlays, not document content
     }
 
 
