@@ -77,10 +77,12 @@ impl InputHandler {
     }
 
     /// Handle keyboard input
-    pub fn on_key(&mut self, doc: &Doc, _viewport: &Viewport, event: &KeyEvent) -> bool {
+    pub fn on_key(&mut self, doc: &Doc, _viewport: &Viewport, event: &KeyEvent, modifiers: &winit::event::Modifiers) -> bool {
         if event.state != ElementState::Pressed {
             return false;
         }
+
+        let shift_held = modifiers.state().shift_key();
 
         match &event.logical_key {
             Key::Character(ch) => {
@@ -185,7 +187,7 @@ impl InputHandler {
                             sel.cursor.column = line_text.chars().count() as u32;
                         }
                     }
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -215,7 +217,7 @@ impl InputHandler {
                             }
                         }
                     }
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -241,7 +243,7 @@ impl InputHandler {
                             sel.cursor.column = target_column.min(line_length);
                         }
                     }
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -270,7 +272,7 @@ impl InputHandler {
                             sel.cursor.column = target_column.min(line_length);
                         }
                     }
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -280,7 +282,7 @@ impl InputHandler {
                 self.goal_column = None;  // Reset goal column
                 for sel in &mut self.selections {
                     sel.cursor.column = 0;
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -295,7 +297,7 @@ impl InputHandler {
                         let line_text = tree.get_text_slice(line_start..line_end);
                         sel.cursor.column = line_text.chars().count() as u32;
                     }
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -375,7 +377,7 @@ impl InputHandler {
                         sel.cursor.column = 0;
                     }
 
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }
@@ -404,7 +406,7 @@ impl InputHandler {
                         sel.cursor.column = 0;
                     }
 
-                    if !event.repeat {
+                    if !shift_held {
                         sel.anchor = sel.cursor;
                     }
                 }

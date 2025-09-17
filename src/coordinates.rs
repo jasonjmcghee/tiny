@@ -320,6 +320,12 @@ pub struct Viewport {
     /// Margin for document content (left, top)
     pub margin: LayoutPos,
 
+    // === Cached document bounds ===
+    /// Cached document bounds (width, height) to avoid recalculation
+    cached_doc_bounds: Option<(f32, f32)>,
+    /// Document version when bounds were last calculated
+    cached_bounds_version: u64,
+
     // === Optional font system for accurate measurement ===
     font_system: Option<Arc<crate::font::SharedFontSystem>>,
 }
@@ -339,6 +345,8 @@ impl Viewport {
             scale_factor,
             metrics: TextMetrics::new(13.0), // Default 14pt font
             margin: LayoutPos::new(4.0, 4.0), // 4px margin left and top
+            cached_doc_bounds: None,
+            cached_bounds_version: 0,
             font_system: None,
         }
     }
@@ -525,19 +533,34 @@ impl Viewport {
         )
     }
 
-    /// Check if layout rectangle is visible in view
+    /// Check if layout rectangle is visible in view (with margins for smooth scrolling)
     pub fn is_visible(&self, rect: LayoutRect) -> bool {
         let view_rect = self.layout_rect_to_view(rect);
-        view_rect.x.0 < self.logical_size.width.0
-            && view_rect.x.0 + view_rect.width.0 > 0.0
-            && view_rect.y.0 < self.logical_size.height.0
-            && view_rect.y.0 + view_rect.height.0 > 0.0
+
+        // Add much more generous margins for smooth scrolling
+        let margin = self.metrics.line_height * 10.0;  // 10 lines of margin
+
+        let is_visible = view_rect.x.0 < self.logical_size.width.0 + margin
+            && view_rect.x.0 + view_rect.width.0 > -margin
+            && view_rect.y.0 < self.logical_size.height.0 + margin
+            && view_rect.y.0 + view_rect.height.0 > -margin;
+
+        // Debug ALL visibility calculations to find the bug
+        println!("VISIBILITY CHECK: layout=({:.1},{:.1} {}x{}), view=({:.1},{:.1} {}x{}), viewport={}x{}, scroll=({:.1},{:.1}), margin={:.1}, result={}",
+            rect.x.0, rect.y.0, rect.width.0, rect.height.0,
+            view_rect.x.0, view_rect.y.0, view_rect.width.0, view_rect.height.0,
+            self.logical_size.width.0, self.logical_size.height.0,
+            self.scroll.x.0, self.scroll.y.0, margin, is_visible);
+
+        is_visible
     }
 
     // === Scrolling ===
 
     /// Scroll to make a layout position visible
     pub fn ensure_visible(&mut self, pos: LayoutPos) {
+        let old_scroll_y = self.scroll.y.0;
+
         // Horizontal scrolling
         if pos.x < self.scroll.x {
             self.scroll.x = pos.x;
@@ -551,13 +574,117 @@ impl Viewport {
         } else if pos.y + self.metrics.line_height > self.scroll.y + self.logical_size.height {
             self.scroll.y = pos.y + self.metrics.line_height - self.logical_size.height;
         }
+
+        if old_scroll_y != self.scroll.y.0 {
+            println!("ENSURE_VISIBLE: cursor at ({:.1}, {:.1}), scroll changed from {:.1} to {:.1}",
+                     pos.x.0, pos.y.0, old_scroll_y, self.scroll.y.0);
+        }
     }
 
     /// Get visible line range
     pub fn visible_lines(&self) -> std::ops::Range<u32> {
         let first_line = (self.scroll.y / self.metrics.line_height) as u32;
         let last_line = ((self.scroll.y + self.logical_size.height) / self.metrics.line_height) as u32 + 1;
+
+        // Debug output to see what we're calculating
+        static mut DEBUG_COUNT: u32 = 0;
+        unsafe {
+            if DEBUG_COUNT < 3 {
+                println!("VISIBLE_LINES: scroll_y={:.1}, window_height={:.1}, line_height={:.1} -> lines {}..{}",
+                         self.scroll.y.0, self.logical_size.height.0, self.metrics.line_height,
+                         first_line, last_line);
+                DEBUG_COUNT += 1;
+            }
+        }
+
         first_line..last_line
+    }
+
+    /// Get visible line range with margins for smooth scrolling
+    pub fn visible_lines_with_margin(&self, margin_lines: u32) -> std::ops::Range<u32> {
+        let lines = self.visible_lines();
+        let first_line = lines.start.saturating_sub(margin_lines);
+        let last_line = lines.end + margin_lines;
+        first_line..last_line
+    }
+
+    /// Get visible byte range using tree navigation (to be called with tree reference)
+    pub fn visible_byte_range_with_tree(&self, tree: &crate::tree::Tree) -> std::ops::Range<usize> {
+        let total_lines = tree.line_count();
+        let lines = self.visible_lines_with_margin(2); // 2 lines margin
+
+        // Clamp to valid line ranges
+        let start_line = lines.start.min(total_lines.saturating_sub(1));
+        let end_line = lines.end.min(total_lines + 5); // Allow 5 lines past end
+
+        let start_byte = tree.line_to_byte(start_line).unwrap_or(0);
+        let end_byte = tree.line_to_byte(end_line).unwrap_or(tree.byte_count());
+
+        println!("DEBUG: visible range calculation - scroll_y={:.1}, lines={}..{}, bytes={}..{}, total_lines={}",
+                 self.scroll.y.0, start_line, end_line, start_byte, end_byte, total_lines);
+
+        // Ensure we always have SOME content to render
+        if start_byte >= end_byte {
+            println!("WARNING: Invalid byte range, falling back to entire document");
+            return 0..tree.byte_count();
+        }
+
+        start_byte..end_byte
+    }
+
+    /// Get visible layout rectangle (area that should be rendered)
+    pub fn visible_layout_rect(&self) -> LayoutRect {
+        LayoutRect {
+            x: self.scroll.x,
+            y: self.scroll.y,
+            width: self.logical_size.width,
+            height: self.logical_size.height,
+        }
+    }
+
+    /// Get document bounds with caching
+    pub fn get_document_bounds(&mut self, tree: &crate::tree::Tree) -> (f32, f32) {
+        // Check if cache is valid
+        if let Some(bounds) = self.cached_doc_bounds {
+            if self.cached_bounds_version == tree.version {
+                return bounds;
+            }
+        }
+
+        // Recalculate bounds
+        let total_lines = tree.line_count() as f32;
+        let doc_height = (total_lines + 5.0) * self.metrics.line_height;
+
+        // Find longest line
+        let mut max_line_length = 0;
+        for line_num in 0..tree.line_count() {
+            if let Some(line_start) = tree.line_to_byte(line_num) {
+                let line_end = tree.line_to_byte(line_num + 1).unwrap_or(tree.byte_count());
+                let line_text = tree.get_text_slice(line_start..line_end);
+                let line_length = line_text.chars().count();
+                max_line_length = max_line_length.max(line_length);
+            }
+        }
+        let doc_width = (max_line_length + 5) as f32 * self.metrics.space_width;
+
+        // Cache the result
+        let bounds = (doc_width, doc_height);
+        self.cached_doc_bounds = Some(bounds);
+        self.cached_bounds_version = tree.version;
+
+        bounds
+    }
+
+    /// Clamp scroll position to document bounds
+    pub fn clamp_scroll_to_bounds(&mut self, tree: &crate::tree::Tree) {
+        let (doc_width, doc_height) = self.get_document_bounds(tree);
+
+        // Don't scroll past document bounds
+        let max_scroll_x = (doc_width - self.logical_size.width.0).max(0.0);
+        let max_scroll_y = (doc_height - self.logical_size.height.0).max(0.0);
+
+        self.scroll.x.0 = self.scroll.x.0.clamp(0.0, max_scroll_x);
+        self.scroll.y.0 = self.scroll.y.0.clamp(0.0, max_scroll_y);
     }
 
     // === Helpers ===

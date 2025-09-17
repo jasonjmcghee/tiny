@@ -45,6 +45,11 @@ pub struct GpuRenderer {
     rect_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
 
+    // Text effect shader pipelines
+    effect_pipelines: std::collections::HashMap<u32, wgpu::RenderPipeline>,
+    effect_uniform_buffers: std::collections::HashMap<u32, wgpu::Buffer>,
+    effect_bind_groups: std::collections::HashMap<u32, wgpu::BindGroup>,
+
     // Uniform buffer
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -63,6 +68,187 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
+    /// Get device for custom widget rendering
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Get queue for custom widget rendering
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Get uniform bind group for viewport transforms
+    pub fn uniform_bind_group(&self) -> &wgpu::BindGroup {
+        &self.uniform_bind_group
+    }
+
+    /// Get surface for custom rendering
+    pub fn surface(&mut self) -> &mut wgpu::Surface<'static> {
+        &mut self.surface
+    }
+
+    /// Get uniform buffer for custom rendering
+    pub fn uniform_buffer(&self) -> &wgpu::Buffer {
+        &self.uniform_buffer
+    }
+
+    /// Get rect pipeline for widget backgrounds
+    pub fn rect_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.rect_pipeline
+    }
+
+    /// Get rect vertex buffer for widget backgrounds
+    pub fn rect_vertex_buffer(&self) -> &wgpu::Buffer {
+        &self.rect_vertex_buffer
+    }
+
+    /// Get effect uniform buffer for updating shader parameters
+    pub fn effect_uniform_buffer(&self, shader_id: u32) -> Option<&wgpu::Buffer> {
+        self.effect_uniform_buffers.get(&shader_id)
+    }
+
+    /// Register a text effect shader with the GPU renderer
+    pub fn register_text_effect_shader(&mut self, shader_id: u32, shader_source: &str, uniform_size: u64) {
+        println!("Registering text effect shader ID {}", shader_id);
+
+        // Create shader module
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("Text Effect Shader {}", shader_id)),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        // Create uniform buffer for this effect
+        let effect_uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("Text Effect Uniform Buffer {}", shader_id)),
+            size: uniform_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create bind group layouts (generic for any text effect)
+        let viewport_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Text Effect Viewport Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let glyph_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Text Effect Glyph Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let effect_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Text Effect Uniform Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        // Create effect bind group
+        let effect_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("Text Effect Bind Group {}", shader_id)),
+            layout: &effect_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: effect_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Create pipeline layout
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Text Effect Pipeline Layout {}", shader_id)),
+            bind_group_layouts: &[&viewport_bind_group_layout, &glyph_bind_group_layout, &effect_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // Create render pipeline
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Text Effect Pipeline {}", shader_id)),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GlyphVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 16,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Uint32,
+                        },
+                    ],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Store in registries
+        self.effect_pipelines.insert(shader_id, pipeline);
+        self.effect_uniform_buffers.insert(shader_id, effect_uniform_buffer);
+        self.effect_bind_groups.insert(shader_id, effect_bind_group);
+
+        println!("Registered text effect shader ID {}", shader_id);
+    }
+
     /// Upload font atlas texture to GPU
     pub fn upload_font_atlas(&self, atlas_data: &[u8], width: u32, height: u32) {
         self.queue.write_texture(
@@ -368,7 +554,7 @@ impl GpuRenderer {
             mapped_at_creation: false,
         });
 
-        Self {
+        let renderer = Self {
             device,
             queue,
             surface,
@@ -383,7 +569,14 @@ impl GpuRenderer {
             glyph_bind_group,
             rect_vertex_buffer,
             glyph_vertex_buffer,
-        }
+            effect_pipelines: std::collections::HashMap::new(),
+            effect_uniform_buffers: std::collections::HashMap::new(),
+            effect_bind_groups: std::collections::HashMap::new(),
+        };
+
+        // Start with empty shader registry - widgets will register their own
+
+        renderer
     }
 
     /// Execute batched draw commands (transforms view → physical)
@@ -479,7 +672,7 @@ impl GpuRenderer {
         output.present();
     }
 
-    fn draw_rects(&self, render_pass: &mut wgpu::RenderPass, instances: &[RectInstance], scale_factor: f32) {
+    pub fn draw_rects(&self, render_pass: &mut wgpu::RenderPass, instances: &[RectInstance], scale_factor: f32) {
         if instances.is_empty() {
             return;
         }
@@ -555,12 +748,31 @@ impl GpuRenderer {
         println!("  Draw call completed with {} vertices", vertices.len());
     }
 
-    fn draw_glyphs(&self, render_pass: &mut wgpu::RenderPass, instances: &[GlyphInstance], scale_factor: f32) {
+    pub fn draw_glyphs(&self, render_pass: &mut wgpu::RenderPass, instances: &[GlyphInstance], scale_factor: f32) {
+        self.draw_glyphs_with_effects(render_pass, instances, scale_factor, None);
+    }
+
+    /// Draw glyphs with optional shader effects
+    pub fn draw_glyphs_with_effects(&self, render_pass: &mut wgpu::RenderPass, instances: &[GlyphInstance], scale_factor: f32, shader_id: Option<u32>) {
         if instances.is_empty() {
             return;
         }
 
-        println!("GPU: draw_glyphs called with {} glyphs, scale={:.1}", instances.len(), scale_factor);
+        println!("GPU: draw_glyphs called with {} glyphs, scale={:.1}, shader_id={:?}", instances.len(), scale_factor, shader_id);
+
+        // Choose pipeline based on shader effect
+        let (pipeline, extra_bind_group) = if let Some(id) = shader_id {
+            if let (Some(effect_pipeline), Some(effect_bind_group)) =
+                (self.effect_pipelines.get(&id), self.effect_bind_groups.get(&id)) {
+                println!("  Using custom shader pipeline for effect ID {}", id);
+                (effect_pipeline, Some(effect_bind_group))
+            } else {
+                println!("  Warning: Shader ID {} not found, using default pipeline", id);
+                (&self.glyph_pipeline, None)
+            }
+        } else {
+            (&self.glyph_pipeline, None)
+        };
 
         // Generate vertices for glyphs (already in physical coordinates after transformation)
         let mut vertices = Vec::new();
@@ -641,14 +853,21 @@ impl GpuRenderer {
         );
         println!("  Uploaded {} bytes to glyph vertex buffer", vertices.len() * std::mem::size_of::<GlyphVertex>());
 
-        // Draw
+        // Draw with chosen pipeline
         println!("  Setting glyph pipeline and binding texture...");
-        render_pass.set_pipeline(&self.glyph_pipeline);
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+
+        // Bind extra effect uniforms if using custom shader
+        if let Some(effect_bind_group) = extra_bind_group {
+            render_pass.set_bind_group(2, effect_bind_group, &[]);
+        }
+
         render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(..));
         render_pass.draw(0..vertices.len() as u32, 0..1);
-        println!("  Glyph draw call completed with {} vertices", vertices.len());
+        println!("  Glyph draw call completed with {} vertices using {} pipeline",
+                 vertices.len(), if shader_id.is_some() { "custom" } else { "default" });
     }
 
     /// Resize surface when window changes

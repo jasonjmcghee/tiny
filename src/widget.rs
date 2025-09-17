@@ -140,15 +140,16 @@ impl Widget for TextWidget {
         for glyph in &layout.glyphs {
             let mut color = glyph.color;
 
-            // Apply text effects if available
-            if let Some(text_styles) = ctx.text_styles {
+            // Apply debug colorizing for off-screen content
+            if ctx.debug_offscreen {
+                color = 0xFF0000FF; // Bright red for off-screen content
+            } else if let Some(text_styles) = ctx.text_styles {
                 let char_bytes = glyph.char.len_utf8();
                 let effects = text_styles.get_effects_in_range(byte_pos..byte_pos + char_bytes);
 
                 for effect in effects {
                     if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
                         color = new_color;
-                        break;
                     }
                 }
                 byte_pos += char_bytes;
@@ -449,6 +450,7 @@ mod tests {
             text_styles: None,
             font_system: Some(&font_system),
             viewport: &viewport,
+            debug_offscreen: false,
         };
 
         widget.paint(&mut ctx);
@@ -458,8 +460,8 @@ mod tests {
             RenderOp::Glyphs { glyphs, .. } => {
                 assert_eq!(glyphs.len(), 1);
                 let glyph = &glyphs[0];
-                assert_eq!(glyph.pos.x, PhysicalPixels(10.0));
-                assert_eq!(glyph.pos.y, PhysicalPixels(24.0)); // 20.0 + 4.0 baseline offset
+                assert_eq!(glyph.pos.x, LogicalPixels(10.0));
+                assert_eq!(glyph.pos.y, LogicalPixels(24.0)); // 20.0 + 4.0 baseline offset
                 assert_eq!(glyph.color, 0xFFFFFFFF);
             }
             _ => panic!("Expected Glyphs command"),
@@ -486,6 +488,7 @@ mod tests {
             text_styles: None,
             font_system: None,
             viewport: &viewport,
+            debug_offscreen: false,
         };
 
         cursor.paint(&mut ctx);

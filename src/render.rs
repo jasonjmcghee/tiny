@@ -2,11 +2,11 @@
 //!
 //! Widgets emit commands, renderer batches and optimizes them for GPU
 
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, Viewport};
 use crate::tree::{Node, Point, Rect, Span, Tree, Widget};
 use std::sync::Arc;
 #[allow(unused)]
 use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, PhysicalPos, Viewport};
 
 // === Render Commands ===
 /// High-level rendering operations
@@ -151,8 +151,13 @@ impl Renderer {
         // Reset document position for new frame
         self.current_doc_pos = DocPos::default();
 
-        // Walk visible tree portion
-        self.walk_node_with_tree(&tree.root, viewport, Some(tree));
+        // Use the sum-tree visible range system we built
+        println!("VISIBLE RANGE WALKING: Starting visible range rendering");
+        let visible_range = self.viewport.visible_byte_range_with_tree(tree);
+        println!("  Visible byte range: {}..{}", visible_range.start, visible_range.end);
+
+        self.walk_visible_range(tree, visible_range);
+        println!("VISIBLE RANGE WALKING: Finished, found {} widgets total", self.commands.len());
 
         // Render selections and cursors as overlays
         self.render_selections(selections, tree);
@@ -169,6 +174,66 @@ impl Renderer {
     }
 
     /// Walk tree node with tree reference for cursor positioning
+    /// Walk only the visible range using sum-tree navigation
+    fn walk_visible_range(&mut self, tree: &Tree, byte_range: std::ops::Range<usize>) {
+        // Reset document position to start of visible range
+        let start_line = tree.byte_to_line(byte_range.start);
+        self.current_doc_pos.byte_offset = byte_range.start;
+        self.current_doc_pos.line = start_line;
+        self.current_doc_pos.column = 0; // Simplified - would calculate actual column
+
+        // Use tree's efficient range walking
+        tree.walk_visible_range(byte_range, |spans, span_start, span_end| {
+            self.render_spans_at_position(spans, span_start, span_end);
+        });
+    }
+
+    /// Render spans at their calculated position (called by walk_visible_range)
+    fn render_spans_at_position(&mut self, spans: &[Span], span_start: usize, span_end: usize) {
+        println!("RANGE WALKER FOUND: {} spans in byte range {}..{} at doc pos: ({}, {})",
+                 spans.len(), span_start, span_end, self.current_doc_pos.line, self.current_doc_pos.column);
+
+        // Collect text spans to render together (keep existing coalescing for efficiency)
+        let mut coalesced_text = Vec::new();
+        let mut total_lines = 0u32;
+
+        for span in spans {
+            if let Span::Text { bytes, lines } = span {
+                coalesced_text.extend_from_slice(bytes);
+                total_lines += lines;
+            }
+        }
+
+        // Render the coalesced text if any
+        if !coalesced_text.is_empty() {
+            let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
+            let text = std::str::from_utf8(&coalesced_text).unwrap_or("");
+
+            println!("  Rendering text chunk ({} bytes) at layout pos: ({:.1}, {:.1})",
+                     coalesced_text.len(), layout_pos.x, layout_pos.y);
+
+            self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
+
+            // Update document position for next chunk
+            self.current_doc_pos.byte_offset += coalesced_text.len();
+            self.current_doc_pos.line += total_lines;
+
+            if total_lines > 0 {
+                self.current_doc_pos.column = 0;
+            } else {
+                self.current_doc_pos.column += text.chars().count() as u32;
+            }
+        }
+
+        // Handle widgets (keep existing widget rendering logic)
+        for span in spans {
+            if let Span::Widget(widget) = span {
+                let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
+                self.render_widget(widget.as_ref(), layout_pos.x, layout_pos.y);
+            }
+        }
+    }
+
     fn walk_node_with_tree(&mut self, node: &Node, clip: Rect, tree: Option<&Tree>) {
         match node {
             Node::Leaf { spans, .. } => {
@@ -200,6 +265,7 @@ impl Renderer {
                     self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
                     self.current_doc_pos.byte_offset += coalesced_text.len();
                     self.current_doc_pos.line += total_lines;
+
                     // Reset column to 0 after newlines (simplified - would track properly)
                     if total_lines > 0 {
                         self.current_doc_pos.column = 0;
@@ -265,9 +331,12 @@ impl Renderer {
             height: widget_size.height,
         };
 
-        if !self.viewport.is_visible(widget_rect) {
-            return; // Skip off-screen widgets
-        }
+        // Check visibility for debug coloring but don't actually cull
+        let is_visible = self.viewport.is_visible(widget_rect);
+        // Don't cull anything - just use visibility for debug coloring
+
+        println!("RENDERING WIDGET: layout=({:.1},{:.1}), scroll=({:.1},{:.1})",
+                 layout_pos.x, layout_pos.y, self.viewport.scroll.x.0, self.viewport.scroll.y.0);
 
         // Create paint context with proper coordinate info
         let mut paint_ctx = crate::tree::PaintContext {
@@ -278,6 +347,7 @@ impl Renderer {
             text_styles: self.text_styles.as_deref(),
             font_system: self.font_system.as_ref(),
             viewport: &self.viewport,
+            debug_offscreen: !is_visible,
         };
 
         // Let the widget paint itself

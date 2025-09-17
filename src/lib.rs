@@ -122,7 +122,8 @@ impl Editor {
 
         // Process input - create a dummy viewport for compatibility
         let dummy_viewport = coordinates::Viewport::new(800.0, 600.0, 1.0);
-        self.input.on_key(&self.doc, &dummy_viewport, event);
+        let dummy_modifiers = winit::event::Modifiers::default();
+        self.input.on_key(&self.doc, &dummy_viewport, event, &dummy_modifiers);
 
         // Update syntax if needed
         if self.syntax.is_some() {

@@ -128,6 +128,8 @@ pub struct PaintContext<'a> {
     pub font_system: Option<&'a std::sync::Arc<crate::font::SharedFontSystem>>,
     /// Viewport for all coordinate transformations and metrics
     pub viewport: &'a Viewport,
+    /// Debug flag: render in red if off-screen
+    pub debug_offscreen: bool,
 }
 
 // === Implementation ===

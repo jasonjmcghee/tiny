@@ -613,3 +613,60 @@ mod tests {
         assert_eq!(tree.get_line_at(8), "世界");
     }
 }
+
+impl Tree {
+    /// Walk nodes that intersect with a byte range for efficient visible-range rendering
+    /// This enables O(log n) navigation to find only the content that should be rendered
+    pub fn walk_visible_range<F>(&self, byte_range: std::ops::Range<usize>, mut callback: F)
+    where
+        F: FnMut(&[crate::tree::Span], usize, usize),  // (spans, byte_start, byte_end)
+    {
+        self.walk_range_in_node(&self.root, byte_range, 0, &mut callback);
+    }
+
+    /// Recursively walk nodes that intersect with the target byte range
+    fn walk_range_in_node<F>(&self, node: &Node, range: std::ops::Range<usize>, node_start: usize, callback: &mut F)
+    where
+        F: FnMut(&[crate::tree::Span], usize, usize),
+    {
+        let node_bytes = match node {
+            Node::Leaf { sums, .. } => sums.bytes,
+            Node::Internal { sums, .. } => sums.bytes,
+        };
+
+        let node_end = node_start + node_bytes;
+
+        // Skip if this node doesn't intersect with our target range
+        if node_end <= range.start || node_start >= range.end {
+            return;
+        }
+
+        match node {
+            Node::Leaf { spans, .. } => {
+                // This leaf intersects - call callback with the spans and range info
+                let intersect_start = node_start.max(range.start);
+                let intersect_end = node_end.min(range.end);
+                callback(spans, intersect_start, intersect_end);
+            }
+            Node::Internal { children, .. } => {
+                // Recurse into children that might intersect
+                let mut child_start = node_start;
+                for child in children {
+                    let child_bytes = match child {
+                        Node::Leaf { sums, .. } => sums.bytes,
+                        Node::Internal { sums, .. } => sums.bytes,
+                    };
+
+                    let child_end = child_start + child_bytes;
+
+                    // Only recurse if child intersects with range
+                    if child_end > range.start && child_start < range.end {
+                        self.walk_range_in_node(child, range.clone(), child_start, callback);
+                    }
+
+                    child_start = child_end;
+                }
+            }
+        }
+    }
+}

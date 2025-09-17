@@ -30,6 +30,7 @@ fn main() {
         text_styles: None,
         font_system: Some(&font_system),
         viewport: &viewport,
+        debug_offscreen: false,
     };
 
     widget.paint(&mut ctx);
@@ -61,6 +62,7 @@ fn main() {
         text_styles: None,
         font_system: Some(&font_system),
         viewport: &viewport,
+        debug_offscreen: false,
     };
 
     widget.paint(&mut ctx);
@@ -103,6 +105,7 @@ fn main() {
         text_styles: None,
         font_system: Some(&font_system),
         viewport: &viewport,
+        debug_offscreen: false,
     };
 
     widget.paint(&mut ctx);
