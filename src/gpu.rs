@@ -390,14 +390,14 @@ impl GpuRenderer {
         println!("GPU::render called with {} batches, viewport: logical={:.0}x{:.0}, scale={:.1}",
                  batches.len(), viewport.logical_size.width, viewport.logical_size.height, viewport.scale_factor);
 
-        // Update uniform buffer with LOGICAL viewport size (not physical)
-        // Shaders will normalize using these logical dimensions
+        // Update uniform buffer with PHYSICAL viewport size
+        // Since glyphs are in physical pixels, shaders need physical dimensions
         let uniforms = ShaderUniforms {
-            viewport_size: [viewport.logical_size.width, viewport.logical_size.height],
+            viewport_size: [viewport.physical_size.width as f32, viewport.physical_size.height as f32],
             _padding: [0.0, 0.0],
         };
-        println!("  Sending logical viewport_size [{:.0}, {:.0}] to shaders",
-                 viewport.logical_size.width, viewport.logical_size.height);
+        println!("  Sending physical viewport_size [{:.0}, {:.0}] to shaders",
+                 viewport.physical_size.width as f32, viewport.physical_size.height as f32);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
@@ -561,7 +561,7 @@ impl GpuRenderer {
 
         println!("GPU: draw_glyphs called with {} glyphs, scale={:.1}", instances.len(), scale_factor);
 
-        // Generate vertices for glyphs (transform view → physical)
+        // Generate vertices for glyphs (already in physical coordinates from font system)
         let mut vertices = Vec::new();
         for (i, glyph) in instances.iter().enumerate() {
             // Calculate glyph size from texture coordinates
@@ -570,20 +570,21 @@ impl GpuRenderer {
             let glyph_width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * atlas_size;
             let glyph_height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * atlas_size;
 
-            // Apply scale factor to transform from view to physical coordinates
-            let physical_x = glyph.x * scale_factor;
-            let physical_y = glyph.y * scale_factor;
-            let physical_width = glyph_width * scale_factor;
-            let physical_height = glyph_height * scale_factor;
+            // Glyph positions and dimensions are already in physical pixels from font system
+            // No need to apply scale factor
+            let physical_x = glyph.x;
+            let physical_y = glyph.y;
+            let physical_width = glyph_width;
+            let physical_height = glyph_height;
 
             if i == 0 {
-                println!("  First glyph: view=({:.1}, {:.1}) → physical=({:.1}, {:.1}), size={:.1}x{:.1}",
-                         glyph.x, glyph.y, physical_x, physical_y, physical_width, physical_height);
+                println!("  First glyph: physical=({:.1}, {:.1}), size={:.1}x{:.1}",
+                         physical_x, physical_y, physical_width, physical_height);
                 println!("    Tex coords: [{:.3}, {:.3}, {:.3}, {:.3}]",
                          glyph.tex_coords[0], glyph.tex_coords[1], glyph.tex_coords[2], glyph.tex_coords[3]);
             }
 
-            // Quad for each glyph (in physical coordinates)
+            // Quad for each glyph (already in physical coordinates)
             let x1 = physical_x;
             let y1 = physical_y;
             let x2 = physical_x + physical_width;

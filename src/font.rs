@@ -277,7 +277,8 @@ impl SharedFontSystem {
         let physical_size = logical_font_size * scale_factor;
         let layout = font_system.layout_text(text, physical_size);
 
-        // Scale positions back to logical coordinates
+        // Return layout unchanged - it's already in physical pixels
+        // which is what we need for direct GPU rendering
         TextLayout {
             glyphs: layout
                 .glyphs
