@@ -8,6 +8,7 @@ use tiny_editor::{
     tree::{Content, Doc, Edit, Rect},
 };
 use std::sync::Arc;
+use tiny_editor::coordinates::LogicalPixels;
 
 #[test]
 fn test_document_to_render_pipeline() {
@@ -21,10 +22,10 @@ fn test_document_to_render_pipeline() {
     renderer.update_viewport(800.0, 600.0, 1.0);
 
     let viewport = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: 800.0,
-        height: 600.0,
+        x: LogicalPixels(0.0),
+        y: LogicalPixels(0.0),
+        width: LogicalPixels(800.0),
+        height: LogicalPixels(600.0),
     };
 
     let batches = renderer.render(&tree, viewport);
@@ -51,10 +52,10 @@ fn test_incremental_typing_render() {
     renderer.set_font_system(font_system);
 
     let viewport = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: 800.0,
-        height: 600.0,
+        x: LogicalPixels(0.0),
+        y: LogicalPixels(0.0),
+        width: LogicalPixels(800.0),
+        height: LogicalPixels(600.0),
     };
 
     // Type and render each character
@@ -89,10 +90,10 @@ fn test_multiline_render() {
     renderer.set_font_system(font_system);
 
     let viewport = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: 800.0,
-        height: 600.0,
+        x: LogicalPixels(0.0),
+        y: LogicalPixels(0.0),
+        width: LogicalPixels(800.0),
+        height: LogicalPixels(600.0),
     };
 
     let batches = renderer.render(&tree, viewport);
@@ -119,10 +120,10 @@ fn test_glyph_batch_properties() {
     renderer.set_font_system(font_system.clone());
 
     let viewport = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: 800.0,
-        height: 600.0,
+        x: LogicalPixels(0.0),
+        y: LogicalPixels(0.0),
+        width: LogicalPixels(800.0),
+        height: LogicalPixels(600.0),
     };
 
     let batches = renderer.render(&tree, viewport);
@@ -139,7 +140,7 @@ fn test_glyph_batch_properties() {
             }
 
             // H and i should have different x positions
-            assert_ne!(instances[0].x, instances[1].x);
+            assert_ne!(instances[0].pos.x, instances[1].pos.x);
             break;
         }
     }

@@ -8,6 +8,7 @@ use tiny_editor::{
     coordinates::{Viewport, LayoutPos},
 };
 use std::sync::Arc;
+use tiny_editor::coordinates::LogicalPixels;
 
 fn main() {
     println!("🎨 Widget Paint System Debug");
@@ -22,8 +23,8 @@ fn main() {
 
     let mut commands = Vec::new();
     let mut ctx = PaintContext {
-        layout_pos: LayoutPos { x: 10.0, y: 20.0 },
-        view_pos: Some(viewport.layout_to_view(LayoutPos { x: 10.0, y: 20.0 })),
+        layout_pos: LayoutPos { x: LogicalPixels(10.0), y: LogicalPixels(20.0) },
+        view_pos: Some(viewport.layout_to_view(LayoutPos { x: LogicalPixels(10.0), y: LogicalPixels(20.0) })),
         doc_pos: None,
         commands: &mut commands,
         text_styles: None,
@@ -40,7 +41,7 @@ fn main() {
             RenderOp::Glyphs { glyphs, .. } => {
                 println!("  Command {}: {} glyphs", i, glyphs.len());
                 for (j, glyph) in glyphs.iter().enumerate() {
-                    println!("    Glyph {}: pos=({:.1}, {:.1})", j, glyph.x, glyph.y);
+                    println!("    Glyph {}: pos=({:.1}, {:.1})", j, glyph.pos.x.0, glyph.pos.y.0);
                 }
             }
             _ => println!("  Command {}: Non-glyph", i),
@@ -53,8 +54,8 @@ fn main() {
 
     let mut commands = Vec::new();
     let mut ctx = PaintContext {
-        layout_pos: LayoutPos { x: 0.0, y: 0.0 },
-        view_pos: Some(viewport.layout_to_view(LayoutPos { x: 0.0, y: 0.0 })),
+        layout_pos: LayoutPos { x: LogicalPixels(0.0), y: LogicalPixels(0.0) },
+        view_pos: Some(viewport.layout_to_view(LayoutPos { x: LogicalPixels(0.0), y: LogicalPixels(0.0) })),
         doc_pos: None,
         commands: &mut commands,
         text_styles: None,
@@ -75,10 +76,10 @@ fn main() {
                     let glyph_a = &glyphs[0];
                     let glyph_b = &glyphs[1];
 
-                    println!("    Glyph A: pos=({:.1}, {:.1})", glyph_a.x, glyph_a.y);
-                    println!("    Glyph B: pos=({:.1}, {:.1})", glyph_b.x, glyph_b.y);
+                    println!("    Glyph A: pos=({:.1}, {:.1})", glyph_a.pos.x.0, glyph_a.pos.y.0);
+                    println!("    Glyph B: pos=({:.1}, {:.1})", glyph_b.pos.x.0, glyph_b.pos.y.0);
 
-                    if glyph_a.x == glyph_b.x {
+                    if glyph_a.pos.x == glyph_b.pos.x {
                         println!("    🐛 WIDGET BUG: Both glyphs at same X!");
                     } else {
                         println!("    ✅ Widget glyphs advance properly");
@@ -95,8 +96,8 @@ fn main() {
 
     let mut commands = Vec::new();
     let mut ctx = PaintContext {
-        layout_pos: LayoutPos { x: 50.0, y: 100.0 },
-        view_pos: Some(viewport.layout_to_view(LayoutPos { x: 50.0, y: 100.0 })),
+        layout_pos: LayoutPos { x: LogicalPixels(50.0), y: LogicalPixels(100.0) },
+        view_pos: Some(viewport.layout_to_view(LayoutPos { x: LogicalPixels(50.0), y: LogicalPixels(100.0) })),
         doc_pos: None,
         commands: &mut commands,
         text_styles: None,
@@ -111,16 +112,16 @@ fn main() {
             println!("'Hello' widget -> {} glyphs", glyphs.len());
 
             for (i, glyph) in glyphs.iter().enumerate() {
-                println!("  [{}] pos=({:.1}, {:.1})", i, glyph.x, glyph.y);
+                println!("  [{}] pos=({:.1}, {:.1})", i, glyph.pos.x.0, glyph.pos.y.0);
             }
 
             // Check if all at same position
             if glyphs.len() > 1 {
-                let first_x = glyphs[0].x;
-                let all_same = glyphs.iter().all(|g| g.x == first_x);
+                let first_x = glyphs[0].pos.x;
+                let all_same = glyphs.iter().all(|g| g.pos.x == first_x);
 
                 if all_same {
-                    println!("  🚨 WIDGET BUG: All glyphs at X={:.1}", first_x);
+                    println!("  🚨 WIDGET BUG: All glyphs at X={:.1}", first_x.0);
                 } else {
                     println!("  ✅ Widget glyphs have different positions");
                 }

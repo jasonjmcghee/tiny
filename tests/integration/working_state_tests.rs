@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
+    use tiny_editor::coordinates::LogicalPixels;
     use super::*;
 
     #[test]
@@ -31,10 +32,10 @@ mod tests {
         renderer.set_font_system(font_system.clone());
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&doc.read(), viewport);
@@ -54,20 +55,20 @@ mod tests {
         assert_eq!(glyphs.len(), 3, "Should have 3 glyphs for ABC");
 
         // CRITICAL: Test that characters advance properly (not overlap)
-        assert!(glyphs[1].x > glyphs[0].x, "B should be right of A");
-        assert!(glyphs[2].x > glyphs[1].x, "C should be right of B");
+        assert!(glyphs[1].pos.x.0 > glyphs[0].pos.x.0, "B should be right of A");
+        assert!(glyphs[2].pos.x.0 > glyphs[1].pos.x.0, "C should be right of B");
 
         // Test reasonable spacing (based on current working values)
-        let spacing_ab = glyphs[1].x - glyphs[0].x;
-        let spacing_bc = glyphs[2].x - glyphs[1].x;
+        let spacing_ab = glyphs[1].pos.x.0 - glyphs[0].pos.x.0;
+        let spacing_bc = glyphs[2].pos.x.0 - glyphs[1].pos.x.0;
 
         // Should be reasonable character spacing (not too small, not huge)
         assert!(spacing_ab > 5.0 && spacing_ab < 20.0, "A-B spacing should be reasonable");
         assert!(spacing_bc > 5.0 && spacing_bc < 20.0, "B-C spacing should be reasonable");
 
         // Should be on same line
-        assert_eq!(glyphs[0].y, glyphs[1].y, "Should be on same line");
-        assert_eq!(glyphs[1].y, glyphs[2].y, "Should be on same line");
+        assert_eq!(glyphs[0].pos.y, glyphs[1].pos.y, "Should be on same line");
+        assert_eq!(glyphs[1].pos.y, glyphs[2].pos.y, "Should be on same line");
     }
 
     #[test]
@@ -81,10 +82,10 @@ mod tests {
         renderer.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&tree, viewport);
@@ -99,14 +100,14 @@ mod tests {
             let glyph_b = &instances[1];
 
             // A should be at start of first line
-            assert!(glyph_a.x < 5.0, "A should be near start of line");
+            assert!(glyph_a.pos.x.0 < 5.0, "A should be near start of line");
 
             // B should be at start of second line
-            assert!(glyph_b.x < 5.0, "B should be near start of line");
-            assert!(glyph_b.y > glyph_a.y, "B should be below A");
+            assert!(glyph_b.pos.x.0 < 5.0, "B should be near start of line");
+            assert!(glyph_b.pos.y.0 > glyph_a.pos.y.0, "B should be below A");
 
             // Line spacing should be reasonable
-            let line_spacing = glyph_b.y - glyph_a.y;
+            let line_spacing = glyph_b.pos.y.0 - glyph_a.pos.y.0;
             assert!(line_spacing > 15.0 && line_spacing < 50.0,
                     "Line spacing should be reasonable, got {:.1}", line_spacing);
         } else {
@@ -125,10 +126,10 @@ mod tests {
         renderer.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&tree, viewport);
@@ -143,7 +144,7 @@ mod tests {
             let mut char_positions = Vec::new();
             for glyph in instances {
                 if glyph.color != 0x00000000 { // Skip transparent chars
-                    char_positions.push((glyph.x, glyph.y));
+                    char_positions.push((glyph.pos.x.0, glyph.pos.y.0));
                 }
             }
 
@@ -172,15 +173,15 @@ mod tests {
             let layout = font_system.layout_text(&ch.to_string(), 14.0);
             if !layout.glyphs.is_empty() {
                 let glyph = &layout.glyphs[0];
-                assert!(glyph.width > 0.0, "Glyph '{}' should have width", ch);
-                assert!(glyph.height > 0.0, "Glyph '{}' should have height", ch);
+                assert!(glyph.size.width.0 > 0.0, "Glyph '{}' should have width", ch);
+                assert!(glyph.size.height.0 > 0.0, "Glyph '{}' should have height", ch);
             }
         }
 
         // Test line height
         let multiline = font_system.layout_text("A\nB", 14.0);
         if multiline.glyphs.len() >= 2 {
-            let line_height = multiline.glyphs[1].y - multiline.glyphs[0].y;
+            let line_height = multiline.glyphs[1].pos.y.0 - multiline.glyphs[0].pos.y.0;
             assert!(line_height > 15.0 && line_height < 25.0,
                     "Line height should be reasonable for 14pt font");
         }
@@ -189,8 +190,8 @@ mod tests {
         let scaled = font_system.layout_text_scaled("A", 14.0, 2.0);
         if !scaled.glyphs.is_empty() {
             let glyph = &scaled.glyphs[0];
-            assert!(glyph.width > 10.0, "Scaled glyph should have substantial width");
-            assert!(glyph.height > 10.0, "Scaled glyph should have substantial height");
+            assert!(glyph.size.width.0 > 10.0, "Scaled glyph should have substantial width");
+            assert!(glyph.size.height.0 > 10.0, "Scaled glyph should have substantial height");
         }
     }
 }

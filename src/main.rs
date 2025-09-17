@@ -11,6 +11,7 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
+use tiny_editor::coordinates::{LogicalPixels, Viewport};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Tiny Editor...");
@@ -200,10 +201,10 @@ fn main() {
                     let logical_height = physical_size.height as f32 / scale_factor;
 
                     let viewport = Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: logical_width,
-                        height: logical_height,
+                        x: LogicalPixels(0.0),
+                        y: LogicalPixels(0.0),
+                        width: LogicalPixels(logical_width),
+                        height: LogicalPixels(logical_height),
                     };
 
                     // Update renderer viewport with proper scale factor
@@ -223,7 +224,7 @@ fn main() {
                     // Execute on GPU with logical viewport dimensions
                     unsafe {
                         // Create viewport for GPU rendering
-                        let viewport = tiny_editor::coordinates::Viewport::new(logical_width, logical_height, scale_factor);
+                        let viewport = Viewport::new(logical_width, logical_height, scale_factor);
                         renderer.render(&batches, &viewport);
                     }
                 }

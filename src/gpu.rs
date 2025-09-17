@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 #[allow(unused)]
 use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
+use crate::coordinates::Viewport;
 
 /// Vertex data for rectangles
 #[repr(C)]
@@ -386,7 +387,7 @@ impl GpuRenderer {
     }
 
     /// Execute batched draw commands (transforms view → physical)
-    pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &crate::coordinates::Viewport) {
+    pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &Viewport) {
         println!("GPU::render called with {} batches, viewport: logical={:.0}x{:.0}, scale={:.1}",
                  batches.len(), viewport.logical_size.width, viewport.logical_size.height, viewport.scale_factor);
 
@@ -458,10 +459,10 @@ impl GpuRenderer {
                     }
                     BatchedDraw::SetClip(rect) => {
                         // Transform clip rect from view to physical
-                        let physical_x = (rect.x * viewport.scale_factor) as u32;
-                        let physical_y = (rect.y * viewport.scale_factor) as u32;
-                        let physical_width = (rect.width * viewport.scale_factor) as u32;
-                        let physical_height = (rect.height * viewport.scale_factor) as u32;
+                        let physical_x = (rect.x.0 * viewport.scale_factor) as u32;
+                        let physical_y = (rect.y.0 * viewport.scale_factor) as u32;
+                        let physical_width = (rect.width.0 * viewport.scale_factor) as u32;
+                        let physical_height = (rect.height.0 * viewport.scale_factor) as u32;
 
                         render_pass.set_scissor_rect(
                             physical_x,
@@ -489,14 +490,14 @@ impl GpuRenderer {
         let mut vertices = Vec::new();
         for (i, rect) in instances.iter().enumerate() {
             // Apply scale factor to transform from view to physical coordinates
-            let physical_x = rect.rect.x * scale_factor;
-            let physical_y = rect.rect.y * scale_factor;
-            let physical_width = rect.rect.width * scale_factor;
-            let physical_height = rect.rect.height * scale_factor;
+            let physical_x = rect.rect.x.0 * scale_factor;
+            let physical_y = rect.rect.y.0 * scale_factor;
+            let physical_width = rect.rect.width.0 * scale_factor;
+            let physical_height = rect.rect.height.0 * scale_factor;
 
             if i == 0 {
                 println!("  First rect: view=({:.1}, {:.1}) {}x{} → physical=({:.1}, {:.1}) {}x{}",
-                         rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height,
+                         rect.rect.x.0, rect.rect.y.0, rect.rect.width.0, rect.rect.height.0,
                          physical_x, physical_y, physical_width, physical_height);
             }
 
@@ -572,8 +573,8 @@ impl GpuRenderer {
 
             // Glyph positions and dimensions are already in physical pixels from font system
             // No need to apply scale factor
-            let physical_x = glyph.x;
-            let physical_y = glyph.y;
+            let physical_x = glyph.pos.x.0;
+            let physical_y = glyph.pos.y.0;
             let physical_width = glyph_width;
             let physical_height = glyph_height;
 

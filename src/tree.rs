@@ -8,6 +8,7 @@ use simdutf8::basic::from_utf8;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, LogicalSize, ViewPos, Viewport};
 
 /// Maximum spans per leaf node (tuned for cache line)
 #[allow(dead_code)]
@@ -97,26 +98,16 @@ pub enum Content {
     Widget(Arc<dyn Widget>),
 }
 
-/// Rectangle for spatial queries
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
+/// Rectangle for spatial queries (in layout space)
+pub type Rect = LayoutRect;
 
-/// Point for hit testing
-#[derive(Clone, Copy, Debug)]
-pub struct Point {
-    pub x: f32,
-    pub y: f32,
-}
+/// Point for hit testing (in layout space)
+pub type Point = LayoutPos;
 
 /// Widget trait - implemented by all visual elements
 pub trait Widget: Send + Sync {
-    /// Measure widget size
-    fn measure(&self) -> (f32, f32);
+    /// Measure widget size (returns logical size)
+    fn measure(&self) -> LogicalSize;
     /// Get z-index for layering
     fn z_index(&self) -> i32;
     /// Test if point hits this widget
@@ -130,11 +121,11 @@ pub trait Widget: Send + Sync {
 /// Context passed to widgets during painting
 pub struct PaintContext<'a> {
     /// Widget's position in layout space (pre-scroll)
-    pub layout_pos: crate::coordinates::LayoutPos,
+    pub layout_pos: LayoutPos,
     /// Widget's position in view space (post-scroll, None if off-screen)
-    pub view_pos: Option<crate::coordinates::ViewPos>,
+    pub view_pos: Option<ViewPos>,
     /// Document position (if widget is text-related)
-    pub doc_pos: Option<crate::coordinates::DocPos>,
+    pub doc_pos: Option<DocPos>,
     /// Current commands being built (widgets emit in LAYOUT space)
     pub commands: &'a mut Vec<crate::render::RenderOp>,
     /// Text style provider for syntax highlighting
@@ -142,7 +133,7 @@ pub struct PaintContext<'a> {
     /// Font system for text layout and rasterization (shared reference)
     pub font_system: Option<&'a std::sync::Arc<crate::font::SharedFontSystem>>,
     /// Viewport for all coordinate transformations and metrics
-    pub viewport: &'a crate::coordinates::Viewport,
+    pub viewport: &'a Viewport,
 }
 
 // === Implementation ===
@@ -483,9 +474,13 @@ impl Tree {
                     sums.lines += lines; // Use cached count!
                 }
                 Span::Widget(w) => {
-                    let (width, height) = w.measure();
-                    sums.bounds.width = sums.bounds.width.max(width);
-                    sums.bounds.height += height;
+                    let size = w.measure();
+                    sums.bounds.width = LogicalPixels(
+                        sums.bounds.width.0.max(size.width.0)
+                    );
+                    sums.bounds.height = LogicalPixels(
+                        sums.bounds.height.0 + size.height.0
+                    );
                     sums.max_z = sums.max_z.max(w.z_index());
                 }
                 Span::Selection { range, .. } => {
@@ -509,8 +504,12 @@ impl Tree {
 
             sums.bytes += child_sums.bytes;
             sums.lines += child_sums.lines;
-            sums.bounds.width = sums.bounds.width.max(child_sums.bounds.width);
-            sums.bounds.height += child_sums.bounds.height;
+            sums.bounds.width = LogicalPixels(
+                sums.bounds.width.0.max(child_sums.bounds.width.0)
+            );
+            sums.bounds.height = LogicalPixels(
+                sums.bounds.height.0 + child_sums.bounds.height.0
+            );
             sums.max_z = sums.max_z.max(child_sums.max_z);
         }
 
@@ -669,14 +668,7 @@ pub struct TreePos {
     pub offset_in_span: usize,
 }
 
-impl Rect {
-    pub fn contains(&self, pt: Point) -> bool {
-        pt.x >= self.x
-            && pt.x <= self.x + self.width
-            && pt.y >= self.y
-            && pt.y <= self.y + self.height
-    }
-}
+// Rect::contains is now implemented in coordinates.rs for LayoutRect
 
 #[cfg(test)]
 mod tests {

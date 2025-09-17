@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
+    use tiny_editor::coordinates::LogicalPixels;
     use super::*;
 
     #[test]
@@ -22,10 +23,10 @@ mod tests {
         renderer.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&tree, viewport);
@@ -70,10 +71,10 @@ mod tests {
             renderer.set_font_system(font_system);
 
             let viewport = Rect {
-                x: 0.0,
-                y: 0.0,
-                width: 800.0,
-                height: 600.0,
+                x: LogicalPixels(0.0),
+                y: LogicalPixels(0.0),
+                width: LogicalPixels(800.0),
+                height: LogicalPixels(600.0),
             };
 
             let batches = renderer.render(&tree, viewport);
@@ -101,10 +102,10 @@ mod tests {
         renderer.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&tree, viewport);
@@ -137,10 +138,10 @@ mod tests {
         renderer_2x.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches_1x = renderer_1x.render(&tree, viewport);
@@ -176,10 +177,10 @@ mod tests {
         renderer.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&tree, viewport);
@@ -214,10 +215,10 @@ mod tests {
         renderer.set_font_system(font_system);
 
         let viewport = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(800.0),
+            height: LogicalPixels(600.0),
         };
 
         let batches = renderer.render(&tree, viewport);

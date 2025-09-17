@@ -4,6 +4,7 @@
 //! leveraging our sum tree structure for fast queries without full traversal.
 
 use crate::tree::{Node, Span, Tree};
+use crate::coordinates::DocPos;
 use std::ops::Range;
 
 impl Tree {
@@ -451,6 +452,36 @@ impl Tree {
                 .sum(),
         }
     }
+
+    /// Convert DocPos to byte offset in document - O(log n)
+    pub fn doc_pos_to_byte(&self, pos: DocPos) -> usize {
+        if let Some(line_start) = self.line_to_byte(pos.line) {
+            // Get the text of this line to calculate column offset
+            let line_end = self.line_to_byte(pos.line + 1).unwrap_or(self.byte_count());
+            let line_text = self.get_text_slice(line_start..line_end);
+
+            // Calculate byte offset within line accounting for tabs
+            let mut byte_offset = 0;
+            let mut visual_column = 0;
+
+            for ch in line_text.chars() {
+                if visual_column >= pos.column {
+                    break;
+                }
+                if ch == '\t' {
+                    visual_column = ((visual_column / 4) + 1) * 4; // 4-space tabs
+                } else {
+                    visual_column += 1;
+                }
+                byte_offset += ch.len_utf8();
+            }
+
+            line_start + byte_offset
+        } else {
+            pos.byte_offset // Fallback to stored byte offset
+        }
+    }
+
 }
 
 #[cfg(test)]

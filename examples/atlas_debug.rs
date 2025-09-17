@@ -15,8 +15,8 @@ fn main() {
     if !layout.glyphs.is_empty() {
         let glyph = &layout.glyphs[0];
         println!("Glyph 'A':");
-        println!("  Position: ({:.1}, {:.1})", glyph.x, glyph.y);
-        println!("  Size: ({:.1}, {:.1})", glyph.width, glyph.height);
+        println!("  Position: ({:.1}, {:.1})", glyph.pos.x.0, glyph.pos.y.0);
+        println!("  Size: ({:.1}, {:.1})", glyph.size.width.0, glyph.size.height.0);
         println!("  Texture coords: [{:.6}, {:.6}, {:.6}, {:.6}]",
                  glyph.tex_coords[0], glyph.tex_coords[1],
                  glyph.tex_coords[2], glyph.tex_coords[3]);

@@ -2,13 +2,14 @@
 //!
 //! This eliminates font/texture complexity to test basic GPU pipeline
 
+use std::sync::Arc;
+use tiny_editor::coordinates::{LogicalPixels, LogicalSize};
 use tiny_editor::{
-    app::{AppLogic, TinyApp},
-    coordinates::LayoutPos,
+    app::{AppLogic, TinyApp}
+    ,
     render::RenderOp,
     tree::{Doc, PaintContext, Point, Rect, Widget},
 };
-use std::sync::Arc;
 
 /// Simple red rectangle widget for testing
 #[derive(Clone)]
@@ -19,8 +20,8 @@ struct TestRect {
 }
 
 impl Widget for TestRect {
-    fn measure(&self) -> (f32, f32) {
-        (self.width, self.height)
+    fn measure(&self) -> LogicalSize {
+        LogicalSize::new(self.width, self.height)
     }
 
     fn z_index(&self) -> i32 {
@@ -38,8 +39,8 @@ impl Widget for TestRect {
             rect: Rect {
                 x: ctx.layout_pos.x,
                 y: ctx.layout_pos.y,
-                width: self.width,
-                height: self.height,
+                width: LogicalPixels(self.width),
+                height: LogicalPixels(self.height),
             },
             color: self.color,
         });

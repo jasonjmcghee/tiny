@@ -7,18 +7,17 @@ use fontdue::layout::{CoordinateSystem, Layout, TextStyle};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use crate::coordinates::{PhysicalPos, PhysicalSizeF};
 
 /// Information about a positioned glyph ready for rendering
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PositionedGlyph {
     /// Character for debugging
     pub char: char,
     /// Position in physical pixels (already scaled)
-    pub x: f32,
-    pub y: f32,
+    pub pos: PhysicalPos,
     /// Size in physical pixels (already scaled)
-    pub width: f32,
-    pub height: f32,
+    pub size: PhysicalSizeF,
     /// Texture coordinates in atlas [u0, v0, u1, v1]
     pub tex_coords: [f32; 4],
     /// Color (default white)
@@ -119,10 +118,8 @@ impl FontSystem {
 
                 positioned_glyphs.push(PositionedGlyph {
                     char: ch,
-                    x,
-                    y,
-                    width: tab_width,
-                    height: space_entry.height,
+                    pos: PhysicalPos::new(x, y),
+                    size: PhysicalSizeF::new(tab_width, space_entry.height),
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // No texture for tab
                     color: 0x00000000, // Transparent
                 });
@@ -143,10 +140,8 @@ impl FontSystem {
             // Everything is already at the right scale
             positioned_glyphs.push(PositionedGlyph {
                 char: ch,
-                x, // Already scaled
-                y, // Already scaled
-                width: entry.width,
-                height: entry.height,
+                pos: PhysicalPos::new(x, y), // Already scaled
+                size: PhysicalSizeF::new(entry.width, entry.height),
                 tex_coords: entry.tex_coords,
                 color: 0xFFFFFFFF,
             });
@@ -285,10 +280,8 @@ impl SharedFontSystem {
                 .iter()
                 .map(|g| PositionedGlyph {
                     char: g.char,
-                    x: g.x,
-                    y: g.y,
-                    width: g.width,
-                    height: g.height,
+                    pos: g.pos.clone(),
+                    size: g.size.clone(),
                     tex_coords: g.tex_coords,
                     color: g.color,
                 })
@@ -312,6 +305,51 @@ impl SharedFontSystem {
     pub fn atlas_size(&self) -> (u32, u32) {
         self.inner.lock().atlas_size()
     }
+
+    /// Hit test: find character position at x coordinate using binary search
+    /// Uses the FULL line layout to get accurate positioning with kerning/ligatures
+    pub fn hit_test_line(&self, line_text: &str, logical_font_size: f32, scale_factor: f32, target_x: f32) -> u32 {
+        if line_text.is_empty() {
+            return 0;
+        }
+
+        // Layout the full line to get accurate glyph positions
+        let full_layout = self.layout_text_scaled(line_text, logical_font_size, scale_factor);
+
+        // Handle case where layout produces no glyphs (whitespace-only lines)
+        if full_layout.glyphs.is_empty() {
+            if full_layout.width > 0.0 {
+                // Use the font system's actual measurement of the line width
+                let line_width_logical = full_layout.width / scale_factor;
+                let progress = (target_x / line_width_logical).clamp(0.0, 1.0);
+                return (progress * line_text.chars().count() as f32) as u32;
+            } else {
+                // Truly empty line
+                return 0;
+            }
+        }
+
+        let target_x_physical = target_x * scale_factor; // Convert to physical pixels
+
+        // Binary search through glyph positions
+        let mut left = 0;
+        let mut right = full_layout.glyphs.len();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            let glyph = &full_layout.glyphs[mid];
+            let glyph_center = glyph.pos.x.0 + glyph.size.width.0 / 2.0;
+
+            if glyph_center <= target_x_physical {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        // Return character position (not glyph position - could differ with ligatures)
+        left as u32
+    }
 }
 
 /// Convert layout to GPU instances
@@ -327,8 +365,10 @@ pub fn layout_to_instances(
         .map(|g| {
             GlyphInstance {
                 glyph_id: 0, // Not used anymore
-                x: (g.x + offset_x) * scale_factor,
-                y: (g.y + offset_y) * scale_factor,
+                pos: PhysicalPos::new(
+                    (g.pos.x.0 + offset_x) * scale_factor,
+                    (g.pos.y.0 + offset_y) * scale_factor,
+                ),
                 color: g.color,
                 tex_coords: g.tex_coords,
             }
@@ -338,6 +378,7 @@ pub fn layout_to_instances(
 
 #[cfg(test)]
 mod tests {
+    use crate::coordinates::PhysicalPixels;
     use super::*;
 
     #[test]
@@ -362,12 +403,12 @@ mod tests {
 
         let glyph = &layout.glyphs[0];
         assert_eq!(glyph.char, 'A');
-        assert_eq!(glyph.x, 0.0); // First char at x=0
+        assert_eq!(glyph.pos.x, PhysicalPixels(0.0)); // First char at x=0
         // The y position from fontdue represents baseline offset
         // For the default font at size 14, this is exactly 4.0
-        assert_eq!(glyph.y, 4.0);
-        assert!(glyph.width > 0.0);
-        assert!(glyph.height > 0.0);
+        assert_eq!(glyph.pos.y, PhysicalPixels(4.0));
+        assert!(glyph.size.width.0 > 0.0);
+        assert!(glyph.size.height.0 > 0.0);
 
         // Texture coords should be valid
         assert!(glyph.tex_coords[2] > glyph.tex_coords[0]); // u1 > u0
@@ -388,8 +429,8 @@ mod tests {
 
         // 2x layout should have ~2x the spacing
         // Get the x position of the second character
-        let spacing_1x = layout_1x.glyphs[1].x;
-        let spacing_2x = layout_2x.glyphs[1].x;
+        let spacing_1x = layout_1x.glyphs[1].pos.x.0;
+        let spacing_2x = layout_2x.glyphs[1].pos.x.0;
 
         // Should be roughly 2x (within rounding tolerance)
         // Font metrics can vary, so we allow a wider range
@@ -410,8 +451,8 @@ mod tests {
 
         // Glyphs should have same logical positions
         for (g1, g2) in layout1.glyphs.iter().zip(layout2.glyphs.iter()) {
-            assert_eq!(g1.x, g2.x);
-            assert_eq!(g1.y, g2.y);
+            assert_eq!(g1.pos.x, g2.pos.x);
+            assert_eq!(g1.pos.y, g2.pos.y);
         }
     }
 

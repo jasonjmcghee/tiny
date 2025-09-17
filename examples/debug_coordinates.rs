@@ -15,8 +15,8 @@ fn main() {
         let glyph = &layout.glyphs[0];
 
         println!("Font system glyph 'A':");
-        println!("  Position: ({:.3}, {:.3})", glyph.x, glyph.y);
-        println!("  Size from font: ({:.3}, {:.3})", glyph.width, glyph.height);
+        println!("  Position: ({:.3}, {:.3})", glyph.pos.x.0, glyph.pos.y.0);
+        println!("  Size from font: ({:.3}, {:.3})", glyph.size.width.0, glyph.size.height.0);
         println!("  Texture coords: [{:.3}, {:.3}, {:.3}, {:.3}]",
                  glyph.tex_coords[0], glyph.tex_coords[1],
                  glyph.tex_coords[2], glyph.tex_coords[3]);
@@ -29,20 +29,20 @@ fn main() {
         println!("  GPU calculated size: ({:.3}, {:.3})", gpu_width, gpu_height);
 
         // Compare
-        if (glyph.width - gpu_width).abs() > 1.0 {
+        if (glyph.size.width.0 - gpu_width).abs() > 1.0 {
             println!("  🐛 SIZE MISMATCH: Font says {:.1}px wide, GPU calculates {:.1}px",
-                     glyph.width, gpu_width);
+                     glyph.size.width.0, gpu_width);
         }
 
         // Test coordinate transformation (simulate shader)
         let viewport_width = 800.0;
         let viewport_height = 400.0;
 
-        let clip_x = (glyph.x / (viewport_width * 0.5)) - 1.0;
-        let clip_y = 1.0 - (glyph.y / (viewport_height * 0.5));
+        let clip_x = (glyph.pos.x.0 / (viewport_width * 0.5)) - 1.0;
+        let clip_y = 1.0 - (glyph.pos.y.0 / (viewport_height * 0.5));
 
         println!("Shader coordinate transformation:");
-        println!("  Screen pos: ({:.3}, {:.3})", glyph.x, glyph.y);
+        println!("  Screen pos: ({:.3}, {:.3})", glyph.pos.x.0, glyph.pos.y.0);
         println!("  Clip space: ({:.3}, {:.3})", clip_x, clip_y);
 
         // Check if coordinates are reasonable
@@ -70,7 +70,7 @@ fn main() {
         if !layout.glyphs.is_empty() {
             let glyph = &layout.glyphs[0];
             println!("'{}': size=({:.1}, {:.1}) tex_size=({:.1}, {:.1})",
-                     ch, glyph.width, glyph.height,
+                     ch, glyph.size.width.0, glyph.size.height.0,
                      (glyph.tex_coords[2] - glyph.tex_coords[0]) * 2048.0,
                      (glyph.tex_coords[3] - glyph.tex_coords[1]) * 2048.0);
         }

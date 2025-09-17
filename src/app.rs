@@ -7,24 +7,29 @@ use std::io::BufRead;
 use crate::{
     font::SharedFontSystem,
     gpu::GpuRenderer,
+    input::InputHandler,
     render::Renderer,
-    tree::{Content, Doc, Edit, Rect},
+    tree::{Doc, Point, Rect},
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
+use crate::coordinates::{DocPos, LogicalPixels};
 
 /// Trait for handling application-specific logic
 pub trait AppLogic {
     /// Handle keyboard input
-    fn on_key(&mut self, _key: &winit::event::KeyEvent) -> bool {
+    fn on_key(&mut self, _key: &winit::event::KeyEvent, _viewport: &crate::coordinates::Viewport) -> bool {
         // Default implementation with basic editor functionality
+        false
+    }
+
+    /// Handle mouse click at logical position
+    fn on_click(&mut self, _pos: Point, _viewport: &crate::coordinates::Viewport) -> bool {
         false
     }
 
@@ -36,13 +41,18 @@ pub trait AppLogic {
         panic!("This AppLogic implementation doesn't support editing")
     }
 
-    /// Get cursor position
+    /// Get cursor position (for compatibility)
     fn cursor_pos(&self) -> usize {
         0
     }
 
-    /// Set cursor position
+    /// Set cursor position (for compatibility)
     fn set_cursor_pos(&mut self, _pos: usize) {}
+
+    /// Get cursor document position for scrolling (returns None if no scrolling needed)
+    fn get_cursor_doc_pos(&self) -> Option<DocPos> {
+        None
+    }
 
     /// Called after setup is complete
     fn on_ready(&mut self) {}
@@ -66,6 +76,9 @@ pub struct TinyApp<T: AppLogic> {
     window_title: String,
     window_size: (f32, f32),
     font_size: f32,
+
+    // Track cursor position for clicks
+    cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 
 impl<T: AppLogic> TinyApp<T> {
@@ -79,6 +92,7 @@ impl<T: AppLogic> TinyApp<T> {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             font_size: 14.0,
+            cursor_position: None,
         }
     }
 
@@ -176,17 +190,71 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    let should_redraw = self.logic.on_key(&event);
-                    if should_redraw {
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
+                    if let Some(cpu_renderer) = &self.cpu_renderer {
+                        let should_redraw = self.logic.on_key(&event, cpu_renderer.viewport());
+                        if should_redraw {
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
                         }
+                    }
+                }
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                // Store cursor position for click handling
+                self.cursor_position = Some(position);
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                if let (Some(window), Some(cpu_renderer), Some(position)) =
+                    (&self.window, &self.cpu_renderer, self.cursor_position) {
+
+                    let scale = window.scale_factor() as f32;
+                    let logical_x = position.x as f32 / scale;
+                    let logical_y = position.y as f32 / scale;
+
+                    // Convert to document coordinates
+                    let point = Point {
+                        x: LogicalPixels(logical_x),
+                        y: LogicalPixels(logical_y),
+                    };
+
+                    let should_redraw = self.logic.on_click(point, cpu_renderer.viewport());
+                    if should_redraw {
+                        window.request_redraw();
                     }
                 }
             }
 
             WindowEvent::RedrawRequested => {
                 self.render_frame();
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                    let scroll_amount = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                            y * cpu_renderer.viewport().metrics.line_height
+                        }
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                            pos.y as f32
+                        }
+                    };
+
+                    // Update scroll in viewport
+                    let viewport = cpu_renderer.viewport_mut();
+                    let new_scroll_y = (viewport.scroll.y.0 - scroll_amount).max(0.0);
+                    viewport.scroll.y = LogicalPixels(new_scroll_y);
+
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
             }
 
             WindowEvent::Resized(new_size) => {
@@ -211,6 +279,12 @@ impl<T: AppLogic> TinyApp<T> {
             // Update logic
             self.logic.on_update();
 
+            // Check if we need to scroll to make cursor visible
+            if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
+                let layout_pos = cpu_renderer.viewport().doc_to_layout(cursor_pos);
+                cpu_renderer.viewport_mut().ensure_visible(layout_pos);
+            }
+
             // Calculate viewport dimensions
             let size = window.inner_size();
             let scale_factor = window.scale_factor() as f32;
@@ -222,10 +296,10 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Define viewport for rendering
             let viewport = Rect {
-                x: 0.0,
-                y: 0.0,
-                width: logical_width,
-                height: logical_height,
+                x: LogicalPixels(0.0),
+                y: LogicalPixels(0.0),
+                width: LogicalPixels(logical_width),
+                height: LogicalPixels(logical_height),
             };
 
             // Generate render commands
@@ -250,164 +324,42 @@ impl<T: AppLogic> TinyApp<T> {
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {
     pub doc: Doc,
-    pub cursor_pos: AtomicUsize,
+    pub input: InputHandler,
 }
 
 impl EditorLogic {
     pub fn new(doc: Doc) -> Self {
         Self {
             doc,
-            cursor_pos: AtomicUsize::new(0),
+            input: InputHandler::new(),
         }
     }
 }
 
 impl AppLogic for EditorLogic {
-    fn on_key(&mut self, event: &winit::event::KeyEvent) -> bool {
-        println!("Key pressed: {:?}", event.logical_key);
+    fn on_key(&mut self, event: &winit::event::KeyEvent, viewport: &crate::coordinates::Viewport) -> bool {
+        // Delegate to InputHandler
+        self.input.on_key(&self.doc, viewport, event);
 
-        match &event.logical_key {
-            Key::Character(ch) => {
-                // Insert character at cursor
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                println!("Inserting '{}' at position {}", ch, cursor_pos);
-
-                self.doc.edit(Edit::Insert {
-                    pos: cursor_pos,
-                    content: Content::Text(ch.to_string()),
-                });
-                self.doc.flush();
-
-                // Move cursor forward
-                self.cursor_pos.store(cursor_pos + ch.len(), Ordering::Relaxed);
-
-                // Debug: print document content
-                let text = self.doc.read().to_string();
-                println!("Document now contains: '{}'", text);
-                println!("Cursor at: {}", self.cursor_pos.load(Ordering::Relaxed));
-
-                true // Request redraw
-            }
-            Key::Named(NamedKey::Space) => {
-                // Handle space character
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                println!("Inserting space at position {}", cursor_pos);
-
-                self.doc.edit(Edit::Insert {
-                    pos: cursor_pos,
-                    content: Content::Text(" ".to_string()),
-                });
-                self.doc.flush();
-
-                self.cursor_pos.store(cursor_pos + 1, Ordering::Relaxed);
-
-                let text = self.doc.read().to_string();
-                println!("Document now contains: '{}'", text);
-                println!("Cursor at: {}", self.cursor_pos.load(Ordering::Relaxed));
-
-                true
-            }
-            Key::Named(NamedKey::Enter) => {
-                // Handle enter/newline
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                println!("Inserting newline at position {}", cursor_pos);
-
-                self.doc.edit(Edit::Insert {
-                    pos: cursor_pos,
-                    content: Content::Text("\n".to_string()),
-                });
-                self.doc.flush();
-
-                self.cursor_pos.store(cursor_pos + 1, Ordering::Relaxed);
-
-                let text = self.doc.read().to_string();
-                println!("Document now contains: '{}'", text);
-                println!("Cursor at: {}", self.cursor_pos.load(Ordering::Relaxed));
-
-                true
-            }
-            Key::Named(NamedKey::Tab) => {
-                // Handle tab character
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                println!("Inserting tab at position {}", cursor_pos);
-
-                self.doc.edit(Edit::Insert {
-                    pos: cursor_pos,
-                    content: Content::Text("\t".to_string()),
-                });
-                self.doc.flush();
-
-                self.cursor_pos.store(cursor_pos + 1, Ordering::Relaxed); // Tab is one character
-
-                let text = self.doc.read().to_string();
-                println!("Document now contains: '{}'", text);
-                println!("Cursor at: {}", self.cursor_pos.load(Ordering::Relaxed));
-
-                true
-            }
-            Key::Named(NamedKey::Backspace) => {
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                if cursor_pos > 0 {
-                    println!("Backspace at position {}", cursor_pos);
-
-                    self.doc.edit(Edit::Delete {
-                        range: cursor_pos - 1..cursor_pos,
-                    });
-                    self.doc.flush();
-
-                    self.cursor_pos.store(cursor_pos - 1, Ordering::Relaxed);
-
-                    let text = self.doc.read().to_string();
-                    println!("Document now contains: '{}'", text);
-
-                    true // Request redraw
-                } else {
-                    false
-                }
-            }
-            Key::Named(NamedKey::F1) => {
-                print_editor_info(&self.doc);
-                false
-            }
-            Key::Named(NamedKey::F2) => {
-                print_performance_stats();
-                false
-            }
-            Key::Named(NamedKey::ArrowLeft) => {
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                if cursor_pos > 0 {
-                    self.cursor_pos.store(cursor_pos - 1, Ordering::Relaxed);
-                    println!("Cursor moved left to position {}", cursor_pos - 1);
-                    true
-                } else {
-                    false
-                }
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                let cursor_pos = self.cursor_pos.load(Ordering::Relaxed);
-                let doc_len = self.doc.read().to_string().len();
-                if cursor_pos < doc_len {
-                    self.cursor_pos.store(cursor_pos + 1, Ordering::Relaxed);
-                    println!("Cursor moved right to position {}", cursor_pos + 1);
-                    true
-                } else {
-                    false
-                }
-            }
-            Key::Named(NamedKey::Home) => {
-                self.cursor_pos.store(0, Ordering::Relaxed);
-                println!("Cursor moved to start (position 0)");
-                true
-            }
-            Key::Named(NamedKey::End) => {
-                let doc_len = self.doc.read().to_string().len();
-                self.cursor_pos.store(doc_len, Ordering::Relaxed);
-                println!("Cursor moved to end (position {})", doc_len);
-                true
-            }
-            _ => false,
-        }
+        // Always redraw after keyboard input for now
+        // InputHandler handles the actual logic
+        true
     }
+
+    fn on_click(&mut self, pos: Point, viewport: &crate::coordinates::Viewport) -> bool {
+        // Convert to mouse click for InputHandler
+        // Note: InputHandler expects alt_held for multi-cursor, we'll default to false
+        // Check if Alt is held using keyboard modifiers (would need to track this)
+        self.input.on_mouse_click(
+            &self.doc,
+            viewport,
+            pos,
+            winit::event::MouseButton::Left,
+            false, // alt_held - would need to track keyboard state
+        );
+        true
+    }
+
 
     fn doc(&self) -> &Doc {
         &self.doc
@@ -418,11 +370,23 @@ impl AppLogic for EditorLogic {
     }
 
     fn cursor_pos(&self) -> usize {
-        self.cursor_pos.load(Ordering::Relaxed)
+        // Return first selection's cursor byte position for compatibility
+        self.input
+            .selections()
+            .first()
+            .map(|s| s.cursor.byte_offset)
+            .unwrap_or(0)
     }
 
-    fn set_cursor_pos(&mut self, pos: usize) {
-        self.cursor_pos.store(pos, Ordering::Relaxed);
+    fn set_cursor_pos(&mut self, _pos: usize) {
+        // InputHandler doesn't expose a way to set cursor position directly
+        // This would need to be added to InputHandler if needed
+        // For now, just clear extra selections
+        self.input.clear_selections();
+    }
+
+    fn get_cursor_doc_pos(&self) -> Option<DocPos> {
+        Some(self.input.primary_cursor_doc_pos(&self.doc))
     }
 }
 
@@ -454,7 +418,7 @@ pub fn run_simple_app(title: &str, doc: Doc) -> Result<(), Box<dyn std::error::E
     }
 
     impl AppLogic for SimpleApp {
-        fn on_key(&mut self, _event: &winit::event::KeyEvent) -> bool {
+        fn on_key(&mut self, _event: &winit::event::KeyEvent, _viewport: &crate::coordinates::Viewport) -> bool {
             false // No key handling
         }
 

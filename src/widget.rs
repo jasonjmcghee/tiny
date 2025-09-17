@@ -2,11 +2,11 @@
 //!
 //! Text rendering uses the consolidated FontSystem from font.rs
 
+use crate::coordinates::{LogicalPixels, LogicalSize, PhysicalPos};
 use crate::tree::{Point, Widget};
 use std::sync::Arc;
 
 // === Core Widget Types ===
-
 /// Text widget - renders text using the consolidated FontSystem
 pub struct TextWidget {
     /// UTF-8 text content
@@ -87,7 +87,7 @@ pub enum Severity {
 // === Widget Implementations ===
 
 impl Widget for TextWidget {
-    fn measure(&self) -> (f32, f32) {
+    fn measure(&self) -> LogicalSize {
         // This is a fallback - ideally widget would have access to viewport metrics
         // during measure, but for now we estimate
         let text = std::str::from_utf8(&self.text).unwrap_or("");
@@ -95,7 +95,7 @@ impl Widget for TextWidget {
         // Use reasonable defaults that will be corrected during paint
         let estimated_width = char_count as f32 * 8.4; // Approximate monospace width
         let estimated_height = 19.6; // 14pt * 1.4 line height
-        (estimated_width, estimated_height)
+        LogicalSize::new(estimated_width, estimated_height)
     }
 
     fn z_index(&self) -> i32 {
@@ -103,8 +103,8 @@ impl Widget for TextWidget {
     }
 
     fn hit_test(&self, pt: Point) -> bool {
-        let (width, height) = self.measure();
-        pt.x >= 0.0 && pt.x <= width && pt.y >= 0.0 && pt.y <= height
+        let size = self.measure();
+        pt.x >= LogicalPixels(0.0) && pt.x <= size.width && pt.y >= LogicalPixels(0.0) && pt.y <= size.height
     }
 
     fn paint(&self, ctx: &mut crate::tree::PaintContext<'_>) {
@@ -154,14 +154,20 @@ impl Widget for TextWidget {
                 byte_pos += char_bytes;
             }
 
-            // Position in layout space (glyphs are already in logical coordinates)
-            let glyph_x = ctx.layout_pos.x + glyph.x;
-            let glyph_y = ctx.layout_pos.y + glyph.y;
+            // Glyphs from font system are in physical pixels relative to (0,0)
+            // We need to position them at the layout position
+            // But since GlyphInstance uses PhysicalPos, we need to convert layout to physical
+            // The scroll transformation will happen later in the renderer
+            let layout_pos_physical_x = ctx.layout_pos.x.0 * ctx.viewport.scale_factor;
+            let layout_pos_physical_y = ctx.layout_pos.y.0 * ctx.viewport.scale_factor;
+            let glyph_pos = PhysicalPos::new(
+                layout_pos_physical_x + glyph.pos.x.0,
+                layout_pos_physical_y + glyph.pos.y.0,
+            );
 
             glyph_instances.push(GlyphInstance {
                 glyph_id: 0, // Not used anymore
-                x: glyph_x,
-                y: glyph_y,
+                pos: glyph_pos,
                 color,
                 tex_coords: glyph.tex_coords,
             });
@@ -182,8 +188,8 @@ impl Widget for TextWidget {
 }
 
 impl Widget for CursorWidget {
-    fn measure(&self) -> (f32, f32) {
-        (self.style.width, 19.6) // Use standard line height (14pt * 1.4)
+    fn measure(&self) -> LogicalSize {
+        LogicalSize::new(self.style.width, 19.6) // Use standard line height (14pt * 1.4)
     }
 
     fn z_index(&self) -> i32 {
@@ -209,8 +215,8 @@ impl Widget for CursorWidget {
             rect: Rect {
                 x: ctx.layout_pos.x,
                 y: ctx.layout_pos.y,
-                width: self.style.width,
-                height: line_height,
+                width: LogicalPixels(self.style.width),
+                height: LogicalPixels(line_height),
             },
             color,
         });
@@ -222,9 +228,9 @@ impl Widget for CursorWidget {
 }
 
 impl Widget for SelectionWidget {
-    fn measure(&self) -> (f32, f32) {
+    fn measure(&self) -> LogicalSize {
         // Size determined by text range
-        (0.0, 0.0)
+        LogicalSize::new(0.0, 0.0)
     }
 
     fn z_index(&self) -> i32 {
@@ -241,8 +247,8 @@ impl Widget for SelectionWidget {
 
         // TODO: Calculate actual bounds based on text range
         // For now, draw a simple rectangle
-        let width = 100.0; // Would be calculated from text metrics
-        let height = ctx.viewport.metrics.line_height;
+        let width = LogicalPixels(100.0); // Would be calculated from text metrics
+        let height = LogicalPixels(ctx.viewport.metrics.line_height);
 
         ctx.commands.push(RenderOp::Rect {
             rect: Rect {
@@ -261,7 +267,7 @@ impl Widget for SelectionWidget {
 }
 
 impl Widget for LineNumberWidget {
-    fn measure(&self) -> (f32, f32) {
+    fn measure(&self) -> LogicalSize {
         // Measure line number text
         let text = format!("{}", self.line);
         let widget = TextWidget {
@@ -276,8 +282,8 @@ impl Widget for LineNumberWidget {
     }
 
     fn hit_test(&self, pt: Point) -> bool {
-        let (width, height) = self.measure();
-        pt.x >= 0.0 && pt.x <= width && pt.y >= 0.0 && pt.y <= height
+        let size = self.measure();
+        pt.x >= LogicalPixels(0.0) && pt.x <= size.width && pt.y >= LogicalPixels(0.0) && pt.y <= size.height
     }
 
     fn paint(&self, ctx: &mut crate::tree::PaintContext<'_>) {
@@ -296,8 +302,8 @@ impl Widget for LineNumberWidget {
 }
 
 impl Widget for DiagnosticWidget {
-    fn measure(&self) -> (f32, f32) {
-        (0.0, 2.0) // Underline height
+    fn measure(&self) -> LogicalSize {
+        LogicalSize::new(0.0, 2.0) // Underline height
     }
 
     fn z_index(&self) -> i32 {
@@ -350,8 +356,8 @@ impl Widget for DiagnosticWidget {
 }
 
 impl Widget for StyleWidget {
-    fn measure(&self) -> (f32, f32) {
-        (0.0, 0.0) // Style has no size
+    fn measure(&self) -> LogicalSize {
+        LogicalSize::new(0.0, 0.0) // Style has no size
     }
 
     fn z_index(&self) -> i32 {
@@ -422,10 +428,10 @@ pub fn diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinates::{LayoutPos, Viewport};
+    use crate::coordinates::{LayoutPos, LogicalPixels, PhysicalPixels, Viewport};
     use crate::font::SharedFontSystem;
     use crate::render::RenderOp;
-    use crate::tree::{PaintContext, Point};
+    use crate::tree::PaintContext;
     use std::sync::Arc;
 
     #[test]
@@ -437,7 +443,7 @@ mod tests {
 
         let mut commands = Vec::new();
         let mut ctx = PaintContext {
-            layout_pos: LayoutPos { x: 10.0, y: 20.0 },
+            layout_pos: LayoutPos { x: LogicalPixels(10.0), y: LogicalPixels(20.0) },
             view_pos: None,
             doc_pos: None,
             commands: &mut commands,
@@ -453,8 +459,8 @@ mod tests {
             RenderOp::Glyphs { glyphs, .. } => {
                 assert_eq!(glyphs.len(), 1);
                 let glyph = &glyphs[0];
-                assert_eq!(glyph.x, 10.0);
-                assert_eq!(glyph.y, 24.0); // 20.0 + 4.0 baseline offset
+                assert_eq!(glyph.pos.x, PhysicalPixels(10.0));
+                assert_eq!(glyph.pos.y, PhysicalPixels(24.0)); // 20.0 + 4.0 baseline offset
                 assert_eq!(glyph.color, 0xFFFFFFFF);
             }
             _ => panic!("Expected Glyphs command"),
@@ -474,7 +480,7 @@ mod tests {
         let viewport = Viewport::new(800.0, 600.0, 1.0);
         let mut commands = Vec::new();
         let mut ctx = PaintContext {
-            layout_pos: LayoutPos { x: 50.0, y: 100.0 },
+            layout_pos: LayoutPos { x: LogicalPixels(50.0), y: LogicalPixels(100.0) },
             view_pos: None,
             doc_pos: None,
             commands: &mut commands,
@@ -488,10 +494,10 @@ mod tests {
         assert_eq!(commands.len(), 1);
         match &commands[0] {
             RenderOp::Rect { rect, color } => {
-                assert_eq!(rect.x, 50.0);
-                assert_eq!(rect.y, 100.0);
-                assert_eq!(rect.width, 2.0);
-                assert_eq!(rect.height, 19.6); // line_height (14.0 * 1.4)
+                assert_eq!(rect.x, LogicalPixels(50.0));
+                assert_eq!(rect.y, LogicalPixels(100.0));
+                assert_eq!(rect.width, LogicalPixels(2.0));
+                assert_eq!(rect.height, LogicalPixels(19.6)); // line_height (14.0 * 1.4)
                 assert_eq!(*color, 0x7FFF0000); // 50% opacity red
             }
             _ => panic!("Expected Rect command"),

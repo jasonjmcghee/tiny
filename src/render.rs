@@ -2,11 +2,11 @@
 //!
 //! Widgets emit commands, renderer batches and optimizes them for GPU
 
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, Viewport};
 use crate::tree::{Node, Point, Rect, Span, Tree, Widget};
 use std::sync::Arc;
 #[allow(unused)]
 use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, PhysicalPos, Viewport};
 
 // === Render Commands ===
 /// High-level rendering operations
@@ -34,12 +34,11 @@ pub enum RenderOp {
     Custom { pipeline: u32, data: Arc<[u8]> },
 }
 
-/// Single glyph instance
-#[derive(Clone, Copy, Debug)]
+/// Single glyph instance (in physical pixels)
+#[derive(Clone, Debug)]
 pub struct GlyphInstance {
     pub glyph_id: u16,
-    pub x: f32,
-    pub y: f32,
+    pub pos: PhysicalPos,  // Physical pixel position
     pub color: u32,
     pub tex_coords: [f32; 4], // [u0, v0, u1, v1] in atlas
 }
@@ -132,6 +131,11 @@ impl Renderer {
         &self.viewport
     }
 
+    /// Get mutable reference to viewport
+    pub fn viewport_mut(&mut self) -> &mut Viewport {
+        &mut self.viewport
+    }
+
     /// Render tree to commands
     pub fn render(&mut self, tree: &Tree, viewport: Rect) -> Vec<BatchedDraw> {
         println!("Renderer::render called with viewport: {:?}", viewport);
@@ -140,8 +144,8 @@ impl Renderer {
         self.commands.clear();
         self.clip_stack.clear();
         self.transform = Transform {
-            x: viewport.x,
-            y: viewport.y,
+            x: viewport.x.0,
+            y: viewport.y.0,
         };
 
         // Reset document position for new frame
@@ -188,6 +192,13 @@ impl Renderer {
                     self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
                     self.current_doc_pos.byte_offset += coalesced_text.len();
                     self.current_doc_pos.line += total_lines;
+                    // Reset column to 0 after newlines (simplified - would track properly)
+                    if total_lines > 0 {
+                        self.current_doc_pos.column = 0;
+                    } else {
+                        // Approximate column increment (would need actual char count)
+                        self.current_doc_pos.column += coalesced_text.len() as u32;
+                    }
                 }
 
                 // Handle widgets separately (simplified for now)
@@ -239,7 +250,7 @@ impl Renderer {
     }
 
     /// Render text span
-    fn render_text(&mut self, bytes: &[u8], x: f32, y: f32) {
+    fn render_text(&mut self, bytes: &[u8], x: LogicalPixels, y: LogicalPixels) {
         // Text spans should be rendered via TextWidget, not directly
         // This is a fallback for raw text spans without widgets
         use crate::widget::TextWidget;
@@ -253,7 +264,7 @@ impl Renderer {
     }
 
     /// Render widget
-    fn render_widget(&mut self, widget: &dyn Widget, x: f32, y: f32) {
+    fn render_widget(&mut self, widget: &dyn Widget, x: LogicalPixels, y: LogicalPixels) {
         let layout_pos = LayoutPos { x, y };
         let view_pos = self.viewport.layout_to_view(layout_pos);
 
@@ -262,8 +273,8 @@ impl Renderer {
         let widget_rect = LayoutRect {
             x: layout_pos.x,
             y: layout_pos.y,
-            width: widget_size.0,
-            height: widget_size.1,
+            width: widget_size.width,
+            height: widget_size.height,
         };
 
         if !self.viewport.is_visible(widget_rect) {
@@ -286,28 +297,28 @@ impl Renderer {
     }
 
     /// Render cursor
-    fn render_cursor(&mut self, x: f32, y: f32) {
+    fn render_cursor(&mut self, x: LogicalPixels, y: LogicalPixels) {
         self.commands.push(RenderOp::Rect {
             rect: Rect {
                 x,
                 y,
-                width: 2.0,
-                height: self.viewport.metrics.line_height,
+                width: LogicalPixels(2.0),
+                height: LogicalPixels(self.viewport.metrics.line_height),
             },
             color: 0xFFFFFFFF,
         });
     }
 
     /// Render selection highlight
-    fn render_selection(&mut self, _range: std::ops::Range<usize>, x: f32, y: f32) {
+    fn render_selection(&mut self, _range: std::ops::Range<usize>, x: LogicalPixels, y: LogicalPixels) {
         // Calculate selection bounds
-        let width = 100.0; // Would calculate from text
+        let width = LogicalPixels(100.0); // Would calculate from text
         self.commands.push(RenderOp::Rect {
             rect: Rect {
                 x,
                 y,
                 width,
-                height: self.viewport.metrics.line_height,
+                height: LogicalPixels(self.viewport.metrics.line_height),
             },
             color: 0x4080FF80,
         });
@@ -341,12 +352,12 @@ impl Renderer {
                 RenderOp::Glyphs { glyphs, .. } => {
                     // Transform glyphs from layout to view space
                     for glyph in glyphs.iter() {
-                        let layout_pos = LayoutPos { x: glyph.x, y: glyph.y };
-                        let view_pos = self.viewport.layout_to_view(layout_pos);
-
-                        let mut transformed_glyph = *glyph;
-                        transformed_glyph.x = view_pos.x;
-                        transformed_glyph.y = view_pos.y;
+                        // Glyphs are in physical pixels but at layout position
+                        // We need to apply scroll offset
+                        let mut transformed_glyph = glyph.clone();
+                        // Apply scroll offset (viewport.scroll is in logical pixels, need to scale)
+                        transformed_glyph.pos.x.0 -= self.viewport.scroll.x.0 * self.viewport.scale_factor;
+                        transformed_glyph.pos.y.0 -= self.viewport.scroll.y.0 * self.viewport.scale_factor;
                         current_glyphs.push(transformed_glyph);
                     }
                 }

@@ -5,13 +5,16 @@
 //! 2. Layout space: logical pixels, pre-scroll (where widgets live)
 //! 3. View space: logical pixels, post-scroll (what's visible)
 //! 4. Physical space: device pixels (what GPU renders)
+//!
+//! IMPORTANT: Text rendering is special - it works directly in physical pixels
+//! for crisp rendering, bypassing the normal logical->physical transformation.
 
 use std::sync::Arc;
 
 // === Document Space ===
 
 /// Position in document (text/editing operations)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct DocPos {
     /// Byte offset in the document
     pub byte_offset: usize,
@@ -21,66 +24,220 @@ pub struct DocPos {
     pub column: u32,
 }
 
+// === Logical Pixels (used by Layout and View spaces) ===
+
+/// Logical pixels - DPI-independent unit
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+pub struct LogicalPixels(pub f32);
+
+impl LogicalPixels {
+    pub fn to_physical(self, scale_factor: f32) -> PhysicalPixels {
+        PhysicalPixels(self.0 * scale_factor)
+    }
+}
+
+impl std::ops::Add for LogicalPixels {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        LogicalPixels(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Add<f32> for LogicalPixels {
+    type Output = Self;
+    fn add(self, rhs: f32) -> Self {
+        LogicalPixels(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub for LogicalPixels {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        LogicalPixels(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::Sub<f32> for LogicalPixels {
+    type Output = Self;
+    fn sub(self, rhs: f32) -> Self {
+        LogicalPixels(self.0 - rhs)
+    }
+}
+
+impl std::ops::Mul<f32> for LogicalPixels {
+    type Output = Self;
+    fn mul(self, rhs: f32) -> Self {
+        LogicalPixels(self.0 * rhs)
+    }
+}
+
+impl std::ops::Div<f32> for LogicalPixels {
+    type Output = f32;
+    fn div(self, rhs: f32) -> f32 {
+        self.0 / rhs
+    }
+}
+
+impl std::fmt::Display for LogicalPixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Logical size in DPI-independent pixels
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LogicalSize {
+    pub width: LogicalPixels,
+    pub height: LogicalPixels,
+}
+
+impl LogicalSize {
+    pub fn new(width: f32, height: f32) -> Self {
+        Self {
+            width: LogicalPixels(width),
+            height: LogicalPixels(height),
+        }
+    }
+}
+
 // === Layout Space (pre-scroll) ===
 
 /// Position in layout space - where things are before scrolling
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LayoutPos {
-    pub x: f32,
-    pub y: f32,
+    pub x: LogicalPixels,
+    pub y: LogicalPixels,
+}
+
+impl LayoutPos {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            x: LogicalPixels(x),
+            y: LogicalPixels(y),
+        }
+    }
 }
 
 /// Size in layout space
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayoutSize {
-    pub width: f32,
-    pub height: f32,
-}
+pub type LayoutSize = LogicalSize;
 
 /// Rectangle in layout space
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LayoutRect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    pub x: LogicalPixels,
+    pub y: LogicalPixels,
+    pub width: LogicalPixels,
+    pub height: LogicalPixels,
+}
+
+impl LayoutRect {
+    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x: LogicalPixels(x),
+            y: LogicalPixels(y),
+            width: LogicalPixels(width),
+            height: LogicalPixels(height),
+        }
+    }
+
+    pub fn contains(&self, pt: LayoutPos) -> bool {
+        pt.x.0 >= self.x.0
+            && pt.x.0 <= self.x.0 + self.width.0
+            && pt.y.0 >= self.y.0
+            && pt.y.0 <= self.y.0 + self.height.0
+    }
 }
 
 // === View Space (post-scroll) ===
 
 /// Position in view space - layout minus scroll offset
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ViewPos {
-    pub x: f32,
-    pub y: f32,
+    pub x: LogicalPixels,
+    pub y: LogicalPixels,
+}
+
+impl ViewPos {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            x: LogicalPixels(x),
+            y: LogicalPixels(y),
+        }
+    }
 }
 
 /// Size in view space (same as layout size)
-pub type ViewSize = LayoutSize;
+pub type ViewSize = LogicalSize;
 
 /// Rectangle in view space
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewRect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    pub x: LogicalPixels,
+    pub y: LogicalPixels,
+    pub width: LogicalPixels,
+    pub height: LogicalPixels,
+}
+
+impl ViewRect {
+    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x: LogicalPixels(x),
+            y: LogicalPixels(y),
+            width: LogicalPixels(width),
+            height: LogicalPixels(height),
+        }
+    }
 }
 
 // === Physical Space (device pixels) ===
 
-/// Position in physical pixels
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PhysicalPos {
-    pub x: f32,
-    pub y: f32,
+/// Physical pixels - actual device pixels
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PhysicalPixels(pub f32);
+
+impl PhysicalPixels {
+    pub fn to_logical(self, scale_factor: f32) -> LogicalPixels {
+        LogicalPixels(self.0 / scale_factor)
+    }
 }
 
-/// Size in physical pixels
+/// Position in physical pixels
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PhysicalPos {
+    pub x: PhysicalPixels,
+    pub y: PhysicalPixels,
+}
+
+impl PhysicalPos {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            x: PhysicalPixels(x),
+            y: PhysicalPixels(y),
+        }
+    }
+}
+
+/// Size in physical pixels (keeping u32 for GPU compatibility)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PhysicalSize {
     pub width: u32,
     pub height: u32,
+}
+
+/// Size in physical pixels (float version for calculations)
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PhysicalSizeF {
+    pub width: PhysicalPixels,
+    pub height: PhysicalPixels,
+}
+
+impl PhysicalSizeF {
+    pub fn new(width: f32, height: f32) -> Self {
+        Self {
+            width: PhysicalPixels(width),
+            height: PhysicalPixels(height),
+        }
+    }
 }
 
 // === Text Metrics (single source of truth) ===
@@ -150,7 +307,7 @@ pub struct Viewport {
 
     // === Window dimensions ===
     /// Logical size (DPI-independent)
-    pub logical_size: LayoutSize,
+    pub logical_size: LogicalSize,
     /// Physical size (device pixels)
     pub physical_size: PhysicalSize,
     /// HiDPI scale factor
@@ -172,11 +329,8 @@ impl Viewport {
         };
 
         Self {
-            scroll: LayoutPos { x: 0.0, y: 0.0 },
-            logical_size: LayoutSize {
-                width: logical_width,
-                height: logical_height,
-            },
+            scroll: LayoutPos::new(0.0, 0.0),  // Start at origin
+            logical_size: LogicalSize::new(logical_width, logical_height),
             physical_size,
             scale_factor,
             metrics: TextMetrics::new(14.0), // Default 14pt font
@@ -191,16 +345,14 @@ impl Viewport {
         // Update metrics based on actual font measurements
         let test_layout = font_system.layout_text_scaled(" ", self.metrics.font_size, self.scale_factor);
         if !test_layout.glyphs.is_empty() {
-            self.metrics.space_width = test_layout.width;
+            // Convert from physical pixels back to logical pixels
+            self.metrics.space_width = test_layout.width / self.scale_factor;
         }
     }
 
     /// Update viewport on window resize
     pub fn resize(&mut self, logical_width: f32, logical_height: f32, scale_factor: f32) {
-        self.logical_size = LayoutSize {
-            width: logical_width,
-            height: logical_height,
-        };
+        self.logical_size = LogicalSize::new(logical_width, logical_height);
         self.scale_factor = scale_factor;
         self.physical_size = PhysicalSize {
             width: (logical_width * scale_factor) as u32,
@@ -212,10 +364,10 @@ impl Viewport {
 
     /// Document position to layout position
     pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
-        LayoutPos {
-            x: self.metrics.column_to_x(pos.column),
-            y: pos.line as f32 * self.metrics.line_height,
-        }
+        LayoutPos::new(
+            self.metrics.column_to_x(pos.column),
+            pos.line as f32 * self.metrics.line_height,
+        )
     }
 
     /// Document position to layout with actual text (more accurate)
@@ -235,26 +387,26 @@ impl Viewport {
             self.metrics.column_to_x(pos.column)
         };
 
-        LayoutPos {
+        LayoutPos::new(
             x,
-            y: pos.line as f32 * self.metrics.line_height,
-        }
+            pos.line as f32 * self.metrics.line_height,
+        )
     }
 
     /// Layout position to view position (apply scroll)
     pub fn layout_to_view(&self, pos: LayoutPos) -> ViewPos {
-        ViewPos {
-            x: pos.x - self.scroll.x,
-            y: pos.y - self.scroll.y,
-        }
+        ViewPos::new(
+            pos.x.0 - self.scroll.x.0,
+            pos.y.0 - self.scroll.y.0,
+        )
     }
 
     /// View position to physical position (apply scale factor)
     pub fn view_to_physical(&self, pos: ViewPos) -> PhysicalPos {
-        PhysicalPos {
-            x: pos.x * self.scale_factor,
-            y: pos.y * self.scale_factor,
-        }
+        PhysicalPos::new(
+            pos.x.0 * self.scale_factor,
+            pos.y.0 * self.scale_factor,
+        )
     }
 
     /// Combined: Document to view position
@@ -276,27 +428,53 @@ impl Viewport {
 
     /// Physical position to view position
     pub fn physical_to_view(&self, pos: PhysicalPos) -> ViewPos {
-        ViewPos {
-            x: pos.x / self.scale_factor,
-            y: pos.y / self.scale_factor,
-        }
+        ViewPos::new(
+            pos.x.0 / self.scale_factor,
+            pos.y.0 / self.scale_factor,
+        )
     }
 
     /// View position to layout position (unapply scroll)
     pub fn view_to_layout(&self, pos: ViewPos) -> LayoutPos {
-        LayoutPos {
-            x: pos.x + self.scroll.x,
-            y: pos.y + self.scroll.y,
-        }
+        LayoutPos::new(
+            pos.x.0 + self.scroll.x.0,
+            pos.y.0 + self.scroll.y.0,
+        )
     }
 
     /// Layout position to document position (approximate)
     pub fn layout_to_doc(&self, pos: LayoutPos) -> DocPos {
-        let line = (pos.y / self.metrics.line_height) as u32;
-        let column = (pos.x / self.metrics.space_width) as u32;
+        let line = (pos.y.0 / self.metrics.line_height) as u32;
+        let column = (pos.x.0 / self.metrics.space_width) as u32;
 
         DocPos {
             byte_offset: 0, // Would need document access for accurate byte offset
+            line,
+            column,
+        }
+    }
+
+    /// Layout position to document position using font system's binary search hit testing
+    pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &crate::tree::Tree) -> DocPos {
+        let line = (pos.y.0 / self.metrics.line_height) as u32;
+
+        let column = if let Some(font_system) = &self.font_system {
+            // Get the line text and use font system's accurate hit testing
+            if let Some(line_start) = tree.line_to_byte(line) {
+                let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
+                let line_text = tree.get_text_slice(line_start..line_end);
+
+                font_system.hit_test_line(&line_text, self.metrics.font_size, self.scale_factor, pos.x.0)
+            } else {
+                0
+            }
+        } else {
+            // Fallback to space-width estimation
+            (pos.x.0 / self.metrics.space_width) as u32
+        };
+
+        DocPos {
+            byte_offset: 0, // Could be calculated by tree.doc_pos_to_byte if needed
             line,
             column,
         }
@@ -316,21 +494,21 @@ impl Viewport {
 
     /// Transform layout rectangle to view rectangle
     pub fn layout_rect_to_view(&self, rect: LayoutRect) -> ViewRect {
-        ViewRect {
-            x: rect.x - self.scroll.x,
-            y: rect.y - self.scroll.y,
-            width: rect.width,
-            height: rect.height,
-        }
+        ViewRect::new(
+            rect.x.0 - self.scroll.x.0,
+            rect.y.0 - self.scroll.y.0,
+            rect.width.0,
+            rect.height.0,
+        )
     }
 
     /// Check if layout rectangle is visible in view
     pub fn is_visible(&self, rect: LayoutRect) -> bool {
         let view_rect = self.layout_rect_to_view(rect);
-        view_rect.x < self.logical_size.width
-            && view_rect.x + view_rect.width > 0.0
-            && view_rect.y < self.logical_size.height
-            && view_rect.y + view_rect.height > 0.0
+        view_rect.x.0 < self.logical_size.width.0
+            && view_rect.x.0 + view_rect.width.0 > 0.0
+            && view_rect.y.0 < self.logical_size.height.0
+            && view_rect.y.0 + view_rect.height.0 > 0.0
     }
 
     // === Scrolling ===
@@ -384,15 +562,6 @@ impl Viewport {
 
 // === Convenience Implementations ===
 
-impl LayoutRect {
-    pub fn contains(&self, pos: LayoutPos) -> bool {
-        pos.x >= self.x
-            && pos.x <= self.x + self.width
-            && pos.y >= self.y
-            && pos.y <= self.y + self.height
-    }
-}
-
 impl ViewRect {
     pub fn contains(&self, pos: ViewPos) -> bool {
         pos.x >= self.x
@@ -408,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_coordinate_transformations() {
-        let mut viewport = Viewport::new(800.0, 600.0, 2.0); // 2x scale (retina)
+        let viewport = Viewport::new(800.0, 600.0, 2.0); // 2x scale (retina)
 
         // Doc → Layout → View → Physical
         let doc_pos = DocPos {
@@ -418,50 +587,50 @@ mod tests {
         };
 
         let layout_pos = viewport.doc_to_layout(doc_pos);
-        assert_eq!(layout_pos.x, 10.0 * viewport.metrics.space_width);
-        assert_eq!(layout_pos.y, 5.0 * viewport.metrics.line_height);
+        assert_eq!(layout_pos.x, LogicalPixels(10.0 * viewport.metrics.space_width));
+        assert_eq!(layout_pos.y, LogicalPixels(5.0 * viewport.metrics.line_height));
 
         let view_pos = viewport.layout_to_view(layout_pos);
         assert_eq!(view_pos.x, layout_pos.x); // No scroll initially
         assert_eq!(view_pos.y, layout_pos.y);
 
         let physical_pos = viewport.view_to_physical(view_pos);
-        assert_eq!(physical_pos.x, view_pos.x * 2.0); // 2x scale
-        assert_eq!(physical_pos.y, view_pos.y * 2.0);
+        assert_eq!(physical_pos.x, PhysicalPixels(view_pos.x.0 * 2.0)); // 2x scale
+        assert_eq!(physical_pos.y, PhysicalPixels(view_pos.y.0 * 2.0));
     }
 
     #[test]
     fn test_scrolling() {
         let mut viewport = Viewport::new(800.0, 600.0, 1.0);
-        viewport.scroll = LayoutPos { x: 100.0, y: 200.0 };
+        viewport.scroll = LayoutPos { x: LogicalPixels(100.0), y: LogicalPixels(200.0) };
 
-        let layout_pos = LayoutPos { x: 150.0, y: 250.0 };
+        let layout_pos = LayoutPos { x: LogicalPixels(150.0), y: LogicalPixels(250.0) };
         let view_pos = viewport.layout_to_view(layout_pos);
 
-        assert_eq!(view_pos.x, 50.0); // 150 - 100 scroll
-        assert_eq!(view_pos.y, 50.0); // 250 - 200 scroll
+        assert_eq!(view_pos.x, LogicalPixels(50.0)); // 150 - 100 scroll
+        assert_eq!(view_pos.y, LogicalPixels(50.0)); // 250 - 200 scroll
     }
 
     #[test]
     fn test_visibility_check() {
         let mut viewport = Viewport::new(800.0, 600.0, 1.0);
-        viewport.scroll = LayoutPos { x: 100.0, y: 100.0 };
+        viewport.scroll = LayoutPos { x: LogicalPixels(100.0), y: LogicalPixels(100.0) };
 
         // Visible rectangle
         let visible_rect = LayoutRect {
-            x: 150.0,
-            y: 150.0,
-            width: 100.0,
-            height: 100.0,
+            x: LogicalPixels(150.0),
+            y: LogicalPixels(150.0),
+            width: LogicalPixels(100.0),
+            height: LogicalPixels(100.0),
         };
         assert!(viewport.is_visible(visible_rect));
 
         // Off-screen rectangle
         let offscreen_rect = LayoutRect {
-            x: 0.0,
-            y: 0.0,
-            width: 50.0,
-            height: 50.0,
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(50.0),
+            height: LogicalPixels(50.0),
         };
         assert!(!viewport.is_visible(offscreen_rect));
     }

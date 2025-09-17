@@ -12,12 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // This is a minimal text editor built in ~1000 lines of Rust.
 //
 // Key features:
-// ✓ Lock-free reads via ArcSwap (RCU pattern)
-// ✓ Everything is a widget (text, cursors, selections)
-// ✓ O(log n) operations via sum-tree
-// ✓ Tree-sitter syntax highlighting
-// ✓ GPU-accelerated rendering with wgpu
-// ✓ Multi-cursor support
+// [x] Lock-free reads via ArcSwap (RCU pattern)
+// [x] Everything is a widget (text, cursors, selections)
+// [x] O(log n) operations via sum-tree
+// [x] Tree-sitter syntax highlighting
+// [x] GPU-accelerated rendering with wgpu
+// [x] Multi-cursor support
 
 fn main() {
     println!("Hello from tiny editor!");
@@ -46,3 +46,4 @@ fn main() {
         .with_font_size(14.0)
         .run()
 }
+

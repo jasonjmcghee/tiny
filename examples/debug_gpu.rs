@@ -1,7 +1,7 @@
 //! Debug what happens in the actual GPU rendering
 
 use tiny_editor::{
-    app::{AppLogic, EditorLogic, TinyApp},
+    app::{EditorLogic, TinyApp},
     tree::Doc,
 };
 

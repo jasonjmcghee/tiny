@@ -6,6 +6,7 @@ use tiny_editor::{
     tree::{Content, Doc, Edit, Rect},
 };
 use std::sync::Arc;
+use tiny_editor::coordinates::LogicalPixels;
 
 fn main() {
     println!("🔄 Complete Pipeline Debug");
@@ -23,14 +24,14 @@ fn main() {
     println!("Document text: '{}'", tree.to_string());
 
     let viewport = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: 800.0,
-        height: 400.0,
+        x: LogicalPixels(0.0),
+        y: LogicalPixels(0.0),
+        width: LogicalPixels(800.0),
+        height: LogicalPixels(400.0),
     };
 
     // Set up renderer
-    let mut renderer = Renderer::new((viewport.x, viewport.y), 1.0);
+    let mut renderer = Renderer::new((viewport.x.0, viewport.y.0), 1.0);
     let font_system = Arc::new(SharedFontSystem::new());
     font_system.prerasterize_ascii(14.0);
     renderer.set_font_system(font_system.clone());
@@ -49,7 +50,7 @@ fn main() {
                 println!("  Batch {}: {} glyphs", i, instances.len());
                 for (j, glyph) in instances.iter().enumerate() {
                     println!("    Glyph {}: pos=({:.1}, {:.1}) color=0x{:08X}",
-                             j, glyph.x, glyph.y, glyph.color);
+                             j, glyph.pos.x.0, glyph.pos.y.0, glyph.color);
                 }
             }
             BatchedDraw::RectBatch { instances } => {
@@ -80,10 +81,10 @@ fn main() {
                     let glyph_a = &instances[0];
                     let glyph_b = &instances[1];
 
-                    println!("    Glyph A: pos=({:.1}, {:.1})", glyph_a.x, glyph_a.y);
-                    println!("    Glyph B: pos=({:.1}, {:.1})", glyph_b.x, glyph_b.y);
+                    println!("    Glyph A: pos=({:.1}, {:.1})", glyph_a.pos.x.0, glyph_a.pos.y.0);
+                    println!("    Glyph B: pos=({:.1}, {:.1})", glyph_b.pos.x.0, glyph_b.pos.y.0);
 
-                    if glyph_a.x == glyph_b.x {
+                    if glyph_a.pos.x == glyph_b.pos.x {
                         println!("    🐛 PIPELINE BUG: Both glyphs at same X!");
                     } else {
                         println!("    ✅ Pipeline glyphs advance properly");
@@ -116,14 +117,14 @@ fn main() {
 
                 if !instances.is_empty() {
                     let first = &instances[0];
-                    println!("    First glyph: pos=({:.1}, {:.1})", first.x, first.y);
+                    println!("    First glyph: pos=({:.1}, {:.1})", first.pos.x.0, first.pos.y.0);
 
                     // Check if all glyphs are at same position (matches your debug output)
                     if instances.len() > 1 {
-                        let all_same_x = instances.iter().all(|g| g.x == first.x);
+                        let all_same_x = instances.iter().all(|g| g.pos.x == first.pos.x);
                         if all_same_x {
                             println!("    🚨 FOUND THE BUG: All {} glyphs at same X position: {:.1}",
-                                   instances.len(), first.x);
+                                   instances.len(), first.pos.x.0);
                         } else {
                             println!("    ✅ Glyphs at different X positions");
                         }

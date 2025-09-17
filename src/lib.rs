@@ -120,8 +120,9 @@ impl Editor {
         // Save checkpoint before edit
         self.history.checkpoint(self.doc.read());
 
-        // Process input
-        self.input.on_key(&self.doc, event);
+        // Process input - create a dummy viewport for compatibility
+        let dummy_viewport = coordinates::Viewport::new(800.0, 600.0, 1.0);
+        self.input.on_key(&self.doc, &dummy_viewport, event);
 
         // Update syntax if needed
         if self.syntax.is_some() {
@@ -136,7 +137,9 @@ impl Editor {
         button: winit::event::MouseButton,
         alt_held: bool,
     ) {
-        self.input.on_mouse_click(&self.doc, pos, button, alt_held);
+        // Create a dummy viewport for compatibility
+        let dummy_viewport = coordinates::Viewport::new(800.0, 600.0, 1.0);
+        self.input.on_mouse_click(&self.doc, &dummy_viewport, pos, button, alt_held);
     }
 
     /// Undo
@@ -178,7 +181,7 @@ impl Editor {
 
     /// Get cursor positions
     pub fn cursors(&self) -> Vec<usize> {
-        self.input.selections().iter().map(|s| s.cursor).collect()
+        self.input.selections().iter().map(|s| s.cursor.byte_offset).collect()
     }
 
     /// Get document version
