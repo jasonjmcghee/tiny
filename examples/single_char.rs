@@ -17,4 +17,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run with shared app infrastructure (no boilerplate!)
     run_simple_app("Single Character Test", doc)
 }
-

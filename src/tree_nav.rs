@@ -3,8 +3,8 @@
 //! This module extends the Tree with efficient navigation methods similar to a rope,
 //! leveraging our sum tree structure for fast queries without full traversal.
 
-use crate::tree::{Node, Span, Tree};
 use crate::coordinates::DocPos;
+use crate::tree::{Node, Span, Tree};
 use std::ops::Range;
 
 impl Tree {
@@ -481,7 +481,6 @@ impl Tree {
             pos.byte_offset // Fallback to stored byte offset
         }
     }
-
 }
 
 #[cfg(test)]
@@ -619,14 +618,19 @@ impl Tree {
     /// This enables O(log n) navigation to find only the content that should be rendered
     pub fn walk_visible_range<F>(&self, byte_range: std::ops::Range<usize>, mut callback: F)
     where
-        F: FnMut(&[crate::tree::Span], usize, usize),  // (spans, byte_start, byte_end)
+        F: FnMut(&[crate::tree::Span], usize, usize), // (spans, byte_start, byte_end)
     {
         self.walk_range_in_node(&self.root, byte_range, 0, &mut callback);
     }
 
     /// Recursively walk nodes that intersect with the target byte range
-    fn walk_range_in_node<F>(&self, node: &Node, range: std::ops::Range<usize>, node_start: usize, callback: &mut F)
-    where
+    fn walk_range_in_node<F>(
+        &self,
+        node: &Node,
+        range: std::ops::Range<usize>,
+        node_start: usize,
+        callback: &mut F,
+    ) where
         F: FnMut(&[crate::tree::Span], usize, usize),
     {
         let node_bytes = match node {

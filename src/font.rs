@@ -70,7 +70,7 @@ impl FontSystem {
         let font = fontdue::Font::from_bytes(font_data as &[u8], fontdue::FontSettings::default())
             .expect("Failed to load JetBrains Mono font");
 
-        let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
+        let layout = Layout::new(CoordinateSystem::PositiveYDown);
         let atlas_size = (2048, 2048);
         let atlas_data = vec![0; (atlas_size.0 * atlas_size.1) as usize];
 
@@ -277,6 +277,7 @@ impl FontSystem {
 }
 
 /// Thread-safe wrapper for FontSystem
+#[derive(Clone)]
 pub struct SharedFontSystem {
     inner: Arc<Mutex<FontSystem>>,
 }

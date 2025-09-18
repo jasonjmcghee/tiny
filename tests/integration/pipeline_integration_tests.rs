@@ -2,15 +2,15 @@
 //!
 //! Tests the complete document -> render -> GPU pipeline
 
+use std::sync::Arc;
 use tiny_editor::font::SharedFontSystem;
 use tiny_editor::render::{BatchedDraw, Renderer};
 use tiny_editor::tree::{Content, Doc, Edit, Rect};
-use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
-    use tiny_editor::coordinates::LogicalPixels;
     use super::*;
+    use tiny_editor::coordinates::LogicalPixels;
 
     #[test]
     fn test_single_character_pipeline() {
@@ -48,7 +48,10 @@ mod tests {
         assert_eq!(instances.len(), 1, "Should have exactly 1 glyph instance");
 
         let glyph = &instances[0];
-        assert!(glyph.tex_coords[2] > glyph.tex_coords[0], "Should have valid texture coords");
+        assert!(
+            glyph.tex_coords[2] > glyph.tex_coords[0],
+            "Should have valid texture coords"
+        );
         assert_eq!(glyph.color, 0xFFFFFFFF, "Should be white by default");
     }
 
@@ -80,15 +83,22 @@ mod tests {
             let batches = renderer.render(&tree, viewport);
 
             // Should have glyph batch with correct number of characters
-            let total_glyphs: usize = batches.iter().map(|batch| {
-                if let BatchedDraw::GlyphBatch { instances, .. } = batch {
-                    instances.len()
-                } else {
-                    0
-                }
-            }).sum();
+            let total_glyphs: usize = batches
+                .iter()
+                .map(|batch| {
+                    if let BatchedDraw::GlyphBatch { instances, .. } = batch {
+                        instances.len()
+                    } else {
+                        0
+                    }
+                })
+                .sum();
 
-            assert_eq!(total_glyphs, i + 1, "Should render correct number of glyphs");
+            assert_eq!(
+                total_glyphs,
+                i + 1,
+                "Should render correct number of glyphs"
+            );
         }
     }
 
@@ -111,13 +121,16 @@ mod tests {
         let batches = renderer.render(&tree, viewport);
 
         // Count total glyphs across all batches
-        let total_glyphs: usize = batches.iter().map(|batch| {
-            if let BatchedDraw::GlyphBatch { instances, .. } = batch {
-                instances.len()
-            } else {
-                0
-            }
-        }).sum();
+        let total_glyphs: usize = batches
+            .iter()
+            .map(|batch| {
+                if let BatchedDraw::GlyphBatch { instances, .. } = batch {
+                    instances.len()
+                } else {
+                    0
+                }
+            })
+            .sum();
 
         // Should render all characters (excluding newlines in display)
         assert_eq!(total_glyphs, 18, "Should render all visible characters");
@@ -152,17 +165,27 @@ mod tests {
         assert!(!batches_2x.is_empty());
 
         // Both should have same number of glyphs
-        let glyphs_1x: usize = batches_1x.iter().filter_map(|b|
-            if let BatchedDraw::GlyphBatch { instances, .. } = b {
-                Some(instances.len())
-            } else { None }
-        ).sum();
+        let glyphs_1x: usize = batches_1x
+            .iter()
+            .filter_map(|b| {
+                if let BatchedDraw::GlyphBatch { instances, .. } = b {
+                    Some(instances.len())
+                } else {
+                    None
+                }
+            })
+            .sum();
 
-        let glyphs_2x: usize = batches_2x.iter().filter_map(|b|
-            if let BatchedDraw::GlyphBatch { instances, .. } = b {
-                Some(instances.len())
-            } else { None }
-        ).sum();
+        let glyphs_2x: usize = batches_2x
+            .iter()
+            .filter_map(|b| {
+                if let BatchedDraw::GlyphBatch { instances, .. } = b {
+                    Some(instances.len())
+                } else {
+                    None
+                }
+            })
+            .sum();
 
         assert_eq!(glyphs_1x, glyphs_2x, "Should render same number of glyphs");
     }
@@ -187,13 +210,16 @@ mod tests {
 
         // Empty document should still generate some batches (background, etc.)
         // but no glyph instances
-        let total_glyphs: usize = batches.iter().map(|batch| {
-            if let BatchedDraw::GlyphBatch { instances, .. } = batch {
-                instances.len()
-            } else {
-                0
-            }
-        }).sum();
+        let total_glyphs: usize = batches
+            .iter()
+            .map(|batch| {
+                if let BatchedDraw::GlyphBatch { instances, .. } = batch {
+                    instances.len()
+                } else {
+                    0
+                }
+            })
+            .sum();
 
         assert_eq!(total_glyphs, 0, "Empty document should have no glyphs");
     }
@@ -225,8 +251,12 @@ mod tests {
         assert!(!batches.is_empty(), "Should render text and widget");
 
         // Should have both glyph and rect batches
-        let has_glyphs = batches.iter().any(|b| matches!(b, BatchedDraw::GlyphBatch { .. }));
-        let has_rects = batches.iter().any(|b| matches!(b, BatchedDraw::RectBatch { .. }));
+        let has_glyphs = batches
+            .iter()
+            .any(|b| matches!(b, BatchedDraw::GlyphBatch { .. }));
+        let has_rects = batches
+            .iter()
+            .any(|b| matches!(b, BatchedDraw::RectBatch { .. }));
 
         assert!(has_glyphs, "Should have text glyphs");
         assert!(has_rects, "Should have cursor rect");

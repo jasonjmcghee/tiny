@@ -7,6 +7,7 @@ extern crate lazy_static;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod app;
 pub mod coordinates; // Coordinate system abstraction
 pub mod font;
 pub mod gpu;
@@ -19,7 +20,6 @@ pub mod text_effects;
 pub mod tree;
 pub mod tree_nav; // O(log n) navigation methods
 pub mod widget;
-pub mod app;
 
 // Re-export core types
 pub use history::History;
@@ -27,8 +27,8 @@ pub use input::{InputHandler, Selection};
 pub use render::{BatchedDraw, RenderOp, Renderer};
 pub use syntax::SyntaxHighlighter;
 pub use tree::{Content, Doc, Edit, Point, Rect, Span, Tree};
-pub use widget::{Widget, WidgetEvent, EventResponse, LayoutConstraints, LayoutResult, WidgetId};
 pub use widget::{CursorWidget, SelectionWidget, StyleId, TextWidget};
+pub use widget::{EventResponse, LayoutConstraints, LayoutResult, Widget, WidgetEvent, WidgetId};
 
 use std::path::Path;
 
@@ -124,7 +124,8 @@ impl Editor {
         // Process input - create a dummy viewport for compatibility
         let dummy_viewport = coordinates::Viewport::new(800.0, 600.0, 1.0);
         let dummy_modifiers = winit::event::Modifiers::default();
-        self.input.on_key(&self.doc, &dummy_viewport, event, &dummy_modifiers);
+        self.input
+            .on_key(&self.doc, &dummy_viewport, event, &dummy_modifiers);
 
         // Update syntax if needed
         if self.syntax.is_some() {
@@ -141,7 +142,8 @@ impl Editor {
     ) {
         // Create a dummy viewport for compatibility
         let dummy_viewport = coordinates::Viewport::new(800.0, 600.0, 1.0);
-        self.input.on_mouse_click(&self.doc, &dummy_viewport, pos, button, alt_held);
+        self.input
+            .on_mouse_click(&self.doc, &dummy_viewport, pos, button, alt_held);
     }
 
     /// Undo
@@ -173,7 +175,8 @@ impl Editor {
 
     /// Render to GPU commands
     pub fn render(&mut self, viewport: Rect) -> Vec<BatchedDraw> {
-        self.renderer.render(&self.doc.read(), viewport, self.input.selections())
+        self.renderer
+            .render(&self.doc.read(), viewport, self.input.selections())
     }
 
     /// Get text content
@@ -183,7 +186,11 @@ impl Editor {
 
     /// Get cursor positions
     pub fn cursors(&self) -> Vec<usize> {
-        self.input.selections().iter().map(|s| s.cursor.byte_offset).collect()
+        self.input
+            .selections()
+            .iter()
+            .map(|s| s.cursor.byte_offset)
+            .collect()
     }
 
     /// Get document version
@@ -261,4 +268,3 @@ impl EditorBuilder {
         Ok(editor)
     }
 }
-

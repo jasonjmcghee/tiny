@@ -2,11 +2,8 @@
 //!
 //! Text rendering uses the consolidated FontSystem from font.rs
 
-use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, DocPos, ViewPos, Viewport};
+use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
 use std::sync::Arc;
-use std::ops::Range;
-
-// === Core Widget System Types ===
 
 /// Widget identifier for texture access
 pub type WidgetId = u64;
@@ -67,28 +64,23 @@ pub struct PaintContext<'a> {
 // === Content Type for TextWidget ===
 
 /// Describes what type of content a TextWidget contains
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ContentType {
     /// Full lines (legacy, for non-virtualized content)
+    #[default]
     Full,
     /// Extracted columns with horizontal offset (NoWrap mode)
     Columns {
         /// Starting column in the original line
         start_col: usize,
         /// X offset for rendering (negative for scrolled content)
-        x_offset: f32
+        x_offset: f32,
     },
     /// Wrapped visual lines (SoftWrap mode)
     Wrapped {
         /// The visual lines after wrapping
-        visual_lines: Vec<String>
+        visual_lines: Vec<String>,
     },
-}
-
-impl Default for ContentType {
-    fn default() -> Self {
-        ContentType::Full
-    }
 }
 
 // === Widget Implementations ===
@@ -102,6 +94,8 @@ pub struct TextWidget {
     pub size: LogicalSize,
     /// Type of content (full, columns, or wrapped)
     pub content_type: ContentType,
+    /// Original byte offset in the document (for syntax highlighting)
+    pub original_byte_offset: usize,
 }
 
 impl Clone for TextWidget {
@@ -111,6 +105,7 @@ impl Clone for TextWidget {
             style: self.style,
             size: self.size,
             content_type: self.content_type.clone(),
+            original_byte_offset: self.original_byte_offset,
         }
     }
 }
@@ -266,6 +261,22 @@ impl Widget for TextWidget {
             return;
         }
 
+        static mut STYLE_DEBUG_COUNT: u32 = 0;
+        unsafe {
+            if STYLE_DEBUG_COUNT < 3 {
+                println!(
+                    "WIDGET PAINT: text_styles = {}, text len = {}",
+                    if ctx.text_styles.is_some() {
+                        "Some"
+                    } else {
+                        "None"
+                    },
+                    text.len()
+                );
+                STYLE_DEBUG_COUNT += 1;
+            }
+        }
+
         // Get the shared font system from context
         let font_system = ctx.font_system;
 
@@ -283,7 +294,10 @@ impl Widget for TextWidget {
 
         // Handle different content types
         let x_base_offset = match &self.content_type {
-            ContentType::Columns { x_offset, start_col: _ } => *x_offset,
+            ContentType::Columns {
+                x_offset,
+                start_col: _,
+            } => *x_offset,
             _ => 0.0,
         };
 
@@ -295,12 +309,21 @@ impl Widget for TextWidget {
             for glyph in &layout.glyphs {
                 let mut color = glyph.color;
 
-                // Apply text styles if available for syntax highlighting
+                // Apply text styles if available (syntax highlighting)
+                // Use original_byte_offset to map to the document position
                 if let Some(text_styles) = ctx.text_styles {
                     let char_bytes = glyph.char.len_utf8();
-                    let effects = text_styles.get_effects_in_range(
-                        global_byte_pos + byte_pos..global_byte_pos + byte_pos + char_bytes
-                    );
+                    let doc_pos = self.original_byte_offset + global_byte_pos + byte_pos;
+                    let effects = text_styles.get_effects_in_range(doc_pos..doc_pos + char_bytes);
+
+                    static mut DEBUG_COUNT: u32 = 0;
+                    unsafe {
+                        if DEBUG_COUNT < 5 && !effects.is_empty() {
+                            println!("WIDGET: Got {} effects for char '{}' at doc_pos {} (local byte {}, original_offset {})",
+                                     effects.len(), glyph.char, doc_pos, global_byte_pos + byte_pos, self.original_byte_offset);
+                            DEBUG_COUNT += 1;
+                        }
+                    }
 
                     for effect in effects {
                         if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
@@ -378,8 +401,13 @@ impl Widget for TextWidget {
                         crate::text_effects::EffectType::Shader { id, ref params } => {
                             shader_id = Some(id);
                             // Update effect uniform buffer with shader parameters
-                            if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(id) {
-                                ctx.queue.write_buffer(effect_buffer, 0, bytemuck::cast_slice(&**params));
+                            if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(id)
+                            {
+                                ctx.queue.write_buffer(
+                                    effect_buffer,
+                                    0,
+                                    bytemuck::cast_slice(&**params),
+                                );
                             }
                         }
                         // Ignore other effect types for now (weight, italic, etc.)
@@ -390,9 +418,15 @@ impl Widget for TextWidget {
 
             // Render with or without shader effects
             if let Some(id) = shader_id {
-                ctx.gpu_renderer.draw_glyphs_with_effects(render_pass, &all_glyph_instances, 1.0, Some(id));
+                ctx.gpu_renderer.draw_glyphs_with_effects(
+                    render_pass,
+                    &all_glyph_instances,
+                    1.0,
+                    Some(id),
+                );
             } else {
-                ctx.gpu_renderer.draw_glyphs(render_pass, &all_glyph_instances, 1.0);
+                ctx.gpu_renderer
+                    .draw_glyphs(render_pass, &all_glyph_instances, 1.0);
             }
         }
     }
@@ -426,7 +460,7 @@ impl Widget for CursorWidget {
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         LayoutResult {
-            size: LogicalSize::new(self.style.width, 19.6)
+            size: LogicalSize::new(self.style.width, 19.6),
         }
     }
 
@@ -439,7 +473,6 @@ impl Widget for CursorWidget {
     }
 
     fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        use crate::render::RenderOp;
         use crate::coordinates::LayoutRect as Rect;
 
         // Apply blinking animation
@@ -459,7 +492,8 @@ impl Widget for CursorWidget {
             },
             color,
         };
-        ctx.gpu_renderer.draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
+        ctx.gpu_renderer
+            .draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
     }
 
     fn clone_box(&self) -> Arc<dyn Widget> {
@@ -486,7 +520,7 @@ impl Widget for SelectionWidget {
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         LayoutResult {
-            size: LogicalSize::new(0.0, 0.0)
+            size: LogicalSize::new(0.0, 0.0),
         }
     }
 
@@ -516,7 +550,8 @@ impl Widget for SelectionWidget {
             },
             color: self.color,
         };
-        ctx.gpu_renderer.draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
+        ctx.gpu_renderer
+            .draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
     }
 
     fn clone_box(&self) -> Arc<dyn Widget> {
@@ -546,7 +581,7 @@ impl Widget for LineNumberWidget {
         let width = text.len() as f32 * 8.4;
         let height = 19.6;
         LayoutResult {
-            size: LogicalSize::new(width, height)
+            size: LogicalSize::new(width, height),
         }
     }
 
@@ -568,6 +603,7 @@ impl Widget for LineNumberWidget {
             style: self.style,
             size: LogicalSize::new(width, height),
             content_type: ContentType::default(),
+            original_byte_offset: 0, // Line numbers don't need syntax highlighting
         };
         widget.paint(ctx, render_pass);
     }
@@ -596,7 +632,7 @@ impl Widget for DiagnosticWidget {
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         LayoutResult {
-            size: LogicalSize::new(0.0, 2.0)
+            size: LogicalSize::new(0.0, 2.0),
         }
     }
 
@@ -609,8 +645,6 @@ impl Widget for DiagnosticWidget {
     }
 
     fn paint(&self, ctx: &PaintContext<'_>, _render_pass: &mut wgpu::RenderPass) {
-        use crate::coordinates::LayoutPos;
-
         let color = match self.severity {
             Severity::Error => 0xFFFF0000u32,   // Red
             Severity::Warning => 0xFFFF8800u32, // Orange
@@ -652,7 +686,7 @@ impl Widget for StyleWidget {
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         LayoutResult {
-            size: LogicalSize::new(0.0, 0.0)
+            size: LogicalSize::new(0.0, 0.0),
         }
     }
 
@@ -681,9 +715,10 @@ impl Widget for StyleWidget {
 pub fn text(s: &str) -> Arc<dyn Widget> {
     Arc::new(TextWidget {
         text: Arc::from(s.as_bytes()),
-        style: 0, // Default style
+        style: 0,                         // Default style
         size: LogicalSize::new(0.0, 0.0), // Will be calculated properly in render_text
         content_type: ContentType::default(),
+        original_byte_offset: 0, // Default offset
     })
 }
 
@@ -722,30 +757,4 @@ pub fn diagnostic(
         message: Arc::from(message),
         range,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::coordinates::{LayoutPos, LogicalPixels, PhysicalPixels, Viewport};
-    use crate::font::SharedFontSystem;
-    use crate::render::RenderOp;
-    use std::sync::Arc;
-
-    // Tests disabled temporarily - need GPU resources for new PaintContext
-    // TODO: Create mock GPU resources for testing
-    /*
-    #[test]
-    fn test_text_widget_paint() {
-        // Test disabled - PaintContext now requires GPU resources
-    }
-    */
-
-    // Test disabled - PaintContext now requires GPU resources
-    /*
-    #[test]
-    fn test_cursor_widget_render() {
-        // Test disabled - PaintContext now requires GPU resources
-    }
-    */
 }

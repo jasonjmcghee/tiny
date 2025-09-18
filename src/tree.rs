@@ -2,14 +2,14 @@
 //!
 //! Everything is a span in a B-tree with summed metadata for O(log n) queries.
 
+use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels};
+use crate::widget::Widget;
 use arc_swap::ArcSwap;
 use crossbeam::queue::SegQueue;
 use simdutf8::basic::from_utf8;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, ViewPos, Viewport};
-use crate::widget::{Widget, PaintContext};
 
 /// Maximum spans per leaf node (tuned for cache line)
 #[allow(dead_code)]
@@ -98,7 +98,6 @@ pub type Rect = LayoutRect;
 
 /// Point for hit testing (in layout space)
 pub type Point = LayoutPos;
-
 
 // === Implementation ===
 
@@ -439,12 +438,8 @@ impl Tree {
                 }
                 Span::Widget(w) => {
                     let size = w.measure();
-                    sums.bounds.width = LogicalPixels(
-                        sums.bounds.width.0.max(size.width.0)
-                    );
-                    sums.bounds.height = LogicalPixels(
-                        sums.bounds.height.0 + size.height.0
-                    );
+                    sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(size.width.0));
+                    sums.bounds.height = LogicalPixels(sums.bounds.height.0 + size.height.0);
                     sums.max_z = sums.max_z.max(w.z_index());
                 }
             }
@@ -465,12 +460,8 @@ impl Tree {
 
             sums.bytes += child_sums.bytes;
             sums.lines += child_sums.lines;
-            sums.bounds.width = LogicalPixels(
-                sums.bounds.width.0.max(child_sums.bounds.width.0)
-            );
-            sums.bounds.height = LogicalPixels(
-                sums.bounds.height.0 + child_sums.bounds.height.0
-            );
+            sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(child_sums.bounds.width.0));
+            sums.bounds.height = LogicalPixels(sums.bounds.height.0 + child_sums.bounds.height.0);
             sums.max_z = sums.max_z.max(child_sums.max_z);
         }
 
@@ -756,4 +747,3 @@ mod tests {
         assert_eq!(doc.read().to_string(), "Text");
     }
 }
-

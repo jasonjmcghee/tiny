@@ -2,13 +2,13 @@
 //!
 //! Tests that multiple components work together correctly
 
+use std::sync::Arc;
+use tiny_editor::coordinates::LogicalPixels;
 use tiny_editor::{
     font::SharedFontSystem,
     render::{BatchedDraw, Renderer},
     tree::{Content, Doc, Edit, Rect},
 };
-use std::sync::Arc;
-use tiny_editor::coordinates::LogicalPixels;
 
 #[test]
 fn test_document_to_render_pipeline() {

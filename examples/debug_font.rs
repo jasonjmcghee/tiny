@@ -15,7 +15,10 @@ fn main() {
 
     if !layout_single.glyphs.is_empty() {
         let glyph = &layout_single.glyphs[0];
-        println!("  Glyph: '{}' at ({:.1}, {:.1})", glyph.char, glyph.pos.x.0, glyph.pos.y.0);
+        println!(
+            "  Glyph: '{}' at ({:.1}, {:.1})",
+            glyph.char, glyph.pos.x.0, glyph.pos.y.0
+        );
     }
 
     // Test 2: Two characters - THIS SHOULD REVEAL THE BUG
@@ -27,9 +30,18 @@ fn main() {
         let glyph_a = &layout_double.glyphs[0];
         let glyph_b = &layout_double.glyphs[1];
 
-        println!("  Glyph A: '{}' at ({:.1}, {:.1})", glyph_a.char, glyph_a.pos.x.0, glyph_a.pos.y.0);
-        println!("  Glyph B: '{}' at ({:.1}, {:.1})", glyph_b.char, glyph_b.pos.x.0, glyph_b.pos.y.0);
-        println!("  X advancement: {:.1} pixels", glyph_b.pos.x.0 - glyph_a.pos.x.0);
+        println!(
+            "  Glyph A: '{}' at ({:.1}, {:.1})",
+            glyph_a.char, glyph_a.pos.x.0, glyph_a.pos.y.0
+        );
+        println!(
+            "  Glyph B: '{}' at ({:.1}, {:.1})",
+            glyph_b.char, glyph_b.pos.x.0, glyph_b.pos.y.0
+        );
+        println!(
+            "  X advancement: {:.1} pixels",
+            glyph_b.pos.x.0 - glyph_a.pos.x.0
+        );
 
         // CRITICAL TEST: Are they at the same position?
         if glyph_a.pos.x == glyph_b.pos.x {
@@ -45,7 +57,10 @@ fn main() {
     println!("'Hello' -> {} glyphs", layout_multi.glyphs.len());
 
     for (i, glyph) in layout_multi.glyphs.iter().enumerate() {
-        println!("  [{}] '{}' at ({:.3}, {:.3})", i, glyph.char, glyph.pos.x.0, glyph.pos.y.0);
+        println!(
+            "  [{}] '{}' at ({:.3}, {:.3})",
+            i, glyph.char, glyph.pos.x.0, glyph.pos.y.0
+        );
     }
 
     // Check if all glyphs are at same position (bug indicator)
@@ -54,7 +69,10 @@ fn main() {
         let all_same = layout_multi.glyphs.iter().all(|g| g.pos.x == first_x);
 
         if all_same {
-            println!("  🚨 CRITICAL BUG: All glyphs at same X position: {:.1}", first_x.0);
+            println!(
+                "  🚨 CRITICAL BUG: All glyphs at same X position: {:.1}",
+                first_x.0
+            );
         } else {
             println!("  ✅ Glyphs have different X positions");
         }

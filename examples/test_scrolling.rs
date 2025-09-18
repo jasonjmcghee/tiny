@@ -7,7 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a large document with 100 lines
     let mut text = String::new();
     for i in 1..=100 {
-        text.push_str(&format!("Line {:03}: This is a test line with some content to make it wider\n", i));
+        text.push_str(&format!(
+            "Line {:03}: This is a test line with some content to make it wider\n",
+            i
+        ));
     }
 
     let doc = Doc::from_str(&text);

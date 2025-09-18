@@ -3,6 +3,7 @@
 //! Demonstrates the complete system working together
 
 use std::sync::Arc;
+use tiny_editor::coordinates::{LogicalPixels, Viewport};
 use tiny_editor::font::SharedFontSystem;
 use tiny_editor::{gpu::GpuRenderer, Editor, Rect};
 use winit::{
@@ -11,7 +12,6 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
-use tiny_editor::coordinates::{LogicalPixels, Viewport};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Tiny Editor...");
@@ -72,8 +72,11 @@ impl ApplicationHandler for TinyEditorApp {
 
             // Debug: Check if atlas has actual data
             let non_zero_pixels = atlas_data.iter().filter(|&&p| p > 0).count();
-            println!("Atlas has {} non-zero pixels out of {} total",
-                     non_zero_pixels, atlas_data.len());
+            println!(
+                "Atlas has {} non-zero pixels out of {} total",
+                non_zero_pixels,
+                atlas_data.len()
+            );
 
             renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
             println!("Uploaded font atlas to GPU");
@@ -151,7 +154,10 @@ fn main() {
                     let logical_width = physical_size.width as f32 / scale_factor;
                     let logical_height = physical_size.height as f32 / scale_factor;
 
-                    println!("Window resized: {:?}, scale_factor: {}", physical_size, scale_factor);
+                    println!(
+                        "Window resized: {:?}, scale_factor: {}",
+                        physical_size, scale_factor
+                    );
 
                     // Update editor viewport
                     if let Some(editor) = &mut self.editor {
@@ -208,7 +214,9 @@ fn main() {
                     };
 
                     // Update renderer viewport with proper scale factor
-                    editor.renderer.update_viewport(logical_width, logical_height, scale_factor);
+                    editor
+                        .renderer
+                        .update_viewport(logical_width, logical_height, scale_factor);
 
                     // Set up renderer with font system
                     editor.renderer.set_font_system(font_system.clone());
@@ -253,4 +261,3 @@ fn main() {
         }
     }
 }
-

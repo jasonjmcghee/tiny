@@ -3,19 +3,19 @@
 //! Two side-by-side widgets that track mouse position with circles.
 //! Demonstrates widget composition, custom rendering, and event handling.
 
-use std::sync::Arc;
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
 use tiny_editor::{
     coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport},
     font::SharedFontSystem,
     gpu::GpuRenderer,
-    text_effects::{TextEffect, EffectType, TextStyleProvider, priority},
+    input::InputHandler,
+    render::Renderer,
+    text_effects::{priority, EffectType, TextEffect, TextStyleProvider},
     tree::Doc,
-    render::{Renderer, BatchedDraw, GlyphInstance, RectInstance},
-    input::{InputHandler},
-    widget::{Widget, WidgetId, WidgetEvent, EventResponse, LayoutConstraints, LayoutResult},
+    widget::{EventResponse, LayoutConstraints, LayoutResult, Widget, WidgetEvent, WidgetId},
 };
 use winit::{
     application::ApplicationHandler,
@@ -33,19 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
-// === Widget System Extensions ===
-
-
-/// Data passed to circle SDF shader
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CircleShaderData {
-    center: [f32; 2],
-    radius: f32,
-    color: u32,
-}
-
 
 // === Circle Tracker Widget ===
 
@@ -160,19 +147,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let alpha = 1.0 - smoothstep(-1.0, 1.0, sdf);
 
     // Unpack color
-    let r = f32((circle_data.color >> 16u) & 0xFFu) / 255.0;
-    let g = f32((circle_data.color >> 8u) & 0xFFu) / 255.0;
-    let b = f32(circle_data.color & 0xFFu) / 255.0;
-    let a = f32((circle_data.color >> 24u) & 0xFFu) / 255.0;
+    let r = f32((circle_data.color >> 24u) & 0xFFu) / 255.0;
+    let g = f32((circle_data.color >> 16u) & 0xFFu) / 255.0;
+    let b = f32((circle_data.color >> 8u) & 0xFFu) / 255.0;
+    let a = f32(circle_data.color & 0xFFu) / 255.0;
 
     return vec4<f32>(r, g, b, a * alpha);
 }
 "#;
 
-        let shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Circle SDF Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Circle SDF Shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            });
 
         // Create circle uniform buffer
         let circle_uniform_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -183,19 +172,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         });
 
         // Create bind group layout for circle data
-        let circle_bind_group_layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Circle Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let circle_bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Circle Bind Group Layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
 
         // Create circle bind group
         let circle_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -208,64 +199,70 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         });
 
         // Get viewport bind group layout from existing uniform
-        let viewport_bind_group_layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Viewport Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let viewport_bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Viewport Bind Group Layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
 
         // Create pipeline layout
-        let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Circle Pipeline Layout"),
-            bind_group_layouts: &[&viewport_bind_group_layout, &circle_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Circle Pipeline Layout"),
+                bind_group_layouts: &[&viewport_bind_group_layout, &circle_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         // Create render pipeline
-        let pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Circle Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 8, // vec2<f32> = 8 bytes
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x2, // position only
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Circle Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 8, // vec2<f32> = 8 bytes
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2, // position only
+                        }],
                     }],
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Bgra8UnormSrgb, // Assume standard format
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Bgra8Unorm, // Assume standard format
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
         // Create vertex buffer for quad
         let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -284,20 +281,34 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     /// Draw widget background and border using the existing rect pipeline
-    fn draw_background(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    fn draw_background(
+        &self,
+        ctx: &tiny_editor::widget::PaintContext<'_>,
+        render_pass: &mut wgpu::RenderPass,
+    ) {
         let mut resources = self.resources.borrow_mut();
         // Create background vertex buffer if needed
         if resources.background_vertex_buffer.is_none() {
-            resources.background_vertex_buffer = Some(Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Widget Background Buffer"),
-                size: 360, // 30 vertices * 12 bytes each (plenty for background + borders)
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })));
+            resources.background_vertex_buffer = Some(Arc::new(ctx.device.create_buffer(
+                &wgpu::BufferDescriptor {
+                    label: Some("Widget Background Buffer"),
+                    size: 360, // 30 vertices * 12 bytes each (plenty for background + borders)
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            )));
         }
         let scale = ctx.viewport.scale_factor;
-        let bg_color = if self.is_hovered { 0xFF333333 } else { 0xFF222222 };
-        let border_color = if self.is_hovered { 0xFF666666 } else { 0xFF444444 };
+        let bg_color = if self.is_hovered {
+            0x333333FF
+        } else {
+            0x222222FF
+        };
+        let border_color = if self.is_hovered {
+            0x666666FF
+        } else {
+            0x444444FF
+        };
         let border_width = 2.0;
 
         // Batch all rectangles (background + 4 borders) into one draw call
@@ -307,31 +318,62 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         self.add_rect_vertices(&mut vertices, self.bounds, bg_color, scale);
 
         // Top border
-        self.add_rect_vertices(&mut vertices,
-            LayoutRect::new(self.bounds.x.0, self.bounds.y.0, self.bounds.width.0, border_width),
-            border_color, scale);
+        self.add_rect_vertices(
+            &mut vertices,
+            LayoutRect::new(
+                self.bounds.x.0,
+                self.bounds.y.0,
+                self.bounds.width.0,
+                border_width,
+            ),
+            border_color,
+            scale,
+        );
 
         // Bottom border
-        self.add_rect_vertices(&mut vertices,
-            LayoutRect::new(self.bounds.x.0, self.bounds.y.0 + self.bounds.height.0 - border_width,
-                           self.bounds.width.0, border_width),
-            border_color, scale);
+        self.add_rect_vertices(
+            &mut vertices,
+            LayoutRect::new(
+                self.bounds.x.0,
+                self.bounds.y.0 + self.bounds.height.0 - border_width,
+                self.bounds.width.0,
+                border_width,
+            ),
+            border_color,
+            scale,
+        );
 
         // Left border
-        self.add_rect_vertices(&mut vertices,
-            LayoutRect::new(self.bounds.x.0, self.bounds.y.0, border_width, self.bounds.height.0),
-            border_color, scale);
+        self.add_rect_vertices(
+            &mut vertices,
+            LayoutRect::new(
+                self.bounds.x.0,
+                self.bounds.y.0,
+                border_width,
+                self.bounds.height.0,
+            ),
+            border_color,
+            scale,
+        );
 
         // Right border
-        self.add_rect_vertices(&mut vertices,
-            LayoutRect::new(self.bounds.x.0 + self.bounds.width.0 - border_width, self.bounds.y.0,
-                           border_width, self.bounds.height.0),
-            border_color, scale);
+        self.add_rect_vertices(
+            &mut vertices,
+            LayoutRect::new(
+                self.bounds.x.0 + self.bounds.width.0 - border_width,
+                self.bounds.y.0,
+                border_width,
+                self.bounds.height.0,
+            ),
+            border_color,
+            scale,
+        );
 
         // Upload and draw all rectangles in one call using our own buffer
         if !vertices.is_empty() {
             if let Some(bg_buffer) = &resources.background_vertex_buffer {
-                ctx.queue.write_buffer(bg_buffer, 0, bytemuck::cast_slice(&vertices));
+                ctx.queue
+                    .write_buffer(bg_buffer, 0, bytemuck::cast_slice(&vertices));
                 render_pass.set_pipeline(ctx.gpu_renderer.rect_pipeline());
                 render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bg_buffer.slice(..));
@@ -341,8 +383,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     /// Helper to add rectangle vertices to batch
-    fn add_rect_vertices(&self, vertices: &mut Vec<tiny_editor::gpu::RectVertex>,
-                        rect: LayoutRect, color: u32, scale: f32) {
+    fn add_rect_vertices(
+        &self,
+        vertices: &mut Vec<tiny_editor::gpu::RectVertex>,
+        rect: LayoutRect,
+        color: u32,
+        scale: f32,
+    ) {
         let x1 = rect.x.0 * scale;
         let y1 = rect.y.0 * scale;
         let x2 = (rect.x.0 + rect.width.0) * scale;
@@ -350,12 +397,30 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         // Two triangles for rectangle
         vertices.extend_from_slice(&[
-            tiny_editor::gpu::RectVertex { position: [x1, y1], color },
-            tiny_editor::gpu::RectVertex { position: [x2, y1], color },
-            tiny_editor::gpu::RectVertex { position: [x1, y2], color },
-            tiny_editor::gpu::RectVertex { position: [x2, y1], color },
-            tiny_editor::gpu::RectVertex { position: [x2, y2], color },
-            tiny_editor::gpu::RectVertex { position: [x1, y2], color },
+            tiny_editor::gpu::RectVertex {
+                position: [x1, y1],
+                color,
+            },
+            tiny_editor::gpu::RectVertex {
+                position: [x2, y1],
+                color,
+            },
+            tiny_editor::gpu::RectVertex {
+                position: [x1, y2],
+                color,
+            },
+            tiny_editor::gpu::RectVertex {
+                position: [x2, y1],
+                color,
+            },
+            tiny_editor::gpu::RectVertex {
+                position: [x2, y2],
+                color,
+            },
+            tiny_editor::gpu::RectVertex {
+                position: [x1, y2],
+                color,
+            },
         ]);
     }
 }
@@ -372,9 +437,16 @@ impl Widget for CircleTracker {
     fn handle_event(&mut self, event: &WidgetEvent) -> EventResponse {
         match event {
             WidgetEvent::MouseMove(pos) => {
-                println!("Widget bounds: ({:.1},{:.1}) {}x{}, mouse: ({:.1},{:.1}), contains: {}",
-                         self.bounds.x.0, self.bounds.y.0, self.bounds.width.0, self.bounds.height.0,
-                         pos.x.0, pos.y.0, self.contains_point(*pos));
+                println!(
+                    "Widget bounds: ({:.1},{:.1}) {}x{}, mouse: ({:.1},{:.1}), contains: {}",
+                    self.bounds.x.0,
+                    self.bounds.y.0,
+                    self.bounds.width.0,
+                    self.bounds.height.0,
+                    pos.x.0,
+                    pos.y.0,
+                    self.contains_point(*pos)
+                );
 
                 if self.contains_point(*pos) {
                     self.mouse_pos = Some(*pos);
@@ -410,10 +482,8 @@ impl Widget for CircleTracker {
                 } else {
                     EventResponse::Ignored
                 }
-            },
-            &WidgetEvent::KeyboardInput(_, _) => {
-                EventResponse::Ignored
             }
+            &WidgetEvent::KeyboardInput(_, _) => EventResponse::Ignored,
         }
     }
 
@@ -426,7 +496,11 @@ impl Widget for CircleTracker {
         }
     }
 
-    fn paint(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    fn paint(
+        &self,
+        ctx: &tiny_editor::widget::PaintContext<'_>,
+        render_pass: &mut wgpu::RenderPass,
+    ) {
         // Draw widget background using existing rect pipeline first
         self.draw_background(ctx, render_pass);
 
@@ -435,7 +509,10 @@ impl Widget for CircleTracker {
 
         // Draw SDF circle directly to GPU
         if let Some(mouse_pos) = self.mouse_pos {
-            println!("Drawing circle at ({:.1}, {:.1})", mouse_pos.x.0, mouse_pos.y.0);
+            println!(
+                "Drawing circle at ({:.1}, {:.1})",
+                mouse_pos.x.0, mouse_pos.y.0
+            );
             let radius = 20.0;
 
             // Create quad vertices around mouse position (convert to physical coordinates)
@@ -470,17 +547,26 @@ impl Widget for CircleTracker {
 
             // Upload vertices and uniforms
             let resources = self.resources.borrow();
-            if let (Some(vertex_buffer), Some(uniform_buffer), Some(_bind_group)) =
-                (&resources.vertex_buffer, &resources.circle_uniform_buffer, &resources.circle_bind_group) {
-
-                ctx.queue.write_buffer(vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-                ctx.queue.write_buffer(uniform_buffer, 0, bytemuck::cast_slice(&circle_uniform_data));
+            if let (Some(vertex_buffer), Some(uniform_buffer), Some(_bind_group)) = (
+                &resources.vertex_buffer,
+                &resources.circle_uniform_buffer,
+                &resources.circle_bind_group,
+            ) {
+                ctx.queue
+                    .write_buffer(vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+                ctx.queue.write_buffer(
+                    uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&circle_uniform_data),
+                );
             }
 
             // Render with our custom pipeline
-            if let (Some(pipeline), Some(vertex_buffer), Some(circle_bind_group)) =
-                (&resources.circle_pipeline, &resources.vertex_buffer, &resources.circle_bind_group) {
-
+            if let (Some(pipeline), Some(vertex_buffer), Some(circle_bind_group)) = (
+                &resources.circle_pipeline,
+                &resources.vertex_buffer,
+                &resources.circle_bind_group,
+            ) {
                 println!("Rendering circle with custom pipeline");
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]); // Viewport uniforms
@@ -556,8 +642,10 @@ unsafe impl Sync for MouseCircleTextEffect {}
 
 impl TextStyleProvider for MouseCircleTextEffect {
     fn get_effects_in_range(&self, range: Range<usize>) -> Vec<TextEffect> {
-        println!("MouseCircleTextEffect::get_effects_in_range called for range {}..{}, mouse_pos={:?}",
-                 range.start, range.end, self.mouse_pos);
+        println!(
+            "MouseCircleTextEffect::get_effects_in_range called for range {}..{}, mouse_pos={:?}",
+            range.start, range.end, self.mouse_pos
+        );
 
         if let Some(mouse_pos) = self.mouse_pos {
             // Use shader effect with mouse position parameters
@@ -566,15 +654,18 @@ impl TextStyleProvider for MouseCircleTextEffect {
                 effect: EffectType::Shader {
                     id: 1, // Circle SDF shader ID
                     params: Arc::new([
-                        mouse_pos.x.0,          // Mouse X
-                        mouse_pos.y.0,          // Mouse Y
-                        self.circle_radius,     // Circle radius
-                        0.0,                    // Padding
+                        mouse_pos.x.0,      // Mouse X
+                        mouse_pos.y.0,      // Mouse Y
+                        self.circle_radius, // Circle radius
+                        0.0,                // Padding
                     ]),
                 },
                 priority: priority::SELECTION,
             };
-            println!("  Returning shader effect for mouse at ({:.1}, {:.1})", mouse_pos.x.0, mouse_pos.y.0);
+            println!(
+                "  Returning shader effect for mouse at ({:.1}, {:.1})",
+                mouse_pos.x.0, mouse_pos.y.0
+            );
             vec![effect]
         } else {
             println!("  No mouse position, returning no effects");
@@ -589,6 +680,10 @@ impl TextStyleProvider for MouseCircleTextEffect {
     fn name(&self) -> &str {
         "mouse_circle_effect"
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // === Document Editor Widget ===
@@ -602,17 +697,15 @@ struct DocumentEditorWidget {
     input: InputHandler,
     text_effect: MouseCircleTextEffect,
     render_priority: i32,
-
-    // Custom glyph shader with SDF circle effects
-    circle_text_pipeline: Option<Arc<wgpu::RenderPipeline>>,
-    mouse_uniform_buffer: Option<Arc<wgpu::Buffer>>,
-    mouse_bind_group: Option<Arc<wgpu::BindGroup>>,
 }
 
 impl DocumentEditorWidget {
     fn new(id: WidgetId, bounds: LayoutRect, text: &str, viewport: Viewport) -> Self {
         let doc = Doc::from_str(text);
-        let renderer = Rc::new(RefCell::new(Renderer::new((bounds.width.0, bounds.height.0), viewport.scale_factor)));
+        let renderer = Rc::new(RefCell::new(Renderer::new(
+            (bounds.width.0, bounds.height.0),
+            viewport.scale_factor,
+        )));
 
         // Don't set text effects on renderer - we'll pass them per-frame
         let text_effect = MouseCircleTextEffect::new(viewport.clone());
@@ -625,109 +718,12 @@ impl DocumentEditorWidget {
             input: InputHandler::new(),
             text_effect,
             render_priority: 0,
-            circle_text_pipeline: None,
-            mouse_uniform_buffer: None,
-            mouse_bind_group: None,
         }
     }
 
     fn with_priority(mut self, priority: i32) -> Self {
         self.render_priority = priority;
         self
-    }
-
-    /// Create custom glyph pipeline with SDF circle effects
-    fn ensure_circle_text_pipeline(&mut self, ctx: &mut tiny_editor::widget::PaintContext<'_>) {
-        if self.circle_text_pipeline.is_some() {
-            return;
-        }
-
-        println!("Creating custom glyph shader with SDF circle effects...");
-
-        // Custom glyph shader based on existing one but with SDF circle effect
-        let shader_source = r#"
-// Based on existing glyph.wgsl but with SDF circle effects
-
-struct Uniforms {
-    viewport_size: vec2<f32>,
-}
-
-struct MouseUniforms {
-    mouse_pos: vec2<f32>,
-    radius: f32,
-    _padding: f32,
-}
-
-@group(0) @binding(0)
-var<uniform> uniforms: Uniforms;
-
-@group(1) @binding(0)
-var t_glyph: texture_2d<f32>;
-@group(1) @binding(1)
-var s_glyph: sampler;
-
-@group(2) @binding(0)
-var<uniform> mouse_data: MouseUniforms;
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_coord: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) world_pos: vec2<f32>,
-}
-
-@vertex
-fn vs_main(
-    @location(0) position: vec2<f32>,
-    @location(1) tex_coord: vec2<f32>,
-    @location(2) color: u32,
-) -> VertexOutput {
-    var out: VertexOutput;
-
-    // Same as original glyph shader
-    out.clip_position = vec4<f32>(
-        (position.x / (uniforms.viewport_size.x * 0.5)) - 1.0,
-        1.0 - (position.y / (uniforms.viewport_size.y * 0.5)),
-        0.0,
-        1.0
-    );
-
-    out.tex_coord = tex_coord;
-    out.world_pos = position; // Pass world position for SDF calculation
-
-    // Convert color from packed u32 to vec4
-    let r = f32((color >> 24u) & 0xFFu) / 255.0;
-    let g = f32((color >> 16u) & 0xFFu) / 255.0;
-    let b = f32((color >> 8u) & 0xFFu) / 255.0;
-    let a = f32(color & 0xFFu) / 255.0;
-    out.color = vec4<f32>(r, g, b, a);
-
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Sample glyph texture (alpha channel) - same as original
-    let glyph_alpha = textureSample(t_glyph, s_glyph, in.tex_coord).r;
-
-    // Calculate SDF circle effect
-    let dist = length(in.world_pos - mouse_data.mouse_pos);
-    let sdf = dist - mouse_data.radius;
-    let circle_alpha = 1.0 - smoothstep(-1.0, 1.0, sdf);
-
-    // Blend original text color with red circle effect
-    let base_color = in.color.rgb;
-    let circle_color = vec3<f32>(1.0, 0.0, 0.0); // Red
-    let final_color = mix(base_color, circle_color, circle_alpha);
-
-    return vec4<f32>(final_color, in.color.a * glyph_alpha);
-}
-"#;
-
-        // Create the shader, pipeline, uniforms, etc.
-        // [Implementation continues...]
-        let _ = shader_source; // For now, just store the source
-        println!("Circle text shader source ready!");
     }
 }
 
@@ -772,7 +768,13 @@ impl Widget for DocumentEditorWidget {
             WidgetEvent::MouseClick(pos, button) => {
                 if self.contains_point(*pos) {
                     // Handle click in document coordinates
-                    self.input.on_mouse_click(&self.doc, self.renderer.borrow().viewport(), *pos, *button, false);
+                    self.input.on_mouse_click(
+                        &self.doc,
+                        self.renderer.borrow().viewport(),
+                        *pos,
+                        *button,
+                        false,
+                    );
                     EventResponse::Redraw
                 } else {
                     EventResponse::Ignored
@@ -780,7 +782,12 @@ impl Widget for DocumentEditorWidget {
             }
             WidgetEvent::KeyboardInput(key_event, modifiers) => {
                 // Handle keyboard input using the existing InputHandler
-                self.input.on_key(&self.doc, self.renderer.borrow().viewport(), key_event, modifiers);
+                self.input.on_key(
+                    &self.doc,
+                    self.renderer.borrow().viewport(),
+                    key_event,
+                    modifiers,
+                );
                 EventResponse::Redraw
             }
             _ => EventResponse::Ignored,
@@ -802,7 +809,11 @@ impl Widget for DocumentEditorWidget {
         }
     }
 
-    fn paint(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    fn paint(
+        &self,
+        ctx: &tiny_editor::widget::PaintContext<'_>,
+        render_pass: &mut wgpu::RenderPass,
+    ) {
         // Set font system and GPU renderer on embedded renderer
         {
             let mut renderer = self.renderer.borrow_mut();
@@ -813,7 +824,8 @@ impl Widget for DocumentEditorWidget {
         // Upload font atlas for this render pass
         let atlas_data = ctx.font_system.atlas_data();
         let (atlas_width, atlas_height) = ctx.font_system.atlas_size();
-        ctx.gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+        ctx.gpu_renderer
+            .upload_font_atlas(&atlas_data, atlas_width, atlas_height);
 
         // Create viewport rect for this widget (relative to widget bounds)
         let widget_viewport = tiny_editor::tree::Rect {
@@ -835,7 +847,10 @@ impl Widget for DocumentEditorWidget {
         }
 
         impl tiny_editor::text_effects::TextStyleProvider for CombinedTextStyles {
-            fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<tiny_editor::text_effects::TextEffect> {
+            fn get_effects_in_range(
+                &self,
+                range: std::ops::Range<usize>,
+            ) -> Vec<tiny_editor::text_effects::TextEffect> {
                 // Get syntax highlighting first
                 let mut effects = self.syntax.get_effects_in_range(range.clone());
                 // Then overlay mouse effects
@@ -850,6 +865,10 @@ impl Widget for DocumentEditorWidget {
             fn name(&self) -> &str {
                 "combined_styles"
             }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
         }
 
         let combined_styles = CombinedTextStyles {
@@ -857,11 +876,18 @@ impl Widget for DocumentEditorWidget {
             mouse_effect: self.text_effect.clone(),
         };
 
-        self.renderer.borrow_mut().set_text_styles(Box::new(combined_styles));
+        self.renderer
+            .borrow_mut()
+            .set_text_styles(Box::new(combined_styles));
 
         // Use the new hybrid rendering with direct widget painting
         let selections = self.input.selections();
-        let batches = self.renderer.borrow_mut().render_with_pass(&self.doc.read(), widget_viewport, selections, Some(render_pass));
+        let batches = self.renderer.borrow_mut().render_with_pass(
+            &self.doc.read(),
+            widget_viewport,
+            selections,
+            Some(render_pass),
+        );
 
         // The hybrid renderer handles widget painting directly now
         // We just need to handle our custom mouse circle shader effect
@@ -876,11 +902,15 @@ impl Widget for DocumentEditorWidget {
 
             // Update the effect uniform buffer directly
             if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(1) {
-                ctx.queue.write_buffer(effect_buffer, 0, bytemuck::cast_slice(&mouse_data));
+                ctx.queue
+                    .write_buffer(effect_buffer, 0, bytemuck::cast_slice(&mouse_data));
             }
         }
 
-        println!("Document editor widget painted using hybrid renderer with {} batches!", batches.len());
+        println!(
+            "Document editor widget painted using hybrid renderer with {} batches!",
+            batches.len()
+        );
     }
 
     fn bounds(&self) -> LayoutRect {
@@ -902,7 +932,6 @@ impl Widget for DocumentEditorWidget {
     }
 }
 
-
 // === Tiled Layout Widget ===
 
 /// Simple horizontal tiling layout
@@ -910,7 +939,7 @@ struct TiledLayout {
     id: WidgetId,
     bounds: LayoutRect,
     text_widget: Option<DocumentEditorWidget>, // Left widget: document editor with effects
-    circle_widget: Option<CircleTracker>, // Right widget: circle tracker
+    circle_widget: Option<CircleTracker>,      // Right widget: circle tracker
 }
 
 impl TiledLayout {
@@ -1030,7 +1059,11 @@ impl Widget for TiledLayout {
         }
     }
 
-    fn paint(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    fn paint(
+        &self,
+        ctx: &tiny_editor::widget::PaintContext<'_>,
+        render_pass: &mut wgpu::RenderPass,
+    ) {
         // Paint widgets directly without collecting mutable references
         // Paint text widget first (lower priority)
         if let Some(text_widget) = &self.text_widget {
@@ -1069,7 +1102,6 @@ impl Widget for TiledLayout {
                 render_pass.set_scissor_rect(0, 0, viewport_width, viewport_height);
             }
         }
-
     }
 
     fn bounds(&self) -> LayoutRect {
@@ -1086,9 +1118,9 @@ impl Widget for TiledLayout {
     }
 }
 
-
 // === Main Application ===
 
+#[derive(Default)]
 struct CircleApp {
     window: Option<Arc<Window>>,
     gpu_renderer: Option<GpuRenderer>,
@@ -1098,41 +1130,12 @@ struct CircleApp {
     // Widget system
     root_widget: Option<TiledLayout>,
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
-    last_hovered_widget: Option<usize>, // Track which widget was hovered last
     modifiers: winit::event::Modifiers, // Track modifier keys
-
-    // Custom circle rendering
-    circle_pipeline: Option<wgpu::RenderPipeline>,
-    circle_vertex_buffer: Option<wgpu::Buffer>,
-    device: Option<Arc<wgpu::Device>>,
-    queue: Option<Arc<wgpu::Queue>>,
-
-}
-
-impl Default for CircleApp {
-    fn default() -> Self {
-        Self {
-            window: None,
-            gpu_renderer: None,
-            font_system: None,
-            viewport: None,
-            root_widget: None,
-            cursor_position: None,
-            last_hovered_widget: None,
-            modifiers: winit::event::Modifiers::default(),
-            circle_pipeline: None,
-            circle_vertex_buffer: None,
-            device: None,
-            queue: None,
-        }
-    }
 }
 
 impl ApplicationHandler for CircleApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            println!("🪟 Creating window...");
-
             let window = Arc::new(
                 event_loop
                     .create_window(
@@ -1144,11 +1147,9 @@ impl ApplicationHandler for CircleApp {
             );
 
             // Setup GPU renderer
-            println!("🎮 Initializing GPU...");
             let mut gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
 
             // Setup font system (needed for existing render pipeline)
-            println!("🔤 Setting up fonts...");
             let font_system = Arc::new(SharedFontSystem::new());
             let scale_factor = window.scale_factor() as f32;
             font_system.prerasterize_ascii(14.0 * scale_factor);
@@ -1160,61 +1161,46 @@ impl ApplicationHandler for CircleApp {
             let mut viewport = Viewport::new(logical_width, logical_height, scale_factor);
             viewport.set_font_system(font_system.clone());
 
-
             // Create widget layout
-            let mut root_widget = TiledLayout::new(0, LayoutRect {
-                x: LogicalPixels(0.0),
-                y: LogicalPixels(0.0),
-                width: LogicalPixels(logical_width),
-                height: LogicalPixels(logical_height),
-            });
+            let mut root_widget = TiledLayout::new(
+                0,
+                LayoutRect {
+                    x: LogicalPixels(0.0),
+                    y: LogicalPixels(0.0),
+                    width: LogicalPixels(logical_width),
+                    height: LogicalPixels(logical_height),
+                },
+            );
 
             // Register circle text effect shader with GPU renderer
             let shader_source = include_str!("../src/shaders/circle_glyph.wgsl");
             gpu_renderer.register_text_effect_shader(1, shader_source, 16);
 
             // Add document editor widget on left with mouse effects
-            root_widget.set_text_widget(DocumentEditorWidget::new(
-                1, // Widget ID
-                LayoutRect::new(0.0, 0.0, logical_width / 2.0, logical_height),
-                r#"Hello, World!
-
-This is a document editor widget with mouse-based text effects.
-
-Move your mouse over this text to see the circle effect applied to the text rendering.
-
-The text uses the existing TextEffect system with a custom TextStyleProvider that colors text based on mouse position.
-
-You can also type to edit this text!
-
-Line 1: The quick brown fox jumps over the lazy dog.
-Line 2: ABCDEFGHIJKLMNOPQRSTUVWXYZ
-Line 3: abcdefghijklmnopqrstuvwxyz
-Line 4: 0123456789 !@#$%^&*()
-Line 5: This demonstrates widgets can be full editors.
-Line 6: Each widget has its own document and renderer.
-Line 7: Text effects are applied per-widget.
-Line 8: Pretty cool architecture, right?
-
-fn main() {
-    println!("Code highlighting works too!");
-    let x = 42;
-    let y = "Hello, world!";
-}
-
-More text to make the document longer...
-Even more text...
-And more...
-Keep going..."#,
-                viewport.clone(),
-            ).with_priority(1));
+            root_widget.set_text_widget(
+                DocumentEditorWidget::new(
+                    1, // Widget ID
+                    LayoutRect::new(0.0, 0.0, logical_width / 2.0, logical_height),
+                    include_str!("../assets/sample.rs"),
+                    viewport.clone(),
+                )
+                .with_priority(1),
+            );
 
             // Add circle widget on right
-            root_widget.set_circle_widget(CircleTracker::new(
-                2, // Widget ID
-                LayoutRect::new(logical_width / 2.0, 0.0, logical_width / 2.0, logical_height),
-                0xFFE24A4A, // Red
-            ).with_priority(2));
+            root_widget.set_circle_widget(
+                CircleTracker::new(
+                    2, // Widget ID
+                    LayoutRect::new(
+                        logical_width / 2.0,
+                        0.0,
+                        logical_width / 2.0,
+                        logical_height,
+                    ),
+                    0xE24A4AFF, // Red
+                )
+                .with_priority(2),
+            );
 
             // Layout the widgets
             root_widget.layout(LayoutConstraints {
@@ -1229,7 +1215,7 @@ Keep going..."#,
             self.viewport = Some(viewport);
             self.root_widget = Some(root_widget);
 
-            println!("✅ Setup complete!");
+            println!("Setup complete!");
 
             // Initial render
             if let Some(window) = &self.window {
@@ -1298,8 +1284,8 @@ Keep going..."#,
                 ..
             } => {
                 if let (Some(window), Some(root_widget), Some(position)) =
-                    (&self.window, &mut self.root_widget, self.cursor_position) {
-
+                    (&self.window, &mut self.root_widget, self.cursor_position)
+                {
                     let scale = window.scale_factor() as f32;
                     let logical_x = position.x as f32 / scale;
                     let logical_y = position.y as f32 / scale;
@@ -1327,8 +1313,8 @@ Keep going..."#,
 
                 // Update viewport and widget bounds
                 if let (Some(window), Some(viewport), Some(root_widget)) =
-                    (&self.window, &mut self.viewport, &mut self.root_widget) {
-
+                    (&self.window, &mut self.viewport, &mut self.root_widget)
+                {
                     let scale_factor = window.scale_factor() as f32;
                     let logical_width = new_size.width as f32 / scale_factor;
                     let logical_height = new_size.height as f32 / scale_factor;
@@ -1358,29 +1344,47 @@ Keep going..."#,
 
 impl CircleApp {
     fn render_frame(&mut self) {
-        if let (Some(_window), Some(gpu_renderer), Some(viewport), Some(font_system), Some(root_widget)) =
-            (&self.window, &mut self.gpu_renderer, &self.viewport, &self.font_system, &mut self.root_widget) {
-
+        if let (
+            Some(_window),
+            Some(gpu_renderer),
+            Some(viewport),
+            Some(font_system),
+            Some(root_widget),
+        ) = (
+            &self.window,
+            &mut self.gpu_renderer,
+            &self.viewport,
+            &self.font_system,
+            &mut self.root_widget,
+        ) {
             // Update widgets
             root_widget.update(0.016); // Assume 60fps
 
             // Simple single-pass rendering
             let output = gpu_renderer.surface().get_current_texture().unwrap();
-            let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let view = output
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
 
-            let mut encoder = gpu_renderer.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Widget Render Encoder"),
-            });
+            let mut encoder =
+                gpu_renderer
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Widget Render Encoder"),
+                    });
 
             // Update viewport uniforms
             let uniforms = tiny_editor::gpu::ShaderUniforms {
-                viewport_size: [viewport.physical_size.width as f32, viewport.physical_size.height as f32],
+                viewport_size: [
+                    viewport.physical_size.width as f32,
+                    viewport.physical_size.height as f32,
+                ],
                 _padding: [0.0, 0.0],
             };
             gpu_renderer.queue().write_buffer(
                 gpu_renderer.uniform_buffer(),
                 0,
-                bytemuck::cast_slice(&[uniforms])
+                bytemuck::cast_slice(&[uniforms]),
             );
 
             {
@@ -1411,7 +1415,7 @@ impl CircleApp {
                     queue: gpu_renderer.queue(),
                     uniform_bind_group: gpu_renderer.uniform_bind_group(),
                     gpu_renderer,
-                    font_system: &font_system,
+                    font_system,
                     text_styles: None, // No global text styles, widgets provide their own
                     layout_pos: LayoutPos::new(0.0, 0.0), // Legacy field
                 };
@@ -1420,7 +1424,9 @@ impl CircleApp {
                 root_widget.paint(&paint_ctx, &mut render_pass);
             }
 
-            gpu_renderer.queue().submit(std::iter::once(encoder.finish()));
+            gpu_renderer
+                .queue()
+                .submit(std::iter::once(encoder.finish()));
             output.present();
         }
     }

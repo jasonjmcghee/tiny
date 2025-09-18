@@ -12,7 +12,6 @@ use crate::{
     text_effects::TextStyleProvider,
     tree::{Doc, Point, Rect},
 };
-use std::any::TypeId;
 #[allow(unused)]
 use std::io::BufRead;
 use std::sync::Arc;
@@ -89,11 +88,18 @@ pub trait AppLogic: 'static {
         &[] // Default to no selections
     }
 
+    /// Get text style provider for syntax highlighting or other effects
+    fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
+        None // Default to no text styles
+    }
+
     /// Called after setup is complete
     fn on_ready(&mut self) {}
 
     /// Called before each render (for animations, etc.)
-    fn on_update(&mut self) {}
+    fn on_update(&mut self) {
+        // Default implementation - subclasses can override
+    }
 }
 
 /// Shared winit application that handles all GPU/font boilerplate
@@ -193,11 +199,11 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             );
 
             // Setup GPU renderer
-            println!("🎮 Initializing GPU...");
+            println!("Initializing GPU...");
             let gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
 
             // Setup font system
-            println!("🔤 Setting up fonts...");
+            println!("Setting up fonts...");
             let font_system = Arc::new(SharedFontSystem::new());
 
             // Get scale factor for high DPI displays
@@ -221,7 +227,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             self.font_system = Some(font_system);
             self.cpu_renderer = Some(cpu_renderer);
 
-            println!("✅ Setup complete!");
+            println!("Setup complete!");
             self.logic.on_ready();
 
             // Initial render
@@ -239,7 +245,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                println!("👋 Goodbye!");
+                println!("Goodbye!");
                 event_loop.exit();
             }
 
@@ -478,14 +484,23 @@ impl<T: AppLogic> TinyApp<T> {
             // Update CPU renderer viewport - this is where scale factor should be handled
             cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
 
-            // Set up syntax highlighting if this is EditorLogic
-            // This is a bit hacky but works for now
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<EditorLogic>() {
-                // We know T is EditorLogic, so we can set the text styles
-                // But we need unsafe transmute since we can't prove it at compile time
-                let editor_logic = unsafe { &*((&self.logic) as *const T as *const EditorLogic) };
-                if let Some(highlighter) = editor_logic.syntax_highlighter() {
-                    cpu_renderer.set_text_styles_ref(highlighter);
+            // Set up syntax highlighter for InputEdit-aware rendering
+            if let Some(text_styles) = self.logic.text_styles() {
+                if let Some(syntax_hl) = text_styles
+                    .as_any()
+                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                {
+                    // Use the same syntax highlighter instance that gets InputEdit updates
+                    let shared_highlighter = Arc::new(syntax_hl.clone());
+                    cpu_renderer.set_syntax_highlighter(shared_highlighter);
+
+                    // Also set as backup (renderer will prioritize syntax_highlighter)
+                    cpu_renderer.set_text_styles_ref(text_styles);
+                    println!("APP: Set InputEdit-aware syntax highlighter with fallback");
+                } else {
+                    // Fallback for other text style providers
+                    cpu_renderer.set_text_styles_ref(text_styles);
+                    println!("APP: Using legacy text styles provider");
                 }
             }
 
@@ -497,10 +512,12 @@ impl<T: AppLogic> TinyApp<T> {
                 height: LogicalPixels(logical_height),
             };
 
-            // Generate render commands
+            // Generate render commands using direct GPU rendering path
             let doc = self.logic.doc();
             let selections = self.logic.selections();
-            let batches = cpu_renderer.render(&doc.read(), viewport, selections);
+
+            // Use render_with_pass(None) to go through the working viewport query path
+            let batches = cpu_renderer.render_with_pass(&doc.read(), viewport, selections, None);
 
             // Upload atlas (in case new glyphs were rasterized)
             if let Some(font_system) = &self.font_system {
@@ -530,24 +547,46 @@ impl EditorLogic {
         let syntax_highlighter: Box<dyn TextStyleProvider> =
             Box::new(SyntaxHighlighter::new_rust());
 
-        // Request initial highlight
+        // Request initial highlight using the new API
         let text = doc.read().to_string();
-        syntax_highlighter.request_update(&text, doc.version());
+        println!(
+            "EditorLogic: Requesting initial syntax highlighting for {} bytes of text",
+            text.len()
+        );
+        // Use the new API for consistency (no edit info for initial parse)
+        if let Some(syntax_hl) = syntax_highlighter
+            .as_any()
+            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+        {
+            syntax_hl.request_update_with_edit(&text, doc.version(), None);
+        } else {
+            syntax_highlighter.request_update(&text, doc.version());
+        }
+
+        // Give the background thread a moment to parse (reduced debounce is 10ms)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Create input handler with syntax highlighter reference
+        let mut input = InputHandler::new();
+        if let Some(syntax_hl) = syntax_highlighter
+            .as_any()
+            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+        {
+            // Clone the SyntaxHighlighter and wrap in Arc for sharing
+            let shared_highlighter = Arc::new(syntax_hl.clone());
+            input.set_syntax_highlighter(shared_highlighter);
+            println!("EditorLogic: Connected syntax highlighter to InputHandler");
+        }
 
         Self {
             doc,
-            input: InputHandler::new(),
+            input,
             syntax_highlighter: Some(syntax_highlighter),
         }
     }
 }
 
-impl EditorLogic {
-    /// Get a reference to the syntax highlighter if available
-    pub fn syntax_highlighter(&self) -> Option<&dyn TextStyleProvider> {
-        self.syntax_highlighter.as_ref().map(|h| &**h)
-    }
-}
+// Methods moved to AppLogic trait implementation
 
 impl AppLogic for EditorLogic {
     fn on_key(
@@ -556,18 +595,14 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &winit::event::Modifiers,
     ) -> bool {
-        // Delegate to InputHandler
-        self.input.on_key(&self.doc, viewport, event, modifiers);
+        // Simply pass the key to InputHandler - it handles all coordination now
+        let input_handled = self.input.on_key(&self.doc, viewport, event, modifiers);
 
-        // Update syntax highlighting after text changes
-        if let Some(ref highlighter) = self.syntax_highlighter {
-            let text = self.doc.read().to_string();
-            highlighter.request_update(&text, self.doc.version());
-        }
+        // The InputHandler now manages edit buffering and InputEdit coordination
+        // We don't need to do anything here anymore!
 
-        // Always redraw after keyboard input for now
-        // InputHandler handles the actual logic
-        true
+        // Return whether we handled the input
+        input_handled
     }
 
     fn on_click(
@@ -632,6 +667,18 @@ impl AppLogic for EditorLogic {
 
     fn selections(&self) -> &[crate::input::Selection] {
         self.input.selections()
+    }
+
+    fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
+        self.syntax_highlighter.as_ref().map(|h| &**h)
+    }
+
+    fn on_update(&mut self) {
+        // Check if we should send pending syntax updates (debounce timer expired)
+        if self.input.should_flush() {
+            println!("DEBOUNCE: Sending pending syntax updates after idle timeout");
+            self.input.flush_syntax_updates(&self.doc);
+        }
     }
 }
 

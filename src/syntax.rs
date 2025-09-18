@@ -6,7 +6,7 @@ use crate::text_effects::{priority, EffectType, TextEffect, TextStyleProvider};
 use arc_swap::ArcSwap;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree as TSTree};
+use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree as TSTree};
 
 /// Language configuration for syntax highlighting
 pub struct LanguageConfig {
@@ -53,6 +53,7 @@ pub enum TokenType {
 }
 
 /// Background syntax highlighter with debouncing
+#[derive(Clone)]
 pub struct SyntaxHighlighter {
     /// Current highlights (lock-free read!)
     highlights: Arc<ArcSwap<Vec<TextEffect>>>,
@@ -60,62 +61,165 @@ pub struct SyntaxHighlighter {
     tx: mpsc::Sender<ParseRequest>,
     /// Provider name
     name: &'static str,
+    /// Cached tree for viewport queries
+    cached_tree: Arc<ArcSwap<Option<TSTree>>>,
+    /// Language for creating queries
+    language: Language,
+    /// Highlight query
+    query: Arc<Query>,
+}
+
+/// Text edit information for tree-sitter incremental parsing
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_position: Point,
+    pub old_end_position: Point,
+    pub new_end_position: Point,
 }
 
 /// Parse request for background thread
 struct ParseRequest {
     text: String,
-    #[allow(dead_code)]
     version: u64,
+    /// Edit information for incremental parsing
+    edit: Option<TextEdit>,
+}
+
+/// Viewport query request
+pub struct ViewportQuery {
+    pub byte_range: std::ops::Range<usize>,
 }
 
 impl SyntaxHighlighter {
+    /// Apply an incremental edit for efficient reparsing
+    pub fn apply_edit(&self, edit: TextEdit) {
+        // Send edit to background thread
+        let _ = self.tx.send(ParseRequest {
+            text: String::new(), // Will be set by request_update_with_edit
+            version: 0,         // Will be set by request_update_with_edit
+            edit: Some(edit),
+        });
+    }
+
+    /// Request update with edit information
+    pub fn request_update_with_edit(&self, text: &str, version: u64, edit: Option<TextEdit>) {
+        if let Some(ref edit_info) = edit {
+            println!("SYNTAX: Sending request_update_with_edit WITH InputEdit: start_byte={}", edit_info.start_byte);
+        } else {
+            println!("SYNTAX: Sending request_update_with_edit WITHOUT InputEdit");
+        }
+        let _ = self.tx.send(ParseRequest {
+            text: text.to_string(),
+            version,
+            edit,
+        });
+    }
+
     /// Create highlighter for any language with background parsing
     pub fn new(config: LanguageConfig) -> Result<Self, tree_sitter::LanguageError> {
         let mut parser = Parser::new();
         parser.set_language(&config.language)?;
 
-        let query = Query::new(&config.language, config.highlights_query)
-            .expect("Failed to create highlight query");
+        let query = Arc::new(
+            Query::new(&config.language, config.highlights_query)
+                .expect("Failed to create highlight query"),
+        );
+        let query_clone = query.clone();
 
         let highlights = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let highlights_clone = highlights.clone();
+        let cached_tree = Arc::new(ArcSwap::from_pointee(None));
+        let cached_tree_clone = cached_tree.clone();
 
         let (tx, rx) = mpsc::channel::<ParseRequest>();
 
         // Background parsing thread with debouncing
         thread::spawn(move || {
+            println!("SYNTAX: Background thread started");
             let mut tree: Option<TSTree> = None;
             let mut cursor = QueryCursor::new();
             let mut last_text = String::new();
+            let mut is_first_parse = true;
 
             while let Ok(request) = rx.recv() {
-                // Debounce: wait for more requests, use the latest one
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                println!(
+                    "SYNTAX: Received parse request for {} bytes",
+                    request.text.len()
+                );
+                // Shorter debounce for initial parse, longer for subsequent
+                let debounce_ms = if is_first_parse { 10 } else { 100 };
+                std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
 
                 // Drain any additional requests that came in during debounce
                 let final_request = rx.try_iter().last().unwrap_or(request);
 
                 // Skip if text hasn't changed (avoid redundant parsing)
-                if final_request.text == last_text {
+                if final_request.text == last_text && final_request.edit.is_none() {
+                    println!("SYNTAX: Skipping - text unchanged and no edit");
                     continue;
                 }
                 last_text = final_request.text.clone();
 
-                // Parse with tree-sitter (incremental parsing for speed)
+                // Apply edit to existing tree for incremental parsing
+                if let Some(edit) = &final_request.edit {
+                    if let Some(ref mut existing_tree) = tree {
+                        println!("SYNTAX: Applying incremental edit: start_byte={}, old_end={}, new_end={}",
+                                 edit.start_byte, edit.old_end_byte, edit.new_end_byte);
+
+                        let ts_edit = InputEdit {
+                            start_byte: edit.start_byte,
+                            old_end_byte: edit.old_end_byte,
+                            new_end_byte: edit.new_end_byte,
+                            start_position: edit.start_position,
+                            old_end_position: edit.old_end_position,
+                            new_end_position: edit.new_end_position,
+                        };
+
+                        existing_tree.edit(&ts_edit);
+                    }
+                }
+
+                println!(
+                    "SYNTAX: Parsing {} bytes with tree-sitter (incremental={})",
+                    final_request.text.len(),
+                    final_request.edit.is_some()
+                );
+                // Parse with tree-sitter (incremental if we have existing tree)
                 tree = parser.parse(&final_request.text, tree.as_ref());
 
                 if let Some(ref ts_tree) = tree {
                     let mut effects = Vec::new();
-                    let capture_names = query.capture_names();
+                    let capture_names = query_clone.capture_names();
 
-                    let mut matches =
-                        cursor.matches(&query, ts_tree.root_node(), final_request.text.as_bytes());
+                    let mut matches = cursor.matches(
+                        &query_clone,
+                        ts_tree.root_node(),
+                        final_request.text.as_bytes(),
+                    );
 
                     // Extract syntax highlighting from tree-sitter results
+                    let mut capture_count = 0;
                     while let Some(match_) = matches.next() {
                         for capture in match_.captures {
                             let capture_name = &capture_names[capture.index as usize];
+                            capture_count += 1;
+
+                            // Debug: log first few captures to see what tree-sitter is finding
+                            if capture_count <= 10 {
+                                let node_text = &final_request.text[capture.node.start_byte()
+                                    ..capture.node.end_byte().min(final_request.text.len())];
+                                println!(
+                                    "SYNTAX: Capture #{}: name='{}', text='{}', range={}..{}",
+                                    capture_count,
+                                    capture_name,
+                                    node_text.chars().take(20).collect::<String>(),
+                                    capture.node.start_byte(),
+                                    capture.node.end_byte()
+                                );
+                            }
 
                             if let Some(token) = Self::capture_name_to_token_type(capture_name) {
                                 effects.push(TextEffect {
@@ -123,6 +227,8 @@ impl SyntaxHighlighter {
                                     effect: EffectType::Color(Self::token_type_to_color(token)),
                                     priority: priority::SYNTAX,
                                 });
+                            } else if capture_count <= 10 {
+                                println!("  -> No token type mapping for '{}'", capture_name);
                             }
                         }
                     }
@@ -131,8 +237,23 @@ impl SyntaxHighlighter {
                     effects.sort_by_key(|e| (e.range.start, e.range.end));
                     let cleaned = Self::remove_overlaps(effects);
 
+                    println!(
+                        "SYNTAX: Generated {} effects for {} bytes of text",
+                        cleaned.len(),
+                        final_request.text.len()
+                    );
+                    if !cleaned.is_empty() {
+                        println!("  First effect: {:?}", cleaned.first());
+                    }
+
                     // Atomic swap - readers never block! Old highlighting stays until this completes
                     highlights_clone.store(Arc::new(cleaned));
+
+                    // Store the tree for viewport queries
+                    cached_tree_clone.store(Arc::new(Some(ts_tree.clone())));
+
+                    // Mark first parse as complete
+                    is_first_parse = false;
                 }
             }
         });
@@ -141,6 +262,9 @@ impl SyntaxHighlighter {
             highlights,
             tx,
             name: config.name,
+            cached_tree,
+            language: config.language,
+            query,
         })
     }
 
@@ -235,23 +359,188 @@ impl SyntaxHighlighter {
         }
     }
 
-    /// Convert token type to color
+    /// Convert token type to color (RGBA format)
     pub fn token_type_to_color(token: TokenType) -> u32 {
         match token {
-            TokenType::Keyword => 0xFFC678DD,     // Purple
-            TokenType::Function => 0xFF61AFEF,    // Blue
-            TokenType::Type => 0xFFE5C07B,        // Yellow-orange
-            TokenType::String => 0xFF98C379,      // Green
-            TokenType::Number => 0xFFD19A66,      // Orange
-            TokenType::Comment => 0xFF5C6370,     // Gray
-            TokenType::Constant => 0xFFD19A66,    // Orange
-            TokenType::Operator => 0xFF56B6C2,    // Cyan
-            TokenType::Punctuation => 0xFFABB2BF, // Gray
-            TokenType::Variable => 0xFFABB2BF,    // Default gray
-            TokenType::Attribute => 0xFFE06C75,   // Red
-            TokenType::Namespace => 0xFF61AFEF,   // Blue
-            TokenType::Property => 0xFFE5C07B,    // Yellow
-            TokenType::Parameter => 0xFFABB2BF,   // Gray
+            TokenType::Keyword => 0xC678DDFF,     // Purple
+            TokenType::Function => 0x61AFEFFF,    // Blue
+            TokenType::Type => 0xE5C07BFF,        // Yellow-orange
+            TokenType::String => 0x98C379FF,      // Green
+            TokenType::Number => 0xD19A66FF,      // Orange
+            TokenType::Comment => 0x5C6370FF,     // Gray
+            TokenType::Constant => 0xD19A66FF,    // Orange
+            TokenType::Operator => 0x56B6C2FF,    // Cyan
+            TokenType::Punctuation => 0xABB2BFFF, // Gray
+            TokenType::Variable => 0xABB2BFFF,    // Default gray
+            TokenType::Attribute => 0xE06C75FF,   // Red
+            TokenType::Namespace => 0x61AFEFFF,   // Blue
+            TokenType::Property => 0xE5C07BFF,    // Yellow
+            TokenType::Parameter => 0xABB2BFFF,   // Gray
+        }
+    }
+
+    /// Coalesce adjacent effects with the same color
+    pub fn coalesce_effects(effects: Vec<TextEffect>) -> Vec<TextEffect> {
+        if effects.is_empty() {
+            return effects;
+        }
+
+        let mut coalesced = Vec::with_capacity(effects.len() / 2); // Estimate
+        let mut current_effect: Option<TextEffect> = None;
+
+        for effect in effects {
+            if let Some(ref mut curr) = current_effect {
+                // Check if we can coalesce with current effect
+                if curr.range.end == effect.range.start
+                    && curr.priority == effect.priority
+                    && matches!(&curr.effect, EffectType::Color(c1) if matches!(&effect.effect, EffectType::Color(c2) if c1 == c2))
+                {
+                    // Extend current effect
+                    curr.range.end = effect.range.end;
+                } else {
+                    // Can't coalesce, save current and start new
+                    coalesced.push(curr.clone());
+                    current_effect = Some(effect);
+                }
+            } else {
+                // First effect
+                current_effect = Some(effect);
+            }
+        }
+
+        // Don't forget the last effect
+        if let Some(curr) = current_effect {
+            coalesced.push(curr);
+        }
+
+        coalesced
+    }
+
+    /// Get syntax effects for only the visible byte range - O(visible nodes)
+    pub fn get_visible_effects(
+        &self,
+        text: &str,
+        byte_range: std::ops::Range<usize>,
+    ) -> Vec<TextEffect> {
+        // Get the cached tree if available
+        let tree_guard = self.cached_tree.load();
+        let tree = match tree_guard.as_ref() {
+            Some(tree) => tree,
+            None => {
+                // No tree yet, return empty
+                return Vec::new();
+            }
+        };
+
+        let mut effects = Vec::new();
+        let mut cursor = QueryCursor::new();
+
+        // Set the byte range for the query cursor - this is the key optimization!
+        // tree-sitter will only visit nodes that intersect this range
+        cursor.set_byte_range(byte_range.clone());
+
+        let capture_names = self.query.capture_names();
+        let mut matches = cursor.matches(&self.query, tree.root_node(), text.as_bytes());
+
+        // Process only the visible matches
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                let capture_name = &capture_names[capture.index as usize];
+
+                // Check if this capture is actually in our visible range
+                let node_start = capture.node.start_byte();
+                let node_end = capture.node.end_byte();
+
+                if node_end < byte_range.start || node_start > byte_range.end {
+                    continue; // Skip nodes outside visible range
+                }
+
+                if let Some(token) = Self::capture_name_to_token_type(capture_name) {
+                    effects.push(TextEffect {
+                        range: node_start..node_end,
+                        effect: EffectType::Color(Self::token_type_to_color(token)),
+                        priority: priority::SYNTAX,
+                    });
+                }
+            }
+        }
+
+        // Sort, remove overlaps, and coalesce adjacent effects
+        effects.sort_by_key(|e| (e.range.start, e.range.end));
+        let cleaned = Self::remove_overlaps(effects);
+        Self::coalesce_effects(cleaned)
+    }
+
+    /// Walk visible nodes in tree (alternative approach using tree walking)
+    pub fn walk_visible_nodes(
+        &self,
+        text: &str,
+        byte_range: std::ops::Range<usize>,
+    ) -> Vec<TextEffect> {
+        let tree_guard = self.cached_tree.load();
+        let tree = match tree_guard.as_ref() {
+            Some(tree) => tree,
+            None => return Vec::new(),
+        };
+
+        let mut effects = Vec::new();
+        let mut cursor = tree.root_node().walk();
+        self.collect_visible_effects(&mut cursor, text, &byte_range, &mut effects);
+
+        effects.sort_by_key(|e| (e.range.start, e.range.end));
+        Self::remove_overlaps(effects)
+    }
+
+    fn collect_visible_effects(
+        &self,
+        cursor: &mut tree_sitter::TreeCursor,
+        text: &str,
+        visible_range: &std::ops::Range<usize>,
+        effects: &mut Vec<TextEffect>,
+    ) {
+        let node = cursor.node();
+        let node_start = node.start_byte();
+        let node_end = node.end_byte();
+
+        // Early exit if this entire subtree is outside visible range
+        if node_end < visible_range.start || node_start > visible_range.end {
+            return;
+        }
+
+        // Check if this node has a syntax capture
+        let node_kind = node.kind();
+        if let Some(token) = self.node_kind_to_token_type(node_kind) {
+            effects.push(TextEffect {
+                range: node_start..node_end,
+                effect: EffectType::Color(Self::token_type_to_color(token)),
+                priority: priority::SYNTAX,
+            });
+        }
+
+        // Only recurse into children if this node intersects visible range
+        if cursor.goto_first_child() {
+            loop {
+                self.collect_visible_effects(cursor, text, visible_range, effects);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+            cursor.goto_parent();
+        }
+    }
+
+    /// Map node kind directly to token type (simpler than capture names)
+    fn node_kind_to_token_type(&self, kind: &str) -> Option<TokenType> {
+        // This is a simplified version - would need language-specific mapping
+        match kind {
+            "string" | "string_literal" | "string_content" => Some(TokenType::String),
+            "number" | "integer" | "float" => Some(TokenType::Number),
+            "comment" | "line_comment" | "block_comment" => Some(TokenType::Comment),
+            "function" | "function_declaration" | "method_declaration" => Some(TokenType::Function),
+            "type" | "type_identifier" | "primitive_type" => Some(TokenType::Type),
+            _ if kind.contains("keyword") => Some(TokenType::Keyword),
+            _ if kind.contains("operator") => Some(TokenType::Operator),
+            _ => None,
         }
     }
 
@@ -280,6 +569,8 @@ impl SyntaxHighlighter {
 
 impl TextStyleProvider for SyntaxHighlighter {
     fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<TextEffect> {
+        // For now, still use the full cached effects
+        // In the future, this could be replaced with on-demand viewport queries
         let all_effects = self.highlights.load();
 
         // Binary search for efficient range query
@@ -287,23 +578,163 @@ impl TextStyleProvider for SyntaxHighlighter {
             .binary_search_by_key(&range.start, |e| e.range.start)
             .unwrap_or_else(|i| i);
 
-        all_effects[start_idx..]
+        let result: Vec<TextEffect> = all_effects[start_idx..]
             .iter()
             .take_while(|e| e.range.start < range.end)
             .cloned()
-            .collect()
+            .collect();
+
+        static mut DEBUG_COUNT: u32 = 0;
+        unsafe {
+            if DEBUG_COUNT < 10 && !result.is_empty() {
+                println!(
+                    "SYNTAX: Returning {} effects for range {}..{} (total effects: {})",
+                    result.len(),
+                    range.start,
+                    range.end,
+                    all_effects.len()
+                );
+                DEBUG_COUNT += 1;
+            }
+        }
+
+        result
     }
 
+    // Remove the duplicate method - it's not part of the trait
+
     fn request_update(&self, text: &str, version: u64) {
-        // Send to background thread (non-blocking)
-        let _ = self.tx.send(ParseRequest {
-            text: text.to_string(),
-            version,
-        });
+        println!("SYNTAX: OLD request_update called (no InputEdit) - this should be avoided!");
+        // Send to background thread (non-blocking) without edit info
+        self.request_update_with_edit(text, version, None);
     }
 
     fn name(&self) -> &str {
         self.name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Convert byte position to tree-sitter Point using efficient tree navigation
+fn byte_to_point(tree: &crate::tree::Tree, byte_pos: usize) -> Point {
+    let line = tree.byte_to_line(byte_pos);
+
+    // Get column by finding start of line and calculating offset
+    let line_start = tree.line_to_byte(line).unwrap_or(0);
+    let byte_in_line = byte_pos - line_start;
+
+    // Get the line text to calculate visual column (accounting for tabs)
+    let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
+    let line_text = tree.get_text_slice(line_start..line_end);
+
+    let mut column = 0;
+    let mut byte_offset = 0;
+
+    for ch in line_text.chars() {
+        if byte_offset >= byte_in_line {
+            break;
+        }
+        if ch == '\t' {
+            column = ((column / 4) + 1) * 4; // 4-space tabs
+        } else {
+            column += 1;
+        }
+        byte_offset += ch.len_utf8();
+    }
+
+    Point { row: line as usize, column }
+}
+
+/// Create TextEdit from document edit information using tree navigation
+pub fn create_text_edit(
+    tree: &crate::tree::Tree,
+    edit: &crate::tree::Edit,
+) -> TextEdit {
+    use crate::tree::Edit;
+
+    match edit {
+        Edit::Insert { pos, content } => {
+            let content_text = match content {
+                crate::tree::Content::Text(s) => s.clone(),
+                crate::tree::Content::Widget(_) => String::new(), // Widgets don't affect text parsing
+            };
+
+            let start_point = byte_to_point(tree, *pos);
+            let end_point = start_point; // Insert doesn't change end position initially
+
+            // Calculate new end position after insert
+            let new_end_point = {
+                let mut line = start_point.row;
+                let mut column = start_point.column;
+                for ch in content_text.chars() {
+                    if ch == '\n' {
+                        line += 1;
+                        column = 0;
+                    } else {
+                        column += 1;
+                    }
+                }
+                Point { row: line as usize, column }
+            };
+
+            TextEdit {
+                start_byte: *pos,
+                old_end_byte: *pos,
+                new_end_byte: *pos + content_text.len(),
+                start_position: start_point,
+                old_end_position: end_point,
+                new_end_position: new_end_point,
+            }
+        }
+        Edit::Delete { range } => {
+            let start_point = byte_to_point(tree, range.start);
+            let old_end_point = byte_to_point(tree, range.end);
+
+            TextEdit {
+                start_byte: range.start,
+                old_end_byte: range.end,
+                new_end_byte: range.start, // Delete shrinks to start position
+                start_position: start_point,
+                old_end_position: old_end_point,
+                new_end_position: start_point, // New end is at start after deletion
+            }
+        }
+        Edit::Replace { range, content } => {
+            let content_text = match content {
+                crate::tree::Content::Text(s) => s.clone(),
+                crate::tree::Content::Widget(_) => String::new(),
+            };
+
+            let start_point = byte_to_point(tree, range.start);
+            let old_end_point = byte_to_point(tree, range.end);
+
+            // Calculate new end position after replacement
+            let new_end_point = {
+                let mut line = start_point.row;
+                let mut column = start_point.column;
+                for ch in content_text.chars() {
+                    if ch == '\n' {
+                        line += 1;
+                        column = 0;
+                    } else {
+                        column += 1;
+                    }
+                }
+                Point { row: line as usize, column }
+            };
+
+            TextEdit {
+                start_byte: range.start,
+                old_end_byte: range.end,
+                new_end_byte: range.start + content_text.len(),
+                start_position: start_point,
+                old_end_position: old_end_point,
+                new_end_position: new_end_point,
+            }
+        }
     }
 }
 

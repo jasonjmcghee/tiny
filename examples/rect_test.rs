@@ -5,8 +5,7 @@
 use std::sync::Arc;
 use tiny_editor::coordinates::{LogicalPixels, LogicalSize};
 use tiny_editor::{
-    app::{AppLogic, TinyApp}
-    ,
+    app::{AppLogic, TinyApp},
     render::RenderOp,
     tree::{Doc, PaintContext, Point, Rect, Widget},
 };
@@ -33,7 +32,10 @@ impl Widget for TestRect {
     }
 
     fn paint(&self, ctx: &mut PaintContext<'_>) {
-        println!("TestRect::paint at ({:.1}, {:.1})", ctx.layout_pos.x, ctx.layout_pos.y);
+        println!(
+            "TestRect::paint at ({:.1}, {:.1})",
+            ctx.layout_pos.x, ctx.layout_pos.y
+        );
 
         ctx.commands.push(RenderOp::Rect {
             rect: Rect {

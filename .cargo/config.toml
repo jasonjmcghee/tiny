@@ -1,0 +1,12 @@
+#[build]
+#rustflags = ["-Z", "threads=8", "-Cforce-frame-pointers=yes"]
+rustflags = ["-Z", "threads=8"]
+codegen-backend = "cranelift"
+
+#[build]
+#rustflags = ["-C", "target-cpu=native"]
+#
+#[profile.release]
+#opt-level = 3
+#lto = "fat"
+#codegen-units = 1

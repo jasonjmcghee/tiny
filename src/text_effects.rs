@@ -19,6 +19,9 @@ pub trait TextStyleProvider: Send + Sync {
 
     /// Get provider name for debugging
     fn name(&self) -> &str;
+
+    /// Downcast support for type-specific operations
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// A single text styling effect
@@ -192,6 +195,10 @@ mod tests {
 
         fn name(&self) -> &str {
             "mock"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

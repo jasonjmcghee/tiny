@@ -16,22 +16,31 @@ fn main() {
 
         println!("Font system glyph 'A':");
         println!("  Position: ({:.3}, {:.3})", glyph.pos.x.0, glyph.pos.y.0);
-        println!("  Size from font: ({:.3}, {:.3})", glyph.size.width.0, glyph.size.height.0);
-        println!("  Texture coords: [{:.3}, {:.3}, {:.3}, {:.3}]",
-                 glyph.tex_coords[0], glyph.tex_coords[1],
-                 glyph.tex_coords[2], glyph.tex_coords[3]);
+        println!(
+            "  Size from font: ({:.3}, {:.3})",
+            glyph.size.width.0, glyph.size.height.0
+        );
+        println!(
+            "  Texture coords: [{:.3}, {:.3}, {:.3}, {:.3}]",
+            glyph.tex_coords[0], glyph.tex_coords[1], glyph.tex_coords[2], glyph.tex_coords[3]
+        );
 
         // Calculate size the way GPU currently does it (WRONG)
         let atlas_size = 2048.0;
         let gpu_width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * atlas_size;
         let gpu_height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * atlas_size;
 
-        println!("  GPU calculated size: ({:.3}, {:.3})", gpu_width, gpu_height);
+        println!(
+            "  GPU calculated size: ({:.3}, {:.3})",
+            gpu_width, gpu_height
+        );
 
         // Compare
         if (glyph.size.width.0 - gpu_width).abs() > 1.0 {
-            println!("  🐛 SIZE MISMATCH: Font says {:.1}px wide, GPU calculates {:.1}px",
-                     glyph.size.width.0, gpu_width);
+            println!(
+                "  🐛 SIZE MISMATCH: Font says {:.1}px wide, GPU calculates {:.1}px",
+                glyph.size.width.0, gpu_width
+            );
         }
 
         // Test coordinate transformation (simulate shader)
@@ -69,10 +78,14 @@ fn main() {
         let layout = font_system.layout_text(&ch.to_string(), 14.0);
         if !layout.glyphs.is_empty() {
             let glyph = &layout.glyphs[0];
-            println!("'{}': size=({:.1}, {:.1}) tex_size=({:.1}, {:.1})",
-                     ch, glyph.size.width.0, glyph.size.height.0,
-                     (glyph.tex_coords[2] - glyph.tex_coords[0]) * 2048.0,
-                     (glyph.tex_coords[3] - glyph.tex_coords[1]) * 2048.0);
+            println!(
+                "'{}': size=({:.1}, {:.1}) tex_size=({:.1}, {:.1})",
+                ch,
+                glyph.size.width.0,
+                glyph.size.height.0,
+                (glyph.tex_coords[2] - glyph.tex_coords[0]) * 2048.0,
+                (glyph.tex_coords[3] - glyph.tex_coords[1]) * 2048.0
+            );
         }
     }
 }

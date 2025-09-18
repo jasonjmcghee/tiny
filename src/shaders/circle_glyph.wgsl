@@ -2,7 +2,7 @@
 // Based on glyph.wgsl but adds SDF circle effect blending
 
 struct Uniforms {
-    viewport_size: vec2<f32>,
+    viewport_size: vec2<f32>
 }
 
 struct CircleEffectUniforms {

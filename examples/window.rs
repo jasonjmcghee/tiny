@@ -6,7 +6,7 @@ use tiny_editor::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let doc = Doc::from_str(include_str!("../assets/sample.rs"));
+    let doc = Doc::from_str(&include_str!("../assets/sample.rs").repeat(10));
 
     TinyApp::new(EditorLogic::new(doc))
         .with_title("Tiny Editor - Ultra-Minimal")

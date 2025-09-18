@@ -1,8 +1,8 @@
 //! Simple scrolling test
 
-use tiny_editor::tree::{Doc, Content, Edit};
 use tiny_editor::app::{AppLogic, TinyApp};
 use tiny_editor::coordinates::DocPos;
+use tiny_editor::tree::{Content, Doc, Edit};
 
 struct ScrollTestApp {
     doc: Doc,
@@ -13,7 +13,10 @@ impl ScrollTestApp {
     fn new() -> Self {
         let mut text = String::new();
         for i in 1..=100 {
-            text.push_str(&format!("Line {:03}: This is line number {} out of 100 total lines\n", i, i));
+            text.push_str(&format!(
+                "Line {:03}: This is line number {} out of 100 total lines\n",
+                i, i
+            ));
         }
         Self {
             doc: Doc::from_str(&text),
