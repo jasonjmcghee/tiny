@@ -312,8 +312,6 @@ pub fn create_rust_highlighter() -> Box<dyn TextStyleProvider> {
     Box::new(SyntaxHighlighter::new_rust())
 }
 
-// Old style system removed - replaced with TextStyleProvider
-
 #[cfg(test)]
 mod tests {
     use super::*;

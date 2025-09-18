@@ -26,7 +26,8 @@ pub use history::History;
 pub use input::{InputHandler, Selection};
 pub use render::{BatchedDraw, RenderOp, Renderer};
 pub use syntax::SyntaxHighlighter;
-pub use tree::{Content, Doc, Edit, Point, Rect, Span, Tree, Widget};
+pub use tree::{Content, Doc, Edit, Point, Rect, Span, Tree};
+pub use widget::{Widget, WidgetEvent, EventResponse, LayoutConstraints, LayoutResult, WidgetId};
 pub use widget::{CursorWidget, SelectionWidget, StyleId, TextWidget};
 
 use std::path::Path;

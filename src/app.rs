@@ -8,8 +8,11 @@ use crate::{
     gpu::GpuRenderer,
     input::InputHandler,
     render::Renderer,
+    syntax::SyntaxHighlighter,
+    text_effects::TextStyleProvider,
     tree::{Doc, Point, Rect},
 };
+use std::any::TypeId;
 #[allow(unused)]
 use std::io::BufRead;
 use std::sync::Arc;
@@ -27,7 +30,7 @@ enum ScrollDirection {
 }
 
 /// Trait for handling application-specific logic
-pub trait AppLogic {
+pub trait AppLogic: 'static {
     /// Handle keyboard input
     fn on_key(
         &mut self,
@@ -122,6 +125,9 @@ pub struct TinyApp<T: AppLogic> {
     // Track mouse drag
     mouse_pressed: bool,
     drag_start: Option<winit::dpi::PhysicalPosition<f64>>,
+
+    // Key track
+    just_pressed_key: bool,
 }
 
 impl<T: AppLogic> TinyApp<T> {
@@ -141,6 +147,7 @@ impl<T: AppLogic> TinyApp<T> {
             modifiers: winit::event::Modifiers::default(),
             mouse_pressed: false,
             drag_start: None,
+            just_pressed_key: false,
         }
     }
 
@@ -238,6 +245,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
+                    self.just_pressed_key = true;
                     // Check for scroll lock toggle (F12 key)
                     if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) =
                         event.logical_key
@@ -451,11 +459,14 @@ impl<T: AppLogic> TinyApp<T> {
             // Update logic
             self.logic.on_update();
 
-            // Only scroll to cursor if it moved via keyboard, not every frame
-            // This prevents fighting with manual mouse wheel scrolling
-            if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
-                let layout_pos = cpu_renderer.viewport().doc_to_layout(cursor_pos);
-                cpu_renderer.viewport_mut().ensure_visible(layout_pos);
+            if self.just_pressed_key {
+                self.just_pressed_key = false;
+                // Only scroll to cursor if it moved via keyboard, not every frame
+                // This prevents fighting with manual mouse wheel scrolling
+                if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
+                    let layout_pos = cpu_renderer.viewport().doc_to_layout(cursor_pos);
+                    cpu_renderer.viewport_mut().ensure_visible(layout_pos);
+                }
             }
 
             // Calculate viewport dimensions
@@ -466,6 +477,17 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Update CPU renderer viewport - this is where scale factor should be handled
             cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
+
+            // Set up syntax highlighting if this is EditorLogic
+            // This is a bit hacky but works for now
+            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<EditorLogic>() {
+                // We know T is EditorLogic, so we can set the text styles
+                // But we need unsafe transmute since we can't prove it at compile time
+                let editor_logic = unsafe { &*((&self.logic) as *const T as *const EditorLogic) };
+                if let Some(highlighter) = editor_logic.syntax_highlighter() {
+                    cpu_renderer.set_text_styles_ref(highlighter);
+                }
+            }
 
             // Define viewport for rendering
             let viewport = Rect {
@@ -499,14 +521,31 @@ impl<T: AppLogic> TinyApp<T> {
 pub struct EditorLogic {
     pub doc: Doc,
     pub input: InputHandler,
+    pub syntax_highlighter: Option<Box<dyn TextStyleProvider>>,
 }
 
 impl EditorLogic {
     pub fn new(doc: Doc) -> Self {
+        // Always enable Rust syntax highlighting
+        let syntax_highlighter: Box<dyn TextStyleProvider> =
+            Box::new(SyntaxHighlighter::new_rust());
+
+        // Request initial highlight
+        let text = doc.read().to_string();
+        syntax_highlighter.request_update(&text, doc.version());
+
         Self {
             doc,
             input: InputHandler::new(),
+            syntax_highlighter: Some(syntax_highlighter),
         }
+    }
+}
+
+impl EditorLogic {
+    /// Get a reference to the syntax highlighter if available
+    pub fn syntax_highlighter(&self) -> Option<&dyn TextStyleProvider> {
+        self.syntax_highlighter.as_ref().map(|h| &**h)
     }
 }
 
@@ -519,6 +558,12 @@ impl AppLogic for EditorLogic {
     ) -> bool {
         // Delegate to InputHandler
         self.input.on_key(&self.doc, viewport, event, modifiers);
+
+        // Update syntax highlighting after text changes
+        if let Some(ref highlighter) = self.syntax_highlighter {
+            let text = self.doc.read().to_string();
+            highlighter.request_update(&text, self.doc.version());
+        }
 
         // Always redraw after keyboard input for now
         // InputHandler handles the actual logic

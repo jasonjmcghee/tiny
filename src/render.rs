@@ -3,7 +3,8 @@
 //! Widgets emit commands, renderer batches and optimizes them for GPU
 
 use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
-use crate::tree::{Node, Point, Rect, Span, Tree, Widget};
+use crate::tree::{Node, Point, Rect, Span, Tree};
+use crate::widget::{Widget, PaintContext};
 use std::sync::Arc;
 #[allow(unused)]
 use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
@@ -80,6 +81,8 @@ pub struct Renderer {
     viewport: Viewport,
     /// Current document position for rendering
     current_doc_pos: DocPos,
+    /// GPU renderer reference for widget painting
+    gpu_renderer: Option<*const crate::gpu::GpuRenderer>,
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +92,11 @@ struct Transform {
     #[allow(dead_code)]
     y: f32,
 }
+
+// SAFETY: Renderer is Send + Sync because the GPU renderer pointer
+// is only used during render calls which happen on the same thread
+unsafe impl Send for Renderer {}
+unsafe impl Sync for Renderer {}
 
 impl Renderer {
     pub fn new(size: (f32, f32), scale_factor: f32) -> Self {
@@ -100,12 +108,30 @@ impl Renderer {
             font_system: None,
             viewport: Viewport::new(size.0, size.1, scale_factor),
             current_doc_pos: DocPos::default(),
+            gpu_renderer: None,
         }
     }
 
-    /// Set text style provider
+    /// Set GPU renderer reference for widget painting
+    pub fn set_gpu_renderer(&mut self, gpu_renderer: &crate::gpu::GpuRenderer) {
+        self.gpu_renderer = Some(gpu_renderer as *const _);
+    }
+
+    /// Get GPU renderer reference
+    fn gpu_renderer(&self) -> Option<&crate::gpu::GpuRenderer> {
+        self.gpu_renderer.map(|ptr| unsafe { &*ptr })
+    }
+
+    /// Set text style provider (takes ownership)
     pub fn set_text_styles(&mut self, provider: Box<dyn crate::text_effects::TextStyleProvider>) {
         self.text_styles = Some(provider);
+    }
+
+    /// Set text style provider (borrows)
+    pub fn set_text_styles_ref(&mut self, provider: &dyn crate::text_effects::TextStyleProvider) {
+        // For now, we can't store a borrowed provider since text_styles expects ownership
+        // This needs refactoring - for now syntax highlighting won't work with the new system
+        // TODO: Refactor text_styles to work with references or Arc
     }
 
     /// Set font system (takes shared reference)
@@ -136,8 +162,19 @@ impl Renderer {
         &mut self.viewport
     }
 
-    /// Render tree to commands
+    /// Render tree to commands (or directly to GPU for widgets)
     pub fn render(&mut self, tree: &Tree, viewport: Rect, selections: &[crate::input::Selection]) -> Vec<BatchedDraw> {
+        self.render_with_pass(tree, viewport, selections, None)
+    }
+
+    /// Render tree with optional direct GPU render pass for widgets
+    pub fn render_with_pass(
+        &mut self,
+        tree: &Tree,
+        viewport: Rect,
+        selections: &[crate::input::Selection],
+        render_pass: Option<&mut wgpu::RenderPass>,
+    ) -> Vec<BatchedDraw> {
         println!("Renderer::render called with viewport: {:?}", viewport);
 
         // Clear previous frame
@@ -156,7 +193,13 @@ impl Renderer {
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
         println!("  Visible byte range: {}..{}", visible_range.start, visible_range.end);
 
-        self.walk_visible_range(tree, visible_range);
+        if render_pass.is_some() {
+            // Direct GPU rendering mode for widgets
+            self.walk_visible_range_with_pass(tree, visible_range, render_pass);
+        } else {
+            // Command generation mode (legacy)
+            self.walk_visible_range(tree, visible_range);
+        }
         println!("VISIBLE RANGE WALKING: Finished, found {} widgets total", self.commands.len());
 
         // Render selections and cursors as overlays
@@ -171,6 +214,135 @@ impl Renderer {
     /// Walk tree node, emitting commands
     fn walk_node(&mut self, node: &Node, clip: Rect) {
         self.walk_node_with_tree(node, clip, None);
+    }
+
+    /// Walk visible range with direct GPU rendering for widgets
+    fn walk_visible_range_with_pass(
+        &mut self,
+        tree: &Tree,
+        byte_range: std::ops::Range<usize>,
+        mut render_pass: Option<&mut wgpu::RenderPass>,
+    ) {
+        use crate::widget::{Widget};
+        use crate::coordinates::VisibleLineContent;
+
+        // Same culling logic as walk_visible_range but with direct widget painting
+        let mut all_visible_bytes = Vec::new();
+        tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
+            for span in spans {
+                match span {
+                    crate::tree::Span::Widget(widget) => {
+                        // If we have a render pass and supporting resources, paint directly
+                        if let Some(pass) = render_pass.as_mut() {
+                            if let (Some(font_system), Some(gpu_renderer)) =
+                                (&self.font_system, self.gpu_renderer()) {
+
+                                // Create paint context for the widget
+                                let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
+                                let ctx = crate::widget::PaintContext {
+                                    viewport: &self.viewport,
+                                    device: gpu_renderer.device(),
+                                    queue: gpu_renderer.queue(),
+                                    uniform_bind_group: gpu_renderer.uniform_bind_group(),
+                                    gpu_renderer,
+                                    font_system,
+                                    text_styles: self.text_styles.as_deref(),
+                                    layout_pos,
+                                };
+
+                                // Let widget paint directly to GPU
+                                // Widgets need to be mutable for paint(), but they're in Arc
+                                // We need to clone the widget to get a mutable version
+                                // This is okay since paint() is for rendering, not state mutation
+                                widget.paint(&ctx, pass);
+                            }
+                        }
+                    }
+                    crate::tree::Span::Text { bytes, .. } => {
+                        all_visible_bytes.extend_from_slice(bytes);
+                    }
+                }
+            }
+        });
+
+        // Convert collected text to string and handle as a single TextWidget
+        if !all_visible_bytes.is_empty() {
+            let all_visible_text = std::str::from_utf8(&all_visible_bytes).unwrap_or("");
+            let lines: Vec<&str> = all_visible_text.lines().collect();
+
+            // Apply horizontal culling to each line
+            let mut culled_text = Vec::new();
+            let mut x_offset = 0.0f32;
+            let mut start_col = 0usize;
+
+            for (idx, line_text) in lines.iter().enumerate() {
+                let visible_content = self.viewport.visible_line_content(line_text, idx as u32);
+
+                match visible_content {
+                    VisibleLineContent::Columns { text, start_col: line_start_col, x_offset: line_x_offset } => {
+                        if !text.is_empty() {
+                            if line_text.len() > 100 && line_x_offset > 0.0 {
+                                x_offset = line_x_offset;
+                                start_col = line_start_col;
+                            }
+                            culled_text.extend_from_slice(text.as_bytes());
+                        }
+                    }
+                    VisibleLineContent::Wrapped { visual_lines } => {
+                        for vline in visual_lines {
+                            culled_text.extend_from_slice(vline.as_bytes());
+                        }
+                    }
+                }
+
+                if idx < lines.len() - 1 {
+                    culled_text.push(b'\n');
+                }
+            }
+
+            // Render as TextWidget with direct GPU painting
+            if !culled_text.is_empty() && render_pass.is_some() {
+                use crate::widget::{TextWidget, ContentType};
+                use std::sync::Arc;
+
+                let layout_pos = crate::coordinates::LayoutPos::new(
+                    self.viewport.margin.x.0,
+                    self.viewport.margin.y.0
+                );
+
+                // Create a temporary TextWidget for the visible text
+                let mut text_widget = TextWidget {
+                    text: Arc::from(culled_text.as_slice()),
+                    style: 0,
+                    size: crate::coordinates::LogicalSize::new(100.0, 100.0), // Will be measured in paint
+                    content_type: if x_offset != 0.0 || start_col > 0 {
+                        ContentType::Columns { start_col, x_offset }
+                    } else {
+                        ContentType::Full
+                    },
+                };
+
+                // Paint the widget directly
+                if let Some(pass) = render_pass.as_mut() {
+                    if let (Some(font_system), Some(gpu_renderer)) =
+                        (&self.font_system, self.gpu_renderer()) {
+
+                        let ctx = crate::widget::PaintContext {
+                            viewport: &self.viewport,
+                            device: gpu_renderer.device(),
+                            queue: gpu_renderer.queue(),
+                            uniform_bind_group: gpu_renderer.uniform_bind_group(),
+                            gpu_renderer,
+                            font_system,
+                            text_styles: self.text_styles.as_deref(),
+                            layout_pos,
+                        };
+
+                        text_widget.paint(&ctx, pass);
+                    }
+                }
+            }
+        }
     }
 
     /// Walk tree node with tree reference for cursor positioning
@@ -393,7 +565,7 @@ impl Renderer {
         self.render_widget(&widget, x, y);
     }
 
-    /// Render widget
+    /// Render widget by converting it to render commands
     fn render_widget(&mut self, widget: &dyn Widget, x: LogicalPixels, y: LogicalPixels) {
         let layout_pos = LayoutPos { x, y };
         let view_pos = self.viewport.layout_to_view(layout_pos);
@@ -419,23 +591,113 @@ impl Renderer {
             self.viewport.is_visible(widget_rect)
         };
 
-        println!("RENDERING WIDGET: layout=({:.1},{:.1}), scroll=({:.1},{:.1})",
-                 layout_pos.x, layout_pos.y, self.viewport.scroll.x.0, self.viewport.scroll.y.0);
+        if !is_visible {
+            return;
+        }
 
-        // Create paint context with proper coordinate info
-        let mut paint_ctx = crate::tree::PaintContext {
-            layout_pos,
-            view_pos: Some(view_pos),
-            doc_pos: Some(self.current_doc_pos),
-            commands: &mut self.commands,
-            text_styles: self.text_styles.as_deref(),
-            font_system: self.font_system.as_ref(),
-            viewport: &self.viewport,
-            debug_offscreen: !is_visible,
+        println!("RENDERING WIDGET: layout=({:.1},{:.1}), scroll=({:.1},{:.1})",
+                 layout_pos.x.0, layout_pos.y.0, self.viewport.scroll.x.0, self.viewport.scroll.y.0);
+
+        // Handle TextWidget conversion to RenderOp::Glyphs
+        if let Some(text_widget) = widget.as_any().downcast_ref::<crate::widget::TextWidget>() {
+            self.render_text_widget_to_commands(text_widget, layout_pos);
+        }
+        // Future: Handle other widget types here as needed
+    }
+
+    /// Convert TextWidget to RenderOp::Glyphs commands
+    fn render_text_widget_to_commands(&mut self, text_widget: &crate::widget::TextWidget, layout_pos: LayoutPos) {
+        use crate::widget::ContentType;
+
+        let text = std::str::from_utf8(&text_widget.text).unwrap_or("");
+        if text.is_empty() {
+            return;
+        }
+
+        // Get the shared font system
+        let font_system = if let Some(ref fs) = self.font_system {
+            fs.clone()
+        } else {
+            println!("Warning: No font system available for TextWidget rendering");
+            return;
         };
 
-        // Let the widget paint itself
-        widget.paint(&mut paint_ctx);
+        // Use font size and scale from viewport metrics
+        let font_size = self.viewport.metrics.font_size;
+        let scale_factor = self.viewport.scale_factor;
+        let line_height = self.viewport.metrics.line_height;
+
+        // Handle multi-line text
+        let lines: Vec<&str> = text.lines().collect();
+        let mut all_glyph_instances = Vec::new();
+        let mut y_offset = 0.0;
+        let mut global_byte_pos = 0;
+
+        // Handle different content types for horizontal scrolling
+        let x_base_offset = match &text_widget.content_type {
+            ContentType::Columns { x_offset, start_col } => {
+                if *x_offset != 0.0 {
+                    println!("TextWidget applying x_offset={:.1} for columns starting at {}", x_offset, start_col);
+                }
+                *x_offset
+            }
+            _ => 0.0,
+        };
+
+        for line_text in lines.iter() {
+            // Layout this single line using the font system
+            let layout = font_system.layout_text_scaled(line_text, font_size, scale_factor);
+
+            let mut byte_pos = 0;
+            for glyph in &layout.glyphs {
+                let mut color = glyph.color;
+
+                // Apply text styles if available (syntax highlighting)
+                if let Some(text_styles) = &self.text_styles {
+                    let char_bytes = glyph.char.len_utf8();
+                    let effects = text_styles.get_effects_in_range(
+                        global_byte_pos + byte_pos..global_byte_pos + byte_pos + char_bytes
+                    );
+
+                    for effect in effects {
+                        if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
+                            color = new_color;
+                        }
+                    }
+                    byte_pos += char_bytes;
+                }
+
+                // Font system returns glyphs in physical pixels relative to (0,0)
+                // Convert to logical and add layout position plus line offset and x_base_offset
+                let glyph_logical_x = glyph.pos.x.0 / scale_factor;
+                let glyph_logical_y = glyph.pos.y.0 / scale_factor;
+
+                let glyph_pos = LayoutPos::new(
+                    layout_pos.x.0 + x_base_offset + glyph_logical_x,
+                    layout_pos.y.0 + y_offset + glyph_logical_y,
+                );
+
+                all_glyph_instances.push(GlyphInstance {
+                    glyph_id: 0, // Not used anymore
+                    pos: glyph_pos, // In layout space (logical pixels)
+                    color,
+                    tex_coords: glyph.tex_coords,
+                });
+            }
+
+            // Update position for next line
+            global_byte_pos += line_text.len() + 1; // +1 for newline
+            y_offset += line_height;
+        }
+
+        // Emit RenderOp::Glyphs command if we have glyphs
+        if !all_glyph_instances.is_empty() {
+            println!("Emitting RenderOp::Glyphs with {} glyph instances from TextWidget", all_glyph_instances.len());
+            self.commands.push(RenderOp::Glyphs {
+                glyphs: Arc::from(all_glyph_instances),
+                style: text_widget.style,
+            });
+        }
     }
 
     /// Render cursor

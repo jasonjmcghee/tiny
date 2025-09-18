@@ -10,6 +10,12 @@
 //! for crisp rendering, bypassing the normal logical->physical transformation.
 
 use std::sync::Arc;
+
+// === Scrolloff Configuration (Neovim-style) ===
+/// Number of lines to keep visible above/below cursor when scrolling vertically
+const VERTICAL_SCROLLOFF_LINES: f32 = 4.0;
+/// Number of characters to keep visible left/right of cursor when scrolling horizontally
+const HORIZONTAL_SCROLLOFF_CHARS: f32 = 8.0;
 // === Line Rendering Mode ===
 
 /// How lines should be rendered - with horizontal scroll or soft wrap
@@ -608,9 +614,8 @@ impl Viewport {
         let old_scroll_x = self.scroll.x.0;
         let old_scroll_y = self.scroll.y.0;
 
-        // Vertical scrolling with 4-line scrolloff margin (like Neovim)
-        let v_scrolloff_lines = 4.0;
-        let v_scrolloff = v_scrolloff_lines * self.metrics.line_height;
+        // Vertical scrolling with configurable scrolloff margin
+        let v_scrolloff = VERTICAL_SCROLLOFF_LINES * self.metrics.line_height;
 
         // Top margin check - if cursor goes above scrolloff area, scroll up one line
         let top_margin = self.scroll.y.0 + v_scrolloff;
@@ -626,9 +631,8 @@ impl Viewport {
             self.scroll.y.0 = pos.y.0 - self.logical_size.height.0 + v_scrolloff + self.metrics.line_height;
         }
 
-        // Horizontal scrolling with 8-character scrolloff margin (like Neovim)
-        let h_scrolloff_chars = 8.0;
-        let h_scrolloff = h_scrolloff_chars * self.metrics.space_width;
+        // Horizontal scrolling with configurable scrolloff margin
+        let h_scrolloff = HORIZONTAL_SCROLLOFF_CHARS * self.metrics.space_width;
 
         // Left margin check - if cursor goes before scrolloff area, scroll left one character
         let left_margin = self.scroll.x.0 + h_scrolloff;

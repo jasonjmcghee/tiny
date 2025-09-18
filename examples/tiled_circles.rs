@@ -4,6 +4,8 @@
 //! Demonstrates widget composition, custom rendering, and event handling.
 
 use std::sync::Arc;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::ops::Range;
 use tiny_editor::{
     coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport},
@@ -13,6 +15,7 @@ use tiny_editor::{
     tree::Doc,
     render::{Renderer, BatchedDraw, GlyphInstance, RectInstance},
     input::{InputHandler},
+    widget::{Widget, WidgetId, WidgetEvent, EventResponse, LayoutConstraints, LayoutResult},
 };
 use winit::{
     application::ApplicationHandler,
@@ -20,9 +23,6 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
-
-/// Widget identifier for texture access
-pub type WidgetId = u64;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Tiled Circle Trackers...");
@@ -34,49 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// === New Widget System (Prototype) ===
-
-/// Widget event types
-#[derive(Debug, Clone)]
-enum WidgetEvent {
-    MouseMove(LayoutPos),
-    MouseEnter,
-    MouseLeave,
-    MouseClick(LayoutPos, winit::event::MouseButton),
-    KeyboardInput(winit::event::KeyEvent, winit::event::Modifiers),
-}
-
-/// Event response from widgets
-#[derive(Debug, Clone)]
-enum EventResponse {
-    Handled,
-    Ignored,
-    Redraw, // Widget needs redraw
-}
-
-/// Layout constraints for widgets
-#[derive(Debug, Clone, Copy)]
-struct LayoutConstraints {
-    max_width: LogicalPixels,
-    max_height: LogicalPixels,
-}
-
-/// Layout result from widget
-#[derive(Debug, Clone, Copy)]
-struct LayoutResult {
-    size: LogicalSize,
-}
-
-/// Paint context for widgets with full GPU access
-struct PaintContext<'a> {
-    viewport: &'a Viewport,
-    device: &'a wgpu::Device,
-    queue: &'a wgpu::Queue,
-    uniform_bind_group: &'a wgpu::BindGroup,
-    gpu_renderer: &'a GpuRenderer,
-    font_system: &'a Arc<SharedFontSystem>, // For text rendering
-    text_styles: Option<&'a dyn TextStyleProvider>, // Text effects for this frame
-}
+// === Widget System Extensions ===
 
 
 /// Data passed to circle SDF shader
@@ -100,13 +58,22 @@ struct CircleTracker {
     circle_color: u32,
     render_priority: i32, // Render priority for layering
 
-    // Custom rendering resources (created lazily)
-    circle_pipeline: Option<wgpu::RenderPipeline>,
-    vertex_buffer: Option<wgpu::Buffer>,
-    circle_uniform_buffer: Option<wgpu::Buffer>,
-    circle_bind_group: Option<wgpu::BindGroup>,
-    background_vertex_buffer: Option<wgpu::Buffer>, // Separate buffer for backgrounds
+    // Custom rendering resources (created lazily, single-threaded)
+    resources: Rc<RefCell<CircleResources>>,
 }
+
+struct CircleResources {
+    circle_pipeline: Option<Arc<wgpu::RenderPipeline>>,
+    vertex_buffer: Option<Arc<wgpu::Buffer>>,
+    circle_uniform_buffer: Option<Arc<wgpu::Buffer>>,
+    circle_bind_group: Option<Arc<wgpu::BindGroup>>,
+    background_vertex_buffer: Option<Arc<wgpu::Buffer>>,
+}
+
+// SAFETY: CircleTracker is only used on the main thread during rendering
+// RefCell ensures runtime borrow checking for safe mutation
+unsafe impl Send for CircleTracker {}
+unsafe impl Sync for CircleTracker {}
 
 impl CircleTracker {
     fn new(id: WidgetId, bounds: LayoutRect, color: u32) -> Self {
@@ -117,11 +84,13 @@ impl CircleTracker {
             is_hovered: false,
             circle_color: color,
             render_priority: 0, // Default priority
-            circle_pipeline: None,
-            vertex_buffer: None,
-            circle_uniform_buffer: None,
-            circle_bind_group: None,
-            background_vertex_buffer: None,
+            resources: Rc::new(RefCell::new(CircleResources {
+                circle_pipeline: None,
+                vertex_buffer: None,
+                circle_uniform_buffer: None,
+                circle_bind_group: None,
+                background_vertex_buffer: None,
+            })),
         }
     }
 
@@ -131,8 +100,9 @@ impl CircleTracker {
     }
 
     /// Create SDF circle pipeline and resources (called lazily)
-    fn ensure_circle_pipeline(&mut self, ctx: &PaintContext) {
-        if self.circle_pipeline.is_some() {
+    fn ensure_circle_pipeline(&self, ctx: &tiny_editor::widget::PaintContext<'_>) {
+        let mut resources = self.resources.borrow_mut();
+        if resources.circle_pipeline.is_some() {
             return; // Already created
         }
 
@@ -305,24 +275,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             mapped_at_creation: false,
         });
 
-        self.circle_pipeline = Some(pipeline);
-        self.vertex_buffer = Some(vertex_buffer);
-        self.circle_uniform_buffer = Some(circle_uniform_buffer);
-        self.circle_bind_group = Some(circle_bind_group);
+        resources.circle_pipeline = Some(Arc::new(pipeline));
+        resources.vertex_buffer = Some(Arc::new(vertex_buffer));
+        resources.circle_uniform_buffer = Some(Arc::new(circle_uniform_buffer));
+        resources.circle_bind_group = Some(Arc::new(circle_bind_group));
 
         println!("Circle SDF pipeline created successfully!");
     }
 
     /// Draw widget background and border using the existing rect pipeline
-    fn draw_background(&mut self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
+    fn draw_background(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+        let mut resources = self.resources.borrow_mut();
         // Create background vertex buffer if needed
-        if self.background_vertex_buffer.is_none() {
-            self.background_vertex_buffer = Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        if resources.background_vertex_buffer.is_none() {
+            resources.background_vertex_buffer = Some(Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Widget Background Buffer"),
                 size: 360, // 30 vertices * 12 bytes each (plenty for background + borders)
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            }));
+            })));
         }
         let scale = ctx.viewport.scale_factor;
         let bg_color = if self.is_hovered { 0xFF333333 } else { 0xFF222222 };
@@ -359,7 +330,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         // Upload and draw all rectangles in one call using our own buffer
         if !vertices.is_empty() {
-            if let Some(bg_buffer) = &self.background_vertex_buffer {
+            if let Some(bg_buffer) = &resources.background_vertex_buffer {
                 ctx.queue.write_buffer(bg_buffer, 0, bytemuck::cast_slice(&vertices));
                 render_pass.set_pipeline(ctx.gpu_renderer.rect_pipeline());
                 render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
@@ -389,7 +360,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 }
 
-impl InteractiveWidget for CircleTracker {
+impl Widget for CircleTracker {
     fn widget_id(&self) -> WidgetId {
         self.id
     }
@@ -455,7 +426,7 @@ impl InteractiveWidget for CircleTracker {
         }
     }
 
-    fn paint(&mut self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
+    fn paint(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
         // Draw widget background using existing rect pipeline first
         self.draw_background(ctx, render_pass);
 
@@ -498,8 +469,9 @@ impl InteractiveWidget for CircleTracker {
             ];
 
             // Upload vertices and uniforms
+            let resources = self.resources.borrow();
             if let (Some(vertex_buffer), Some(uniform_buffer), Some(_bind_group)) =
-                (&self.vertex_buffer, &self.circle_uniform_buffer, &self.circle_bind_group) {
+                (&resources.vertex_buffer, &resources.circle_uniform_buffer, &resources.circle_bind_group) {
 
                 ctx.queue.write_buffer(vertex_buffer, 0, bytemuck::cast_slice(&vertices));
                 ctx.queue.write_buffer(uniform_buffer, 0, bytemuck::cast_slice(&circle_uniform_data));
@@ -507,12 +479,12 @@ impl InteractiveWidget for CircleTracker {
 
             // Render with our custom pipeline
             if let (Some(pipeline), Some(vertex_buffer), Some(circle_bind_group)) =
-                (&self.circle_pipeline, &self.vertex_buffer, &self.circle_bind_group) {
+                (&resources.circle_pipeline, &resources.vertex_buffer, &resources.circle_bind_group) {
 
                 println!("Rendering circle with custom pipeline");
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]); // Viewport uniforms
-                render_pass.set_bind_group(1, circle_bind_group, &[]); // Circle uniforms
+                render_pass.set_bind_group(1, circle_bind_group.as_ref(), &[]); // Circle uniforms
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..4, 0..1); // Triangle strip
                 println!("Circle draw call completed");
@@ -528,6 +500,29 @@ impl InteractiveWidget for CircleTracker {
 
     fn priority(&self) -> i32 {
         self.render_priority
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_box(&self) -> Arc<dyn Widget> {
+        // Manual clone for CircleTracker
+        Arc::new(CircleTracker {
+            id: self.id,
+            bounds: self.bounds,
+            mouse_pos: self.mouse_pos,
+            is_hovered: self.is_hovered,
+            circle_color: self.circle_color,
+            render_priority: self.render_priority,
+            resources: Rc::new(RefCell::new(CircleResources {
+                circle_pipeline: None, // Reset GPU resources in clone
+                vertex_buffer: None,
+                circle_uniform_buffer: None,
+                circle_bind_group: None,
+                background_vertex_buffer: None,
+            })),
+        })
     }
 }
 
@@ -554,6 +549,10 @@ impl MouseCircleTextEffect {
         self.mouse_pos = pos;
     }
 }
+
+// SAFETY: MouseCircleTextEffect is only used on main thread during rendering
+unsafe impl Send for MouseCircleTextEffect {}
+unsafe impl Sync for MouseCircleTextEffect {}
 
 impl TextStyleProvider for MouseCircleTextEffect {
     fn get_effects_in_range(&self, range: Range<usize>) -> Vec<TextEffect> {
@@ -599,21 +598,21 @@ struct DocumentEditorWidget {
     id: WidgetId,
     bounds: LayoutRect,
     doc: Doc,
-    renderer: Renderer,
+    renderer: Rc<RefCell<Renderer>>,
     input: InputHandler,
     text_effect: MouseCircleTextEffect,
     render_priority: i32,
 
     // Custom glyph shader with SDF circle effects
-    circle_text_pipeline: Option<wgpu::RenderPipeline>,
-    mouse_uniform_buffer: Option<wgpu::Buffer>,
-    mouse_bind_group: Option<wgpu::BindGroup>,
+    circle_text_pipeline: Option<Arc<wgpu::RenderPipeline>>,
+    mouse_uniform_buffer: Option<Arc<wgpu::Buffer>>,
+    mouse_bind_group: Option<Arc<wgpu::BindGroup>>,
 }
 
 impl DocumentEditorWidget {
     fn new(id: WidgetId, bounds: LayoutRect, text: &str, viewport: Viewport) -> Self {
         let doc = Doc::from_str(text);
-        let renderer = Renderer::new((bounds.width.0, bounds.height.0), viewport.scale_factor);
+        let renderer = Rc::new(RefCell::new(Renderer::new((bounds.width.0, bounds.height.0), viewport.scale_factor)));
 
         // Don't set text effects on renderer - we'll pass them per-frame
         let text_effect = MouseCircleTextEffect::new(viewport.clone());
@@ -626,7 +625,6 @@ impl DocumentEditorWidget {
             input: InputHandler::new(),
             text_effect,
             render_priority: 0,
-            // Custom rendering resources
             circle_text_pipeline: None,
             mouse_uniform_buffer: None,
             mouse_bind_group: None,
@@ -639,7 +637,7 @@ impl DocumentEditorWidget {
     }
 
     /// Create custom glyph pipeline with SDF circle effects
-    fn ensure_circle_text_pipeline(&mut self, ctx: &PaintContext) {
+    fn ensure_circle_text_pipeline(&mut self, ctx: &mut tiny_editor::widget::PaintContext<'_>) {
         if self.circle_text_pipeline.is_some() {
             return;
         }
@@ -733,7 +731,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 }
 
-impl InteractiveWidget for DocumentEditorWidget {
+// SAFETY: DocumentEditorWidget is only used on main thread during rendering
+// Rc<RefCell<>> provides single-threaded interior mutability
+unsafe impl Send for DocumentEditorWidget {}
+unsafe impl Sync for DocumentEditorWidget {}
+
+impl Widget for DocumentEditorWidget {
     fn widget_id(&self) -> WidgetId {
         self.id
     }
@@ -769,7 +772,7 @@ impl InteractiveWidget for DocumentEditorWidget {
             WidgetEvent::MouseClick(pos, button) => {
                 if self.contains_point(*pos) {
                     // Handle click in document coordinates
-                    self.input.on_mouse_click(&self.doc, self.renderer.viewport(), *pos, *button, false);
+                    self.input.on_mouse_click(&self.doc, self.renderer.borrow().viewport(), *pos, *button, false);
                     EventResponse::Redraw
                 } else {
                     EventResponse::Ignored
@@ -777,7 +780,7 @@ impl InteractiveWidget for DocumentEditorWidget {
             }
             WidgetEvent::KeyboardInput(key_event, modifiers) => {
                 // Handle keyboard input using the existing InputHandler
-                self.input.on_key(&self.doc, self.renderer.viewport(), key_event, modifiers);
+                self.input.on_key(&self.doc, self.renderer.borrow().viewport(), key_event, modifiers);
                 EventResponse::Redraw
             }
             _ => EventResponse::Ignored,
@@ -786,8 +789,11 @@ impl InteractiveWidget for DocumentEditorWidget {
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         // Update renderer viewport to match widget bounds
-        self.renderer.update_viewport(self.bounds.width.0, self.bounds.height.0,
-                                    self.renderer.viewport().scale_factor);
+        {
+            let mut renderer = self.renderer.borrow_mut();
+            let scale_factor = renderer.viewport().scale_factor;
+            renderer.update_viewport(self.bounds.width.0, self.bounds.height.0, scale_factor);
+        }
         LayoutResult {
             size: LogicalSize {
                 width: self.bounds.width,
@@ -796,16 +802,18 @@ impl InteractiveWidget for DocumentEditorWidget {
         }
     }
 
-    fn paint(&mut self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Set font system on embedded renderer
-        self.renderer.set_font_system(ctx.font_system.clone());
+    fn paint(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+        // Set font system and GPU renderer on embedded renderer
+        {
+            let mut renderer = self.renderer.borrow_mut();
+            renderer.set_font_system(ctx.font_system.clone());
+            renderer.set_gpu_renderer(ctx.gpu_renderer);
+        }
 
         // Upload font atlas for this render pass
         let atlas_data = ctx.font_system.atlas_data();
         let (atlas_width, atlas_height) = ctx.font_system.atlas_size();
         ctx.gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
-
-        // Shader already registered during app setup
 
         // Create viewport rect for this widget (relative to widget bounds)
         let widget_viewport = tiny_editor::tree::Rect {
@@ -815,93 +823,64 @@ impl InteractiveWidget for DocumentEditorWidget {
             height: self.bounds.height,
         };
 
-        // Set text effects on renderer for this frame
-        self.renderer.set_text_styles(Box::new(self.text_effect.clone()));
+        // Always enable Rust syntax highlighting combined with mouse effects
+        let syntax_highlighter = tiny_editor::syntax::SyntaxHighlighter::new_rust();
+        let text = self.doc.read().to_string();
+        syntax_highlighter.request_update(&text, self.doc.version());
 
-        // Use embedded renderer to convert document to render commands
+        // Create a combined text style provider
+        struct CombinedTextStyles {
+            syntax: tiny_editor::syntax::SyntaxHighlighter,
+            mouse_effect: MouseCircleTextEffect,
+        }
+
+        impl tiny_editor::text_effects::TextStyleProvider for CombinedTextStyles {
+            fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<tiny_editor::text_effects::TextEffect> {
+                // Get syntax highlighting first
+                let mut effects = self.syntax.get_effects_in_range(range.clone());
+                // Then overlay mouse effects
+                effects.extend(self.mouse_effect.get_effects_in_range(range));
+                effects
+            }
+
+            fn request_update(&self, text: &str, version: u64) {
+                self.syntax.request_update(text, version);
+            }
+
+            fn name(&self) -> &str {
+                "combined_styles"
+            }
+        }
+
+        let combined_styles = CombinedTextStyles {
+            syntax: syntax_highlighter,
+            mouse_effect: self.text_effect.clone(),
+        };
+
+        self.renderer.borrow_mut().set_text_styles(Box::new(combined_styles));
+
+        // Use the new hybrid rendering with direct widget painting
         let selections = self.input.selections();
-        let batches = self.renderer.render(&self.doc.read(), widget_viewport, selections);
+        let batches = self.renderer.borrow_mut().render_with_pass(&self.doc.read(), widget_viewport, selections, Some(render_pass));
 
-        println!("Embedded renderer produced {} batches", batches.len());
-        for (i, batch) in batches.iter().enumerate() {
-            match batch {
-                BatchedDraw::GlyphBatch { instances, .. } => {
-                    println!("  Batch {}: GlyphBatch with {} instances", i, instances.len());
-                }
-                BatchedDraw::RectBatch { instances } => {
-                    println!("  Batch {}: RectBatch with {} instances", i, instances.len());
-                }
-                _ => {
-                    println!("  Batch {}: Other batch type", i);
-                }
+        // The hybrid renderer handles widget painting directly now
+        // We just need to handle our custom mouse circle shader effect
+        if let Some(mouse_pos) = self.text_effect.mouse_pos {
+            // Update mouse uniform data in the GPU renderer's effect buffer
+            let mouse_data: [f32; 4] = [
+                (mouse_pos.x.0 + self.bounds.x.0) * ctx.viewport.scale_factor, // Convert to physical + widget offset
+                (mouse_pos.y.0 + self.bounds.y.0) * ctx.viewport.scale_factor,
+                self.text_effect.circle_radius * ctx.viewport.scale_factor,
+                0.0, // padding
+            ];
+
+            // Update the effect uniform buffer directly
+            if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(1) {
+                ctx.queue.write_buffer(effect_buffer, 0, bytemuck::cast_slice(&mouse_data));
             }
         }
 
-        // Execute batches directly, transforming coordinates
-        for batch in &batches {
-            match batch {
-                BatchedDraw::GlyphBatch { instances, .. } => {
-                    // Transform glyph positions to widget coordinates
-                    let mut transformed_instances = Vec::new();
-                    for instance in instances {
-                        let mut transformed = instance.clone();
-                        // Add widget offset (glyphs are already in physical coordinates)
-                        transformed.pos.x = transformed.pos.x + self.bounds.x;
-                        transformed.pos.y = transformed.pos.y + self.bounds.y;
-                        transformed_instances.push(transformed);
-                    }
-
-                    // Check if this widget has shader effects and use appropriate pipeline
-                    let shader_id = if self.text_effect.mouse_pos.is_some() {
-                        Some(1) // Use circle SDF shader
-                    } else {
-                        None // Use default glyph shader
-                    };
-
-                    // Update effect uniforms if using custom shader
-                    if let Some(1) = shader_id {
-                        if let Some(mouse_pos) = self.text_effect.mouse_pos {
-                            // Update mouse uniform data in the GPU renderer's effect buffer
-                            let mouse_data: [f32; 4] = [
-                                mouse_pos.x.0 * ctx.viewport.scale_factor, // Convert to physical
-                                mouse_pos.y.0 * ctx.viewport.scale_factor,
-                                self.text_effect.circle_radius * ctx.viewport.scale_factor,
-                                0.0, // padding
-                            ];
-
-                            // Update the effect uniform buffer directly
-                            if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(1) {
-                                ctx.queue.write_buffer(effect_buffer, 0, bytemuck::cast_slice(&mouse_data));
-                            }
-
-                            println!("Updated circle effect uniforms: mouse=({:.1}, {:.1}), radius={:.1}",
-                                    mouse_data[0] / ctx.viewport.scale_factor,
-                                    mouse_data[1] / ctx.viewport.scale_factor,
-                                    mouse_data[2] / ctx.viewport.scale_factor);
-                        }
-                    }
-
-                    // Use new draw method with shader effects
-                    ctx.gpu_renderer.draw_glyphs_with_effects(render_pass, &transformed_instances, ctx.viewport.scale_factor, shader_id);
-                }
-                BatchedDraw::RectBatch { instances } => {
-                    // Transform rectangle positions for cursors/selections
-                    let mut transformed_rects = Vec::new();
-                    for instance in instances {
-                        let mut transformed = instance.clone();
-                        // Add widget offset
-                        transformed.rect.x = transformed.rect.x + self.bounds.x;
-                        transformed.rect.y = transformed.rect.y + self.bounds.y;
-                        transformed_rects.push(transformed);
-                    }
-
-                    ctx.gpu_renderer.draw_rects(render_pass, &transformed_rects, ctx.viewport.scale_factor);
-                }
-                _ => {}
-            }
-        }
-
-        println!("Document editor widget rendered {} batches with actual text!", batches.len());
+        println!("Document editor widget painted using hybrid renderer with {} batches!", batches.len());
     }
 
     fn bounds(&self) -> LayoutRect {
@@ -910,6 +889,16 @@ impl InteractiveWidget for DocumentEditorWidget {
 
     fn priority(&self) -> i32 {
         self.render_priority
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_box(&self) -> Arc<dyn Widget> {
+        // For now, DocumentEditorWidget cannot be cloned due to non-cloneable fields
+        // This would need refactoring for a real implementation
+        panic!("DocumentEditorWidget cloning not supported yet")
     }
 }
 
@@ -943,7 +932,11 @@ impl TiledLayout {
     }
 }
 
-impl InteractiveWidget for TiledLayout {
+// SAFETY: TiledLayout is only used on main thread during rendering
+unsafe impl Send for TiledLayout {}
+unsafe impl Sync for TiledLayout {}
+
+impl Widget for TiledLayout {
     fn widget_id(&self) -> WidgetId {
         self.id
     }
@@ -1037,98 +1030,62 @@ impl InteractiveWidget for TiledLayout {
         }
     }
 
-    fn paint(&mut self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Collect widgets and sort by priority
-        let mut all_widgets: Vec<&mut dyn InteractiveWidget> = Vec::new();
-
-        if let Some(text_widget) = &mut self.text_widget {
-            all_widgets.push(text_widget);
-        }
-
-        if let Some(circle_widget) = &mut self.circle_widget {
-            all_widgets.push(circle_widget);
-        }
-
-        // Sort by priority
-        all_widgets.sort_by_key(|w| w.priority());
-
-        // Paint in priority order with automatic clipping
-        for widget in all_widgets {
-            // Apply scissor rectangle if widget wants clipping
-            if widget.clips_to_bounds() {
-                let bounds = widget.bounds();
+    fn paint(&self, ctx: &tiny_editor::widget::PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+        // Paint widgets directly without collecting mutable references
+        // Paint text widget first (lower priority)
+        if let Some(text_widget) = &self.text_widget {
+            if text_widget.clips_to_bounds() {
+                let bounds = text_widget.bounds();
                 let scale = ctx.viewport.scale_factor;
-
-                // Convert widget bounds to physical pixels for scissor rect
                 let scissor_x = (bounds.x.0 * scale) as u32;
                 let scissor_y = (bounds.y.0 * scale) as u32;
                 let scissor_width = (bounds.width.0 * scale) as u32;
                 let scissor_height = (bounds.height.0 * scale) as u32;
-
-                println!("Setting scissor rect for widget: ({}, {}) {}x{}",
-                         scissor_x, scissor_y, scissor_width, scissor_height);
-
                 render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
             }
-
-            // Paint widget content
-            widget.paint(ctx, render_pass);
-
-            // Clear scissor rect after widget
-            if widget.clips_to_bounds() {
-                // Reset to full viewport
+            text_widget.paint(ctx, render_pass);
+            if text_widget.clips_to_bounds() {
                 let viewport_width = ctx.viewport.physical_size.width;
                 let viewport_height = ctx.viewport.physical_size.height;
                 render_pass.set_scissor_rect(0, 0, viewport_width, viewport_height);
             }
         }
+
+        // Paint circle widget second (higher priority)
+        if let Some(circle_widget) = &self.circle_widget {
+            if circle_widget.clips_to_bounds() {
+                let bounds = circle_widget.bounds();
+                let scale = ctx.viewport.scale_factor;
+                let scissor_x = (bounds.x.0 * scale) as u32;
+                let scissor_y = (bounds.y.0 * scale) as u32;
+                let scissor_width = (bounds.width.0 * scale) as u32;
+                let scissor_height = (bounds.height.0 * scale) as u32;
+                render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+            }
+            circle_widget.paint(ctx, render_pass);
+            if circle_widget.clips_to_bounds() {
+                let viewport_width = ctx.viewport.physical_size.width;
+                let viewport_height = ctx.viewport.physical_size.height;
+                render_pass.set_scissor_rect(0, 0, viewport_width, viewport_height);
+            }
+        }
+
     }
 
     fn bounds(&self) -> LayoutRect {
         self.bounds
     }
-}
 
-/// Next-generation interactive widget trait
-trait InteractiveWidget {
-    /// Unique widget identifier
-    fn widget_id(&self) -> WidgetId;
-
-    /// Update widget state (animations, etc.)
-    fn update(&mut self, dt: f32) -> bool; // returns needs_redraw
-
-    /// Handle input events
-    fn handle_event(&mut self, event: &WidgetEvent) -> EventResponse;
-
-    /// Layout widget with given constraints
-    fn layout(&mut self, constraints: LayoutConstraints) -> LayoutResult;
-
-    /// Paint widget directly to GPU
-    fn paint(&mut self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass);
-
-    /// Widget's bounds for hit testing
-    fn bounds(&self) -> LayoutRect;
-
-    /// Render priority (higher values render later/on top)
-    fn priority(&self) -> i32 {
-        0 // Default priority
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    /// Output texture name (if this widget renders to a named texture for others to read)
-    fn output_texture_name(&self) -> Option<&str> {
-        None
-    }
-
-    /// Whether this widget should clip its content to its bounds
-    fn clips_to_bounds(&self) -> bool {
-        true // Default: clip content to widget bounds
-    }
-
-    /// Check if point is inside widget
-    fn contains_point(&self, point: LayoutPos) -> bool {
-        self.bounds().contains(point)
+    fn clone_box(&self) -> Arc<dyn Widget> {
+        // TiledLayout cannot be cloned due to non-cloneable child widgets
+        panic!("TiledLayout cloning not supported yet")
     }
 }
+
 
 // === Main Application ===
 
@@ -1448,7 +1405,7 @@ impl CircleApp {
                     occlusion_query_set: None,
                 });
 
-                let paint_ctx = PaintContext {
+                let paint_ctx = tiny_editor::widget::PaintContext {
                     viewport,
                     device: gpu_renderer.device(),
                     queue: gpu_renderer.queue(),
@@ -1456,6 +1413,7 @@ impl CircleApp {
                     gpu_renderer,
                     font_system: &font_system,
                     text_styles: None, // No global text styles, widgets provide their own
+                    layout_pos: LayoutPos::new(0.0, 0.0), // Legacy field
                 };
 
                 // Let widgets paint directly to the render pass

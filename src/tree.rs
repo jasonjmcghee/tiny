@@ -8,7 +8,8 @@ use simdutf8::basic::from_utf8;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, LogicalSize, ViewPos, Viewport};
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, ViewPos, Viewport};
+use crate::widget::{Widget, PaintContext};
 
 /// Maximum spans per leaf node (tuned for cache line)
 #[allow(dead_code)]
@@ -98,39 +99,6 @@ pub type Rect = LayoutRect;
 /// Point for hit testing (in layout space)
 pub type Point = LayoutPos;
 
-/// Widget trait - implemented by all visual elements
-pub trait Widget: Send + Sync {
-    /// Measure widget size (returns logical size)
-    fn measure(&self) -> LogicalSize;
-    /// Get z-index for layering
-    fn z_index(&self) -> i32;
-    /// Test if point hits this widget
-    fn hit_test(&self, pt: Point) -> bool;
-    /// Paint widget - generate render commands
-    fn paint(&self, ctx: &mut PaintContext<'_>);
-    /// Clone as trait object
-    fn clone_box(&self) -> Arc<dyn Widget>;
-}
-
-/// Context passed to widgets during painting
-pub struct PaintContext<'a> {
-    /// Widget's position in layout space (pre-scroll)
-    pub layout_pos: LayoutPos,
-    /// Widget's position in view space (post-scroll, None if off-screen)
-    pub view_pos: Option<ViewPos>,
-    /// Document position (if widget is text-related)
-    pub doc_pos: Option<DocPos>,
-    /// Current commands being built (widgets emit in LAYOUT space)
-    pub commands: &'a mut Vec<crate::render::RenderOp>,
-    /// Text style provider for syntax highlighting
-    pub text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
-    /// Font system for text layout and rasterization (shared reference)
-    pub font_system: Option<&'a std::sync::Arc<crate::font::SharedFontSystem>>,
-    /// Viewport for all coordinate transformations and metrics
-    pub viewport: &'a Viewport,
-    /// Debug flag: render in red if off-screen
-    pub debug_offscreen: bool,
-}
 
 // === Implementation ===
 
