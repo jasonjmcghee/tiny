@@ -592,8 +592,6 @@ impl TextStyleProvider for SyntaxHighlighter {
         result
     }
 
-    // Remove the duplicate method - it's not part of the trait
-
     fn request_update(&self, text: &str, version: u64) {
         println!("SYNTAX: OLD request_update called (no InputEdit) - this should be avoided!");
         // Send to background thread (non-blocking) without edit info
