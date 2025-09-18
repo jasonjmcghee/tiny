@@ -254,43 +254,12 @@ impl Widget for TextWidget {
     }
 
     fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        use crate::render::GlyphInstance;
+        use crate::font::create_glyph_instances;
 
         let text = std::str::from_utf8(&self.text).unwrap_or("");
         if text.is_empty() {
             return;
         }
-
-        static mut STYLE_DEBUG_COUNT: u32 = 0;
-        unsafe {
-            if STYLE_DEBUG_COUNT < 3 {
-                println!(
-                    "WIDGET PAINT: text_styles = {}, text len = {}",
-                    if ctx.text_styles.is_some() {
-                        "Some"
-                    } else {
-                        "None"
-                    },
-                    text.len()
-                );
-                STYLE_DEBUG_COUNT += 1;
-            }
-        }
-
-        // Get the shared font system from context
-        let font_system = ctx.font_system;
-
-        // Use font size from viewport metrics
-        let font_size = ctx.viewport.metrics.font_size;
-        let scale_factor = ctx.viewport.scale_factor;
-        let line_height = ctx.viewport.metrics.line_height;
-
-        // TextWidget now handles multi-line text for the virtualized visible range
-        let lines: Vec<&str> = text.lines().collect();
-
-        let mut all_glyph_instances = Vec::new();
-        let mut y_offset = 0.0;
-        let mut global_byte_pos = 0;
 
         // Handle different content types
         let x_base_offset = match &self.content_type {
@@ -301,72 +270,35 @@ impl Widget for TextWidget {
             _ => 0.0,
         };
 
-        for line_text in lines.iter() {
-            // Layout this single line - font system returns glyphs in physical pixels
-            let layout = font_system.layout_text_scaled(line_text, font_size, scale_factor);
+        let layout_pos = crate::coordinates::LayoutPos::new(
+            ctx.layout_pos.x.0 + x_base_offset,
+            ctx.layout_pos.y.0,
+        );
 
-            let mut byte_pos = 0;
-            for glyph in &layout.glyphs {
-                let mut color = glyph.color;
+        // Get effects for this text if available
+        let effects = if let Some(text_styles) = ctx.text_styles {
+            let text_range = self.original_byte_offset..(self.original_byte_offset + text.len());
+            text_styles.get_effects_in_range(text_range)
+        } else {
+            Vec::new()
+        };
 
-                // Apply text styles if available (syntax highlighting)
-                // Use original_byte_offset to map to the document position
-                if let Some(text_styles) = ctx.text_styles {
-                    let char_bytes = glyph.char.len_utf8();
-                    let doc_pos = self.original_byte_offset + global_byte_pos + byte_pos;
-                    let effects = text_styles.get_effects_in_range(doc_pos..doc_pos + char_bytes);
+        // Create glyph instances using the helper
+        let mut all_glyph_instances = create_glyph_instances(
+            ctx.font_system,
+            text,
+            layout_pos,
+            ctx.viewport.metrics.font_size,
+            ctx.viewport.scale_factor,
+            ctx.viewport.metrics.line_height,
+            if effects.is_empty() { None } else { Some(&effects) },
+            self.original_byte_offset,
+        );
 
-                    static mut DEBUG_COUNT: u32 = 0;
-                    unsafe {
-                        if DEBUG_COUNT < 5 && !effects.is_empty() {
-                            println!("WIDGET: Got {} effects for char '{}' at doc_pos {} (local byte {}, original_offset {})",
-                                     effects.len(), glyph.char, doc_pos, global_byte_pos + byte_pos, self.original_byte_offset);
-                            DEBUG_COUNT += 1;
-                        }
-                    }
-
-                    for effect in effects {
-                        if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
-                            color = new_color;
-                        }
-                    }
-                    byte_pos += char_bytes;
-                }
-
-                // Glyphs from font system are in physical pixels relative to (0,0)
-                // We need to:
-                // 1. Convert to logical pixels
-                // 2. Add layout position and offsets
-                // 3. Transform to view space (apply scroll)
-                // 4. Transform back to physical for GPU
-
-                let glyph_logical_x = glyph.pos.x.0 / scale_factor;
-                let glyph_logical_y = glyph.pos.y.0 / scale_factor;
-
-                // Position in layout space (logical pixels)
-                let layout_pos = crate::coordinates::LayoutPos::new(
-                    ctx.layout_pos.x.0 + x_base_offset + glyph_logical_x,
-                    ctx.layout_pos.y.0 + y_offset + glyph_logical_y,
-                );
-
-                // Transform to view space (apply scroll)
-                let view_pos = ctx.viewport.layout_to_view(layout_pos);
-
-                // Transform to physical pixels for GPU
-                let physical_pos = ctx.viewport.view_to_physical(view_pos);
-
-                // Create glyph instance with physical coordinates for GPU
-                all_glyph_instances.push(GlyphInstance {
-                    glyph_id: 0,
-                    pos: crate::coordinates::LayoutPos::new(physical_pos.x.0, physical_pos.y.0), // Store physical coords
-                    color,
-                    tex_coords: glyph.tex_coords,
-                });
-            }
-
-            // Update position for next line
-            global_byte_pos += line_text.len() + 1; // +1 for newline
-            y_offset += line_height;
+        // Transform all glyphs from layout to physical coordinates for GPU
+        for glyph in &mut all_glyph_instances {
+            let physical_pos = ctx.viewport.layout_to_physical(glyph.pos);
+            glyph.pos = crate::coordinates::LayoutPos::new(physical_pos.x.0, physical_pos.y.0);
         }
 
         // Check for shader effects in text styles and render with appropriate pipeline
@@ -418,7 +350,7 @@ impl Widget for TextWidget {
 
             // Render with or without shader effects
             if let Some(id) = shader_id {
-                ctx.gpu_renderer.draw_glyphs_with_effects(
+                ctx.gpu_renderer.draw_glyphs(
                     render_pass,
                     &all_glyph_instances,
                     1.0,
@@ -426,7 +358,7 @@ impl Widget for TextWidget {
                 );
             } else {
                 ctx.gpu_renderer
-                    .draw_glyphs(render_pass, &all_glyph_instances, 1.0);
+                    .draw_glyphs(render_pass, &all_glyph_instances, 1.0, None);
             }
         }
     }

@@ -9,14 +9,14 @@ fn main() {
     // Test 1: Create and manipulate document
     println!("1. Creating document...");
     let doc = Doc::from_str("Hello, world!");
-    println!("   Initial: {}", doc.read().to_string());
+    println!("   Initial: {}", doc.read().flatten_to_string());
 
     // Test 2: Lock-free reads
     println!("\n2. Testing lock-free reads...");
     let start = Instant::now();
     for _ in 0..1_000_000 {
         let snapshot = doc.read(); // This is lock-free!
-        let _ = snapshot.to_string();
+        let _ = snapshot.flatten_to_string();
     }
     let elapsed = start.elapsed();
     println!(
@@ -36,7 +36,7 @@ fn main() {
         content: Content::Text(" How are you?".to_string()),
     });
     doc.flush();
-    println!("   After edits: {}", doc.read().to_string());
+    println!("   After edits: {}", doc.read().flatten_to_string());
 
     // Test 4: Concurrent access (simulated)
     println!("\n4. Testing concurrent access...");
@@ -44,7 +44,7 @@ fn main() {
     std::thread::spawn(move || {
         // Reader thread
         for _ in 0..100 {
-            let _ = doc_clone.to_string();
+            let _ = doc_clone.flatten_to_string();
         }
     });
 
@@ -56,7 +56,7 @@ fn main() {
         });
     }
     doc.flush();
-    println!("   Final: {}", doc.read().to_string());
+    println!("   Final: {}", doc.read().flatten_to_string());
 
     // Test 5: Memory usage
     println!("\n5. Building large document...");

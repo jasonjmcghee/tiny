@@ -22,7 +22,11 @@ fn main() {
 }"#;
 
     let doc = Doc::from_str(initial_text);
-    println!("Initial document ({} bytes):\n{}\n", initial_text.len(), initial_text);
+    println!(
+        "Initial document ({} bytes):\n{}\n",
+        initial_text.len(),
+        initial_text
+    );
 
     // Create syntax highlighter with proper type
     let highlighter = Arc::new(SyntaxHighlighter::new(Languages::rust()).unwrap());
@@ -38,7 +42,10 @@ fn main() {
     // Show some key token positions
     for effect in effects_before.iter().take(5) {
         let text_slice = &initial_text[effect.range.clone()];
-        println!("  '{}' at {}..{}", text_slice, effect.range.start, effect.range.end);
+        println!(
+            "  '{}' at {}..{}",
+            text_slice, effect.range.start, effect.range.end
+        );
     }
 
     // Create an edit: insert 's' after 'let' (position 19)
@@ -52,17 +59,25 @@ fn main() {
 
     // Create TextEdit using our new helper
     let text_edit = create_text_edit(&tree_before, &edit);
-    println!("Created TextEdit: start_byte={}, old_end={}, new_end={}",
-             text_edit.start_byte, text_edit.old_end_byte, text_edit.new_end_byte);
-    println!("  start_position: line={}, col={}",
-             text_edit.start_position.row, text_edit.start_position.column);
+    println!(
+        "Created TextEdit: start_byte={}, old_end={}, new_end={}",
+        text_edit.start_byte, text_edit.old_end_byte, text_edit.new_end_byte
+    );
+    println!(
+        "  start_position: line={}, col={}",
+        text_edit.start_position.row, text_edit.start_position.column
+    );
 
     // Apply the edit to the document
     doc.edit(edit);
     doc.flush();
 
-    let text_after = doc.read().to_string();
-    println!("\nAfter edit ({} bytes):\n{}\n", text_after.len(), text_after);
+    let text_after = doc.read().flatten_to_string();
+    println!(
+        "\nAfter edit ({} bytes):\n{}\n",
+        text_after.len(),
+        text_after
+    );
 
     // Update syntax highlighter with edit information
     highlighter.request_update_with_edit(&text_after, doc.version(), Some(text_edit));
@@ -76,7 +91,10 @@ fn main() {
     let mut correct_highlighting = true;
     for effect in effects_after.iter().take(8) {
         let text_slice = &text_after[effect.range.clone()];
-        println!("  '{}' at {}..{}", text_slice, effect.range.start, effect.range.end);
+        println!(
+            "  '{}' at {}..{}",
+            text_slice, effect.range.start, effect.range.end
+        );
 
         // Check that the highlighted text makes sense
         if text_slice.is_empty() || effect.range.start >= effect.range.end {
@@ -99,13 +117,13 @@ fn main() {
         doc.edit(edit);
         doc.flush();
 
-        let text_current = doc.read().to_string();
+        let text_current = doc.read().flatten_to_string();
         highlighter.request_update_with_edit(&text_current, doc.version(), Some(text_edit));
     }
 
     std::thread::sleep(Duration::from_millis(200)); // Let all edits settle
 
-    let final_text = doc.read().to_string();
+    let final_text = doc.read().flatten_to_string();
     let final_effects = highlighter.get_visible_effects(&final_text, 0..final_text.len());
 
     println!("Final document:\n{}", final_text);

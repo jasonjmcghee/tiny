@@ -7,6 +7,7 @@ use crate::widget::Widget;
 use arc_swap::ArcSwap;
 use crossbeam::queue::SegQueue;
 use simdutf8::basic::from_utf8;
+use std::fmt::Display;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -485,7 +486,7 @@ impl Tree {
     }
 
     /// Convert to string for debugging/saving
-    pub fn to_string(&self) -> String {
+    pub fn flatten_to_string(&self) -> String {
         // Pre-allocate with total byte count to avoid reallocations
         let capacity = match &self.root {
             Node::Leaf { sums, .. } => sums.bytes,
@@ -629,7 +630,7 @@ mod tests {
     fn test_document_operations() {
         // Empty document
         let doc = Doc::from_str("");
-        assert_eq!(doc.read().to_string(), "");
+        assert_eq!(doc.read().flatten_to_string(), "");
         assert_eq!(doc.read().byte_count(), 0);
 
         // Insert at beginning
@@ -638,7 +639,7 @@ mod tests {
             content: Content::Text("A".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().to_string(), "A");
+        assert_eq!(doc.read().flatten_to_string(), "A");
 
         // Insert at end
         doc.edit(Edit::Insert {
@@ -646,7 +647,7 @@ mod tests {
             content: Content::Text("C".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().to_string(), "AC");
+        assert_eq!(doc.read().flatten_to_string(), "AC");
 
         // Insert in middle
         doc.edit(Edit::Insert {
@@ -654,12 +655,12 @@ mod tests {
             content: Content::Text("B".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().to_string(), "ABC");
+        assert_eq!(doc.read().flatten_to_string(), "ABC");
 
         // Delete middle character
         doc.edit(Edit::Delete { range: 1..2 });
         doc.flush();
-        assert_eq!(doc.read().to_string(), "AC");
+        assert_eq!(doc.read().flatten_to_string(), "AC");
     }
 
     #[test]
@@ -675,14 +676,14 @@ mod tests {
             doc.flush();
         }
 
-        assert_eq!(doc.read().to_string(), "Hello, World!");
+        assert_eq!(doc.read().flatten_to_string(), "Hello, World!");
         assert_eq!(doc.read().byte_count(), 13);
     }
 
     #[test]
     fn test_multiline_document() {
         let doc = Doc::from_str("Line 1\nLine 2\nLine 3");
-        assert_eq!(doc.read().to_string(), "Line 1\nLine 2\nLine 3");
+        assert_eq!(doc.read().flatten_to_string(), "Line 1\nLine 2\nLine 3");
 
         // Insert at beginning of line 2 (after "Line 1\n")
         doc.edit(Edit::Insert {
@@ -690,7 +691,10 @@ mod tests {
             content: Content::Text("Start of ".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().to_string(), "Line 1\nStart of Line 2\nLine 3");
+        assert_eq!(
+            doc.read().flatten_to_string(),
+            "Line 1\nStart of Line 2\nLine 3"
+        );
     }
 
     #[test]
@@ -713,7 +717,7 @@ mod tests {
 
         // All edits applied at once
         doc.flush();
-        assert_eq!(doc.read().to_string(), "ABC");
+        assert_eq!(doc.read().flatten_to_string(), "ABC");
     }
 
     #[test]
@@ -724,8 +728,8 @@ mod tests {
         let tree1 = doc.read();
         let tree2 = doc.read();
 
-        assert_eq!(tree1.to_string(), "Shared");
-        assert_eq!(tree2.to_string(), "Shared");
+        assert_eq!(tree1.flatten_to_string(), "Shared");
+        assert_eq!(tree2.flatten_to_string(), "Shared");
 
         // Both readers see same content
         assert_eq!(tree1.byte_count(), tree2.byte_count());
@@ -744,6 +748,6 @@ mod tests {
         doc.flush();
 
         // Text content unchanged
-        assert_eq!(doc.read().to_string(), "Text");
+        assert_eq!(doc.read().flatten_to_string(), "Text");
     }
 }

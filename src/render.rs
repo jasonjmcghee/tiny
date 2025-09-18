@@ -146,14 +146,9 @@ impl Renderer {
     pub fn set_text_styles_ref(&mut self, provider: &dyn crate::text_effects::TextStyleProvider) {
         // We can't store a borrowed reference, but we can clone the effects for this frame
         // This is a temporary solution - ideally we'd pass the provider through the paint context
-        println!(
-            "DEBUG: set_text_styles_ref called with provider: {}",
-            provider.name()
-        );
 
         // Get all effects from the provider (this is a hack, but works for now)
         let all_effects = provider.get_effects_in_range(0..usize::MAX);
-        println!("DEBUG: Got {} effects from provider", all_effects.len());
 
         // Create a simple provider that returns these effects
         struct StaticEffects {
@@ -172,22 +167,6 @@ impl Renderer {
                     .cloned()
                     .collect();
 
-                static mut DEBUG_COUNT: u32 = 0;
-                unsafe {
-                    if DEBUG_COUNT < 5 && !result.is_empty() {
-                        println!(
-                            "StaticEffects: Returning {} effects for range {}..{} (total: {})",
-                            result.len(),
-                            range.start,
-                            range.end,
-                            self.effects.len()
-                        );
-                        if let Some(first) = result.first() {
-                            println!("  First effect in range: {:?}", first);
-                        }
-                        DEBUG_COUNT += 1;
-                    }
-                }
 
                 result
             }
@@ -254,7 +233,7 @@ impl Renderer {
     ) -> Vec<BatchedDraw> {
         // Update cached doc text for syntax queries if it changed
         if self.cached_doc_text.is_none() || tree.version != self.cached_doc_version() {
-            self.cached_doc_text = Some(tree.to_string());
+            self.cached_doc_text = Some(tree.flatten_to_string());
             self.cached_doc_version = tree.version;
         }
 
@@ -269,7 +248,6 @@ impl Renderer {
         selections: &[crate::input::Selection],
         render_pass: Option<&mut wgpu::RenderPass>,
     ) -> Vec<BatchedDraw> {
-        println!("Renderer::render called with viewport: {:?}", viewport);
 
         // Clear previous frame
         self.commands.clear();
@@ -283,12 +261,7 @@ impl Renderer {
         self.current_doc_pos = DocPos::default();
 
         // Use the sum-tree visible range system we built
-        println!("VISIBLE RANGE WALKING: Starting visible range rendering");
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
-        println!(
-            "  Visible byte range: {}..{}",
-            visible_range.start, visible_range.end
-        );
 
         if render_pass.is_some() {
             // Direct GPU rendering mode for widgets
@@ -297,15 +270,10 @@ impl Renderer {
             // Command generation mode (legacy)
             self.walk_visible_range(tree, visible_range);
         }
-        println!(
-            "VISIBLE RANGE WALKING: Finished, found {} widgets total",
-            self.commands.len()
-        );
 
         // Render selections and cursors as overlays
         self.render_selections(selections, tree);
 
-        println!("Generated {} render commands", self.commands.len());
 
         // Batch and optimize commands
         self.batch_commands()
@@ -368,27 +336,9 @@ impl Renderer {
             let doc_text = self.cached_doc_text.as_ref().map(|s| s.as_str()).unwrap_or("");
 
             // Query ONLY the visible AST nodes - O(visible) instead of O(document)!
-            static mut DEBUG_COUNT: u32 = 0;
-            unsafe {
-                if DEBUG_COUNT < 5 {
-                    println!("VIEWPORT SYNTAX: Querying AST for byte range {}..{} (doc version {})",
-                             byte_range.start, byte_range.end, tree.version);
-                    DEBUG_COUNT += 1;
-                }
-            }
 
             let effects = highlighter.get_visible_effects(doc_text, byte_range.clone());
 
-            static mut EFFECT_DEBUG_COUNT: u32 = 0;
-            unsafe {
-                if EFFECT_DEBUG_COUNT < 5 {
-                    println!("VIEWPORT SYNTAX: Got {} effects for visible range", effects.len());
-                    if !effects.is_empty() {
-                        println!("  First effect: {:?}", effects.first());
-                    }
-                    EFFECT_DEBUG_COUNT += 1;
-                }
-            }
 
             Some(effects)
         } else {
@@ -432,16 +382,13 @@ impl Renderer {
 
                     // Use the InputEdit-aware syntax highlighter for text styles
                     let text_styles_for_widget = if let Some(ref syntax_hl) = self.syntax_highlighter {
-                        println!("WIDGET: Using live InputEdit-aware syntax highlighter");
                         // Use the syntax highlighter directly (it implements TextStyleProvider)
                         // This ensures widgets get InputEdit-aware effects
                         Some(syntax_hl.as_ref() as &dyn crate::text_effects::TextStyleProvider)
                     } else if let Some(ref viewport_provider) = viewport_style_provider {
-                        println!("WIDGET: Using viewport-specific effects provider");
                         // Use viewport-specific effects if available
                         Some(viewport_provider as &dyn crate::text_effects::TextStyleProvider)
                     } else {
-                        println!("WIDGET: Falling back to static text styles");
                         // Fallback to static text styles
                         self.text_styles.as_deref()
                     };
@@ -496,7 +443,6 @@ impl Renderer {
     fn walk_node_with_tree(&mut self, node: &Node, clip: Rect, tree: Option<&Tree>) {
         match node {
             Node::Leaf { spans, .. } => {
-                println!("Walking leaf with {} spans", spans.len());
 
                 // First, coalesce adjacent text spans to render as continuous text
                 let mut coalesced_text = Vec::new();
@@ -516,16 +462,6 @@ impl Renderer {
                     let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
                     let text = std::str::from_utf8(&coalesced_text).unwrap_or("");
 
-                    println!(
-                        "  Rendering coalesced text ({} bytes) at layout pos: ({:.1}, {:.1})",
-                        coalesced_text.len(),
-                        layout_pos.x,
-                        layout_pos.y
-                    );
-                    println!(
-                        "    First 100 chars: '{}'",
-                        text.chars().take(100).collect::<String>()
-                    );
 
                     self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
                     self.current_doc_pos.byte_offset += coalesced_text.len();
@@ -676,10 +612,6 @@ impl Renderer {
             return;
         }
 
-        println!(
-            "RENDERING WIDGET: layout=({:.1},{:.1}), scroll=({:.1},{:.1})",
-            layout_pos.x.0, layout_pos.y.0, self.viewport.scroll.x.0, self.viewport.scroll.y.0
-        );
 
         // Handle TextWidget conversion to RenderOp::Glyphs
         if let Some(text_widget) = widget.as_any().downcast_ref::<crate::widget::TextWidget>() {
@@ -694,6 +626,7 @@ impl Renderer {
         text_widget: &crate::widget::TextWidget,
         layout_pos: LayoutPos,
     ) {
+        use crate::font::create_glyph_instances;
         use crate::widget::ContentType;
 
         let text = std::str::from_utf8(&text_widget.text).unwrap_or("");
@@ -701,122 +634,46 @@ impl Renderer {
             return;
         }
 
-        static mut DEBUG_COUNT: u32 = 0;
-        unsafe {
-            if DEBUG_COUNT < 3 {
-                println!(
-                    "render_text_widget_to_commands: text_styles = {}, text len = {}",
-                    if self.text_styles.is_some() {
-                        "Some"
-                    } else {
-                        "None"
-                    },
-                    text.len()
-                );
-                DEBUG_COUNT += 1;
-            }
-        }
-
-        // Get the shared font system
         let font_system = if let Some(ref fs) = self.font_system {
             fs.clone()
         } else {
-            println!("Warning: No font system available for TextWidget rendering");
             return;
         };
 
-        // Use font size and scale from viewport metrics
-        let font_size = self.viewport.metrics.font_size;
-        let scale_factor = self.viewport.scale_factor;
-        let line_height = self.viewport.metrics.line_height;
-
-        // Handle multi-line text
-        let lines: Vec<&str> = text.lines().collect();
-        let mut all_glyph_instances = Vec::new();
-        let mut y_offset = 0.0;
-        let mut global_byte_pos = 0;
-
         // Handle different content types for horizontal scrolling
         let x_base_offset = match &text_widget.content_type {
-            ContentType::Columns {
-                x_offset,
-                start_col,
-            } => {
-                if *x_offset != 0.0 {
-                    println!(
-                        "TextWidget applying x_offset={:.1} for columns starting at {}",
-                        x_offset, start_col
-                    );
-                }
-                *x_offset
-            }
+            ContentType::Columns { x_offset, .. } => *x_offset,
             _ => 0.0,
         };
 
-        // Get ALL effects for the entire text ONCE (instead of per-character)
-        // Use cached effects to avoid race condition with background parsing
-        let all_effects = if let Some(ref text_styles) = self.text_styles {
-            text_styles.get_effects_in_range(text_widget.original_byte_offset..(text_widget.original_byte_offset + text.len()))
+        let adjusted_pos = LayoutPos::new(
+            layout_pos.x.0 + x_base_offset,
+            layout_pos.y.0,
+        );
+
+        // Get effects for this text range
+        let effects = if let Some(ref text_styles) = self.text_styles {
+            text_styles.get_effects_in_range(
+                text_widget.original_byte_offset..(text_widget.original_byte_offset + text.len())
+            )
         } else {
             Vec::new()
         };
 
-        // TODO: Race condition issue - background parsing takes time but widget needs effects immediately
-        // Options: 1) Synchronous parsing for edits, 2) Eventually consistent with stale effects
-
-        for line_text in lines.iter() {
-            // Layout this single line using the font system
-            let layout = font_system.layout_text_scaled(line_text, font_size, scale_factor);
-
-            let mut byte_pos = 0;
-            for glyph in &layout.glyphs {
-                let mut color = glyph.color;
-
-                // Find the appropriate effect for this character (from pre-loaded effects)
-                let char_bytes = glyph.char.len_utf8();
-                let doc_char_pos = text_widget.original_byte_offset + global_byte_pos + byte_pos;
-
-                // Find effect that contains this character position
-                for effect in &all_effects {
-                    if effect.range.start <= doc_char_pos && doc_char_pos < effect.range.end {
-
-                        if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
-                            color = new_color;
-                            break; // Use first matching effect
-                        }
-                    }
-                }
-                byte_pos += char_bytes;
-
-                // Font system returns glyphs in physical pixels relative to (0,0)
-                // Convert to logical and add layout position plus line offset and x_base_offset
-                let glyph_logical_x = glyph.pos.x.0 / scale_factor;
-                let glyph_logical_y = glyph.pos.y.0 / scale_factor;
-
-                let glyph_pos = LayoutPos::new(
-                    layout_pos.x.0 + x_base_offset + glyph_logical_x,
-                    layout_pos.y.0 + y_offset + glyph_logical_y,
-                );
-
-                all_glyph_instances.push(GlyphInstance {
-                    glyph_id: 0,    // Not used anymore
-                    pos: glyph_pos, // In layout space (logical pixels)
-                    color,
-                    tex_coords: glyph.tex_coords,
-                });
-            }
-
-            // Update position for next line
-            global_byte_pos += line_text.len() + 1; // +1 for newline
-            y_offset += line_height;
-        }
+        // Create glyph instances using the helper
+        let all_glyph_instances = create_glyph_instances(
+            &font_system,
+            text,
+            adjusted_pos,
+            self.viewport.metrics.font_size,
+            self.viewport.scale_factor,
+            self.viewport.metrics.line_height,
+            if effects.is_empty() { None } else { Some(&effects) },
+            text_widget.original_byte_offset,
+        );
 
         // Emit RenderOp::Glyphs command if we have glyphs
         if !all_glyph_instances.is_empty() {
-            println!(
-                "Emitting RenderOp::Glyphs with {} glyph instances from TextWidget",
-                all_glyph_instances.len()
-            );
             self.commands.push(RenderOp::Glyphs {
                 glyphs: Arc::from(all_glyph_instances),
                 style: text_widget.style,
@@ -857,11 +714,6 @@ impl Renderer {
                 let layout_pos = self
                     .viewport
                     .doc_to_layout_with_text(selection.cursor, &line_text);
-                println!("CURSOR DEBUG: DocPos=({}, {}), LayoutPos=({:.1}, {:.1}), scroll=({:.1}, {:.1}), line_height={:.1}",
-                         selection.cursor.line, selection.cursor.column,
-                         layout_pos.x.0, layout_pos.y.0,
-                         self.viewport.scroll.x.0, self.viewport.scroll.y.0,
-                         self.viewport.metrics.line_height);
                 self.render_cursor(layout_pos.x, layout_pos.y);
             } else {
                 // Render selection highlight
@@ -917,11 +769,8 @@ impl Renderer {
                 RenderOp::Glyphs { glyphs, .. } => {
                     // Transform glyphs from layout to view space (apply scroll)
                     for glyph in glyphs.iter() {
-                        // Glyphs are now in layout space (logical pixels)
-                        // Apply scroll to get view position
-                        let view_pos = self.viewport.layout_to_view(glyph.pos);
-                        // Then convert to physical pixels for GPU
-                        let physical_pos = self.viewport.view_to_physical(view_pos);
+                        // Transform from layout space directly to physical pixels for GPU
+                        let physical_pos = self.viewport.layout_to_physical(glyph.pos);
 
                         let transformed_glyph = GlyphInstance {
                             glyph_id: glyph.glyph_id,

@@ -404,23 +404,6 @@ impl SharedFontSystem {
 }
 
 impl FontSystem {
-    /// Find which column corresponds to a pixel position (fast path for long lines)
-    fn pixel_to_column_fast(
-        &self,
-        x_logical: f32,
-        text: &str,
-        font_size: f32,
-        scale: f32,
-    ) -> usize {
-        if text.is_empty() || x_logical <= 0.0 {
-            return 0;
-        }
-
-        let char_width = self.char_width_coef() * font_size / scale;
-        let estimated_col = (x_logical / char_width) as usize;
-        estimated_col.min(text.chars().count())
-    }
-
     /// Find which column corresponds to a pixel position
     /// Returns the column index (character position) that starts at or after the given x pixel position
     /// NOTE: x is in logical pixels, not physical pixels
@@ -435,15 +418,14 @@ impl FontSystem {
             return 0;
         }
 
-        // // Use fast path for very long lines to avoid expensive full layout
-        // if text.len() > 1000 {
-        //     return self.pixel_to_column_fast(x_logical, text, font_size, scale);
-        // }
+        // Use fast path for very long lines to avoid expensive full layout
+        if text.len() > 1000 {
+            let char_width = self.char_width_coef() * font_size / scale;
+            let estimated_col = (x_logical / char_width) as usize;
+            return estimated_col.min(text.chars().count());
+        }
 
         // For shorter lines, use binary search on character positions
-        // We need to find which character position corresponds to the x coordinate
-
-        // Binary search through character positions
         let chars: Vec<char> = text.chars().collect();
         let mut left = 0;
         let mut right = chars.len();
@@ -467,30 +449,68 @@ impl FontSystem {
     }
 }
 
-/// Convert layout to GPU instances (now in layout space)
-pub fn layout_to_instances(
-    layout: &TextLayout,
-    offset_x: f32,
-    offset_y: f32,
+/// Convert layout to GPU instances with optional text effects
+pub fn create_glyph_instances(
+    font_system: &SharedFontSystem,
+    text: &str,
+    pos: crate::coordinates::LayoutPos,
+    font_size: f32,
     scale_factor: f32,
+    line_height: f32,
+    effects: Option<&[crate::text_effects::TextEffect]>,
+    original_byte_offset: usize,
 ) -> Vec<GlyphInstance> {
     use crate::coordinates::LayoutPos;
-    layout
-        .glyphs
-        .iter()
-        .map(|g| {
-            // Convert physical pixels to logical for layout space
-            GlyphInstance {
-                glyph_id: 0, // Not used anymore
-                pos: LayoutPos::new(
-                    g.pos.x.0 / scale_factor + offset_x,
-                    g.pos.y.0 / scale_factor + offset_y,
-                ),
-                color: g.color,
-                tex_coords: g.tex_coords,
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut all_glyph_instances = Vec::new();
+    let mut y_offset = 0.0;
+    let mut global_byte_pos = 0;
+
+    for line_text in lines.iter() {
+        // Layout this single line
+        let layout = font_system.layout_text_scaled(line_text, font_size, scale_factor);
+
+        let mut byte_pos = 0;
+        for glyph in &layout.glyphs {
+            let mut color = glyph.color;
+
+            // Apply text effects if available
+            if let Some(effects) = effects {
+                let char_bytes = glyph.char.len_utf8();
+                let doc_pos = original_byte_offset + global_byte_pos + byte_pos;
+
+                for effect in effects {
+                    if effect.range.start <= doc_pos && doc_pos < effect.range.end {
+                        if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
+                            color = new_color;
+                            break;
+                        }
+                    }
+                }
+                byte_pos += char_bytes;
             }
-        })
-        .collect()
+
+            // Convert from physical to logical pixels and add position
+            let glyph_logical_x = glyph.pos.x.0 / scale_factor;
+            let glyph_logical_y = glyph.pos.y.0 / scale_factor;
+
+            all_glyph_instances.push(GlyphInstance {
+                glyph_id: 0,
+                pos: LayoutPos::new(
+                    pos.x.0 + glyph_logical_x,
+                    pos.y.0 + y_offset + glyph_logical_y,
+                ),
+                color,
+                tex_coords: glyph.tex_coords,
+            });
+        }
+
+        global_byte_pos += line_text.len() + 1; // +1 for newline
+        y_offset += line_height;
+    }
+
+    all_glyph_instances
 }
 
 #[cfg(test)]

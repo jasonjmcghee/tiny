@@ -42,7 +42,7 @@ fn main() {
     });
     doc.flush();
 
-    let edited_text = doc.read().to_string();
+    let edited_text = doc.read().flatten_to_string();
     println!("Edited document:\n{}\n", edited_text);
 
     // Update syntax highlighter with new text

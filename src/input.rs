@@ -128,7 +128,7 @@ impl InputHandler {
         );
 
         if let Some(ref syntax_hl) = self.syntax_highlighter {
-            let text_after = doc.read().to_string();
+            let text_after = doc.read().flatten_to_string();
 
             // Send the first edit (TODO: properly batch multiple edits)
             if let Some(first_edit) = self.pending_text_edits.first() {
@@ -825,7 +825,7 @@ impl InputHandler {
         self.flush_syntax_updates(doc);
         if let Some(sel) = self.selections.first() {
             if !sel.is_cursor() {
-                let text = doc.read().to_string();
+                let text = doc.read().flatten_to_string();
                 let range = sel.byte_range(doc);
                 if range.end <= text.len() {
                     let selected = &text[range];

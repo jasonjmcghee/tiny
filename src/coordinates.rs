@@ -590,20 +590,14 @@ impl Viewport {
     pub fn is_visible(&self, rect: LayoutRect) -> bool {
         let view_rect = self.layout_rect_to_view(rect);
 
-        // Add much more generous margins for smooth scrolling
-        let margin = self.metrics.line_height * 10.0; // 10 lines of margin
+        // Add margins for smooth scrolling
+        let margin = self.metrics.line_height * 2.0; // 2 lines of margin
 
         let is_visible = view_rect.x.0 < self.logical_size.width.0 + margin
             && view_rect.x.0 + view_rect.width.0 > -margin
             && view_rect.y.0 < self.logical_size.height.0 + margin
             && view_rect.y.0 + view_rect.height.0 > -margin;
 
-        // Debug ALL visibility calculations to find the bug
-        println!("VISIBILITY CHECK: layout=({:.1},{:.1} {}x{}), view=({:.1},{:.1} {}x{}), viewport={}x{}, scroll=({:.1},{:.1}), margin={:.1}, result={}",
-            rect.x.0, rect.y.0, rect.width.0, rect.height.0,
-            view_rect.x.0, view_rect.y.0, view_rect.width.0, view_rect.height.0,
-            self.logical_size.width.0, self.logical_size.height.0,
-            self.scroll.x.0, self.scroll.y.0, margin, is_visible);
 
         is_visible
     }
@@ -612,8 +606,6 @@ impl Viewport {
 
     /// Scroll to make a layout position visible (Neovim-style with scrolloff)
     pub fn ensure_visible(&mut self, pos: LayoutPos) {
-        let old_scroll_x = self.scroll.x.0;
-        let old_scroll_y = self.scroll.y.0;
 
         // Vertical scrolling with configurable scrolloff margin
         let v_scrolloff = VERTICAL_SCROLLOFF_LINES * self.metrics.line_height;
@@ -651,10 +643,6 @@ impl Viewport {
             self.scroll.x.0 = pos.x.0 - self.logical_size.width.0 + h_scrolloff;
         }
 
-        if old_scroll_x != self.scroll.x.0 || old_scroll_y != self.scroll.y.0 {
-            println!("ENSURE_VISIBLE: cursor at ({:.1}, {:.1}), scroll changed from ({:.1}, {:.1}) to ({:.1}, {:.1})",
-                     pos.x.0, pos.y.0, old_scroll_x, old_scroll_y, self.scroll.x.0, self.scroll.y.0);
-        }
     }
 
     /// Get visible line range
@@ -663,16 +651,6 @@ impl Viewport {
         let last_line =
             ((self.scroll.y + self.logical_size.height) / self.metrics.line_height) as u32 + 1;
 
-        // Debug output to see what we're calculating
-        static mut DEBUG_COUNT: u32 = 0;
-        unsafe {
-            if DEBUG_COUNT < 3 {
-                println!("VISIBLE_LINES: scroll_y={:.1}, window_height={:.1}, line_height={:.1} -> lines {}..{}",
-                         self.scroll.y.0, self.logical_size.height.0, self.metrics.line_height,
-                         first_line, last_line);
-                DEBUG_COUNT += 1;
-            }
-        }
 
         first_line..last_line
     }
@@ -697,12 +675,9 @@ impl Viewport {
         let start_byte = tree.line_to_byte(start_line).unwrap_or(0);
         let end_byte = tree.line_to_byte(end_line).unwrap_or(tree.byte_count());
 
-        println!("DEBUG: visible range calculation - scroll_y={:.1}, lines={}..{}, bytes={}..{}, total_lines={}",
-                 self.scroll.y.0, start_line, end_line, start_byte, end_byte, total_lines);
 
         // Ensure we always have SOME content to render
         if start_byte >= end_byte {
-            println!("WARNING: Invalid byte range, falling back to entire document");
             return 0..tree.byte_count();
         }
 
@@ -724,7 +699,7 @@ impl Viewport {
         // First, find the line with the most characters (just counting)
         let mut longest_line_chars = 0;
         let mut longest_line_text = "".to_string();
-        let mut longest_line_num = 0;
+        let mut _longest_line_num = 0;
 
         for line_num in 0..tree.line_count() {
             if let Some(line_start) = tree.line_to_byte(line_num) {
@@ -735,7 +710,7 @@ impl Viewport {
                 if line_length > longest_line_chars {
                     longest_line_chars = line_length;
                     longest_line_text = line_text_trimmed;
-                    longest_line_num = line_num;
+                    _longest_line_num = line_num;
                 }
             }
         }
@@ -771,11 +746,6 @@ impl Viewport {
         let padding = 5.0 * self.metrics.space_width;
         let doc_width = max_line_width + padding;
 
-        // Debug output for very long lines
-        if longest_line_chars > 1000 {
-            println!("Document bounds: line {} has {} chars, measured width={:.1}, doc_width={:.1} (space_width={:.1})",
-                     longest_line_num, longest_line_chars, max_line_width, doc_width, self.metrics.space_width);
-        }
 
         // Cache the result with the character count
         let bounds = (doc_width, doc_height);
@@ -808,136 +778,30 @@ impl Viewport {
         let max_scroll_y = (doc_height - self.logical_size.height.0).max(0.0);
 
         // Apply the clamping
-        let old_scroll_x = self.scroll.x.0;
         self.scroll.x.0 = self.scroll.x.0.clamp(0.0, max_scroll_x);
         self.scroll.y.0 = self.scroll.y.0.clamp(0.0, max_scroll_y);
 
-        if old_scroll_x != self.scroll.x.0 {
-            println!("Clamped horizontal scroll from {:.1} to {:.1} (max: {:.1}, doc_width: {:.1}, viewport: {:.1})",
-                     old_scroll_x, self.scroll.x.0, max_scroll_x, doc_width, viewport_width);
-        }
     }
 
     // === Horizontal Virtualization ===
 
-    /// Calculate what part of a line is actually visible (with optional token boundaries)
+    /// Calculate what part of a line is actually visible
     pub fn visible_line_content_semantic(
         &self,
         line_text: &str,
         line_num: u32,
-        token_boundaries: Option<&[usize]>, // Byte positions where tokens start/end
+        token_boundaries: Option<&[usize]>,
     ) -> VisibleLineContent {
-        // If we have token boundaries, adjust culling to respect them
-        if let Some(boundaries) = token_boundaries {
-            return self.visible_line_content_with_tokens(line_text, line_num, boundaries);
-        }
-        // Otherwise, use character-based culling
-        self.visible_line_content(line_text, line_num)
+        self.visible_line_content(line_text, line_num, token_boundaries)
     }
 
-    /// Calculate visible content respecting token boundaries
-    fn visible_line_content_with_tokens(
+    /// Calculate what part of a line is actually visible (with optional token boundaries)
+    pub fn visible_line_content(
         &self,
         line_text: &str,
         line_num: u32,
-        token_boundaries: &[usize],
+        token_boundaries: Option<&[usize]>,
     ) -> VisibleLineContent {
-        match self.line_mode {
-            LineMode::NoWrap { .. } => {
-                let horizontal_scroll = self.scroll.x.0;
-
-                if let Some(font_system) = &self.font_system {
-                    let viewport_width = self.logical_size.width.0 - self.margin.x.0 * 2.0;
-                    let buffer_width = viewport_width * 0.5;
-
-                    // Find visible pixel range
-                    let visible_start_x = (horizontal_scroll - buffer_width).max(0.0);
-                    let visible_end_x = horizontal_scroll + viewport_width + buffer_width;
-
-                    // Find first and last visible token
-                    let mut start_byte = 0;
-                    let mut end_byte = line_text.len();
-                    let mut found_start = false;
-
-                    for &boundary in token_boundaries {
-                        if boundary > line_text.len() {
-                            break;
-                        }
-
-                        // Measure position of this boundary
-                        let prefix = &line_text[..boundary];
-                        let layout = font_system.layout_text_scaled(
-                            prefix,
-                            self.metrics.font_size,
-                            self.scale_factor,
-                        );
-                        let x_pos = layout.width / self.scale_factor;
-
-                        if !found_start && x_pos >= visible_start_x {
-                            // Found first visible token boundary
-                            start_byte = if boundary > 0 {
-                                // Back up to previous boundary to include whole token
-                                token_boundaries.iter()
-                                    .rev()
-                                    .find(|&&b| b < boundary)
-                                    .copied()
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            found_start = true;
-                        }
-
-                        if x_pos > visible_end_x {
-                            // Found first token past visible range
-                            end_byte = boundary;
-                            break;
-                        }
-                    }
-
-                    // Extract visible text at token boundaries
-                    let visible_text = line_text[start_byte..end_byte].to_string();
-
-                    // Calculate x_offset for positioning
-                    let x_offset = if start_byte > 0 {
-                        let prefix = &line_text[..start_byte];
-                        let layout = font_system.layout_text_scaled(
-                            prefix,
-                            self.metrics.font_size,
-                            self.scale_factor,
-                        );
-                        layout.width / self.scale_factor
-                    } else {
-                        0.0
-                    };
-
-                    // Calculate start column
-                    let start_col = line_text[..start_byte].chars().count();
-
-                    VisibleLineContent::Columns {
-                        text: visible_text,
-                        start_col,
-                        x_offset,
-                    }
-                } else {
-                    // Fallback to full line
-                    VisibleLineContent::Columns {
-                        text: line_text.to_string(),
-                        start_col: 0,
-                        x_offset: 0.0,
-                    }
-                }
-            }
-            LineMode::SoftWrap { .. } => {
-                VisibleLineContent::Wrapped {
-                    visual_lines: vec![line_text.to_string()],
-                }
-            }
-        }
-    }
-
-    /// Calculate what part of a line is actually visible
-    pub fn visible_line_content(&self, line_text: &str, line_num: u32) -> VisibleLineContent {
         // Use the actual scroll.x value instead of the line_mode's stored value
         match self.line_mode {
             LineMode::NoWrap {
@@ -946,98 +810,32 @@ impl Viewport {
                 // Use the viewport's actual horizontal scroll
                 let horizontal_scroll = self.scroll.x.0;
 
-                // Only extract columns if we have a font system and there's enough text to warrant it
-                if let Some(font_system) = &self.font_system {
-                    // Calculate visible viewport width in logical pixels
-                    let viewport_width = self.logical_size.width.0 - self.margin.x.0 * 2.0;
-
-                    // Add 50% buffer on each side to prevent popping
-                    let buffer_width = viewport_width * 0.5;
-
-                    // Calculate the actual line width in pixels to respect bounds
-                    // Don't count newline characters
-                    let line_text_trimmed = line_text.trim_end_matches('\n').trim_end_matches('\r');
-                    let line_width_pixels =
-                        line_text_trimmed.chars().count() as f32 * self.metrics.space_width;
-
-                    // Calculate culling boundaries with buffer, respecting document bounds
-                    // Start: buffer normally but don't go negative
-                    let cull_start_x = (horizontal_scroll - buffer_width).max(0.0);
-                    // End: buffer OR line end, whichever comes first
-                    let cull_end_x =
-                        (horizontal_scroll + viewport_width + buffer_width).min(line_width_pixels);
-
-                    // Check if we've scrolled past the end of the line
-                    if cull_start_x >= line_width_pixels {
-                        // We've scrolled past the end - return empty
-                        return VisibleLineContent::Columns {
-                            text: String::new(),
-                            start_col: line_text.chars().count(),
-                            x_offset: 0.0,
-                        };
-                    }
-
-                    // Debug output to understand the width calculation
-                    if line_num == 0 && horizontal_scroll > 0.0 {
-                        println!("BUFFER ZONE: scroll={:.1}, viewport={:.1}, buffer={:.1}, cull_range={:.1}..{:.1}, line_width={:.1}",
-                                 horizontal_scroll, viewport_width, buffer_width, cull_start_x, cull_end_x, line_width_pixels);
-                    }
-
-                    // Find start and end columns based on culling boundaries (with buffer)
-                    let start_col = if cull_start_x > 0.0 {
-                        font_system.pixel_to_column(
-                            cull_start_x,
-                            line_text,
-                            self.metrics.font_size,
-                            self.scale_factor,
-                        )
-                    } else {
-                        0
-                    };
-
-                    // Find end column (including buffer zone)
-                    let end_col = font_system.pixel_to_column(
-                        cull_end_x,
+                // Extract visible range
+                let (start_byte, end_byte, x_offset) = if let Some(font_system) = &self.font_system {
+                    let (start, end, offset) = self.calculate_visible_range(
                         line_text,
-                        self.metrics.font_size,
-                        self.scale_factor,
+                        horizontal_scroll,
+                        token_boundaries,
                     );
-
-                    // Extract the visible portion of text
-                    let chars: Vec<char> = line_text.chars().collect();
-
-                    // Handle edge cases to prevent teleportation
-                    let visible_text = if start_col >= chars.len() {
-                        // If we're scrolled past the end of the line, return empty
-                        String::new()
-                    } else {
-                        // Clamp end_col to prevent out-of-bounds and ensure smooth scrolling
-                        let actual_end = end_col.min(chars.len());
-                        // Only extract if we have a valid range
-                        if actual_end > start_col {
-                            chars[start_col..actual_end].iter().collect()
-                        } else {
-                            String::new()
-                        }
-                    };
-
-                    // Calculate x_offset: We need to position the culled text at its original
-                    // position in the line so that when scroll is applied, it appears correctly.
-                    // But we need to use the actual measured width, not an approximation.
-                    let x_offset = if start_col > 0 { cull_start_x } else { 0.0 };
-
-                    VisibleLineContent::Columns {
-                        text: visible_text,
-                        start_col,
-                        x_offset, // Position text at its cull boundary
-                    }
+                    (start, end, offset)
                 } else {
-                    // No font system, return full line (fallback)
-                    VisibleLineContent::Columns {
-                        text: line_text.to_string(),
-                        start_col: 0,
-                        x_offset: 0.0, // No offset - scroll is handled by view transformation
-                    }
+                    (0, line_text.len(), 0.0)
+                };
+
+                // Extract visible text
+                let visible_text = if start_byte < line_text.len() {
+                    line_text[start_byte.min(line_text.len())..end_byte.min(line_text.len())].to_string()
+                } else {
+                    String::new()
+                };
+
+                // Calculate start column
+                let start_col = line_text[..start_byte.min(line_text.len())].chars().count();
+
+                VisibleLineContent::Columns {
+                    text: visible_text,
+                    start_col,
+                    x_offset,
                 }
             }
             LineMode::SoftWrap { wrap_width: _ } => {
@@ -1047,6 +845,120 @@ impl Viewport {
                     visual_lines: vec![line_text.to_string()],
                 }
             }
+        }
+    }
+
+    /// Calculate visible byte range for a line based on horizontal scroll
+    fn calculate_visible_range(
+        &self,
+        line_text: &str,
+        horizontal_scroll: f32,
+        token_boundaries: Option<&[usize]>,
+    ) -> (usize, usize, f32) {
+        let font_system = match &self.font_system {
+            Some(fs) => fs,
+            None => return (0, line_text.len(), 0.0),
+        };
+
+        let viewport_width = self.logical_size.width.0 - self.margin.x.0 * 2.0;
+        let buffer_width = viewport_width * 0.5;
+
+        // Calculate visible pixel range
+        let visible_start_x = (horizontal_scroll - buffer_width).max(0.0);
+        let visible_end_x = horizontal_scroll + viewport_width + buffer_width;
+
+        // Calculate line width
+        let line_text_trimmed = line_text.trim_end_matches('\n').trim_end_matches('\r');
+        let line_width_pixels = line_text_trimmed.chars().count() as f32 * self.metrics.space_width;
+
+        // Check if scrolled past end
+        if visible_start_x >= line_width_pixels {
+            return (line_text.len(), line_text.len(), 0.0);
+        }
+
+        // If we have token boundaries, use them
+        if let Some(boundaries) = token_boundaries {
+            let mut start_byte = 0;
+            let mut end_byte = line_text.len();
+            let mut found_start = false;
+
+            for &boundary in boundaries {
+                if boundary > line_text.len() {
+                    break;
+                }
+
+                // Measure position of this boundary
+                let prefix = &line_text[..boundary];
+                let layout = font_system.layout_text_scaled(
+                    prefix,
+                    self.metrics.font_size,
+                    self.scale_factor,
+                );
+                let x_pos = layout.width / self.scale_factor;
+
+                if !found_start && x_pos >= visible_start_x {
+                    // Found first visible token boundary
+                    start_byte = if boundary > 0 {
+                        // Back up to previous boundary to include whole token
+                        boundaries.iter()
+                            .rev()
+                            .find(|&&b| b < boundary)
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    found_start = true;
+                }
+
+                if x_pos > visible_end_x {
+                    end_byte = boundary;
+                    break;
+                }
+            }
+
+            // Calculate x_offset
+            let x_offset = if start_byte > 0 {
+                let prefix = &line_text[..start_byte];
+                let layout = font_system.layout_text_scaled(
+                    prefix,
+                    self.metrics.font_size,
+                    self.scale_factor,
+                );
+                layout.width / self.scale_factor
+            } else {
+                0.0
+            };
+
+            (start_byte, end_byte, x_offset)
+        } else {
+            // Character-based culling
+            let start_col = if visible_start_x > 0.0 {
+                font_system.pixel_to_column(
+                    visible_start_x,
+                    line_text,
+                    self.metrics.font_size,
+                    self.scale_factor,
+                )
+            } else {
+                0
+            };
+
+            let end_col = font_system.pixel_to_column(
+                visible_end_x.min(line_width_pixels),
+                line_text,
+                self.metrics.font_size,
+                self.scale_factor,
+            );
+
+            // Convert columns to byte positions
+            let chars: Vec<char> = line_text.chars().collect();
+            let start_byte = chars.iter().take(start_col).map(|c| c.len_utf8()).sum();
+            let end_byte = chars.iter().take(end_col).map(|c| c.len_utf8()).sum();
+
+            let x_offset = if start_col > 0 { visible_start_x } else { 0.0 };
+
+            (start_byte, end_byte, x_offset)
         }
     }
 
@@ -1102,11 +1014,11 @@ mod tests {
         let layout_pos = viewport.doc_to_layout(doc_pos);
         assert_eq!(
             layout_pos.x,
-            LogicalPixels(10.0 * viewport.metrics.space_width)
+            LogicalPixels(viewport.margin.x.0 + 10.0 * viewport.metrics.space_width)
         );
         assert_eq!(
             layout_pos.y,
-            LogicalPixels(5.0 * viewport.metrics.line_height)
+            LogicalPixels(viewport.margin.y.0 + 5.0 * viewport.metrics.line_height)
         );
 
         let view_pos = viewport.layout_to_view(layout_pos);

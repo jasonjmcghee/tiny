@@ -273,7 +273,7 @@ fn bench_tree_traversal(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("to_string", size), size, |b, _| {
             let tree = doc.read();
             b.iter(|| {
-                black_box(tree.to_string());
+                black_box(tree.flatten_to_string());
             });
         });
     }

@@ -749,7 +749,7 @@ impl Widget for DocumentEditorWidget {
                     self.text_effect.update_mouse_pos(Some(*pos));
 
                     // Request text style update to regenerate effects
-                    let text = self.doc.read().to_string();
+                    let text = self.doc.read().flatten_to_string();
                     let version = self.doc.version();
                     self.text_effect.request_update(&text, version);
 
@@ -758,7 +758,7 @@ impl Widget for DocumentEditorWidget {
                     self.text_effect.update_mouse_pos(None);
 
                     // Request text style update to clear effects
-                    let text = self.doc.read().to_string();
+                    let text = self.doc.read().flatten_to_string();
                     let version = self.doc.version();
                     self.text_effect.request_update(&text, version);
 
@@ -837,7 +837,7 @@ impl Widget for DocumentEditorWidget {
 
         // Always enable Rust syntax highlighting combined with mouse effects
         let syntax_highlighter = tiny_editor::syntax::SyntaxHighlighter::new_rust();
-        let text = self.doc.read().to_string();
+        let text = self.doc.read().flatten_to_string();
         syntax_highlighter.request_update(&text, self.doc.version());
 
         // Create a combined text style provider

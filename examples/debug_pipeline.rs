@@ -21,7 +21,7 @@ fn main() {
     doc.flush();
 
     let tree = doc.read();
-    println!("Document text: '{}'", tree.to_string());
+    println!("Document text: '{}'", tree.flatten_to_string());
 
     let viewport = Rect {
         x: LogicalPixels(0.0),
@@ -67,7 +67,7 @@ fn main() {
 
     let doc2 = Doc::from_str("AB");
     let tree2 = doc2.read();
-    println!("Document text: '{}'", tree2.to_string());
+    println!("Document text: '{}'", tree2.flatten_to_string());
 
     let batches2 = renderer.render(&tree2, viewport);
     println!("Generated {} render batches", batches2.len());
@@ -113,7 +113,11 @@ fn main() {
         doc3.flush();
 
         let tree = doc3.read();
-        println!("\nAfter typing '{}': document = '{}'", ch, tree.to_string());
+        println!(
+            "\nAfter typing '{}': document = '{}'",
+            ch,
+            tree.flatten_to_string()
+        );
 
         let batches = renderer.render(&tree, viewport);
 

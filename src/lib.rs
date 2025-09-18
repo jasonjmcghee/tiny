@@ -167,7 +167,7 @@ impl Editor {
     /// Update syntax highlighting
     fn update_syntax(&mut self) {
         if let Some(syntax) = &self.syntax {
-            let text = self.doc.read().to_string();
+            let text = self.doc.read().flatten_to_string();
             let version = self.doc.version();
             syntax.request_update(&text, version);
         }
@@ -181,7 +181,7 @@ impl Editor {
 
     /// Get text content
     pub fn text(&self) -> String {
-        self.doc.read().to_string()
+        self.doc.read().flatten_to_string()
     }
 
     /// Get cursor positions

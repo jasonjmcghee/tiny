@@ -548,7 +548,7 @@ impl EditorLogic {
             Box::new(SyntaxHighlighter::new_rust());
 
         // Request initial highlight using the new API
-        let text = doc.read().to_string();
+        let text = doc.read().flatten_to_string();
         println!(
             "EditorLogic: Requesting initial syntax highlighting for {} bytes of text",
             text.len()
@@ -687,8 +687,8 @@ fn print_editor_info(doc: &Doc) {
     println!("\n=== Editor Info ===");
     let tree = doc.read();
     println!("Document tree version: {}", tree.version);
-    println!("Document size: {} bytes", tree.to_string().len());
-    println!("Line count: {}", tree.to_string().lines().count());
+    println!("Document size: {} bytes", tree.flatten_to_string().len());
+    println!("Line count: {}", tree.flatten_to_string().lines().count());
 }
 
 /// Helper to run a simple app with just document rendering

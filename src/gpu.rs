@@ -67,6 +67,53 @@ pub struct GpuRenderer {
     glyph_vertex_buffer: wgpu::Buffer,
 }
 
+/// Helper to create 6 vertices (2 triangles) for a rectangle
+fn create_rect_vertices(x: f32, y: f32, width: f32, height: f32, color: u32) -> [RectVertex; 6] {
+    let x1 = x;
+    let y1 = y;
+    let x2 = x + width;
+    let y2 = y + height;
+
+    [
+        // Triangle 1
+        RectVertex { position: [x1, y1], color },
+        RectVertex { position: [x2, y1], color },
+        RectVertex { position: [x1, y2], color },
+        // Triangle 2
+        RectVertex { position: [x2, y1], color },
+        RectVertex { position: [x2, y2], color },
+        RectVertex { position: [x1, y2], color },
+    ]
+}
+
+/// Helper to create 6 vertices (2 triangles) for a glyph quad
+fn create_glyph_vertices(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    tex_coords: [f32; 4],
+    color: u32,
+) -> [GlyphVertex; 6] {
+    let x1 = x;
+    let y1 = y;
+    let x2 = x + width;
+    let y2 = y + height;
+
+    let [u0, v0, u1, v1] = tex_coords;
+
+    [
+        // Triangle 1
+        GlyphVertex { position: [x1, y1], tex_coord: [u0, v0], color },
+        GlyphVertex { position: [x2, y1], tex_coord: [u1, v0], color },
+        GlyphVertex { position: [x1, y2], tex_coord: [u0, v1], color },
+        // Triangle 2
+        GlyphVertex { position: [x2, y1], tex_coord: [u1, v0], color },
+        GlyphVertex { position: [x2, y2], tex_coord: [u1, v1], color },
+        GlyphVertex { position: [x1, y2], tex_coord: [u0, v1], color },
+    ]
+}
+
 impl GpuRenderer {
     /// Get device for custom widget rendering
     pub fn device(&self) -> &wgpu::Device {
@@ -115,7 +162,6 @@ impl GpuRenderer {
         shader_source: &str,
         uniform_size: u64,
     ) {
-        println!("Registering text effect shader ID {}", shader_id);
 
         // Create shader module
         let shader = self
@@ -268,7 +314,6 @@ impl GpuRenderer {
             .insert(shader_id, effect_uniform_buffer);
         self.effect_bind_groups.insert(shader_id, effect_bind_group);
 
-        println!("Registered text effect shader ID {}", shader_id);
     }
 
     /// Upload font atlas texture to GPU
@@ -612,13 +657,6 @@ impl GpuRenderer {
 
     /// Execute batched draw commands (transforms view → physical)
     pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &Viewport) {
-        println!(
-            "GPU::render called with {} batches, viewport: logical={:.0}x{:.0}, scale={:.1}",
-            batches.len(),
-            viewport.logical_size.width,
-            viewport.logical_size.height,
-            viewport.scale_factor
-        );
 
         // Update uniform buffer with PHYSICAL viewport size
         // Since glyphs are in physical pixels, shaders need physical dimensions
@@ -629,24 +667,13 @@ impl GpuRenderer {
             ],
             _padding: [0.0, 0.0],
         };
-        println!(
-            "  Sending physical viewport_size [{:.0}, {:.0}] to shaders",
-            viewport.physical_size.width as f32, viewport.physical_size.height as f32
-        );
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         let output = match self.surface.get_current_texture() {
-            Ok(output) => {
-                println!(
-                    "  ✅ Got surface texture: {}x{}",
-                    output.texture.width(),
-                    output.texture.height()
-                );
-                output
-            }
+            Ok(output) => output,
             Err(e) => {
-                eprintln!("  ❌ Failed to get surface texture: {:?}", e);
+                eprintln!("Failed to get surface texture: {:?}", e);
                 return;
             }
         };
@@ -692,7 +719,7 @@ impl GpuRenderer {
                     }
                     BatchedDraw::GlyphBatch { instances, .. } => {
                         if !instances.is_empty() {
-                            self.draw_glyphs(&mut render_pass, instances, viewport.scale_factor);
+                            self.draw_glyphs(&mut render_pass, instances, viewport.scale_factor, None);
                         }
                     }
                     BatchedDraw::SetClip(rect) => {
@@ -727,125 +754,50 @@ impl GpuRenderer {
             return;
         }
 
-        println!(
-            "GPU: draw_rects called with {} rectangles, scale={:.1}",
-            instances.len(),
-            scale_factor
-        );
 
         // Generate vertices for rectangles (transform view → physical)
-        let mut vertices = Vec::new();
-        for (i, rect) in instances.iter().enumerate() {
+        let mut vertices = Vec::with_capacity(instances.len() * 6);
+        for rect in instances {
             // Apply scale factor to transform from view to physical coordinates
             let physical_x = rect.rect.x.0 * scale_factor;
             let physical_y = rect.rect.y.0 * scale_factor;
             let physical_width = rect.rect.width.0 * scale_factor;
             let physical_height = rect.rect.height.0 * scale_factor;
 
-            if i == 0 {
-                println!(
-                    "  First rect: view=({:.1}, {:.1}) {}x{} → physical=({:.1}, {:.1}) {}x{}",
-                    rect.rect.x.0,
-                    rect.rect.y.0,
-                    rect.rect.width.0,
-                    rect.rect.height.0,
-                    physical_x,
-                    physical_y,
-                    physical_width,
-                    physical_height
-                );
-            }
-
-            // Two triangles for each rectangle (in physical coordinates)
-            let x1 = physical_x;
-            let y1 = physical_y;
-            let x2 = physical_x + physical_width;
-            let y2 = physical_y + physical_height;
-
-            // Triangle 1
-            vertices.push(RectVertex {
-                position: [x1, y1],
-                color: rect.color,
-            });
-            vertices.push(RectVertex {
-                position: [x2, y1],
-                color: rect.color,
-            });
-            vertices.push(RectVertex {
-                position: [x1, y2],
-                color: rect.color,
-            });
-
-            // Triangle 2
-            vertices.push(RectVertex {
-                position: [x2, y1],
-                color: rect.color,
-            });
-            vertices.push(RectVertex {
-                position: [x2, y2],
-                color: rect.color,
-            });
-            vertices.push(RectVertex {
-                position: [x1, y2],
-                color: rect.color,
-            });
-
-            println!(
-                "    Vertices: ({:.1},{:.1}) ({:.1},{:.1}) ({:.1},{:.1}) ...",
-                x1, y1, x2, y1, x1, y2
+            let rect_verts = create_rect_vertices(
+                physical_x,
+                physical_y,
+                physical_width,
+                physical_height,
+                rect.color,
             );
+            vertices.extend_from_slice(&rect_verts);
         }
 
-        println!(
-            "  Generated {} vertices for {} rectangles",
-            vertices.len(),
-            instances.len()
-        );
 
         // Upload vertices
         self.queue
             .write_buffer(&self.rect_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        println!(
-            "  Uploaded {} bytes to vertex buffer",
-            vertices.len() * std::mem::size_of::<RectVertex>()
-        );
 
         // Draw
-        println!("  Setting pipeline and drawing...");
         render_pass.set_pipeline(&self.rect_pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.rect_vertex_buffer.slice(..));
         render_pass.draw(0..vertices.len() as u32, 0..1);
-        println!("  Draw call completed with {} vertices", vertices.len());
     }
 
+    /// Draw glyphs with optional shader effects
     pub fn draw_glyphs(
         &self,
         render_pass: &mut wgpu::RenderPass,
         instances: &[GlyphInstance],
         scale_factor: f32,
-    ) {
-        self.draw_glyphs_with_effects(render_pass, instances, scale_factor, None);
-    }
-
-    /// Draw glyphs with optional shader effects
-    pub fn draw_glyphs_with_effects(
-        &self,
-        render_pass: &mut wgpu::RenderPass,
-        instances: &[GlyphInstance],
-        scale_factor: f32,
-        shader_id: Option<u32>,
+        shader_id: Option<u32>, // Pass None for default shader
     ) {
         if instances.is_empty() {
             return;
         }
 
-        println!(
-            "GPU: draw_glyphs called with {} glyphs, scale={:.1}, shader_id={:?}",
-            instances.len(),
-            scale_factor,
-            shader_id
-        );
 
         // Choose pipeline based on shader effect
         let (pipeline, extra_bind_group) = if let Some(id) = shader_id {
@@ -853,13 +805,8 @@ impl GpuRenderer {
                 self.effect_pipelines.get(&id),
                 self.effect_bind_groups.get(&id),
             ) {
-                println!("  Using custom shader pipeline for effect ID {}", id);
                 (effect_pipeline, Some(effect_bind_group))
             } else {
-                println!(
-                    "  Warning: Shader ID {} not found, using default pipeline",
-                    id
-                );
                 (&self.glyph_pipeline, None)
             }
         } else {
@@ -867,86 +814,26 @@ impl GpuRenderer {
         };
 
         // Generate vertices for glyphs (already in physical coordinates after transformation)
-        let mut vertices = Vec::new();
-        for (i, glyph) in instances.iter().enumerate() {
+        let mut vertices = Vec::with_capacity(instances.len() * 6);
+        const ATLAS_SIZE: f32 = 2048.0;
+
+        for glyph in instances {
             // Calculate glyph size from texture coordinates
-            // Assuming atlas is 2048x2048
-            let atlas_size = 2048.0;
-            let glyph_width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * atlas_size;
-            let glyph_height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * atlas_size;
+            let glyph_width = (glyph.tex_coords[2] - glyph.tex_coords[0]) * ATLAS_SIZE;
+            let glyph_height = (glyph.tex_coords[3] - glyph.tex_coords[1]) * ATLAS_SIZE;
 
             // Glyph positions are in physical pixels (transformed by renderer)
-            let physical_x = glyph.pos.x.0;
-            let physical_y = glyph.pos.y.0;
-            let physical_width = glyph_width;
-            let physical_height = glyph_height;
-
-            if i == 0 {
-                println!(
-                    "  First glyph: physical=({:.1}, {:.1}), size={:.1}x{:.1}",
-                    physical_x, physical_y, physical_width, physical_height
-                );
-                println!(
-                    "    Tex coords: [{:.3}, {:.3}, {:.3}, {:.3}]",
-                    glyph.tex_coords[0],
-                    glyph.tex_coords[1],
-                    glyph.tex_coords[2],
-                    glyph.tex_coords[3]
-                );
-            }
-
-            // Quad for each glyph (already in physical coordinates)
-            let x1 = physical_x;
-            let y1 = physical_y;
-            let x2 = physical_x + physical_width;
-            let y2 = physical_y + physical_height;
-
-            // Extract texture coordinates from glyph
-            let u0 = glyph.tex_coords[0];
-            let v0 = glyph.tex_coords[1];
-            let u1 = glyph.tex_coords[2];
-            let v1 = glyph.tex_coords[3];
-
-            // Triangle 1
-            vertices.push(GlyphVertex {
-                position: [x1, y1],
-                tex_coord: [u0, v0],
-                color: glyph.color,
-            });
-            vertices.push(GlyphVertex {
-                position: [x2, y1],
-                tex_coord: [u1, v0],
-                color: glyph.color,
-            });
-            vertices.push(GlyphVertex {
-                position: [x1, y2],
-                tex_coord: [u0, v1],
-                color: glyph.color,
-            });
-
-            // Triangle 2
-            vertices.push(GlyphVertex {
-                position: [x2, y1],
-                tex_coord: [u1, v0],
-                color: glyph.color,
-            });
-            vertices.push(GlyphVertex {
-                position: [x2, y2],
-                tex_coord: [u1, v1],
-                color: glyph.color,
-            });
-            vertices.push(GlyphVertex {
-                position: [x1, y2],
-                tex_coord: [u0, v1],
-                color: glyph.color,
-            });
+            let glyph_verts = create_glyph_vertices(
+                glyph.pos.x.0,
+                glyph.pos.y.0,
+                glyph_width,
+                glyph_height,
+                glyph.tex_coords,
+                glyph.color,
+            );
+            vertices.extend_from_slice(&glyph_verts);
         }
 
-        println!(
-            "  Generated {} vertices for {} glyphs",
-            vertices.len(),
-            instances.len()
-        );
 
         // Upload vertices
         self.queue.write_buffer(
@@ -954,13 +841,8 @@ impl GpuRenderer {
             0,
             bytemuck::cast_slice(&vertices),
         );
-        println!(
-            "  Uploaded {} bytes to glyph vertex buffer",
-            vertices.len() * std::mem::size_of::<GlyphVertex>()
-        );
 
         // Draw with chosen pipeline
-        println!("  Setting glyph pipeline and binding texture...");
         render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
@@ -972,15 +854,6 @@ impl GpuRenderer {
 
         render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(..));
         render_pass.draw(0..vertices.len() as u32, 0..1);
-        println!(
-            "  Glyph draw call completed with {} vertices using {} pipeline",
-            vertices.len(),
-            if shader_id.is_some() {
-                "custom"
-            } else {
-                "default"
-            }
-        );
     }
 
     /// Resize surface when window changes
