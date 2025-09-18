@@ -58,7 +58,10 @@ fn main() {
     for (i, effect) in effects2.iter().enumerate() {
         if effect.range.start > 19 {
             // Effects after the edit should be shifted by 1
-            if let Some(orig) = effects1.iter().find(|e| e.range.start == effect.range.start - 1) {
+            if let Some(orig) = effects1
+                .iter()
+                .find(|e| e.range.start == effect.range.start - 1)
+            {
                 if effect.range.end != orig.range.end + 1 {
                     correctly_shifted = false;
                     println!("  ❌ Effect {} not shifted correctly", i);
@@ -81,7 +84,7 @@ fn main() {
 
     // Test effect coalescing
     println!("\nTesting effect coalescing...");
-    use tiny_editor::text_effects::{TextEffect, EffectType, priority};
+    use tiny_editor::text_effects::{priority, EffectType, TextEffect};
     let test_effects = vec![
         TextEffect {
             range: 0..5,
@@ -102,7 +105,11 @@ fn main() {
 
     let coalesced = SyntaxHighlighter::coalesce_effects(test_effects);
     println!("Coalesced {} effects into {} effects", 3, coalesced.len());
-    assert_eq!(coalesced.len(), 2, "Should coalesce adjacent same-color effects");
+    assert_eq!(
+        coalesced.len(),
+        2,
+        "Should coalesce adjacent same-color effects"
+    );
     assert_eq!(coalesced[0].range, 0..10, "First two should be merged");
 
     println!("\n✓ All tests passed!");

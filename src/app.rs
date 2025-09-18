@@ -670,7 +670,7 @@ impl AppLogic for EditorLogic {
     }
 
     fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
-        self.syntax_highlighter.as_ref().map(|h| &**h)
+        self.syntax_highlighter.as_deref()
     }
 
     fn on_update(&mut self) {

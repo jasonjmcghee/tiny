@@ -598,7 +598,6 @@ impl Viewport {
             && view_rect.y.0 < self.logical_size.height.0 + margin
             && view_rect.y.0 + view_rect.height.0 > -margin;
 
-
         is_visible
     }
 
@@ -606,7 +605,6 @@ impl Viewport {
 
     /// Scroll to make a layout position visible (Neovim-style with scrolloff)
     pub fn ensure_visible(&mut self, pos: LayoutPos) {
-
         // Vertical scrolling with configurable scrolloff margin
         let v_scrolloff = VERTICAL_SCROLLOFF_LINES * self.metrics.line_height;
 
@@ -642,7 +640,6 @@ impl Viewport {
             // Scroll right by one character at a time
             self.scroll.x.0 = pos.x.0 - self.logical_size.width.0 + h_scrolloff;
         }
-
     }
 
     /// Get visible line range
@@ -650,7 +647,6 @@ impl Viewport {
         let first_line = (self.scroll.y / self.metrics.line_height) as u32;
         let last_line =
             ((self.scroll.y + self.logical_size.height) / self.metrics.line_height) as u32 + 1;
-
 
         first_line..last_line
     }
@@ -674,7 +670,6 @@ impl Viewport {
 
         let start_byte = tree.line_to_byte(start_line).unwrap_or(0);
         let end_byte = tree.line_to_byte(end_line).unwrap_or(tree.byte_count());
-
 
         // Ensure we always have SOME content to render
         if start_byte >= end_byte {
@@ -746,7 +741,6 @@ impl Viewport {
         let padding = 5.0 * self.metrics.space_width;
         let doc_width = max_line_width + padding;
 
-
         // Cache the result with the character count
         let bounds = (doc_width, doc_height);
         self.cached_doc_bounds = Some(bounds);
@@ -780,7 +774,6 @@ impl Viewport {
         // Apply the clamping
         self.scroll.x.0 = self.scroll.x.0.clamp(0.0, max_scroll_x);
         self.scroll.y.0 = self.scroll.y.0.clamp(0.0, max_scroll_y);
-
     }
 
     // === Horizontal Virtualization ===
@@ -811,7 +804,8 @@ impl Viewport {
                 let horizontal_scroll = self.scroll.x.0;
 
                 // Extract visible range
-                let (start_byte, end_byte, x_offset) = if let Some(font_system) = &self.font_system {
+                let (start_byte, end_byte, x_offset) = if let Some(font_system) = &self.font_system
+                {
                     let (start, end, offset) = self.calculate_visible_range(
                         line_text,
                         horizontal_scroll,
@@ -824,7 +818,8 @@ impl Viewport {
 
                 // Extract visible text
                 let visible_text = if start_byte < line_text.len() {
-                    line_text[start_byte.min(line_text.len())..end_byte.min(line_text.len())].to_string()
+                    line_text[start_byte.min(line_text.len())..end_byte.min(line_text.len())]
+                        .to_string()
                 } else {
                     String::new()
                 };
@@ -900,7 +895,8 @@ impl Viewport {
                     // Found first visible token boundary
                     start_byte = if boundary > 0 {
                         // Back up to previous boundary to include whole token
-                        boundaries.iter()
+                        boundaries
+                            .iter()
                             .rev()
                             .find(|&&b| b < boundary)
                             .copied()

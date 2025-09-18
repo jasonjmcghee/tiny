@@ -167,7 +167,6 @@ impl Renderer {
                     .cloned()
                     .collect();
 
-
                 result
             }
 
@@ -248,7 +247,6 @@ impl Renderer {
         selections: &[crate::input::Selection],
         render_pass: Option<&mut wgpu::RenderPass>,
     ) -> Vec<BatchedDraw> {
-
         // Clear previous frame
         self.commands.clear();
         self.clip_stack.clear();
@@ -273,7 +271,6 @@ impl Renderer {
 
         // Render selections and cursors as overlays
         self.render_selections(selections, tree);
-
 
         // Batch and optimize commands
         self.batch_commands()
@@ -333,12 +330,15 @@ impl Renderer {
         // Get viewport-specific syntax effects if we have a highlighter
         let visible_effects = if let Some(ref highlighter) = self.syntax_highlighter {
             // Always use the latest cached text which was updated in render()
-            let doc_text = self.cached_doc_text.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let doc_text = self
+                .cached_doc_text
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("");
 
             // Query ONLY the visible AST nodes - O(visible) instead of O(document)!
 
             let effects = highlighter.get_visible_effects(doc_text, byte_range.clone());
-
 
             Some(effects)
         } else {
@@ -381,17 +381,18 @@ impl Renderer {
                     };
 
                     // Use the InputEdit-aware syntax highlighter for text styles
-                    let text_styles_for_widget = if let Some(ref syntax_hl) = self.syntax_highlighter {
-                        // Use the syntax highlighter directly (it implements TextStyleProvider)
-                        // This ensures widgets get InputEdit-aware effects
-                        Some(syntax_hl.as_ref() as &dyn crate::text_effects::TextStyleProvider)
-                    } else if let Some(ref viewport_provider) = viewport_style_provider {
-                        // Use viewport-specific effects if available
-                        Some(viewport_provider as &dyn crate::text_effects::TextStyleProvider)
-                    } else {
-                        // Fallback to static text styles
-                        self.text_styles.as_deref()
-                    };
+                    let text_styles_for_widget =
+                        if let Some(ref syntax_hl) = self.syntax_highlighter {
+                            // Use the syntax highlighter directly (it implements TextStyleProvider)
+                            // This ensures widgets get InputEdit-aware effects
+                            Some(syntax_hl.as_ref() as &dyn crate::text_effects::TextStyleProvider)
+                        } else if let Some(ref viewport_provider) = viewport_style_provider {
+                            // Use viewport-specific effects if available
+                            Some(viewport_provider as &dyn crate::text_effects::TextStyleProvider)
+                        } else {
+                            // Fallback to static text styles
+                            self.text_styles.as_deref()
+                        };
 
                     let ctx = crate::widget::PaintContext {
                         viewport: &self.viewport,
@@ -443,7 +444,6 @@ impl Renderer {
     fn walk_node_with_tree(&mut self, node: &Node, clip: Rect, tree: Option<&Tree>) {
         match node {
             Node::Leaf { spans, .. } => {
-
                 // First, coalesce adjacent text spans to render as continuous text
                 let mut coalesced_text = Vec::new();
                 let mut total_lines = 0u32;
@@ -461,7 +461,6 @@ impl Renderer {
                     // Use viewport to transform document position to layout position
                     let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
                     let text = std::str::from_utf8(&coalesced_text).unwrap_or("");
-
 
                     self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
                     self.current_doc_pos.byte_offset += coalesced_text.len();
@@ -612,7 +611,6 @@ impl Renderer {
             return;
         }
 
-
         // Handle TextWidget conversion to RenderOp::Glyphs
         if let Some(text_widget) = widget.as_any().downcast_ref::<crate::widget::TextWidget>() {
             self.render_text_widget_to_commands(text_widget, layout_pos);
@@ -646,15 +644,12 @@ impl Renderer {
             _ => 0.0,
         };
 
-        let adjusted_pos = LayoutPos::new(
-            layout_pos.x.0 + x_base_offset,
-            layout_pos.y.0,
-        );
+        let adjusted_pos = LayoutPos::new(layout_pos.x.0 + x_base_offset, layout_pos.y.0);
 
         // Get effects for this text range
         let effects = if let Some(ref text_styles) = self.text_styles {
             text_styles.get_effects_in_range(
-                text_widget.original_byte_offset..(text_widget.original_byte_offset + text.len())
+                text_widget.original_byte_offset..(text_widget.original_byte_offset + text.len()),
             )
         } else {
             Vec::new()
@@ -668,7 +663,11 @@ impl Renderer {
             self.viewport.metrics.font_size,
             self.viewport.scale_factor,
             self.viewport.metrics.line_height,
-            if effects.is_empty() { None } else { Some(&effects) },
+            if effects.is_empty() {
+                None
+            } else {
+                Some(&effects)
+            },
             text_widget.original_byte_offset,
         );
 
@@ -866,12 +865,16 @@ struct ViewportEffectsProvider {
 }
 
 impl crate::text_effects::TextStyleProvider for ViewportEffectsProvider {
-    fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<crate::text_effects::TextEffect> {
+    fn get_effects_in_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Vec<crate::text_effects::TextEffect> {
         // The range is relative to the visible text, but effects are in document coordinates
         // Adjust the range to document coordinates
         let doc_range = (range.start + self.byte_offset)..(range.end + self.byte_offset);
 
-        self.effects.iter()
+        self.effects
+            .iter()
             .filter(|e| e.range.start < doc_range.end && e.range.end > doc_range.start)
             .filter_map(|e| {
                 // Adjust effect range back to be relative to visible text

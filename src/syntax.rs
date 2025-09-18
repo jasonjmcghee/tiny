@@ -6,7 +6,9 @@ use crate::text_effects::{priority, EffectType, TextEffect, TextStyleProvider};
 use arc_swap::ArcSwap;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree as TSTree};
+use tree_sitter::{
+    InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree as TSTree,
+};
 
 /// Language configuration for syntax highlighting
 pub struct LanguageConfig {
@@ -99,7 +101,7 @@ impl SyntaxHighlighter {
         // Send edit to background thread
         let _ = self.tx.send(ParseRequest {
             text: String::new(), // Will be set by request_update_with_edit
-            version: 0,         // Will be set by request_update_with_edit
+            version: 0,          // Will be set by request_update_with_edit
             edit: Some(edit),
         });
     }
@@ -107,7 +109,10 @@ impl SyntaxHighlighter {
     /// Request update with edit information
     pub fn request_update_with_edit(&self, text: &str, version: u64, edit: Option<TextEdit>) {
         if let Some(ref edit_info) = edit {
-            println!("SYNTAX: Sending request_update_with_edit WITH InputEdit: start_byte={}", edit_info.start_byte);
+            println!(
+                "SYNTAX: Sending request_update_with_edit WITH InputEdit: start_byte={}",
+                edit_info.start_byte
+            );
         } else {
             println!("SYNTAX: Sending request_update_with_edit WITHOUT InputEdit");
         }
@@ -645,14 +650,14 @@ fn byte_to_point(tree: &crate::tree::Tree, byte_pos: usize) -> Point {
         byte_offset += ch.len_utf8();
     }
 
-    Point { row: line as usize, column }
+    Point {
+        row: line as usize,
+        column,
+    }
 }
 
 /// Create TextEdit from document edit information using tree navigation
-pub fn create_text_edit(
-    tree: &crate::tree::Tree,
-    edit: &crate::tree::Edit,
-) -> TextEdit {
+pub fn create_text_edit(tree: &crate::tree::Tree, edit: &crate::tree::Edit) -> TextEdit {
     use crate::tree::Edit;
 
     match edit {
@@ -677,7 +682,10 @@ pub fn create_text_edit(
                         column += 1;
                     }
                 }
-                Point { row: line as usize, column }
+                Point {
+                    row: line as usize,
+                    column,
+                }
             };
 
             TextEdit {
@@ -723,7 +731,10 @@ pub fn create_text_edit(
                         column += 1;
                     }
                 }
-                Point { row: line as usize, column }
+                Point {
+                    row: line as usize,
+                    column,
+                }
             };
 
             TextEdit {

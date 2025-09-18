@@ -49,7 +49,8 @@ impl TestStruct_{} {{
     println!("Document has {} lines\n", source.lines().count());
 
     // Create syntax highlighter
-    let highlighter = SyntaxHighlighter::new(Languages::rust()).expect("Failed to create highlighter");
+    let highlighter =
+        SyntaxHighlighter::new(Languages::rust()).expect("Failed to create highlighter");
     let highlighter = Arc::new(highlighter);
 
     // Request initial parse
@@ -64,7 +65,11 @@ impl TestStruct_{} {{
     let start = Instant::now();
     let all_effects = highlighter.get_effects_in_range(0..source.len());
     let duration = start.elapsed();
-    println!("  Full document: {} effects in {:?}\n", all_effects.len(), duration);
+    println!(
+        "  Full document: {} effects in {:?}\n",
+        all_effects.len(),
+        duration
+    );
 
     // Test 2: Query just visible viewport (new approach)
     println!("Test 2: Viewport query (lines 50-100, approx bytes 2000-4000)");
@@ -77,7 +82,11 @@ impl TestStruct_{} {{
     let start = Instant::now();
     let viewport_effects = highlighter.get_visible_effects(&source, start_byte..end_byte);
     let duration = start.elapsed();
-    println!("  Viewport query: {} effects in {:?}", viewport_effects.len(), duration);
+    println!(
+        "  Viewport query: {} effects in {:?}",
+        viewport_effects.len(),
+        duration
+    );
 
     // Show the speedup
     let all_time = highlighter.get_effects_in_range(0..source.len()).len();
@@ -86,7 +95,10 @@ impl TestStruct_{} {{
     println!("\nComparison:");
     println!("  Full document processes: {} nodes", all_time);
     println!("  Viewport query processes: {} nodes", viewport_time);
-    println!("  Reduction: {:.1}%", (1.0 - viewport_time as f64 / all_time as f64) * 100.0);
+    println!(
+        "  Reduction: {:.1}%",
+        (1.0 - viewport_time as f64 / all_time as f64) * 100.0
+    );
 
     // Test 3: Multiple viewport queries (simulating scrolling)
     println!("\nTest 3: Simulating scrolling (10 viewport queries)");
@@ -97,15 +109,27 @@ impl TestStruct_{} {{
         let start_line = i * 10;
         let end_line = start_line + 50;
 
-        let start_byte = lines.iter().take(start_line).map(|l| l.len() + 1).sum::<usize>();
-        let end_byte = lines.iter().take(end_line).map(|l| l.len() + 1).sum::<usize>().min(source.len());
+        let start_byte = lines
+            .iter()
+            .take(start_line)
+            .map(|l| l.len() + 1)
+            .sum::<usize>();
+        let end_byte = lines
+            .iter()
+            .take(end_line)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            .min(source.len());
 
         let effects = highlighter.get_visible_effects(&source, start_byte..end_byte);
         total_effects += effects.len();
     }
 
     let duration = start.elapsed();
-    println!("  10 viewport queries: {} total effects in {:?}", total_effects, duration);
+    println!(
+        "  10 viewport queries: {} total effects in {:?}",
+        total_effects, duration
+    );
     println!("  Average per query: {:?}\n", duration / 10);
 
     println!("✓ Viewport-aware syntax highlighting is working!");

@@ -76,13 +76,31 @@ fn create_rect_vertices(x: f32, y: f32, width: f32, height: f32, color: u32) -> 
 
     [
         // Triangle 1
-        RectVertex { position: [x1, y1], color },
-        RectVertex { position: [x2, y1], color },
-        RectVertex { position: [x1, y2], color },
+        RectVertex {
+            position: [x1, y1],
+            color,
+        },
+        RectVertex {
+            position: [x2, y1],
+            color,
+        },
+        RectVertex {
+            position: [x1, y2],
+            color,
+        },
         // Triangle 2
-        RectVertex { position: [x2, y1], color },
-        RectVertex { position: [x2, y2], color },
-        RectVertex { position: [x1, y2], color },
+        RectVertex {
+            position: [x2, y1],
+            color,
+        },
+        RectVertex {
+            position: [x2, y2],
+            color,
+        },
+        RectVertex {
+            position: [x1, y2],
+            color,
+        },
     ]
 }
 
@@ -104,13 +122,37 @@ fn create_glyph_vertices(
 
     [
         // Triangle 1
-        GlyphVertex { position: [x1, y1], tex_coord: [u0, v0], color },
-        GlyphVertex { position: [x2, y1], tex_coord: [u1, v0], color },
-        GlyphVertex { position: [x1, y2], tex_coord: [u0, v1], color },
+        GlyphVertex {
+            position: [x1, y1],
+            tex_coord: [u0, v0],
+            color,
+        },
+        GlyphVertex {
+            position: [x2, y1],
+            tex_coord: [u1, v0],
+            color,
+        },
+        GlyphVertex {
+            position: [x1, y2],
+            tex_coord: [u0, v1],
+            color,
+        },
         // Triangle 2
-        GlyphVertex { position: [x2, y1], tex_coord: [u1, v0], color },
-        GlyphVertex { position: [x2, y2], tex_coord: [u1, v1], color },
-        GlyphVertex { position: [x1, y2], tex_coord: [u0, v1], color },
+        GlyphVertex {
+            position: [x2, y1],
+            tex_coord: [u1, v0],
+            color,
+        },
+        GlyphVertex {
+            position: [x2, y2],
+            tex_coord: [u1, v1],
+            color,
+        },
+        GlyphVertex {
+            position: [x1, y2],
+            tex_coord: [u0, v1],
+            color,
+        },
     ]
 }
 
@@ -162,7 +204,6 @@ impl GpuRenderer {
         shader_source: &str,
         uniform_size: u64,
     ) {
-
         // Create shader module
         let shader = self
             .device
@@ -313,7 +354,6 @@ impl GpuRenderer {
         self.effect_uniform_buffers
             .insert(shader_id, effect_uniform_buffer);
         self.effect_bind_groups.insert(shader_id, effect_bind_group);
-
     }
 
     /// Upload font atlas texture to GPU
@@ -657,7 +697,6 @@ impl GpuRenderer {
 
     /// Execute batched draw commands (transforms view → physical)
     pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &Viewport) {
-
         // Update uniform buffer with PHYSICAL viewport size
         // Since glyphs are in physical pixels, shaders need physical dimensions
         let uniforms = ShaderUniforms {
@@ -719,7 +758,12 @@ impl GpuRenderer {
                     }
                     BatchedDraw::GlyphBatch { instances, .. } => {
                         if !instances.is_empty() {
-                            self.draw_glyphs(&mut render_pass, instances, viewport.scale_factor, None);
+                            self.draw_glyphs(
+                                &mut render_pass,
+                                instances,
+                                viewport.scale_factor,
+                                None,
+                            );
                         }
                     }
                     BatchedDraw::SetClip(rect) => {
@@ -754,7 +798,6 @@ impl GpuRenderer {
             return;
         }
 
-
         // Generate vertices for rectangles (transform view → physical)
         let mut vertices = Vec::with_capacity(instances.len() * 6);
         for rect in instances {
@@ -773,7 +816,6 @@ impl GpuRenderer {
             );
             vertices.extend_from_slice(&rect_verts);
         }
-
 
         // Upload vertices
         self.queue
@@ -797,7 +839,6 @@ impl GpuRenderer {
         if instances.is_empty() {
             return;
         }
-
 
         // Choose pipeline based on shader effect
         let (pipeline, extra_bind_group) = if let Some(id) = shader_id {
@@ -833,7 +874,6 @@ impl GpuRenderer {
             );
             vertices.extend_from_slice(&glyph_verts);
         }
-
 
         // Upload vertices
         self.queue.write_buffer(

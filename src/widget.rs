@@ -291,7 +291,11 @@ impl Widget for TextWidget {
             ctx.viewport.metrics.font_size,
             ctx.viewport.scale_factor,
             ctx.viewport.metrics.line_height,
-            if effects.is_empty() { None } else { Some(&effects) },
+            if effects.is_empty() {
+                None
+            } else {
+                Some(&effects)
+            },
             self.original_byte_offset,
         );
 
@@ -350,12 +354,8 @@ impl Widget for TextWidget {
 
             // Render with or without shader effects
             if let Some(id) = shader_id {
-                ctx.gpu_renderer.draw_glyphs(
-                    render_pass,
-                    &all_glyph_instances,
-                    1.0,
-                    Some(id),
-                );
+                ctx.gpu_renderer
+                    .draw_glyphs(render_pass, &all_glyph_instances, 1.0, Some(id));
             } else {
                 ctx.gpu_renderer
                     .draw_glyphs(render_pass, &all_glyph_instances, 1.0, None);
