@@ -20,9 +20,10 @@ fn vs_main(
     var out: VertexOutput;
 
     // Convert position from pixel coords to clip space
+    // Map [0, viewport_width] to [-1, 1] and [0, viewport_height] to [1, -1]
     out.clip_position = vec4<f32>(
-        (position.x / (uniforms.viewport_size.x * 0.5)) - 1.0,
-        1.0 - (position.y / (uniforms.viewport_size.y * 0.5)),
+        (position.x / uniforms.viewport_size.x) * 2.0 - 1.0,
+        1.0 - (position.y / uniforms.viewport_size.y) * 2.0,
         0.0,
         1.0
     );

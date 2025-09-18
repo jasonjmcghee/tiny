@@ -77,48 +77,64 @@ impl Selection {
             let start_layout = viewport.doc_to_layout(start);
             let end_layout = viewport.doc_to_layout(end);
 
+            // Add dummy rectangle for GPU rendering bug workaround
+            rectangles.push(LayoutRect::new(0.0, 0.0, 0.0, 0.0));
+
             rectangles.push(LayoutRect::new(
-                start_layout.x.0,
+                start_layout.x.0 - 2.0, // Align with cursor positioning (-2px shift)
                 start_layout.y.0,
-                end_layout.x.0 - start_layout.x.0,
+                end_layout.x.0 - (start_layout.x.0), // Width from shifted start to end
                 line_height,
             ));
         } else {
             // Multi-line selection
             let start_layout = viewport.doc_to_layout(start);
+            let end_layout = viewport.doc_to_layout(end);
 
-            // First line: from start position to end of line
-            // For now, extend to viewport edge (TODO: calculate actual line width with font system)
-            let first_line_end = viewport.logical_size.width.0 - viewport.margin.x.0;
 
-            rectangles.push(LayoutRect::new(
-                start_layout.x.0,
+            // First line: from start position to right edge of viewport
+            let viewport_right = viewport.logical_size.width.0 - viewport.margin.x.0;
+            let first_line_width = (viewport_right - start_layout.x.0).max(0.0);
+
+            let first_rect = LayoutRect::new(
+                start_layout.x.0 - 2.0, // Align with cursor positioning (-2px shift)
                 start_layout.y.0,
-                first_line_end - start_layout.x.0,
+                first_line_width + 2.0, // Extend width because we shifted start left by 2px
                 line_height,
-            ));
+            );
+            // Try pushing rectangles in reverse order to see if it's an ordering issue
+            let mut temp_rects = Vec::new();
+            temp_rects.push(first_rect);
 
-            // Middle lines: full width rectangles
+            // Middle lines: full width rectangles (if any)
             if end.line > start.line + 1 {
                 let middle_start_y = start_layout.y.0 + line_height;
                 let middle_height = (end.line - start.line - 1) as f32 * line_height;
-
-                rectangles.push(LayoutRect::new(
+                let middle_rect = LayoutRect::new(
                     viewport.margin.x.0,
                     middle_start_y,
                     viewport.logical_size.width.0 - (viewport.margin.x.0 * 2.0),
                     middle_height,
-                ));
+                );
+                temp_rects.push(middle_rect);
             }
 
             // Last line: from start of line to end position
-            let end_layout = viewport.doc_to_layout(end);
-            rectangles.push(LayoutRect::new(
+            let last_rect = LayoutRect::new(
                 viewport.margin.x.0,
                 end_layout.y.0,
-                end_layout.x.0 - viewport.margin.x.0,
+                end_layout.x.0 - viewport.margin.x.0 - 2.0,
                 line_height,
-            ));
+            );
+            temp_rects.push(last_rect);
+
+            // Add a dummy 0-size rectangle at the beginning as a sacrificial first rect
+            rectangles.push(LayoutRect::new(0.0, 0.0, 0.0, 0.0));
+
+            // Now push the real rectangles in normal order
+            for rect in temp_rects {
+                rectangles.push(rect);
+            }
         }
 
         rectangles
@@ -779,9 +795,6 @@ impl InputHandler {
             _ => {}
         }
 
-        // Update selection widgets in tree
-        self.update_selection_widgets(doc);
-
         // Return true to indicate potential scrolling needed
         true
     }
@@ -833,7 +846,6 @@ impl InputHandler {
             self.next_id += 1;
         }
 
-        self.update_selection_widgets(doc);
         true
     }
 
@@ -882,7 +894,6 @@ impl InputHandler {
             self.next_id += 1;
         }
 
-        self.update_selection_widgets(doc);
         true
     }
 
@@ -1043,9 +1054,10 @@ impl InputHandler {
         let mut selection_widgets = Vec::new();
         let mut cursor_widget = None;
 
-        for selection in &self.selections {
-            if selection.is_cursor() {
-                // Create cursor widget
+        for (i, selection) in self.selections.iter().enumerate() {
+            // Always create cursor at the active end of selection (cursor position)
+            // Only create it for the primary selection (index 0)
+            if i == 0 {
                 let tree = doc.read();
                 // Get the line text for accurate cursor positioning
                 let line_text = if let Some(line_start) = tree.line_to_byte(selection.cursor.line)
@@ -1061,9 +1073,12 @@ impl InputHandler {
                 // Use accurate text-based positioning
                 let layout_pos = viewport.doc_to_layout_with_text(selection.cursor, &line_text);
 
-                // Position cursor directly at calculated position (no shift needed)
+                // Position cursor directly at calculated position
                 cursor_widget = Some(widget::cursor(layout_pos));
-            } else {
+            }
+
+            // Create selection widget if it's not just a cursor
+            if !selection.is_cursor() {
                 // Create selection widget with 1-3 rectangles
                 let rectangles = selection.to_rectangles(doc, viewport);
                 if !rectangles.is_empty() {

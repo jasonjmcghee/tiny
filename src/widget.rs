@@ -269,11 +269,11 @@ impl Widget for TextWidget {
             _ => 0.0,
         };
 
-        // TextWidget doesn't have its own position - it's rendered at (0,0) and positioned via transform
-        // This is because text is part of the document content, not an overlay
+        // Text should include margin positioning to match cursor/selection
+        // Add margin to align with cursor/selection coordinate system
         let layout_pos = crate::coordinates::LayoutPos::new(
-            x_base_offset,
-            0.0,
+            ctx.viewport.margin.x.0 + x_base_offset,
+            ctx.viewport.margin.y.0
         );
 
         // Get effects for this text if available
@@ -313,7 +313,9 @@ impl Widget for TextWidget {
             // Scan text styles for shader effects AND apply color effects to glyphs
             if let Some(text_styles) = ctx.text_styles {
                 // Use the same range as before - document-relative positions
-                let text_range = self.original_byte_offset..(self.original_byte_offset + std::str::from_utf8(&self.text).unwrap_or("").len());
+                let text_range = self.original_byte_offset
+                    ..(self.original_byte_offset
+                        + std::str::from_utf8(&self.text).unwrap_or("").len());
                 let effects = text_styles.get_effects_in_range(text_range);
 
                 // Apply color effects to glyphs by updating their colors
@@ -327,7 +329,8 @@ impl Widget for TextWidget {
 
                             for ch in text_str.chars() {
                                 if glyph_idx < all_glyph_instances.len() {
-                                    if byte_pos >= effect.range.start && byte_pos < effect.range.end {
+                                    if byte_pos >= effect.range.start && byte_pos < effect.range.end
+                                    {
                                         all_glyph_instances[glyph_idx].color = color;
                                     }
                                     glyph_idx += 1;
@@ -381,8 +384,8 @@ impl Widget for CursorWidget {
     }
 
     fn update(&mut self, dt: f32) -> bool {
-        // Update blink animation
-        self.blink_phase += dt * 2.0;
+        // Update blink animation - faster and sharper
+        self.blink_phase += dt * 4.0; // 2x faster
         if self.blink_phase > std::f32::consts::TAU {
             self.blink_phase -= std::f32::consts::TAU;
         }
@@ -400,12 +403,7 @@ impl Widget for CursorWidget {
     }
 
     fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(
-            self.position.x.0,
-            self.position.y.0,
-            self.style.width,
-            19.6
-        )
+        LayoutRect::new(self.position.x.0, self.position.y.0, self.style.width, 19.6)
     }
 
     fn priority(&self) -> i32 {
@@ -413,25 +411,74 @@ impl Widget for CursorWidget {
     }
 
     fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        use crate::coordinates::LayoutRect as Rect;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Apply blinking animation
-        let alpha = ((self.blink_phase * 2.0).sin() * 0.5 + 0.5).max(0.3);
-        let color = (self.style.color & 0xFFFFFF00) | (((alpha * 255.0) as u32) << 24);
+        // Track cursor position and last activity time (in milliseconds since program start)
+        static LAST_POS: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
+        static CURSOR_LAST_ACTIVE: AtomicU64 = AtomicU64::new(0);
+        static PROGRAM_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+        let start = PROGRAM_START.get_or_init(std::time::Instant::now);
+        let now_ms = start.elapsed().as_millis() as u64;
+
+        // Check if cursor moved
+        let current_pos = (self.position.x.0, self.position.y.0);
+        if let Ok(mut last) = LAST_POS.lock() {
+            if last.map_or(true, |p| p != current_pos) {
+                *last = Some(current_pos);
+                // Update last activity time
+                CURSOR_LAST_ACTIVE.store(now_ms, Ordering::Relaxed);
+            }
+        }
+
+        // Simple blink logic
+        let last_active = CURSOR_LAST_ACTIVE.load(Ordering::Relaxed);
+        let ms_since_activity = now_ms.saturating_sub(last_active);
+
+        let color = if ms_since_activity < 500 {
+            // Solid cursor for 500ms after activity
+            self.style.color
+        } else {
+            // Blink: 500ms on, 500ms off
+            let blink_phase = (now_ms / 500) % 2;
+            if blink_phase == 0 {
+                self.style.color
+            } else {
+                0x00000000
+            }
+        };
 
         // Use line height from viewport metrics
         let line_height = ctx.viewport.metrics.line_height;
 
-        // Render cursor rectangle directly to GPU at its absolute position
+        // Transform cursor position from layout space to view space (apply scroll offset)
+        let view_pos = ctx.viewport.layout_to_view(self.position);
+
+        // Apply 2px left shift for better alignment
+        let adjusted_view_pos = crate::coordinates::ViewPos::new(
+            view_pos.x.0 - 2.0,
+            view_pos.y.0
+        );
+
+        // Create view-space rectangle for GPU rendering
+        let view_rect = crate::coordinates::ViewRect::new(
+            adjusted_view_pos.x.0,
+            adjusted_view_pos.y.0,
+            self.style.width,
+            line_height,
+        );
+
+        // Convert to render rect format
         let rect_instance = crate::render::RectInstance {
-            rect: Rect {
-                x: self.position.x,
-                y: self.position.y,
-                width: LogicalPixels(self.style.width),
-                height: LogicalPixels(line_height),
-            },
+            rect: crate::coordinates::LayoutRect::new(
+                view_rect.x.0,
+                view_rect.y.0,
+                view_rect.width.0,
+                view_rect.height.0,
+            ),
             color,
         };
+
         ctx.gpu_renderer
             .draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
     }
@@ -490,25 +537,32 @@ impl Widget for SelectionWidget {
             max_y = max_y.max(rect.y.0 + rect.height.0);
         }
 
-        LayoutRect::new(
-            min_x,
-            min_y,
-            max_x - min_x,
-            max_y - min_y
-        )
+        LayoutRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 
     fn priority(&self) -> i32 {
-        -1 // Selection behind text
+        -10 // Selection well behind text
     }
 
     fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        // Render all selection rectangles (1-3 for multi-line selections)
-        let rect_instances: Vec<crate::render::RectInstance> = self.rectangles
+        // Transform all selection rectangles from layout space to view space
+        let rect_instances: Vec<crate::render::RectInstance> = self
+            .rectangles
             .iter()
-            .map(|rect| crate::render::RectInstance {
-                rect: *rect,
-                color: self.color,
+            .map(|rect| {
+                // Transform each rectangle from layout to view space (apply scroll offset)
+                let view_rect = ctx.viewport.layout_rect_to_view(*rect);
+
+                // Convert ViewRect back to LayoutRect format for RectInstance
+                crate::render::RectInstance {
+                    rect: crate::coordinates::LayoutRect::new(
+                        view_rect.x.0,
+                        view_rect.y.0,
+                        view_rect.width.0,
+                        view_rect.height.0,
+                    ),
+                    color: self.color,
+                }
             })
             .collect();
 
@@ -687,8 +741,8 @@ pub fn cursor(position: LayoutPos) -> Arc<dyn Widget> {
     Arc::new(CursorWidget {
         position,
         style: CursorStyle {
-            color: 0xFFFFFFFF,
-            width: 2.0,
+            color: 0xFFFFFFFF, // White cursor
+            width: 2.0,        // Normal width
         },
         blink_phase: 0.0,
     })
@@ -698,7 +752,7 @@ pub fn cursor(position: LayoutPos) -> Arc<dyn Widget> {
 pub fn selection(rectangles: Vec<LayoutRect>) -> Arc<dyn Widget> {
     Arc::new(SelectionWidget {
         rectangles,
-        color: 0x4080FF80, // Semi-transparent blue
+        color: 0x4080FF40, // Semi-transparent blue
     })
 }
 
@@ -767,6 +821,7 @@ impl WidgetManager {
         self.widgets.clear();
         self.sorted_ids.clear();
         self.needs_sort = false;
+        // Don't reset next_id - let it keep incrementing
     }
 
     /// Update all widgets (for animations)
@@ -787,12 +842,8 @@ impl WidgetManager {
     pub fn widgets_in_order(&mut self) -> Vec<Arc<dyn Widget>> {
         if self.needs_sort {
             // Sort by widget priority (z-index)
-            self.sorted_ids.sort_by_key(|&id| {
-                self.widgets
-                    .get(&id)
-                    .map(|w| w.priority())
-                    .unwrap_or(0)
-            });
+            self.sorted_ids
+                .sort_by_key(|&id| self.widgets.get(&id).map(|w| w.priority()).unwrap_or(0));
             self.needs_sort = false;
         }
 
@@ -804,20 +855,40 @@ impl WidgetManager {
 
     /// Paint all widgets in order
     pub fn paint_all(&mut self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        for widget in self.widgets_in_order() {
-            widget.paint(ctx, render_pass);
+        let widgets = self.widgets_in_order();
+        if !widgets.is_empty() {
+            println!("PAINTING {} widgets", widgets.len());
+            for widget in &widgets {
+                println!(
+                    "  Widget type: {}, priority: {}",
+                    if widget.widget_id() == 1 {
+                        "CURSOR"
+                    } else if widget.widget_id() == 2 {
+                        "SELECTION"
+                    } else {
+                        "OTHER"
+                    },
+                    widget.priority()
+                );
+                widget.paint(ctx, render_pass);
+            }
         }
     }
 
     /// Replace selection widgets with new ones
     pub fn set_selection_widgets(&mut self, selections: Vec<Arc<dyn Widget>>) {
-        // Remove existing selection widgets (ID 2 or in range 10000-19999)
+        // Remove all existing selection widgets by widget type
         self.sorted_ids.retain(|&id| {
-            if id == 2 || (id >= 10000 && id < 20000) {
-                self.widgets.remove(&id);
-                false
+            if let Some(widget) = self.widgets.get(&id) {
+                if widget.widget_id() == 2 {
+                    // SelectionWidget returns id 2
+                    self.widgets.remove(&id);
+                    false
+                } else {
+                    true
+                }
             } else {
-                true
+                false // Remove invalid IDs
             }
         });
 
@@ -829,13 +900,18 @@ impl WidgetManager {
 
     /// Set cursor widget (replaces existing)
     pub fn set_cursor_widget(&mut self, cursor: Arc<dyn Widget>) {
-        // Remove existing cursor widget (ID 1 or in range 20000-29999)
+        // Remove all existing cursor widgets by widget type
         self.sorted_ids.retain(|&id| {
-            if id == 1 || (id >= 20000 && id < 30000) {
-                self.widgets.remove(&id);
-                false
+            if let Some(widget) = self.widgets.get(&id) {
+                if widget.widget_id() == 1 {
+                    // CursorWidget returns id 1
+                    self.widgets.remove(&id);
+                    false
+                } else {
+                    true
+                }
             } else {
-                true
+                false // Remove invalid IDs
             }
         });
 

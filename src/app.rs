@@ -14,7 +14,7 @@ use crate::{
 };
 #[allow(unused)]
 use std::io::BufRead;
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -140,6 +140,9 @@ pub struct TinyApp<T: AppLogic> {
 
     // Key track
     just_pressed_key: bool,
+
+    // Animation timer
+    animation_timer_started: Arc<AtomicBool>,
 }
 
 impl<T: AppLogic> TinyApp<T> {
@@ -160,6 +163,7 @@ impl<T: AppLogic> TinyApp<T> {
             mouse_pressed: false,
             drag_start: None,
             just_pressed_key: false,
+            animation_timer_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -456,8 +460,18 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Update widgets (for animations like cursor blinking)
             let dt = 0.016; // ~60fps frame time
-            if cpu_renderer.update_widgets(dt) {
-                window.request_redraw();
+            cpu_renderer.update_widgets(dt);
+
+            // Start animation timer once
+            if !self.animation_timer_started.load(Ordering::Relaxed) {
+                self.animation_timer_started.store(true, Ordering::Relaxed);
+                let window_clone = window.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        window_clone.request_redraw();
+                    }
+                });
             }
 
             if self.just_pressed_key {
@@ -514,6 +528,7 @@ impl<T: AppLogic> TinyApp<T> {
             // Update widget manager with current selections if EditorLogic is being used
             // This ensures cursor and selection widgets are updated
             if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                // For now, always update widgets (widgets_dirty = true)
                 cpu_renderer.set_selection_widgets(&editor.input, &editor.doc);
             }
 
@@ -537,6 +552,8 @@ pub struct EditorLogic {
     pub doc: Doc,
     pub input: InputHandler,
     pub syntax_highlighter: Option<Box<dyn TextStyleProvider>>,
+    /// Flag to indicate widgets need updating
+    widgets_dirty: bool,
 }
 
 impl EditorLogic {
@@ -580,6 +597,7 @@ impl EditorLogic {
             doc,
             input,
             syntax_highlighter: Some(syntax_highlighter),
+            widgets_dirty: true,
         }
     }
 }
@@ -595,7 +613,11 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &winit::event::Modifiers,
     ) -> bool {
-        self.input.on_key(&self.doc, viewport, event, modifiers)
+        let result = self.input.on_key(&self.doc, viewport, event, modifiers);
+        if result {
+            self.widgets_dirty = true; // Mark widgets for update
+        }
+        result
     }
 
     fn on_click(
@@ -613,6 +635,7 @@ impl AppLogic for EditorLogic {
             winit::event::MouseButton::Left,
             alt_held,
         );
+        self.widgets_dirty = true; // Mark widgets for update
         true
     }
 
@@ -627,6 +650,7 @@ impl AppLogic for EditorLogic {
         let alt_held = modifiers.state().alt_key();
         self.input
             .on_mouse_drag(&self.doc, viewport, from, to, alt_held);
+        self.widgets_dirty = true; // Mark widgets for update
         true
     }
 

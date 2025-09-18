@@ -467,6 +467,7 @@ pub fn create_glyph_instances(
     let mut y_offset = 0.0;
     let mut global_byte_pos = 0;
 
+
     for line_text in lines.iter() {
         // Layout this single line
         let layout = font_system.layout_text_scaled(line_text, font_size, scale_factor);

@@ -74,6 +74,9 @@ fn create_rect_vertices(x: f32, y: f32, width: f32, height: f32, color: u32) -> 
     let x2 = x + width;
     let y2 = y + height;
 
+    // Two triangles in counter-clockwise order
+    // Triangle 1: top-left, top-right, bottom-left
+    // Triangle 2: top-right, bottom-right, bottom-left
     [
         // Triangle 1
         RectVertex {
@@ -765,6 +768,9 @@ impl GpuRenderer {
             cpu_renderer.set_cached_doc_text(tree.flatten_to_string());
             cpu_renderer.set_cached_doc_version(tree.version);
 
+            // Widget updates will be handled by passing selections to render_with_pass
+            // The renderer will update widgets based on current selections
+
             // Render with pass - this will paint both text and widgets
             let batches = cpu_renderer.render_with_pass(tree, viewport_rect, selections, Some(&mut render_pass));
 
@@ -902,7 +908,7 @@ impl GpuRenderer {
 
         // Generate vertices for rectangles (transform view → physical)
         let mut vertices = Vec::with_capacity(instances.len() * 6);
-        for rect in instances {
+        for (i, rect) in instances.iter().enumerate() {
             // Apply scale factor to transform from view to physical coordinates
             let physical_x = rect.rect.x.0 * scale_factor;
             let physical_y = rect.rect.y.0 * scale_factor;
@@ -916,6 +922,7 @@ impl GpuRenderer {
                 physical_height,
                 rect.color,
             );
+
             vertices.extend_from_slice(&rect_verts);
         }
 
@@ -923,10 +930,11 @@ impl GpuRenderer {
         self.queue
             .write_buffer(&self.rect_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
 
-        // Draw
+        // Draw all vertices as triangles
         render_pass.set_pipeline(&self.rect_pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.rect_vertex_buffer.slice(..));
+
         render_pass.draw(0..vertices.len() as u32, 0..1);
     }
 

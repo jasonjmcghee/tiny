@@ -263,7 +263,7 @@ impl Renderer {
         &mut self,
         tree: &Tree,
         viewport: Rect,
-        _selections: &[crate::input::Selection],
+        selections: &[crate::input::Selection],
         mut render_pass: Option<&mut wgpu::RenderPass>,
     ) -> Vec<BatchedDraw> {
         // Clear previous frame
@@ -277,20 +277,8 @@ impl Renderer {
         // Reset document position for new frame
         self.current_doc_pos = DocPos::default();
 
-        // Use the sum-tree visible range system we built
-        let visible_range = self.viewport.visible_byte_range_with_tree(tree);
-
-        if render_pass.is_some() {
-            // Direct GPU rendering mode for widgets
-            self.walk_visible_range_with_pass(tree, visible_range, render_pass.as_deref_mut());
-        } else {
-            // Command generation mode (legacy)
-            self.walk_visible_range(tree, visible_range);
-        }
-
-        // Render overlay widgets (cursor, selections) through widget manager
+        // Render selections FIRST (behind text)
         if let Some(ref mut pass) = render_pass {
-            // Get gpu_renderer pointer before borrowing widget_manager
             let gpu_renderer_ptr = self.gpu_renderer;
             if let (Some(font_system), Some(gpu_renderer)) = (&self.font_system, gpu_renderer_ptr.map(|ptr| unsafe { &*ptr })) {
                 let ctx = crate::widget::PaintContext {
@@ -303,8 +291,48 @@ impl Renderer {
                     text_styles: self.text_styles.as_deref(),
                 };
 
-                // Paint all overlay widgets
-                self.widget_manager.paint_all(&ctx, pass);
+                // Paint only selection widgets (negative priority) BEFORE text
+                let widgets = self.widget_manager.widgets_in_order();
+                for widget in &widgets {
+                    if widget.priority() < 0 { // Only selections
+                        widget.paint(&ctx, pass);
+                    }
+                }
+            }
+        }
+
+        // Use the sum-tree visible range system we built
+        let visible_range = self.viewport.visible_byte_range_with_tree(tree);
+
+        if render_pass.is_some() {
+            // Direct GPU rendering mode for widgets
+            self.walk_visible_range_with_pass(tree, visible_range, render_pass.as_deref_mut());
+        } else {
+            // Command generation mode (legacy)
+            self.walk_visible_range(tree, visible_range);
+        }
+
+        // Render cursor and other widgets AFTER text (on top)
+        if let Some(ref mut pass) = render_pass {
+            let gpu_renderer_ptr = self.gpu_renderer;
+            if let (Some(font_system), Some(gpu_renderer)) = (&self.font_system, gpu_renderer_ptr.map(|ptr| unsafe { &*ptr })) {
+                let ctx = crate::widget::PaintContext {
+                    viewport: &self.viewport,
+                    device: gpu_renderer.device(),
+                    queue: gpu_renderer.queue(),
+                    uniform_bind_group: gpu_renderer.uniform_bind_group(),
+                    gpu_renderer,
+                    font_system,
+                    text_styles: self.text_styles.as_deref(),
+                };
+
+                // Paint cursor and other widgets (positive priority) AFTER text
+                let widgets = self.widget_manager.widgets_in_order();
+                for widget in &widgets {
+                    if widget.priority() >= 0 { // Cursor and others
+                        widget.paint(&ctx, pass);
+                    }
+                }
             }
         }
 
@@ -714,6 +742,54 @@ impl Renderer {
     /// Update animation for overlay widgets
     pub fn update_widgets(&mut self, dt: f32) -> bool {
         self.widget_manager.update_all(dt)
+    }
+
+    /// Update widgets from current selections
+    pub fn update_widgets_from_selections(&mut self, selections: &[crate::input::Selection]) {
+        // Clear existing widgets
+        self.widget_manager.clear();
+
+        // Create widgets from selections
+        let mut cursor_widget = None;
+        let mut selection_widgets = Vec::new();
+
+        for selection in selections {
+            if selection.is_cursor() {
+                // Create cursor widget
+                let layout_pos = self.viewport.doc_to_layout(selection.cursor);
+                cursor_widget = Some(crate::widget::cursor(layout_pos));
+            } else {
+                // Create selection widget
+                let start_layout = self.viewport.doc_to_layout(selection.anchor);
+                let end_layout = self.viewport.doc_to_layout(selection.cursor);
+
+                // Simple single rectangle for now
+                let (min_x, max_x) = if start_layout.x.0 < end_layout.x.0 {
+                    (start_layout.x.0, end_layout.x.0)
+                } else {
+                    (end_layout.x.0, start_layout.x.0)
+                };
+                let (min_y, max_y) = if start_layout.y.0 < end_layout.y.0 {
+                    (start_layout.y.0, end_layout.y.0 + self.viewport.metrics.line_height)
+                } else {
+                    (end_layout.y.0, start_layout.y.0 + self.viewport.metrics.line_height)
+                };
+
+                let rect = crate::coordinates::LayoutRect::new(
+                    min_x,
+                    min_y,
+                    max_x - min_x,
+                    max_y - min_y,
+                );
+                selection_widgets.push(crate::widget::selection(vec![rect]));
+            }
+        }
+
+        // Add widgets to manager
+        self.widget_manager.set_selection_widgets(selection_widgets);
+        if let Some(cursor) = cursor_widget {
+            self.widget_manager.set_cursor_widget(cursor);
+        }
     }
 
     /// Get node bounds
