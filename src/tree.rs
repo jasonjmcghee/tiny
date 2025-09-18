@@ -7,7 +7,6 @@ use crate::widget::Widget;
 use arc_swap::ArcSwap;
 use crossbeam::queue::SegQueue;
 use simdutf8::basic::from_utf8;
-use std::fmt::Display;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

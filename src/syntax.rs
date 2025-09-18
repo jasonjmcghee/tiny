@@ -589,20 +589,6 @@ impl TextStyleProvider for SyntaxHighlighter {
             .cloned()
             .collect();
 
-        static mut DEBUG_COUNT: u32 = 0;
-        unsafe {
-            if DEBUG_COUNT < 10 && !result.is_empty() {
-                println!(
-                    "SYNTAX: Returning {} effects for range {}..{} (total effects: {})",
-                    result.len(),
-                    range.start,
-                    range.end,
-                    all_effects.len()
-                );
-                DEBUG_COUNT += 1;
-            }
-        }
-
         result
     }
 

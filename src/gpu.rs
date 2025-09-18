@@ -758,12 +758,7 @@ impl GpuRenderer {
                     }
                     BatchedDraw::GlyphBatch { instances, .. } => {
                         if !instances.is_empty() {
-                            self.draw_glyphs(
-                                &mut render_pass,
-                                instances,
-                                viewport.scale_factor,
-                                None,
-                            );
+                            self.draw_glyphs(&mut render_pass, instances, None);
                         }
                     }
                     BatchedDraw::SetClip(rect) => {
@@ -833,7 +828,6 @@ impl GpuRenderer {
         &self,
         render_pass: &mut wgpu::RenderPass,
         instances: &[GlyphInstance],
-        scale_factor: f32,
         shader_id: Option<u32>, // Pass None for default shader
     ) {
         if instances.is_empty() {

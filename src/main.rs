@@ -38,8 +38,6 @@ impl ApplicationHandler for TinyEditorApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create window when app resumes
         if self.window.is_none() {
-            println!("Creating window...");
-
             let window = Arc::new(
                 event_loop
                     .create_window(

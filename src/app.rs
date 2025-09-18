@@ -182,8 +182,6 @@ impl<T: AppLogic> TinyApp<T> {
 impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            println!("🪟 Creating window: {}", self.window_title);
-
             // Create window
             let window = Arc::new(
                 event_loop
@@ -199,11 +197,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             );
 
             // Setup GPU renderer
-            println!("Initializing GPU...");
             let gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
 
             // Setup font system
-            println!("Setting up fonts...");
             let font_system = Arc::new(SharedFontSystem::new());
 
             // Get scale factor for high DPI displays
@@ -227,7 +223,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             self.font_system = Some(font_system);
             self.cpu_renderer = Some(cpu_renderer);
 
-            println!("Setup complete!");
             self.logic.on_ready();
 
             // Initial render
@@ -413,8 +408,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                     // Update scroll in viewport
                     let viewport = cpu_renderer.viewport_mut();
-                    let old_scroll_y = viewport.scroll.y.0;
-                    let old_scroll_x = viewport.scroll.x.0;
 
                     // Apply the scroll amounts (note: scroll values are inverted)
                     let new_scroll_y = viewport.scroll.y.0 - final_scroll_y;
@@ -426,16 +419,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     let doc = self.logic.doc();
                     let tree = doc.read();
                     viewport.clamp_scroll_to_bounds(&tree);
-
-                    println!(
-                        "MOUSE WHEEL: scroll_y={:.1} ({:.1}->{:.1}), scroll_x={:.1} ({:.1}->{:.1})",
-                        scroll_y,
-                        old_scroll_y,
-                        viewport.scroll.y.0,
-                        scroll_x,
-                        old_scroll_x,
-                        viewport.scroll.x.0
-                    );
 
                     if let Some(window) = &self.window {
                         window.request_redraw();

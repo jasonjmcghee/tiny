@@ -355,10 +355,10 @@ impl Widget for TextWidget {
             // Render with or without shader effects
             if let Some(id) = shader_id {
                 ctx.gpu_renderer
-                    .draw_glyphs(render_pass, &all_glyph_instances, 1.0, Some(id));
+                    .draw_glyphs(render_pass, &all_glyph_instances, Some(id));
             } else {
                 ctx.gpu_renderer
-                    .draw_glyphs(render_pass, &all_glyph_instances, 1.0, None);
+                    .draw_glyphs(render_pass, &all_glyph_instances, None);
             }
         }
     }
@@ -409,7 +409,7 @@ impl Widget for CursorWidget {
 
         // Apply blinking animation
         let alpha = ((self.blink_phase * 2.0).sin() * 0.5 + 0.5).max(0.3);
-        let color = (self.style.color & 0x00FFFFFF) | (((alpha * 255.0) as u32) << 24);
+        let color = (self.style.color & 0xFFFFFF00) | (((alpha * 255.0) as u32) << 24);
 
         // Use line height from viewport metrics
         let line_height = ctx.viewport.metrics.line_height;
@@ -578,10 +578,10 @@ impl Widget for DiagnosticWidget {
 
     fn paint(&self, ctx: &PaintContext<'_>, _render_pass: &mut wgpu::RenderPass) {
         let color = match self.severity {
-            Severity::Error => 0xFFFF0000u32,   // Red
-            Severity::Warning => 0xFFFF8800u32, // Orange
-            Severity::Info => 0xFF0088FFu32,    // Blue
-            Severity::Hint => 0xFF888888u32,    // Gray
+            Severity::Error => 0xFF00FFu32,   // Red
+            Severity::Warning => 0xFF88FFu32, // Orange
+            Severity::Info => 0x0088FFFFu32,  // Blue
+            Severity::Hint => 0x888888FFu32,  // Gray
         };
 
         // Draw wavy underline

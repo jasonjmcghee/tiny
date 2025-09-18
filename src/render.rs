@@ -3,7 +3,6 @@
 //! Widgets emit commands, renderer batches and optimizes them for GPU
 
 use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
-use crate::text_effects::TextStyleProvider;
 use crate::tree::{Node, Point, Rect, Span, Tree};
 use crate::widget::Widget;
 use std::sync::Arc;

@@ -102,10 +102,7 @@ impl Editor {
         if let Some(path) = &self.path {
             io::save(&self.doc, path)
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No file path set",
-            ))
+            Err(std::io::Error::other("No file path set"))
         }
     }
 

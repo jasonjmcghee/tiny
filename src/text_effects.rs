@@ -209,7 +209,7 @@ mod tests {
         let provider = MockProvider {
             effects: vec![TextEffect {
                 range: 0..10,
-                effect: EffectType::Color(0xFF0000),
+                effect: EffectType::Color(0xFF0000FF),
                 priority: priority::SYNTAX,
             }],
         };
@@ -227,12 +227,12 @@ mod tests {
             effects: vec![
                 TextEffect {
                     range: 0..10,
-                    effect: EffectType::Color(0xFF0000),
+                    effect: EffectType::Color(0xFF0000FF),
                     priority: priority::SYNTAX,
                 },
                 TextEffect {
                     range: 20..30,
-                    effect: EffectType::Color(0x00FF00),
+                    effect: EffectType::Color(0x00FF00FF),
                     priority: priority::SYNTAX,
                 },
             ],
