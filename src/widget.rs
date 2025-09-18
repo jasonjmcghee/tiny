@@ -3,6 +3,7 @@
 //! Text rendering uses the consolidated FontSystem from font.rs
 
 use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Widget identifier for texture access
@@ -55,10 +56,6 @@ pub struct PaintContext<'a> {
     pub font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
     /// Text style provider for syntax highlighting (optional)
     pub text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
-
-    // Legacy fields for compatibility (will be removed)
-    /// Widget's position in layout space (for simple widgets)
-    pub layout_pos: LayoutPos,
 }
 
 // === Content Type for TextWidget ===
@@ -113,6 +110,8 @@ impl Clone for TextWidget {
 /// Cursor widget - blinking text cursor
 #[derive(Clone)]
 pub struct CursorWidget {
+    /// Absolute position in layout space
+    pub position: LayoutPos,
     /// Style for cursor (color, width)
     pub style: CursorStyle,
     /// Animation state
@@ -122,8 +121,8 @@ pub struct CursorWidget {
 /// Selection widget - highlight for selected text
 #[derive(Clone)]
 pub struct SelectionWidget {
-    /// Byte range of selection
-    pub range: std::ops::Range<usize>,
+    /// Rectangles that make up this selection (1-3 for multi-line)
+    pub rectangles: Vec<LayoutRect>,
     /// Selection color
     pub color: u32,
 }
@@ -270,9 +269,11 @@ impl Widget for TextWidget {
             _ => 0.0,
         };
 
+        // TextWidget doesn't have its own position - it's rendered at (0,0) and positioned via transform
+        // This is because text is part of the document content, not an overlay
         let layout_pos = crate::coordinates::LayoutPos::new(
-            ctx.layout_pos.x.0 + x_base_offset,
-            ctx.layout_pos.y.0,
+            x_base_offset,
+            0.0,
         );
 
         // Get effects for this text if available
@@ -311,7 +312,8 @@ impl Widget for TextWidget {
 
             // Scan text styles for shader effects AND apply color effects to glyphs
             if let Some(text_styles) = ctx.text_styles {
-                let text_range = 0..std::str::from_utf8(&self.text).unwrap_or("").len();
+                // Use the same range as before - document-relative positions
+                let text_range = self.original_byte_offset..(self.original_byte_offset + std::str::from_utf8(&self.text).unwrap_or("").len());
                 let effects = text_styles.get_effects_in_range(text_range);
 
                 // Apply color effects to glyphs by updating their colors
@@ -319,19 +321,20 @@ impl Widget for TextWidget {
                     match effect.effect {
                         crate::text_effects::EffectType::Color(color) => {
                             // Find glyphs in this effect's range and update their colors
-                            let mut byte_pos = 0;
-                            for glyph in &mut all_glyph_instances {
-                                let char_len = std::str::from_utf8(&self.text)
-                                    .unwrap_or("")
-                                    .chars()
-                                    .nth(byte_pos)
-                                    .map(|c| c.len_utf8())
-                                    .unwrap_or(1);
+                            let text_str = std::str::from_utf8(&self.text).unwrap_or("");
+                            let mut byte_pos = self.original_byte_offset;
+                            let mut glyph_idx = 0;
 
-                                if byte_pos >= effect.range.start && byte_pos < effect.range.end {
-                                    glyph.color = color;
+                            for ch in text_str.chars() {
+                                if glyph_idx < all_glyph_instances.len() {
+                                    if byte_pos >= effect.range.start && byte_pos < effect.range.end {
+                                        all_glyph_instances[glyph_idx].color = color;
+                                    }
+                                    glyph_idx += 1;
+                                    byte_pos += ch.len_utf8();
+                                } else {
+                                    break;
                                 }
-                                byte_pos += char_len;
                             }
                         }
                         crate::text_effects::EffectType::Shader { id, ref params } => {
@@ -397,7 +400,12 @@ impl Widget for CursorWidget {
     }
 
     fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(0.0, 0.0, self.style.width, 19.6)
+        LayoutRect::new(
+            self.position.x.0,
+            self.position.y.0,
+            self.style.width,
+            19.6
+        )
     }
 
     fn priority(&self) -> i32 {
@@ -414,11 +422,11 @@ impl Widget for CursorWidget {
         // Use line height from viewport metrics
         let line_height = ctx.viewport.metrics.line_height;
 
-        // Render cursor rectangle directly to GPU
+        // Render cursor rectangle directly to GPU at its absolute position
         let rect_instance = crate::render::RectInstance {
             rect: Rect {
-                x: ctx.layout_pos.x,
-                y: ctx.layout_pos.y,
+                x: self.position.x,
+                y: self.position.y,
                 width: LogicalPixels(self.style.width),
                 height: LogicalPixels(line_height),
             },
@@ -451,13 +459,43 @@ impl Widget for SelectionWidget {
     }
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
+        // Calculate bounding size from rectangles
+        if self.rectangles.is_empty() {
+            return LayoutResult {
+                size: LogicalSize::new(0.0, 0.0),
+            };
+        }
+
+        let bounds = self.bounds();
         LayoutResult {
-            size: LogicalSize::new(0.0, 0.0),
+            size: LogicalSize::new(bounds.width.0, bounds.height.0),
         }
     }
 
     fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(0.0, 0.0, 0.0, 0.0)
+        // Return bounding box that encompasses all selection rectangles
+        if self.rectangles.is_empty() {
+            return LayoutRect::new(0.0, 0.0, 0.0, 0.0);
+        }
+
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+
+        for rect in &self.rectangles {
+            min_x = min_x.min(rect.x.0);
+            min_y = min_y.min(rect.y.0);
+            max_x = max_x.max(rect.x.0 + rect.width.0);
+            max_y = max_y.max(rect.y.0 + rect.height.0);
+        }
+
+        LayoutRect::new(
+            min_x,
+            min_y,
+            max_x - min_x,
+            max_y - min_y
+        )
     }
 
     fn priority(&self) -> i32 {
@@ -465,25 +503,19 @@ impl Widget for SelectionWidget {
     }
 
     fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        use crate::coordinates::LayoutRect as Rect;
+        // Render all selection rectangles (1-3 for multi-line selections)
+        let rect_instances: Vec<crate::render::RectInstance> = self.rectangles
+            .iter()
+            .map(|rect| crate::render::RectInstance {
+                rect: *rect,
+                color: self.color,
+            })
+            .collect();
 
-        // TODO: Calculate actual bounds based on text range
-        // For now, draw a simple rectangle
-        let width = LogicalPixels(100.0); // Would be calculated from text metrics
-        let height = LogicalPixels(ctx.viewport.metrics.line_height);
-
-        // Render selection rectangle directly to GPU
-        let rect_instance = crate::render::RectInstance {
-            rect: Rect {
-                x: ctx.layout_pos.x,
-                y: ctx.layout_pos.y,
-                width,
-                height,
-            },
-            color: self.color,
-        };
-        ctx.gpu_renderer
-            .draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
+        if !rect_instances.is_empty() {
+            ctx.gpu_renderer
+                .draw_rects(render_pass, &rect_instances, ctx.viewport.scale_factor);
+        }
     }
 
     fn clone_box(&self) -> Arc<dyn Widget> {
@@ -530,7 +562,7 @@ impl Widget for LineNumberWidget {
         // For line numbers, we can use approximate size since they're simple
         let width = text.len() as f32 * 8.4;
         let height = 19.6;
-        let mut widget = TextWidget {
+        let widget = TextWidget {
             text: Arc::from(text.as_bytes()),
             style: self.style,
             size: LogicalSize::new(width, height),
@@ -576,7 +608,7 @@ impl Widget for DiagnosticWidget {
         10 // Above text
     }
 
-    fn paint(&self, ctx: &PaintContext<'_>, _render_pass: &mut wgpu::RenderPass) {
+    fn paint(&self, _ctx: &PaintContext<'_>, _render_pass: &mut wgpu::RenderPass) {
         let color = match self.severity {
             Severity::Error => 0xFF00FFu32,   // Red
             Severity::Warning => 0xFF88FFu32, // Orange
@@ -584,14 +616,10 @@ impl Widget for DiagnosticWidget {
             Severity::Hint => 0x888888FFu32,  // Gray
         };
 
-        // Draw wavy underline
-        let width = 100.0; // TODO: Calculate from text range
-        let segments = (width / 4.0) as i32;
-        let base_y = ctx.layout_pos.y + ctx.viewport.metrics.line_height - 2.0; // Position at bottom of line
-
+        // TODO: Draw wavy underline - needs absolute positioning
         // For now, skip wavy underline rendering - would need line drawing capability in GPU renderer
         // TODO: Implement line rendering for diagnostics
-        let _ = (segments, base_y, color); // Silence unused warnings
+        let _ = color; // Silence unused warnings
     }
 
     fn clone_box(&self) -> Arc<dyn Widget> {
@@ -654,9 +682,10 @@ pub fn text(s: &str) -> Arc<dyn Widget> {
     })
 }
 
-/// Create cursor widget
-pub fn cursor() -> Arc<dyn Widget> {
+/// Create cursor widget at position
+pub fn cursor(position: LayoutPos) -> Arc<dyn Widget> {
     Arc::new(CursorWidget {
+        position,
         style: CursorStyle {
             color: 0xFFFFFFFF,
             width: 2.0,
@@ -665,10 +694,10 @@ pub fn cursor() -> Arc<dyn Widget> {
     })
 }
 
-/// Create selection widget
-pub fn selection(range: std::ops::Range<usize>) -> Arc<dyn Widget> {
+/// Create selection widget from rectangles
+pub fn selection(rectangles: Vec<LayoutRect>) -> Arc<dyn Widget> {
     Arc::new(SelectionWidget {
-        range,
+        rectangles,
         color: 0x4080FF80, // Semi-transparent blue
     })
 }
@@ -689,4 +718,128 @@ pub fn diagnostic(
         message: Arc::from(message),
         range,
     })
+}
+
+/// Widget manager - tracks overlay widgets like cursor and selections
+pub struct WidgetManager {
+    /// All managed widgets
+    widgets: HashMap<WidgetId, Arc<dyn Widget>>,
+    /// Next widget ID to assign
+    next_id: WidgetId,
+    /// Sorted widget IDs by z-order (priority)
+    sorted_ids: Vec<WidgetId>,
+    /// Whether sorted_ids needs updating
+    needs_sort: bool,
+}
+
+impl WidgetManager {
+    pub fn new() -> Self {
+        Self {
+            widgets: HashMap::new(),
+            next_id: 1000,
+            sorted_ids: Vec::new(),
+            needs_sort: false,
+        }
+    }
+
+    /// Add a widget to the manager
+    pub fn add_widget(&mut self, widget: Arc<dyn Widget>) -> WidgetId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.widgets.insert(id, widget);
+        self.sorted_ids.push(id);
+        self.needs_sort = true;
+        id
+    }
+
+    /// Remove a widget by ID
+    pub fn remove_widget(&mut self, id: WidgetId) -> Option<Arc<dyn Widget>> {
+        if let Some(widget) = self.widgets.remove(&id) {
+            self.sorted_ids.retain(|&widget_id| widget_id != id);
+            Some(widget)
+        } else {
+            None
+        }
+    }
+
+    /// Clear all widgets
+    pub fn clear(&mut self) {
+        self.widgets.clear();
+        self.sorted_ids.clear();
+        self.needs_sort = false;
+    }
+
+    /// Update all widgets (for animations)
+    pub fn update_all(&mut self, dt: f32) -> bool {
+        let mut needs_redraw = false;
+        for widget in self.widgets.values_mut() {
+            // Need to get mutable reference through Arc
+            if let Some(widget_mut) = Arc::get_mut(widget) {
+                if widget_mut.update(dt) {
+                    needs_redraw = true;
+                }
+            }
+        }
+        needs_redraw
+    }
+
+    /// Get widgets in render order (sorted by z-index/priority)
+    pub fn widgets_in_order(&mut self) -> Vec<Arc<dyn Widget>> {
+        if self.needs_sort {
+            // Sort by widget priority (z-index)
+            self.sorted_ids.sort_by_key(|&id| {
+                self.widgets
+                    .get(&id)
+                    .map(|w| w.priority())
+                    .unwrap_or(0)
+            });
+            self.needs_sort = false;
+        }
+
+        self.sorted_ids
+            .iter()
+            .filter_map(|id| self.widgets.get(id).cloned())
+            .collect()
+    }
+
+    /// Paint all widgets in order
+    pub fn paint_all(&mut self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+        for widget in self.widgets_in_order() {
+            widget.paint(ctx, render_pass);
+        }
+    }
+
+    /// Replace selection widgets with new ones
+    pub fn set_selection_widgets(&mut self, selections: Vec<Arc<dyn Widget>>) {
+        // Remove existing selection widgets (ID 2 or in range 10000-19999)
+        self.sorted_ids.retain(|&id| {
+            if id == 2 || (id >= 10000 && id < 20000) {
+                self.widgets.remove(&id);
+                false
+            } else {
+                true
+            }
+        });
+
+        // Add new selection widgets
+        for widget in selections {
+            self.add_widget(widget);
+        }
+    }
+
+    /// Set cursor widget (replaces existing)
+    pub fn set_cursor_widget(&mut self, cursor: Arc<dyn Widget>) {
+        // Remove existing cursor widget (ID 1 or in range 20000-29999)
+        self.sorted_ids.retain(|&id| {
+            if id == 1 || (id >= 20000 && id < 30000) {
+                self.widgets.remove(&id);
+                false
+            } else {
+                true
+            }
+        });
+
+        // Add new cursor widget
+        self.add_widget(cursor);
+    }
 }

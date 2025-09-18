@@ -695,6 +695,113 @@ impl GpuRenderer {
         renderer
     }
 
+    /// Render with widgets - combines text and widget rendering
+    pub unsafe fn render_with_widgets(
+        &mut self,
+        tree: &crate::tree::Tree,
+        viewport_rect: crate::tree::Rect,
+        selections: &[crate::input::Selection],
+        cpu_renderer: &mut crate::render::Renderer,
+    ) {
+        // Update uniform buffer - extract values we need before mutable borrow
+        
+        let physical_width = cpu_renderer.viewport().physical_size.width;
+        let physical_height = cpu_renderer.viewport().physical_size.height;
+        let scale_factor = cpu_renderer.viewport().scale_factor;
+
+        let uniforms = ShaderUniforms {
+            viewport_size: [
+                physical_width as f32,
+                physical_height as f32,
+            ],
+            _padding: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let output = match self.surface.get_current_texture() {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Failed to get surface texture: {:?}", e);
+                return;
+            }
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // Set GPU renderer reference for widget painting
+            cpu_renderer.set_gpu_renderer(self);
+
+            // Ensure cached doc text is updated before rendering
+            cpu_renderer.set_cached_doc_text(tree.flatten_to_string());
+            cpu_renderer.set_cached_doc_version(tree.version);
+
+            // Render with pass - this will paint both text and widgets
+            let batches = cpu_renderer.render_with_pass(tree, viewport_rect, selections, Some(&mut render_pass));
+
+            // Also execute any batched commands (for legacy rendering)
+            for batch in &batches {
+                match batch {
+                    BatchedDraw::RectBatch { instances } => {
+                        if !instances.is_empty() {
+                            self.draw_rects(&mut render_pass, instances, scale_factor);
+                        }
+                    }
+                    BatchedDraw::GlyphBatch { instances, .. } => {
+                        if !instances.is_empty() {
+                            self.draw_glyphs(&mut render_pass, instances, None);
+                        }
+                    }
+                    BatchedDraw::SetClip(rect) => {
+                        let physical_x = (rect.x.0 * scale_factor) as u32;
+                        let physical_y = (rect.y.0 * scale_factor) as u32;
+                        let physical_width = (rect.width.0 * scale_factor) as u32;
+                        let physical_height = (rect.height.0 * scale_factor) as u32;
+
+                        render_pass.set_scissor_rect(
+                            physical_x,
+                            physical_y,
+                            physical_width,
+                            physical_height,
+                        );
+                    }
+                }
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+    }
+
     /// Execute batched draw commands (transforms view → physical)
     pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &Viewport) {
         // Update uniform buffer with PHYSICAL viewport size

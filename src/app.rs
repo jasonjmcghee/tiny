@@ -30,6 +30,12 @@ enum ScrollDirection {
 
 /// Trait for handling application-specific logic
 pub trait AppLogic: 'static {
+    /// Get as Any for downcasting
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default implementation returns empty reference
+        &()
+    }
+
     /// Handle keyboard input
     fn on_key(
         &mut self,
@@ -448,6 +454,12 @@ impl<T: AppLogic> TinyApp<T> {
             // Update logic
             self.logic.on_update();
 
+            // Update widgets (for animations like cursor blinking)
+            let dt = 0.016; // ~60fps frame time
+            if cpu_renderer.update_widgets(dt) {
+                window.request_redraw();
+            }
+
             if self.just_pressed_key {
                 self.just_pressed_key = false;
                 // Only scroll to cursor if it moved via keyboard, not every frame
@@ -479,7 +491,7 @@ impl<T: AppLogic> TinyApp<T> {
 
                     // Also set as backup (renderer will prioritize syntax_highlighter)
                     cpu_renderer.set_text_styles_ref(text_styles);
-                    println!("APP: Set InputEdit-aware syntax highlighter with fallback");
+                    // println!("APP: Set InputEdit-aware syntax highlighter with fallback");
                 } else {
                     // Fallback for other text style providers
                     cpu_renderer.set_text_styles_ref(text_styles);
@@ -499,8 +511,11 @@ impl<T: AppLogic> TinyApp<T> {
             let doc = self.logic.doc();
             let selections = self.logic.selections();
 
-            // Use render_with_pass(None) to go through the working viewport query path
-            let batches = cpu_renderer.render_with_pass(&doc.read(), viewport, selections, None);
+            // Update widget manager with current selections if EditorLogic is being used
+            // This ensures cursor and selection widgets are updated
+            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                cpu_renderer.set_selection_widgets(&editor.input, &editor.doc);
+            }
 
             // Upload atlas (in case new glyphs were rasterized)
             if let Some(font_system) = &self.font_system {
@@ -509,9 +524,9 @@ impl<T: AppLogic> TinyApp<T> {
                 gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
             }
 
-            // Execute on GPU with viewport for proper transformations
+            // Render directly with GPU - this will paint widgets
             unsafe {
-                gpu_renderer.render(&batches, cpu_renderer.viewport());
+                gpu_renderer.render_with_widgets(&doc.read(), viewport, selections, cpu_renderer);
             }
         }
     }
@@ -569,23 +584,18 @@ impl EditorLogic {
     }
 }
 
-// Methods moved to AppLogic trait implementation
-
 impl AppLogic for EditorLogic {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn on_key(
         &mut self,
         event: &winit::event::KeyEvent,
         viewport: &crate::coordinates::Viewport,
         modifiers: &winit::event::Modifiers,
     ) -> bool {
-        // Simply pass the key to InputHandler - it handles all coordination now
-        let input_handled = self.input.on_key(&self.doc, viewport, event, modifiers);
-
-        // The InputHandler now manages edit buffering and InputEdit coordination
-        // We don't need to do anything here anymore!
-
-        // Return whether we handled the input
-        input_handled
+        self.input.on_key(&self.doc, viewport, event, modifiers)
     }
 
     fn on_click(

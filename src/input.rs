@@ -2,7 +2,7 @@
 //!
 //! Handles keyboard, mouse, and multi-cursor selections
 
-use crate::coordinates::{DocPos, Viewport};
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, Viewport};
 use crate::syntax::SyntaxHighlighter;
 use crate::tree::{Content, Doc, Edit, Point};
 use std::ops::Range;
@@ -50,6 +50,78 @@ impl Selection {
         } else {
             self.anchor
         }
+    }
+
+    /// Generate rectangles for this selection (1-3 rectangles for multi-line)
+    pub fn to_rectangles(&self, doc: &Doc, viewport: &Viewport) -> Vec<LayoutRect> {
+        if self.is_cursor() {
+            return Vec::new();
+        }
+
+        let tree = doc.read();
+        let mut rectangles = Vec::new();
+
+        // Get start and end positions, ensuring start comes before end
+        let (start, end) = if self.cursor.line < self.anchor.line
+            || (self.cursor.line == self.anchor.line && self.cursor.column < self.anchor.column)
+        {
+            (self.cursor, self.anchor)
+        } else {
+            (self.anchor, self.cursor)
+        };
+
+        let line_height = viewport.metrics.line_height;
+
+        if start.line == end.line {
+            // Single line selection - one rectangle
+            let start_layout = viewport.doc_to_layout(start);
+            let end_layout = viewport.doc_to_layout(end);
+
+            rectangles.push(LayoutRect::new(
+                start_layout.x.0,
+                start_layout.y.0,
+                end_layout.x.0 - start_layout.x.0,
+                line_height,
+            ));
+        } else {
+            // Multi-line selection
+            let start_layout = viewport.doc_to_layout(start);
+
+            // First line: from start position to end of line
+            // For now, extend to viewport edge (TODO: calculate actual line width with font system)
+            let first_line_end = viewport.logical_size.width.0 - viewport.margin.x.0;
+
+            rectangles.push(LayoutRect::new(
+                start_layout.x.0,
+                start_layout.y.0,
+                first_line_end - start_layout.x.0,
+                line_height,
+            ));
+
+            // Middle lines: full width rectangles
+            if end.line > start.line + 1 {
+                let middle_start_y = start_layout.y.0 + line_height;
+                let middle_height = (end.line - start.line - 1) as f32 * line_height;
+
+                rectangles.push(LayoutRect::new(
+                    viewport.margin.x.0,
+                    middle_start_y,
+                    viewport.logical_size.width.0 - (viewport.margin.x.0 * 2.0),
+                    middle_height,
+                ));
+            }
+
+            // Last line: from start of line to end position
+            let end_layout = viewport.doc_to_layout(end);
+            rectangles.push(LayoutRect::new(
+                viewport.margin.x.0,
+                end_layout.y.0,
+                end_layout.x.0 - viewport.margin.x.0,
+                line_height,
+            ));
+        }
+
+        rectangles
     }
 }
 
@@ -958,5 +1030,48 @@ impl InputHandler {
         } else {
             crate::coordinates::DocPos::default()
         }
+    }
+
+    /// Create widget instances for current selections and cursor
+    pub fn create_widgets(
+        &self,
+        doc: &Doc,
+        viewport: &Viewport,
+    ) -> (Vec<Arc<dyn crate::widget::Widget>>, Option<Arc<dyn crate::widget::Widget>>) {
+        use crate::widget;
+
+        let mut selection_widgets = Vec::new();
+        let mut cursor_widget = None;
+
+        for selection in &self.selections {
+            if selection.is_cursor() {
+                // Create cursor widget
+                let tree = doc.read();
+                // Get the line text for accurate cursor positioning
+                let line_text = if let Some(line_start) = tree.line_to_byte(selection.cursor.line)
+                {
+                    let line_end = tree
+                        .line_to_byte(selection.cursor.line + 1)
+                        .unwrap_or(tree.byte_count());
+                    tree.get_text_slice(line_start..line_end)
+                } else {
+                    String::new()
+                };
+
+                // Use accurate text-based positioning
+                let layout_pos = viewport.doc_to_layout_with_text(selection.cursor, &line_text);
+
+                // Position cursor directly at calculated position (no shift needed)
+                cursor_widget = Some(widget::cursor(layout_pos));
+            } else {
+                // Create selection widget with 1-3 rectangles
+                let rectangles = selection.to_rectangles(doc, viewport);
+                if !rectangles.is_empty() {
+                    selection_widgets.push(widget::selection(rectangles));
+                }
+            }
+        }
+
+        (selection_widgets, cursor_widget)
     }
 }
