@@ -147,7 +147,9 @@ impl InputHandler {
                         if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                             let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                             let line_text = tree.get_text_slice(line_start..line_end);
-                            sel.cursor.column = line_text.chars().count() as u32;
+                            // Strip trailing newline before counting characters
+                            let line_text_trimmed = line_text.trim_end_matches('\n');
+                            sel.cursor.column = line_text_trimmed.chars().count() as u32;
                         }
                         sel.anchor = sel.cursor;
                     }
@@ -184,7 +186,9 @@ impl InputHandler {
                         if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                             let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                             let line_text = tree.get_text_slice(line_start..line_end);
-                            sel.cursor.column = line_text.chars().count() as u32;
+                            // Strip trailing newline before counting characters
+                            let line_text_trimmed = line_text.trim_end_matches('\n');
+                            sel.cursor.column = line_text_trimmed.chars().count() as u32;
                         }
                     }
                     if !shift_held {
@@ -201,7 +205,9 @@ impl InputHandler {
                     if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                         let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                         let line_text = tree.get_text_slice(line_start..line_end);
-                        let line_length = line_text.chars().count() as u32;
+                        // Strip trailing newline before counting characters
+                        let line_text_trimmed = line_text.trim_end_matches('\n');
+                        let line_length = line_text_trimmed.chars().count() as u32;
 
                         if sel.cursor.column < line_length {
                             sel.cursor.column += 1;
@@ -237,7 +243,9 @@ impl InputHandler {
                         if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                             let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                             let line_text = tree.get_text_slice(line_start..line_end);
-                            let line_length = line_text.chars().count() as u32;
+                            // Strip trailing newline before counting characters
+                            let line_text_trimmed = line_text.trim_end_matches('\n');
+                            let line_length = line_text_trimmed.chars().count() as u32;
                             // Use goal column if set, otherwise current column
                             let target_column = self.goal_column.unwrap_or(sel.cursor.column);
                             sel.cursor.column = target_column.min(line_length);
@@ -266,7 +274,9 @@ impl InputHandler {
                         if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
                             let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
                             let line_text = tree.get_text_slice(line_start..line_end);
-                            let line_length = line_text.chars().count() as u32;
+                            // Strip trailing newline before counting characters
+                            let line_text_trimmed = line_text.trim_end_matches('\n');
+                            let line_length = line_text_trimmed.chars().count() as u32;
                             // Use goal column if set, otherwise current column
                             let target_column = self.goal_column.unwrap_or(sel.cursor.column);
                             sel.cursor.column = target_column.min(line_length);

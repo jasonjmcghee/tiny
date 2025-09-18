@@ -2,12 +2,12 @@
 //!
 //! Combines font loading, text shaping, glyph rasterization, and atlas management
 
+use crate::coordinates::{PhysicalPos, PhysicalSizeF};
 use crate::render::GlyphInstance;
 use fontdue::layout::{CoordinateSystem, Layout, TextStyle};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::coordinates::{PhysicalPos, PhysicalSizeF};
 
 /// Information about a positioned glyph ready for rendering
 #[derive(Clone, Debug)]
@@ -47,6 +47,8 @@ pub struct FontSystem {
     next_x: u32,
     next_y: u32,
     row_height: u32,
+    /// Approx character width coefficient to multiply by the font for fast calculations
+    char_width_coef: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,11 +70,11 @@ impl FontSystem {
         let font = fontdue::Font::from_bytes(font_data as &[u8], fontdue::FontSettings::default())
             .expect("Failed to load JetBrains Mono font");
 
-        let layout = Layout::new(CoordinateSystem::PositiveYDown);
+        let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
         let atlas_size = (2048, 2048);
         let atlas_data = vec![0; (atlas_size.0 * atlas_size.1) as usize];
 
-        Self {
+        let mut self_ = Self {
             font,
             layout,
             atlas_data,
@@ -81,7 +83,23 @@ impl FontSystem {
             next_x: 0,
             next_y: 0,
             row_height: 0,
+            char_width_coef: 0.0,
+        };
+
+        // Measure the actual character width at our font size
+        // This ensures consistency everywhere
+        let s = "M ";
+        let repeat_count = 1000;
+        let count = repeat_count * s.len();
+        let good_approximation = s.repeat(repeat_count);
+        let font_size_for_calc = 16.0;
+        let char_layout = self_.layout_text(&good_approximation, font_size_for_calc);
+        if char_layout.width > 0.0 {
+            // Use the actual measured width at our font size
+            self_.char_width_coef = (char_layout.width / font_size_for_calc) / (count as f32);
         }
+
+        self_
     }
 
     /// Layout text and get positioned glyphs with texture coordinates
@@ -121,7 +139,7 @@ impl FontSystem {
                     pos: PhysicalPos::new(x, y),
                     size: PhysicalSizeF::new(tab_width, space_entry.height),
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // No texture for tab
-                    color: 0x00000000, // Transparent
+                    color: 0x00000000,                // Transparent
                 });
 
                 max_x = max_x.max(x + tab_width);
@@ -137,10 +155,9 @@ impl FontSystem {
             // Rasterize at the same size we're laying out
             let entry = self.get_or_rasterize(ch, font_size_px as u32);
 
-            // Everything is already at the right scale
             positioned_glyphs.push(PositionedGlyph {
                 char: ch,
-                pos: PhysicalPos::new(x, y), // Already scaled
+                pos: PhysicalPos::new(x, y),
                 size: PhysicalSizeF::new(entry.width, entry.height),
                 tex_coords: entry.tex_coords,
                 color: 0xFFFFFFFF,
@@ -224,6 +241,18 @@ impl FontSystem {
         entry
     }
 
+    /// Layout text with explicit scale factor
+    /// This is a convenience method that converts logical font size to physical
+    pub fn layout_text_scaled(
+        &mut self,
+        text: &str,
+        logical_font_size: f32,
+        scale_factor: f32,
+    ) -> TextLayout {
+        let physical_size = logical_font_size * scale_factor;
+        self.layout_text(text, physical_size)
+    }
+
     /// Pre-rasterize common ASCII characters
     /// font_size_px should already include scale (e.g., 14.0 * 2.0 for retina)
     pub fn prerasterize_ascii(&mut self, font_size_px: f32) {
@@ -241,6 +270,10 @@ impl FontSystem {
     pub fn atlas_size(&self) -> (u32, u32) {
         self.atlas_size
     }
+
+    pub fn char_width_coef(&self) -> f32 {
+        self.char_width_coef
+    }
 }
 
 /// Thread-safe wrapper for FontSystem
@@ -253,6 +286,10 @@ impl SharedFontSystem {
         Self {
             inner: Arc::new(Mutex::new(FontSystem::new())),
         }
+    }
+
+    pub fn char_width_coef(&self) -> f32 {
+        self.inner.lock().char_width_coef()
     }
 
     /// Layout text with automatic crisp rasterization based on stored scale factor
@@ -308,7 +345,13 @@ impl SharedFontSystem {
 
     /// Hit test: find character position at x coordinate using binary search
     /// Uses the FULL line layout to get accurate positioning with kerning/ligatures
-    pub fn hit_test_line(&self, line_text: &str, logical_font_size: f32, scale_factor: f32, target_x: f32) -> u32 {
+    pub fn hit_test_line(
+        &self,
+        line_text: &str,
+        logical_font_size: f32,
+        scale_factor: f32,
+        target_x: f32,
+    ) -> u32 {
         if line_text.is_empty() {
             return 0;
         }
@@ -350,6 +393,77 @@ impl SharedFontSystem {
         // Return character position (not glyph position - could differ with ligatures)
         left as u32
     }
+
+    /// Find which column corresponds to a pixel position
+    pub fn pixel_to_column(&self, x_logical: f32, text: &str, font_size: f32, scale: f32) -> usize {
+        self.inner
+            .lock()
+            .pixel_to_column(x_logical, text, font_size, scale)
+    }
+}
+
+impl FontSystem {
+    /// Find which column corresponds to a pixel position (fast path for long lines)
+    fn pixel_to_column_fast(
+        &self,
+        x_logical: f32,
+        text: &str,
+        font_size: f32,
+        scale: f32,
+    ) -> usize {
+        if text.is_empty() || x_logical <= 0.0 {
+            return 0;
+        }
+
+        let char_width = self.char_width_coef() * font_size / scale;
+        let estimated_col = (x_logical / char_width) as usize;
+        estimated_col.min(text.chars().count())
+    }
+
+    /// Find which column corresponds to a pixel position
+    /// Returns the column index (character position) that starts at or after the given x pixel position
+    /// NOTE: x is in logical pixels, not physical pixels
+    pub fn pixel_to_column(
+        &mut self,
+        x_logical: f32,
+        text: &str,
+        font_size: f32,
+        scale: f32,
+    ) -> usize {
+        if text.is_empty() || x_logical <= 0.0 {
+            return 0;
+        }
+
+        // // Use fast path for very long lines to avoid expensive full layout
+        // if text.len() > 1000 {
+        //     return self.pixel_to_column_fast(x_logical, text, font_size, scale);
+        // }
+
+        // For shorter lines, use binary search on character positions
+        // We need to find which character position corresponds to the x coordinate
+
+        // Binary search through character positions
+        let chars: Vec<char> = text.chars().collect();
+        let mut left = 0;
+        let mut right = chars.len();
+
+        while left < right {
+            let mid = (left + right) / 2;
+
+            // Measure the width from start to this character position
+            let prefix: String = chars[0..mid].iter().collect();
+            let layout = self.layout_text_scaled(&prefix, font_size, scale);
+            let mid_x = layout.width / scale; // Convert to logical pixels
+
+            if mid_x < x_logical {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        left
+    }
 }
 
 /// Convert layout to GPU instances (now in layout space)
@@ -380,8 +494,8 @@ pub fn layout_to_instances(
 
 #[cfg(test)]
 mod tests {
-    use crate::coordinates::PhysicalPixels;
     use super::*;
+    use crate::coordinates::PhysicalPixels;
 
     #[test]
     fn test_font_system_creation() {
@@ -406,8 +520,8 @@ mod tests {
         let glyph = &layout.glyphs[0];
         assert_eq!(glyph.char, 'A');
         assert_eq!(glyph.pos.x, PhysicalPixels(0.0)); // First char at x=0
-        // The y position from fontdue represents baseline offset
-        // For the default font at size 14, this is exactly 4.0
+                                                      // The y position from fontdue represents baseline offset
+                                                      // For the default font at size 14, this is exactly 4.0
         assert_eq!(glyph.pos.y, PhysicalPixels(4.0));
         assert!(glyph.size.width.0 > 0.0);
         assert!(glyph.size.height.0 > 0.0);

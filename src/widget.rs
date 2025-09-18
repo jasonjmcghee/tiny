@@ -6,6 +6,33 @@ use crate::coordinates::{LogicalPixels, LogicalSize};
 use crate::tree::{Point, Widget};
 use std::sync::Arc;
 
+// === Content Type for TextWidget ===
+
+/// Describes what type of content a TextWidget contains
+#[derive(Debug, Clone)]
+pub enum ContentType {
+    /// Full lines (legacy, for non-virtualized content)
+    Full,
+    /// Extracted columns with horizontal offset (NoWrap mode)
+    Columns {
+        /// Starting column in the original line
+        start_col: usize,
+        /// X offset for rendering (negative for scrolled content)
+        x_offset: f32
+    },
+    /// Wrapped visual lines (SoftWrap mode)
+    Wrapped {
+        /// The visual lines after wrapping
+        visual_lines: Vec<String>
+    },
+}
+
+impl Default for ContentType {
+    fn default() -> Self {
+        ContentType::Full
+    }
+}
+
 // === Core Widget Types ===
 /// Text widget - renders text using the consolidated FontSystem
 pub struct TextWidget {
@@ -13,6 +40,10 @@ pub struct TextWidget {
     pub text: Arc<[u8]>,
     /// Style ID for font/size/color
     pub style: StyleId,
+    /// Pre-calculated size (measured with actual font system)
+    pub size: LogicalSize,
+    /// Type of content (full, columns, or wrapped)
+    pub content_type: ContentType,
 }
 
 impl Clone for TextWidget {
@@ -20,6 +51,8 @@ impl Clone for TextWidget {
         Self {
             text: Arc::clone(&self.text),
             style: self.style,
+            size: self.size,
+            content_type: self.content_type.clone(),
         }
     }
 }
@@ -88,14 +121,8 @@ pub enum Severity {
 
 impl Widget for TextWidget {
     fn measure(&self) -> LogicalSize {
-        // This is a fallback - ideally widget would have access to viewport metrics
-        // during measure, but for now we estimate
-        let text = std::str::from_utf8(&self.text).unwrap_or("");
-        let char_count = text.chars().count();
-        // Use reasonable defaults that will be corrected during paint
-        let estimated_width = char_count as f32 * 8.4; // Approximate monospace width
-        let estimated_height = 19.6; // 14pt * 1.4 line height
-        LogicalSize::new(estimated_width, estimated_height)
+        // Return the pre-calculated size that was measured using the actual font system
+        self.size
     }
 
     fn z_index(&self) -> i32 {
@@ -127,56 +154,96 @@ impl Widget for TextWidget {
         // Use font size from viewport metrics
         let font_size = ctx.viewport.metrics.font_size;
         let scale_factor = ctx.viewport.scale_factor;
+        let line_height = ctx.viewport.metrics.line_height;
 
-        // Layout text at physical size for crisp rendering
-        let layout = font_system.layout_text_scaled(text, font_size, scale_factor);
+        // TextWidget now handles multi-line text for the virtualized visible range
+        let lines: Vec<&str> = text.lines().collect();
 
-        // Convert to GPU instances in LAYOUT space
-        let mut glyph_instances = Vec::with_capacity(layout.glyphs.len());
+        // Stats for debugging culling effectiveness
+        let total_chars = text.chars().count();
+        let mut rendered_chars = 0usize;
 
-        // Track byte position for text effects
-        let mut byte_pos = 0;
+        let mut all_glyph_instances = Vec::new();
+        let mut y_offset = 0.0;
+        let mut global_byte_pos = 0;
 
-        for glyph in &layout.glyphs {
-            let mut color = glyph.color;
-
-            // Apply debug colorizing for off-screen content
-            if ctx.debug_offscreen {
-                color = 0xFF0000FF; // Bright red for off-screen content
-            } else if let Some(text_styles) = ctx.text_styles {
-                let char_bytes = glyph.char.len_utf8();
-                let effects = text_styles.get_effects_in_range(byte_pos..byte_pos + char_bytes);
-
-                for effect in effects {
-                    if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
-                        color = new_color;
-                    }
+        // Handle different content types
+        let x_base_offset = match &self.content_type {
+            ContentType::Columns { x_offset, start_col } => {
+                if *x_offset != 0.0 {
+                    println!("TextWidget applying x_offset={:.1} for columns starting at {}", x_offset, start_col);
                 }
-                byte_pos += char_bytes;
+                *x_offset
+            }
+            _ => 0.0,
+        };
+
+        for line_text in lines.iter() {
+            // Layout this single line
+            let layout = font_system.layout_text_scaled(line_text, font_size, scale_factor);
+            rendered_chars += line_text.chars().count();
+
+            let mut byte_pos = 0;
+            for glyph in &layout.glyphs {
+                let mut color = glyph.color;
+
+                // Apply debug colorizing for off-screen content
+                if ctx.debug_offscreen {
+                    color = 0xFF0000FF; // Bright red for off-screen content
+                } else if let Some(text_styles) = ctx.text_styles {
+                    let char_bytes = glyph.char.len_utf8();
+                    let effects = text_styles.get_effects_in_range(
+                        global_byte_pos + byte_pos..global_byte_pos + byte_pos + char_bytes
+                    );
+
+                    for effect in effects {
+                        if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
+                            color = new_color;
+                        }
+                    }
+                    byte_pos += char_bytes;
+                }
+
+                // Glyphs from font system are in physical pixels relative to (0,0)
+                // Convert to logical and add layout position plus line offset
+                let glyph_logical_x = glyph.pos.x.0 / ctx.viewport.scale_factor;
+                let glyph_logical_y = glyph.pos.y.0 / ctx.viewport.scale_factor;
+
+                // Debug first glyph position calculation
+                if all_glyph_instances.is_empty() && x_base_offset != 0.0 {
+                    println!("  First glyph positioning: layout.x={}, x_offset={}, glyph_x={} -> final={}",
+                             ctx.layout_pos.x.0, x_base_offset, glyph_logical_x,
+                             ctx.layout_pos.x.0 + x_base_offset + glyph_logical_x);
+                }
+
+                let glyph_pos = crate::coordinates::LayoutPos::new(
+                    ctx.layout_pos.x.0 + x_base_offset + glyph_logical_x,
+                    ctx.layout_pos.y.0 + y_offset + glyph_logical_y,
+                );
+
+                all_glyph_instances.push(GlyphInstance {
+                    glyph_id: 0, // Not used anymore
+                    pos: glyph_pos,  // Now in layout space (logical pixels)
+                    color,
+                    tex_coords: glyph.tex_coords,
+                });
             }
 
-            // Glyphs from font system are in physical pixels relative to (0,0)
-            // But we want to emit them in layout space for consistent transformation
-            // Convert glyph position to logical and add layout position
-            let glyph_logical_x = glyph.pos.x.0 / ctx.viewport.scale_factor;
-            let glyph_logical_y = glyph.pos.y.0 / ctx.viewport.scale_factor;
-            let glyph_pos = crate::coordinates::LayoutPos::new(
-                ctx.layout_pos.x.0 + glyph_logical_x,
-                ctx.layout_pos.y.0 + glyph_logical_y,
-            );
-
-            glyph_instances.push(GlyphInstance {
-                glyph_id: 0, // Not used anymore
-                pos: glyph_pos,  // Now in layout space (logical pixels)
-                color,
-                tex_coords: glyph.tex_coords,
-            });
+            // Update position for next line
+            global_byte_pos += line_text.len() + 1; // +1 for newline
+            y_offset += line_height;
         }
 
+        // Debug stats for culling effectiveness
+        let glyph_count = all_glyph_instances.len();
+        println!("GLYPH STATS: Laid out {} glyphs for {} chars (visible: {}, total: {}, culled: {})",
+                 glyph_count, rendered_chars, rendered_chars, total_chars,
+                 total_chars.saturating_sub(rendered_chars));
+
         // Emit render command in LAYOUT space
-        if !glyph_instances.is_empty() {
+        if !all_glyph_instances.is_empty() {
             ctx.commands.push(RenderOp::Glyphs {
-                glyphs: Arc::from(glyph_instances.into_boxed_slice()),
+                glyphs: Arc::from(all_glyph_instances.into_boxed_slice()),
                 style: self.style,
             });
         }
@@ -270,11 +337,10 @@ impl Widget for LineNumberWidget {
     fn measure(&self) -> LogicalSize {
         // Measure line number text
         let text = format!("{}", self.line);
-        let widget = TextWidget {
-            text: Arc::from(text.as_bytes()),
-            style: self.style,
-        };
-        widget.measure()
+        // Approximate size for line numbers - will be properly measured during paint
+        let width = text.len() as f32 * 8.4;
+        let height = 19.6;
+        LogicalSize::new(width, height)
     }
 
     fn z_index(&self) -> i32 {
@@ -289,9 +355,14 @@ impl Widget for LineNumberWidget {
     fn paint(&self, ctx: &mut crate::tree::PaintContext<'_>) {
         // Create text widget for the line number and paint it
         let text = format!("{}", self.line);
+        // For line numbers, we can use approximate size since they're simple
+        let width = text.len() as f32 * 8.4;
+        let height = 19.6;
         let widget = TextWidget {
             text: Arc::from(text.as_bytes()),
             style: self.style,
+            size: LogicalSize::new(width, height),
+            content_type: ContentType::default(),
         };
         widget.paint(ctx);
     }
@@ -381,10 +452,13 @@ impl Widget for StyleWidget {
 // === Public API ===
 
 /// Create text widget from string
+/// Note: This creates a widget with default size - use render_text() for accurate sizing
 pub fn text(s: &str) -> Arc<dyn Widget> {
     Arc::new(TextWidget {
         text: Arc::from(s.as_bytes()),
         style: 0, // Default style
+        size: LogicalSize::new(0.0, 0.0), // Will be calculated properly in render_text
+        content_type: ContentType::default(),
     })
 }
 
@@ -472,7 +546,7 @@ mod tests {
     fn test_cursor_widget_render() {
         let cursor = CursorWidget {
             style: CursorStyle {
-                color: 0xFFFF0000, // Red
+                color: 0xFF0000FF, // Red
                 width: 2.0,
             },
             blink_phase: 0.0,

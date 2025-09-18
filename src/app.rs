@@ -2,8 +2,7 @@
 //!
 //! Eliminates boilerplate across examples - focus on rendering logic
 
-#[allow(unused)]
-use std::io::BufRead;
+use crate::coordinates::{DocPos, LogicalPixels};
 use crate::{
     font::SharedFontSystem,
     gpu::GpuRenderer,
@@ -11,6 +10,8 @@ use crate::{
     render::Renderer,
     tree::{Doc, Point, Rect},
 };
+#[allow(unused)]
+use std::io::BufRead;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
@@ -18,7 +19,6 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
-use crate::coordinates::{DocPos, LogicalPixels};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {
@@ -29,18 +29,34 @@ enum ScrollDirection {
 /// Trait for handling application-specific logic
 pub trait AppLogic {
     /// Handle keyboard input
-    fn on_key(&mut self, _key: &winit::event::KeyEvent, _viewport: &crate::coordinates::Viewport, _modifiers: &winit::event::Modifiers) -> bool {
+    fn on_key(
+        &mut self,
+        _key: &winit::event::KeyEvent,
+        _viewport: &crate::coordinates::Viewport,
+        _modifiers: &winit::event::Modifiers,
+    ) -> bool {
         // Default implementation with basic editor functionality
         false
     }
 
     /// Handle mouse click at logical position
-    fn on_click(&mut self, _pos: Point, _viewport: &crate::coordinates::Viewport, _modifiers: &winit::event::Modifiers) -> bool {
+    fn on_click(
+        &mut self,
+        _pos: Point,
+        _viewport: &crate::coordinates::Viewport,
+        _modifiers: &winit::event::Modifiers,
+    ) -> bool {
         false
     }
 
     /// Handle mouse drag from start to end position
-    fn on_drag(&mut self, _from: Point, _to: Point, _viewport: &crate::coordinates::Viewport, _modifiers: &winit::event::Modifiers) -> bool {
+    fn on_drag(
+        &mut self,
+        _from: Point,
+        _to: Point,
+        _viewport: &crate::coordinates::Viewport,
+        _modifiers: &winit::event::Modifiers,
+    ) -> bool {
         false
     }
 
@@ -62,7 +78,7 @@ pub trait AppLogic {
 
     /// Get cursor document position for scrolling (returns None if no scrolling needed)
     fn get_cursor_doc_pos(&self) -> Option<DocPos> {
-        None  // Return None unless cursor actually moved
+        None // Return None unless cursor actually moved
     }
 
     /// Get current selections for rendering
@@ -94,8 +110,8 @@ pub struct TinyApp<T: AppLogic> {
     font_size: f32,
 
     // Scroll lock settings
-    scroll_lock_enabled: bool,  // true = lock to one direction at a time
-    current_scroll_direction: Option<ScrollDirection>,  // which direction is currently locked
+    scroll_lock_enabled: bool, // true = lock to one direction at a time
+    current_scroll_direction: Option<ScrollDirection>, // which direction is currently locked
 
     // Track cursor position for clicks
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
@@ -119,7 +135,7 @@ impl<T: AppLogic> TinyApp<T> {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             font_size: 14.0,
-            scroll_lock_enabled: true,  // Enabled by default
+            scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
             cursor_position: None,
             modifiers: winit::event::Modifiers::default(),
@@ -154,7 +170,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             println!("🪟 Creating window: {}", self.window_title);
-            
+
             // Create window
             let window = Arc::new(
                 event_loop
@@ -223,15 +239,26 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     // Check for scroll lock toggle (F12 key)
-                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) = event.logical_key {
+                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) =
+                        event.logical_key
+                    {
                         self.scroll_lock_enabled = !self.scroll_lock_enabled;
                         self.current_scroll_direction = None; // Reset direction
-                        println!("Scroll lock: {}", if self.scroll_lock_enabled { "ENABLED" } else { "DISABLED" });
+                        println!(
+                            "Scroll lock: {}",
+                            if self.scroll_lock_enabled {
+                                "ENABLED"
+                            } else {
+                                "DISABLED"
+                            }
+                        );
                         return;
                     }
 
                     if let Some(cpu_renderer) = &self.cpu_renderer {
-                        let should_redraw = self.logic.on_key(&event, cpu_renderer.viewport(), &self.modifiers);
+                        let should_redraw =
+                            self.logic
+                                .on_key(&event, cpu_renderer.viewport(), &self.modifiers);
                         if should_redraw {
                             if let Some(window) = &self.window {
                                 window.request_redraw();
@@ -250,9 +277,12 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                 // Check for drag if mouse is pressed
                 if self.mouse_pressed {
-                    if let (Some(window), Some(cpu_renderer), Some(start_pos), Some(end_pos)) =
-                        (&self.window, &self.cpu_renderer, self.drag_start, Some(position)) {
-
+                    if let (Some(window), Some(cpu_renderer), Some(start_pos), Some(end_pos)) = (
+                        &self.window,
+                        &self.cpu_renderer,
+                        self.drag_start,
+                        Some(position),
+                    ) {
                         let scale = window.scale_factor() as f32;
 
                         let start_logical_x = start_pos.x as f32 / scale;
@@ -270,7 +300,12 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             y: LogicalPixels(end_logical_y),
                         };
 
-                        let should_redraw = self.logic.on_drag(from_point, to_point, cpu_renderer.viewport(), &self.modifiers);
+                        let should_redraw = self.logic.on_drag(
+                            from_point,
+                            to_point,
+                            cpu_renderer.viewport(),
+                            &self.modifiers,
+                        );
                         if should_redraw {
                             window.request_redraw();
                         }
@@ -286,8 +321,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 match state {
                     ElementState::Pressed => {
                         if let (Some(window), Some(cpu_renderer), Some(position)) =
-                            (&self.window, &self.cpu_renderer, self.cursor_position) {
-
+                            (&self.window, &self.cpu_renderer, self.cursor_position)
+                        {
                             self.mouse_pressed = true;
                             self.drag_start = self.cursor_position;
 
@@ -301,7 +336,11 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                 y: LogicalPixels(logical_y),
                             };
 
-                            let should_redraw = self.logic.on_click(point, cpu_renderer.viewport(), &self.modifiers);
+                            let should_redraw = self.logic.on_click(
+                                point,
+                                cpu_renderer.viewport(),
+                                &self.modifiers,
+                            );
                             if should_redraw {
                                 window.request_redraw();
                             }
@@ -321,10 +360,10 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let (scroll_x, scroll_y) = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                            (x * cpu_renderer.viewport().metrics.space_width,
-                             y * cpu_renderer.viewport().metrics.line_height)
-                        }
+                        winit::event::MouseScrollDelta::LineDelta(x, y) => (
+                            x * cpu_renderer.viewport().metrics.space_width,
+                            y * cpu_renderer.viewport().metrics.line_height,
+                        ),
                         winit::event::MouseScrollDelta::PixelDelta(pos) => {
                             (pos.x as f32, pos.y as f32)
                         }
@@ -339,7 +378,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             ScrollDirection::Horizontal
                         } else {
                             // No movement, keep current direction
-                            self.current_scroll_direction.unwrap_or(ScrollDirection::Vertical)
+                            self.current_scroll_direction
+                                .unwrap_or(ScrollDirection::Vertical)
                         };
 
                         // Update current direction if we started scrolling
@@ -349,8 +389,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                         // Apply scroll lock
                         match new_direction {
-                            ScrollDirection::Vertical => (0.0, scroll_y),    // Only vertical
-                            ScrollDirection::Horizontal => (scroll_x, 0.0),  // Only horizontal
+                            ScrollDirection::Vertical => (0.0, scroll_y), // Only vertical
+                            ScrollDirection::Horizontal => (scroll_x, 0.0), // Only horizontal
                         }
                     } else {
                         // No scroll lock - free scrolling
@@ -362,9 +402,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     let old_scroll_y = viewport.scroll.y.0;
                     let old_scroll_x = viewport.scroll.x.0;
 
-                    // Apply the scroll amounts
-                    let new_scroll_y = (viewport.scroll.y.0 - final_scroll_y).max(0.0);
-                    let new_scroll_x = (viewport.scroll.x.0 - final_scroll_x).max(0.0);
+                    // Apply the scroll amounts (note: scroll values are inverted)
+                    let new_scroll_y = viewport.scroll.y.0 - final_scroll_y;
+                    let new_scroll_x = viewport.scroll.x.0 - final_scroll_x;
                     viewport.scroll.y = LogicalPixels(new_scroll_y);
                     viewport.scroll.x = LogicalPixels(new_scroll_x);
 
@@ -373,8 +413,15 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     let tree = doc.read();
                     viewport.clamp_scroll_to_bounds(&tree);
 
-                    println!("MOUSE WHEEL: scroll_y={:.1} ({:.1}->{:.1}), scroll_x={:.1} ({:.1}->{:.1})",
-                             scroll_y, old_scroll_y, viewport.scroll.y.0, scroll_x, old_scroll_x, viewport.scroll.x.0);
+                    println!(
+                        "MOUSE WHEEL: scroll_y={:.1} ({:.1}->{:.1}), scroll_x={:.1} ({:.1}->{:.1})",
+                        scroll_y,
+                        old_scroll_y,
+                        viewport.scroll.y.0,
+                        scroll_x,
+                        old_scroll_x,
+                        viewport.scroll.x.0
+                    );
 
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -406,10 +453,10 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Only scroll to cursor if it moved via keyboard, not every frame
             // This prevents fighting with manual mouse wheel scrolling
-            // if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
-            //     let layout_pos = cpu_renderer.viewport().doc_to_layout(cursor_pos);
-            //     cpu_renderer.viewport_mut().ensure_visible(layout_pos);
-            // }
+            if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
+                let layout_pos = cpu_renderer.viewport().doc_to_layout(cursor_pos);
+                cpu_renderer.viewport_mut().ensure_visible(layout_pos);
+            }
 
             // Calculate viewport dimensions
             let size = window.inner_size();
@@ -464,7 +511,12 @@ impl EditorLogic {
 }
 
 impl AppLogic for EditorLogic {
-    fn on_key(&mut self, event: &winit::event::KeyEvent, viewport: &crate::coordinates::Viewport, modifiers: &winit::event::Modifiers) -> bool {
+    fn on_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        viewport: &crate::coordinates::Viewport,
+        modifiers: &winit::event::Modifiers,
+    ) -> bool {
         // Delegate to InputHandler
         self.input.on_key(&self.doc, viewport, event, modifiers);
 
@@ -473,7 +525,12 @@ impl AppLogic for EditorLogic {
         true
     }
 
-    fn on_click(&mut self, pos: Point, viewport: &crate::coordinates::Viewport, modifiers: &winit::event::Modifiers) -> bool {
+    fn on_click(
+        &mut self,
+        pos: Point,
+        viewport: &crate::coordinates::Viewport,
+        modifiers: &winit::event::Modifiers,
+    ) -> bool {
         // Convert to mouse click for InputHandler
         let alt_held = modifiers.state().alt_key();
         self.input.on_mouse_click(
@@ -486,16 +543,17 @@ impl AppLogic for EditorLogic {
         true
     }
 
-    fn on_drag(&mut self, from: Point, to: Point, viewport: &crate::coordinates::Viewport, modifiers: &winit::event::Modifiers) -> bool {
+    fn on_drag(
+        &mut self,
+        from: Point,
+        to: Point,
+        viewport: &crate::coordinates::Viewport,
+        modifiers: &winit::event::Modifiers,
+    ) -> bool {
         // Convert to mouse drag for InputHandler
         let alt_held = modifiers.state().alt_key();
-        self.input.on_mouse_drag(
-            &self.doc,
-            viewport,
-            from,
-            to,
-            alt_held,
-        );
+        self.input
+            .on_mouse_drag(&self.doc, viewport, from, to, alt_held);
         true
     }
 
@@ -548,7 +606,12 @@ pub fn run_simple_app(title: &str, doc: Doc) -> Result<(), Box<dyn std::error::E
     }
 
     impl AppLogic for SimpleApp {
-        fn on_key(&mut self, _event: &winit::event::KeyEvent, _viewport: &crate::coordinates::Viewport, _modifiers: &winit::event::Modifiers) -> bool {
+        fn on_key(
+            &mut self,
+            _event: &winit::event::KeyEvent,
+            _viewport: &crate::coordinates::Viewport,
+            _modifiers: &winit::event::Modifiers,
+        ) -> bool {
             false // No key handling
         }
 
@@ -559,4 +622,3 @@ pub fn run_simple_app(title: &str, doc: Doc) -> Result<(), Box<dyn std::error::E
 
     TinyApp::new(SimpleApp { doc }).with_title(title).run()
 }
-

@@ -2,7 +2,7 @@
 //!
 //! Widgets emit commands, renderer batches and optimizes them for GPU
 
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, Viewport};
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
 use crate::tree::{Node, Point, Rect, Span, Tree, Widget};
 use std::sync::Arc;
 #[allow(unused)]
@@ -176,61 +176,91 @@ impl Renderer {
     /// Walk tree node with tree reference for cursor positioning
     /// Walk only the visible range using sum-tree navigation
     fn walk_visible_range(&mut self, tree: &Tree, byte_range: std::ops::Range<usize>) {
-        // Reset document position to start of visible range
-        let start_line = tree.byte_to_line(byte_range.start);
-        self.current_doc_pos.byte_offset = byte_range.start;
-        self.current_doc_pos.line = start_line;
-        self.current_doc_pos.column = 0; // Simplified - would calculate actual column
+        use crate::coordinates::VisibleLineContent;
 
-        // Use tree's efficient range walking
-        tree.walk_visible_range(byte_range, |spans, span_start, span_end| {
-            self.render_spans_at_position(spans, span_start, span_end);
+        // First, collect all visible text
+        let mut all_visible_bytes = Vec::new();
+        tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
+            for span in spans {
+                if let Span::Text { bytes, .. } = span {
+                    all_visible_bytes.extend_from_slice(bytes);
+                }
+            }
         });
-    }
 
-    /// Render spans at their calculated position (called by walk_visible_range)
-    fn render_spans_at_position(&mut self, spans: &[Span], span_start: usize, span_end: usize) {
-        println!("RANGE WALKER FOUND: {} spans in byte range {}..{} at doc pos: ({}, {})",
-                 spans.len(), span_start, span_end, self.current_doc_pos.line, self.current_doc_pos.column);
+        // Convert to string and split into actual lines
+        let all_visible_text = std::str::from_utf8(&all_visible_bytes).unwrap_or("");
+        let lines: Vec<&str> = all_visible_text.lines().collect();
 
-        // Collect text spans to render together (keep existing coalescing for efficiency)
-        let mut coalesced_text = Vec::new();
-        let mut total_lines = 0u32;
+        println!("DEBUG: Visible text has {} actual lines (from {} bytes)",
+                 lines.len(), all_visible_bytes.len());
 
-        for span in spans {
-            if let Span::Text { bytes, lines } = span {
-                coalesced_text.extend_from_slice(bytes);
-                total_lines += lines;
+        // Now apply horizontal culling to each actual line
+        let mut culled_text = Vec::new();
+        let mut total_original_chars = 0;
+        let mut total_culled_chars = 0;
+        let mut x_offset = 0.0f32;  // Track the x_offset for horizontal scrolling
+        let mut start_col = 0usize; // Track the starting column
+
+        for (idx, line_text) in lines.iter().enumerate() {
+            total_original_chars += line_text.len();
+
+            // Apply horizontal culling to this line
+            let visible_content = self.viewport.visible_line_content(line_text, idx as u32);
+
+            match visible_content {
+                VisibleLineContent::Columns { text, start_col: line_start_col, x_offset: line_x_offset } => {
+                    if !text.is_empty() {
+                        // Debug output for lines that get culled
+                        if line_text.len() > text.len() {
+                            println!("LINE {}: Culled from {} chars to {} chars (cols {}.., x_offset={:.1})",
+                                     idx, line_text.len(), text.len(), line_start_col, line_x_offset);
+                        }
+
+                        // Use the x_offset from the long line (the one that actually needs scrolling)
+                        // Only apply offset for lines that are actually being horizontally scrolled
+                        if line_text.len() > 100 && line_x_offset > 0.0 {
+                            x_offset = line_x_offset;
+                            start_col = line_start_col;
+                        }
+
+                        total_culled_chars += text.len();
+                        culled_text.extend_from_slice(text.as_bytes());
+                    }
+                }
+                VisibleLineContent::Wrapped { visual_lines } => {
+                    for vline in visual_lines {
+                        total_culled_chars += vline.len();
+                        culled_text.extend_from_slice(vline.as_bytes());
+                    }
+                }
+            }
+
+            // Add newline between lines (but not after the last line)
+            if idx < lines.len() - 1 {
+                culled_text.push(b'\n');
+                total_culled_chars += 1;
+                total_original_chars += 1;
             }
         }
 
-        // Render the coalesced text if any
-        if !coalesced_text.is_empty() {
-            let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
-            let text = std::str::from_utf8(&coalesced_text).unwrap_or("");
+        // If we have visible text, render it as ONE widget
+        if !culled_text.is_empty() {
+            let layout_pos = LayoutPos::new(
+                self.viewport.margin.x.0,
+                self.viewport.margin.y.0
+            );
 
-            println!("  Rendering text chunk ({} bytes) at layout pos: ({:.1}, {:.1})",
-                     coalesced_text.len(), layout_pos.x, layout_pos.y);
-
-            self.render_text(&coalesced_text, layout_pos.x, layout_pos.y);
-
-            // Update document position for next chunk
-            self.current_doc_pos.byte_offset += coalesced_text.len();
-            self.current_doc_pos.line += total_lines;
-
-            if total_lines > 0 {
-                self.current_doc_pos.column = 0;
-            } else {
-                self.current_doc_pos.column += text.chars().count() as u32;
+            // Debug output showing culling effectiveness
+            if total_original_chars > total_culled_chars && total_original_chars > 100 {
+                println!("HORIZONTAL CULLING: Saved {} chars (rendered {}, original {}, x_offset={:.1})",
+                         total_original_chars - total_culled_chars,
+                         total_culled_chars,
+                         total_original_chars,
+                         x_offset);
             }
-        }
 
-        // Handle widgets (keep existing widget rendering logic)
-        for span in spans {
-            if let Span::Widget(widget) = span {
-                let layout_pos = self.viewport.doc_to_layout(self.current_doc_pos);
-                self.render_widget(widget.as_ref(), layout_pos.x, layout_pos.y);
-            }
+            self.render_text_with_offset(&culled_text, layout_pos.x, layout_pos.y, x_offset, start_col);
         }
     }
 
@@ -303,15 +333,61 @@ impl Renderer {
         }
     }
 
-    /// Render text span
+    /// Render text span (potentially multi-line for virtualized content)
     fn render_text(&mut self, bytes: &[u8], x: LogicalPixels, y: LogicalPixels) {
-        // Text spans should be rendered via TextWidget, not directly
-        // This is a fallback for raw text spans without widgets
-        use crate::widget::TextWidget;
+        self.render_text_with_offset(bytes, x, y, 0.0, 0);
+    }
+
+    /// Render text span with horizontal offset for scrolling
+    fn render_text_with_offset(&mut self, bytes: &[u8], x: LogicalPixels, y: LogicalPixels, x_offset: f32, start_col: usize) {
+        use crate::widget::{TextWidget, ContentType};
+
+        // Pre-calculate the actual size using the font system
+        let text = std::str::from_utf8(bytes).unwrap_or("");
+        let lines: Vec<&str> = text.lines().collect();
+
+        let mut max_width = 0.0f32;
+        let num_lines = lines.len().max(1);
+        let total_height = num_lines as f32 * self.viewport.metrics.line_height;
+
+        // Measure each line to find the maximum width
+        if let Some(font_system) = &self.font_system {
+            for line in &lines {
+                if !line.is_empty() {
+                    // Layout this line to get its width
+                    let layout = font_system.layout_text_scaled(
+                        line,
+                        self.viewport.metrics.font_size,
+                        self.viewport.scale_factor
+                    );
+                    // Convert physical width to logical pixels
+                    let line_width = layout.width / self.viewport.scale_factor;
+                    max_width = max_width.max(line_width);
+                }
+            }
+        }
+
+        // If no font system or empty text, use a minimum width
+        if max_width == 0.0 {
+            max_width = 1.0;
+        }
+
+        // Use appropriate ContentType based on whether we have horizontal scrolling
+        // The x_offset positions the culled text where it would have been in the full line
+        let content_type = if x_offset != 0.0 || start_col > 0 {
+            ContentType::Columns {
+                start_col,
+                x_offset  // Position text at its original location in the line
+            }
+        } else {
+            ContentType::Full
+        };
 
         let widget = TextWidget {
             text: Arc::from(bytes),
             style: 0,
+            size: LogicalSize::new(max_width, total_height),
+            content_type,
         };
 
         self.render_widget(&widget, x, y);
@@ -331,9 +407,17 @@ impl Renderer {
             height: widget_size.height,
         };
 
-        // Check visibility for debug coloring but don't actually cull
-        let is_visible = self.viewport.is_visible(widget_rect);
-        // Don't cull anything - just use visibility for debug coloring
+        // Check visibility for debug coloring
+        // For horizontally culled text, the view_pos.x will be very negative if we have a large x_offset
+        // In that case, we should consider it visible since we're showing the culled portion
+        let is_visible = if view_pos.x.0 < -1000.0 {
+            // This is likely culled text with large x_offset - it's visible by definition
+            // (we extracted the visible columns)
+            true
+        } else {
+            // Normal visibility check
+            self.viewport.is_visible(widget_rect)
+        };
 
         println!("RENDERING WIDGET: layout=({:.1},{:.1}), scroll=({:.1},{:.1})",
                  layout_pos.x, layout_pos.y, self.viewport.scroll.x.0, self.viewport.scroll.y.0);

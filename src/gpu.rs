@@ -549,7 +549,7 @@ impl GpuRenderer {
 
         let glyph_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Glyph Vertex Buffer"),
-            size: 262144, // 256KB for glyph vertices
+            size: 4 * 1024 * 1024, // 4MB for glyph vertices (supports ~68k glyphs)
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

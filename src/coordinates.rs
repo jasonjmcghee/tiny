@@ -10,6 +10,47 @@
 //! for crisp rendering, bypassing the normal logical->physical transformation.
 
 use std::sync::Arc;
+// === Line Rendering Mode ===
+
+/// How lines should be rendered - with horizontal scroll or soft wrap
+#[derive(Debug, Clone, Copy)]
+pub enum LineMode {
+    /// No wrapping - lines extend infinitely to the right with horizontal scroll
+    NoWrap {
+        /// Current horizontal scroll position in logical pixels
+        horizontal_scroll: f32,
+    },
+    /// Soft wrap - lines wrap at viewport width, no horizontal scroll
+    SoftWrap {
+        /// Width at which to wrap lines in logical pixels
+        wrap_width: f32,
+    },
+}
+
+impl Default for LineMode {
+    fn default() -> Self {
+        LineMode::NoWrap { horizontal_scroll: 0.0 }
+    }
+}
+
+/// Content that's actually visible for a line
+#[derive(Debug, Clone)]
+pub enum VisibleLineContent {
+    /// Extracted columns from a long line (NoWrap mode)
+    Columns {
+        /// The visible text
+        text: String,
+        /// Starting column in the original line
+        start_col: usize,
+        /// X offset for rendering (negative for scrolled content)
+        x_offset: f32,
+    },
+    /// Wrapped visual lines (SoftWrap mode)
+    Wrapped {
+        /// The visual lines after wrapping
+        visual_lines: Vec<String>,
+    },
+}
 
 // === Document Space ===
 
@@ -260,7 +301,7 @@ impl TextMetrics {
         Self {
             font_size,
             line_height: font_size * 1.4,  // Standard line height multiplier
-            space_width: font_size * 0.6,  // Approximate for monospace
+            space_width: font_size * 0.6,  // Will be updated when font system is set
             tab_stops: 4,
         }
     }
@@ -320,11 +361,17 @@ pub struct Viewport {
     /// Margin for document content (left, top)
     pub margin: LayoutPos,
 
+    // === Line rendering mode ===
+    /// How to render lines (with horizontal scroll or soft wrap)
+    pub line_mode: LineMode,
+
     // === Cached document bounds ===
     /// Cached document bounds (width, height) to avoid recalculation
     cached_doc_bounds: Option<(f32, f32)>,
     /// Document version when bounds were last calculated
     cached_bounds_version: u64,
+    /// Character count of the longest line when last measured
+    cached_longest_line_chars: usize,
 
     // === Optional font system for accurate measurement ===
     font_system: Option<Arc<crate::font::SharedFontSystem>>,
@@ -345,8 +392,10 @@ impl Viewport {
             scale_factor,
             metrics: TextMetrics::new(13.0), // Default 14pt font
             margin: LayoutPos::new(4.0, 4.0), // 4px margin left and top
+            line_mode: LineMode::default(),  // Default to no wrap
             cached_doc_bounds: None,
             cached_bounds_version: 0,
+            cached_longest_line_chars: 0,
             font_system: None,
         }
     }
@@ -359,11 +408,8 @@ impl Viewport {
             self.metrics.line_height = (line_layout.glyphs[1].pos.y.0 - line_layout.glyphs[0].pos.y.0) / self.scale_factor;
         }
 
-        // Get actual character width for monospace font
-        let char_layout = font_system.layout_text_scaled("A", self.metrics.font_size, self.scale_factor);
-        if char_layout.width > 0.0 {
-            self.metrics.space_width = char_layout.width / self.scale_factor;
-        }
+        // Approximated
+        self.metrics.space_width = font_system.char_width_coef() * self.metrics.font_size;
 
         self.font_system = Some(font_system);
     }
@@ -557,27 +603,50 @@ impl Viewport {
 
     // === Scrolling ===
 
-    /// Scroll to make a layout position visible
+    /// Scroll to make a layout position visible (Neovim-style with scrolloff)
     pub fn ensure_visible(&mut self, pos: LayoutPos) {
+        let old_scroll_x = self.scroll.x.0;
         let old_scroll_y = self.scroll.y.0;
 
-        // Horizontal scrolling
-        if pos.x < self.scroll.x {
-            self.scroll.x = pos.x;
-        } else if pos.x > self.scroll.x + self.logical_size.width {
-            self.scroll.x = pos.x - self.logical_size.width + 50.0; // Leave some margin
+        // Vertical scrolling with 4-line scrolloff margin (like Neovim)
+        let v_scrolloff_lines = 4.0;
+        let v_scrolloff = v_scrolloff_lines * self.metrics.line_height;
+
+        // Top margin check - if cursor goes above scrolloff area, scroll up one line
+        let top_margin = self.scroll.y.0 + v_scrolloff;
+        if pos.y.0 < top_margin {
+            // Scroll up by one line at a time
+            self.scroll.y.0 = (pos.y.0 - v_scrolloff).max(0.0);
         }
 
-        // Vertical scrolling
-        if pos.y < self.scroll.y {
-            self.scroll.y = pos.y;
-        } else if pos.y + self.metrics.line_height > self.scroll.y + self.logical_size.height {
-            self.scroll.y = pos.y + self.metrics.line_height - self.logical_size.height;
+        // Bottom margin check - if cursor goes below scrolloff area, scroll down one line
+        let bottom_margin = self.scroll.y.0 + self.logical_size.height.0 - v_scrolloff - self.metrics.line_height;
+        if pos.y.0 > bottom_margin {
+            // Scroll down by one line at a time
+            self.scroll.y.0 = pos.y.0 - self.logical_size.height.0 + v_scrolloff + self.metrics.line_height;
         }
 
-        if old_scroll_y != self.scroll.y.0 {
-            println!("ENSURE_VISIBLE: cursor at ({:.1}, {:.1}), scroll changed from {:.1} to {:.1}",
-                     pos.x.0, pos.y.0, old_scroll_y, self.scroll.y.0);
+        // Horizontal scrolling with 8-character scrolloff margin (like Neovim)
+        let h_scrolloff_chars = 8.0;
+        let h_scrolloff = h_scrolloff_chars * self.metrics.space_width;
+
+        // Left margin check - if cursor goes before scrolloff area, scroll left one character
+        let left_margin = self.scroll.x.0 + h_scrolloff;
+        if pos.x.0 < left_margin {
+            // Scroll left by one character at a time
+            self.scroll.x.0 = (pos.x.0 - h_scrolloff).max(0.0);
+        }
+
+        // Right margin check - if cursor goes after scrolloff area, scroll right one character
+        let right_margin = self.scroll.x.0 + self.logical_size.width.0 - h_scrolloff;
+        if pos.x.0 > right_margin {
+            // Scroll right by one character at a time
+            self.scroll.x.0 = pos.x.0 - self.logical_size.width.0 + h_scrolloff;
+        }
+
+        if old_scroll_x != self.scroll.x.0 || old_scroll_y != self.scroll.y.0 {
+            println!("ENSURE_VISIBLE: cursor at ({:.1}, {:.1}), scroll changed from ({:.1}, {:.1}) to ({:.1}, {:.1})",
+                     pos.x.0, pos.y.0, old_scroll_x, old_scroll_y, self.scroll.x.0, self.scroll.y.0);
         }
     }
 
@@ -644,47 +713,213 @@ impl Viewport {
 
     /// Get document bounds with caching
     pub fn get_document_bounds(&mut self, tree: &crate::tree::Tree) -> (f32, f32) {
-        // Check if cache is valid
+        // First, find the line with the most characters (just counting)
+        let mut longest_line_chars = 0;
+        let mut longest_line_text = "".to_string();
+        let mut longest_line_num = 0;
+
+        for line_num in 0..tree.line_count() {
+            if let Some(line_start) = tree.line_to_byte(line_num) {
+                let line_end = tree.line_to_byte(line_num + 1).unwrap_or(tree.byte_count());
+                let line_text_trimmed = tree.get_text_slice(line_start..line_end);
+                let line_length = line_text_trimmed.chars().count();
+
+                if line_length > longest_line_chars {
+                    longest_line_chars = line_length;
+                    longest_line_text = line_text_trimmed;
+                    longest_line_num = line_num;
+                }
+            }
+        }
+
+        // Check if we can use cached bounds
         if let Some(bounds) = self.cached_doc_bounds {
-            if self.cached_bounds_version == tree.version {
+            if self.cached_bounds_version == tree.version &&
+               self.cached_longest_line_chars == longest_line_chars {
                 return bounds;
             }
         }
 
-        // Recalculate bounds
+        // Need to recalculate - the longest line changed or tree version changed
         let total_lines = tree.line_count() as f32;
         let doc_height = (total_lines + 5.0) * self.metrics.line_height;
 
-        // Find longest line
-        let mut max_line_length = 0;
-        for line_num in 0..tree.line_count() {
-            if let Some(line_start) = tree.line_to_byte(line_num) {
-                let line_end = tree.line_to_byte(line_num + 1).unwrap_or(tree.byte_count());
-                let line_text = tree.get_text_slice(line_start..line_end);
-                let line_length = line_text.chars().count();
-                max_line_length = max_line_length.max(line_length);
-            }
-        }
-        let doc_width = (max_line_length + 5) as f32 * self.metrics.space_width;
+        // Now measure ONLY the longest line
+        let max_line_width = if let Some(font_system) = &self.font_system {
+            // Measure the actual longest line
+            let layout = font_system.layout_text_scaled(&longest_line_text, self.metrics.font_size, self.scale_factor);
+            layout.width / self.scale_factor
+        } else {
+            // Fallback to estimation
+            longest_line_chars as f32 * self.metrics.space_width
+        };
 
-        // Cache the result
+        // Add 5 characters worth of padding
+        let padding = 5.0 * self.metrics.space_width;
+        let doc_width = max_line_width + padding;
+
+        // Debug output for very long lines
+        if longest_line_chars > 1000 {
+            println!("Document bounds: line {} has {} chars, measured width={:.1}, doc_width={:.1} (space_width={:.1})",
+                     longest_line_num, longest_line_chars, max_line_width, doc_width, self.metrics.space_width);
+        }
+
+        // Cache the result with the character count
         let bounds = (doc_width, doc_height);
         self.cached_doc_bounds = Some(bounds);
         self.cached_bounds_version = tree.version;
+        self.cached_longest_line_chars = longest_line_chars;
 
         bounds
     }
 
     /// Clamp scroll position to document bounds
     pub fn clamp_scroll_to_bounds(&mut self, tree: &crate::tree::Tree) {
+        // Invalidate cache if it might be stale (temporary fix)
+        self.cached_doc_bounds = None;
+
         let (doc_width, doc_height) = self.get_document_bounds(tree);
 
-        // Don't scroll past document bounds
-        let max_scroll_x = (doc_width - self.logical_size.width.0).max(0.0);
+        // For horizontal scrolling, the maximum scroll should keep content visible
+        // Maximum scroll = document width - viewport width + small padding
+        // This ensures we can see the end of the line but can't scroll into empty space
+
+        let viewport_width = self.logical_size.width.0;
+
+        // At maximum scroll, we want the last part of the line visible
+        // Maximum scroll should be: doc_width - viewport_width
+        // This positions the document end at the right edge of the viewport
+        let max_scroll_x = (doc_width - viewport_width).max(0.0);
+
+        // For vertical, standard scrolling
         let max_scroll_y = (doc_height - self.logical_size.height.0).max(0.0);
 
+        // Apply the clamping
+        let old_scroll_x = self.scroll.x.0;
         self.scroll.x.0 = self.scroll.x.0.clamp(0.0, max_scroll_x);
         self.scroll.y.0 = self.scroll.y.0.clamp(0.0, max_scroll_y);
+
+        if old_scroll_x != self.scroll.x.0 {
+            println!("Clamped horizontal scroll from {:.1} to {:.1} (max: {:.1}, doc_width: {:.1}, viewport: {:.1})",
+                     old_scroll_x, self.scroll.x.0, max_scroll_x, doc_width, viewport_width);
+        }
+    }
+
+    // === Horizontal Virtualization ===
+
+    /// Calculate what part of a line is actually visible
+    pub fn visible_line_content(&self, line_text: &str, line_num: u32) -> VisibleLineContent {
+        // Use the actual scroll.x value instead of the line_mode's stored value
+        match self.line_mode {
+            LineMode::NoWrap { horizontal_scroll: _ } => {
+                // Use the viewport's actual horizontal scroll
+                let horizontal_scroll = self.scroll.x.0;
+
+                // Only extract columns if we have a font system and there's enough text to warrant it
+                if let Some(font_system) = &self.font_system {
+                    // Calculate visible viewport width in logical pixels
+                    let viewport_width = self.logical_size.width.0 - self.margin.x.0 * 2.0;
+
+                    // Add 50% buffer on each side to prevent popping
+                    let buffer_width = viewport_width * 0.5;
+
+                    // Calculate the actual line width in pixels to respect bounds
+                    // Don't count newline characters
+                    let line_text_trimmed = line_text.trim_end_matches('\n').trim_end_matches('\r');
+                    let line_width_pixels = line_text_trimmed.chars().count() as f32 * self.metrics.space_width;
+
+                    // Calculate culling boundaries with buffer, respecting document bounds
+                    // Start: buffer normally but don't go negative
+                    let cull_start_x = (horizontal_scroll - buffer_width).max(0.0);
+                    // End: buffer OR line end, whichever comes first
+                    let cull_end_x = (horizontal_scroll + viewport_width + buffer_width)
+                        .min(line_width_pixels);
+
+                    // Check if we've scrolled past the end of the line
+                    if cull_start_x >= line_width_pixels {
+                        // We've scrolled past the end - return empty
+                        return VisibleLineContent::Columns {
+                            text: String::new(),
+                            start_col: line_text.chars().count(),
+                            x_offset: 0.0,
+                        };
+                    }
+
+                    // Debug output to understand the width calculation
+                    if line_num == 0 && horizontal_scroll > 0.0 {
+                        println!("BUFFER ZONE: scroll={:.1}, viewport={:.1}, buffer={:.1}, cull_range={:.1}..{:.1}, line_width={:.1}",
+                                 horizontal_scroll, viewport_width, buffer_width, cull_start_x, cull_end_x, line_width_pixels);
+                    }
+
+                    // Find start and end columns based on culling boundaries (with buffer)
+                    let start_col = if cull_start_x > 0.0 {
+                        font_system.pixel_to_column(
+                            cull_start_x,
+                            line_text,
+                            self.metrics.font_size,
+                            self.scale_factor
+                        )
+                    } else {
+                        0
+                    };
+
+                    // Find end column (including buffer zone)
+                    let end_col = font_system.pixel_to_column(
+                        cull_end_x,
+                        line_text,
+                        self.metrics.font_size,
+                        self.scale_factor
+                    );
+
+                    // Extract the visible portion of text
+                    let chars: Vec<char> = line_text.chars().collect();
+
+                    // Handle edge cases to prevent teleportation
+                    let visible_text = if start_col >= chars.len() {
+                        // If we're scrolled past the end of the line, return empty
+                        String::new()
+                    } else {
+                        // Clamp end_col to prevent out-of-bounds and ensure smooth scrolling
+                        let actual_end = end_col.min(chars.len());
+                        // Only extract if we have a valid range
+                        if actual_end > start_col {
+                            chars[start_col..actual_end].iter().collect()
+                        } else {
+                            String::new()
+                        }
+                    };
+
+                    // Calculate x_offset: We need to position the culled text at its original
+                    // position in the line so that when scroll is applied, it appears correctly.
+                    // But we need to use the actual measured width, not an approximation.
+                    let x_offset = if start_col > 0 {
+                        cull_start_x
+                    } else {
+                        0.0
+                    };
+
+                    VisibleLineContent::Columns {
+                        text: visible_text,
+                        start_col,
+                        x_offset,  // Position text at its cull boundary
+                    }
+                } else {
+                    // No font system, return full line (fallback)
+                    VisibleLineContent::Columns {
+                        text: line_text.to_string(),
+                        start_col: 0,
+                        x_offset: 0.0,  // No offset - scroll is handled by view transformation
+                    }
+                }
+            }
+            LineMode::SoftWrap { wrap_width: _ } => {
+                // For now, return as single visual line - will implement wrapping later
+                // TODO: Implement proper line wrapping
+                VisibleLineContent::Wrapped {
+                    visual_lines: vec![line_text.to_string()],
+                }
+            }
+        }
     }
 
     // === Helpers ===

@@ -64,7 +64,7 @@ impl ApplicationHandler for TinyEditorApp {
             println!("Initial scale_factor: {}", scale_factor);
 
             // Pre-rasterize ASCII characters at physical size (base * scale)
-            font_system.prerasterize_ascii(14.0 * scale_factor);
+            // font_system.prerasterize_ascii(14.0 * scale_factor);
 
             // Upload atlas to GPU
             let atlas_data = font_system.atlas_data();
