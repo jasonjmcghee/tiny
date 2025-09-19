@@ -210,10 +210,14 @@ pub trait Widget: Send + Sync {
     fn widget_id(&self) -> WidgetId;
 
     /// Update widget state (animations, etc.)
-    fn update(&mut self, dt: f32) -> bool; // returns needs_redraw
+    fn update(&mut self, _dt: f32) -> bool {
+        false
+    }
 
     /// Handle input events
-    fn handle_event(&mut self, event: &WidgetEvent) -> EventResponse;
+    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
+        EventResponse::Ignored // Text doesn't handle events directly
+    }
 
     /// Layout widget with given constraints
     fn layout(&mut self, constraints: LayoutConstraints) -> LayoutResult;
@@ -267,14 +271,6 @@ pub trait Widget: Send + Sync {
 impl Widget for TextWidget {
     fn widget_id(&self) -> WidgetId {
         0 // Text widgets don't need unique IDs for now
-    }
-
-    fn update(&mut self, _dt: f32) -> bool {
-        false // No animations
-    }
-
-    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
-        EventResponse::Ignored // Text doesn't handle events directly
     }
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
@@ -423,10 +419,6 @@ impl Widget for CursorWidget {
             self.blink_phase -= std::f32::consts::TAU;
         }
         true // Always redraw for animation
-    }
-
-    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
-        EventResponse::Ignored // Cursor doesn't handle events
     }
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {

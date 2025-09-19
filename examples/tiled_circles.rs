@@ -901,17 +901,8 @@ impl Widget for DocumentEditorWidget {
             widget_viewport,
             selections,
             Some(render_pass),
-            None,  // Don't pass context - we'll paint widgets manually
+            Some(ctx),
         );
-
-        // Now manually paint the widgets from the embedded renderer's widget_manager
-        {
-            let mut renderer = self.renderer.borrow_mut();
-            let widgets = renderer.widget_manager_mut().widgets_in_order();
-            for widget in widgets {
-                widget.paint(ctx, render_pass);
-            }
-        }
 
         // Update mouse circle shader effect parameters
         if let Some(mouse_pos) = self.text_effect.mouse_pos {

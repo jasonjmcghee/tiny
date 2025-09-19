@@ -146,9 +146,6 @@ impl Renderer {
 
     /// Set text style provider (borrows)
     pub fn set_text_styles_ref(&mut self, provider: &dyn crate::text_effects::TextStyleProvider) {
-        // We can't store a borrowed reference, but we can clone the effects for this frame
-        // This is a temporary solution - ideally we'd pass the provider through the paint context
-
         // Get all effects from the provider (this is a hack, but works for now)
         let all_effects = provider.get_effects_in_range(0..usize::MAX);
 
@@ -293,7 +290,6 @@ impl Renderer {
         if let Some(ref mut pass) = render_pass {
             // Use provided context or create our own
             if let Some(ctx) = widget_paint_context {
-                println!("render_with_pass_and_context: Using provided context for selection widgets");
                 // Paint only selection widgets (negative priority) BEFORE text
                 let widgets = self.widget_manager.widgets_in_order();
                 for widget in &widgets {
@@ -347,7 +343,6 @@ impl Renderer {
         if let Some(ref mut pass) = render_pass {
             // Use provided context or create our own
             if let Some(ctx) = widget_paint_context {
-                println!("render_with_pass_and_context: Using provided context for cursor widgets");
                 // Paint cursor and other widgets (positive priority) AFTER text
                 let widgets = self.widget_manager.widgets_in_order();
                 for widget in &widgets {
