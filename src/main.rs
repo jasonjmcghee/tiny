@@ -146,7 +146,11 @@ fn main() {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(physical_size);
                 }
-                if let Some(window) = &self.window {
+
+                // Render immediately to prevent stretching during resize
+                if let (Some(renderer), Some(editor), Some(font_system), Some(window)) =
+                    (&mut self.renderer, &mut self.editor, &self.font_system, &self.window)
+                {
                     // Get scale factor and update renderer viewport
                     let scale_factor = window.scale_factor() as f32;
                     let logical_width = physical_size.width as f32 / scale_factor;
@@ -158,11 +162,28 @@ fn main() {
                     );
 
                     // Update editor viewport
-                    if let Some(editor) = &mut self.editor {
-                        editor.resize(logical_width, logical_height, scale_factor);
-                    }
+                    editor.resize(logical_width, logical_height, scale_factor);
 
-                    window.request_redraw();
+                    // Render immediately (same as RedrawRequested)
+                    let viewport = Rect {
+                        x: LogicalPixels(0.0),
+                        y: LogicalPixels(0.0),
+                        width: LogicalPixels(logical_width),
+                        height: LogicalPixels(logical_height),
+                    };
+
+                    editor.renderer.update_viewport(logical_width, logical_height, scale_factor);
+                    editor.renderer.set_font_system(font_system.clone());
+                    let batches = editor.render(viewport);
+
+                    let atlas_data = font_system.atlas_data();
+                    let (atlas_width, atlas_height) = font_system.atlas_size();
+                    renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+
+                    unsafe {
+                        let viewport = Viewport::new(logical_width, logical_height, scale_factor);
+                        renderer.render(&batches, &viewport);
+                    }
                 }
             }
 

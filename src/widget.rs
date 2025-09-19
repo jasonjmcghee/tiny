@@ -45,17 +45,50 @@ pub struct PaintContext<'a> {
     /// Viewport for all coordinate transformations and metrics
     pub viewport: &'a Viewport,
     /// GPU device for creating resources
-    pub device: &'a wgpu::Device,
+    pub device: std::sync::Arc<wgpu::Device>,
     /// GPU queue for uploading data
-    pub queue: &'a wgpu::Queue,
+    pub queue: std::sync::Arc<wgpu::Queue>,
     /// Uniform bind group for viewport uniforms
     pub uniform_bind_group: &'a wgpu::BindGroup,
-    /// GPU renderer for access to pipelines and resources
-    pub gpu_renderer: &'a crate::gpu::GpuRenderer,
+    /// GPU renderer for access to pipelines and resources (raw pointer for flexibility)
+    gpu_renderer: *mut crate::gpu::GpuRenderer,
     /// Font system for text layout and rasterization
     pub font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
     /// Text style provider for syntax highlighting (optional)
     pub text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
+}
+
+impl<'a> PaintContext<'a> {
+    /// Create a new PaintContext with raw GPU renderer pointer
+    pub fn new(
+        viewport: &'a Viewport,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+        uniform_bind_group: &'a wgpu::BindGroup,
+        gpu_renderer: *mut crate::gpu::GpuRenderer,
+        font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
+        text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
+    ) -> Self {
+        Self {
+            viewport,
+            device,
+            queue,
+            uniform_bind_group,
+            gpu_renderer,
+            font_system,
+            text_styles,
+        }
+    }
+
+    /// Get immutable reference to GPU renderer (safe wrapper around raw pointer)
+    pub fn gpu(&self) -> &crate::gpu::GpuRenderer {
+        unsafe { &*self.gpu_renderer }
+    }
+
+    /// Get mutable reference to GPU renderer (safe wrapper around raw pointer)
+    pub fn gpu_mut(&self) -> &mut crate::gpu::GpuRenderer {
+        unsafe { &mut *self.gpu_renderer }
+    }
 }
 
 // === Content Type for TextWidget ===
@@ -343,7 +376,7 @@ impl Widget for TextWidget {
                         crate::text_effects::EffectType::Shader { id, ref params } => {
                             shader_id = Some(id);
                             // Update effect uniform buffer with shader parameters
-                            if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(id)
+                            if let Some(effect_buffer) = ctx.gpu().effect_uniform_buffer(id)
                             {
                                 ctx.queue.write_buffer(
                                     effect_buffer,
@@ -360,10 +393,10 @@ impl Widget for TextWidget {
 
             // Render with or without shader effects
             if let Some(id) = shader_id {
-                ctx.gpu_renderer
+                ctx.gpu()
                     .draw_glyphs(render_pass, &all_glyph_instances, Some(id));
             } else {
-                ctx.gpu_renderer
+                ctx.gpu()
                     .draw_glyphs(render_pass, &all_glyph_instances, None);
             }
         }
@@ -479,8 +512,29 @@ impl Widget for CursorWidget {
             color,
         };
 
-        ctx.gpu_renderer
-            .draw_rects(render_pass, &[rect_instance], ctx.viewport.scale_factor);
+        // Create our own vertex buffer to avoid conflicts with shared buffer
+        let scale = ctx.viewport.scale_factor;
+        let vertices = crate::gpu::create_rect_vertices(
+            rect_instance.rect.x.0 * scale,
+            rect_instance.rect.y.0 * scale,
+            rect_instance.rect.width.0 * scale,
+            rect_instance.rect.height.0 * scale,
+            rect_instance.color,
+        );
+
+        // Create temporary buffer for this cursor
+        let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cursor Vertex Buffer"),
+            size: vertices.len() as u64 * std::mem::size_of::<crate::gpu::RectVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        ctx.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        render_pass.set_pipeline(ctx.gpu().rect_pipeline());
+        render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        render_pass.draw(0..vertices.len() as u32, 0..1);
     }
 
     fn clone_box(&self) -> Arc<dyn Widget> {
@@ -567,8 +621,34 @@ impl Widget for SelectionWidget {
             .collect();
 
         if !rect_instances.is_empty() {
-            ctx.gpu_renderer
-                .draw_rects(render_pass, &rect_instances, ctx.viewport.scale_factor);
+            // Create our own vertex buffer to avoid conflicts
+            let scale = ctx.viewport.scale_factor;
+            let mut vertices = Vec::with_capacity(rect_instances.len() * 6);
+
+            for rect in &rect_instances {
+                let rect_verts = crate::gpu::create_rect_vertices(
+                    rect.rect.x.0 * scale,
+                    rect.rect.y.0 * scale,
+                    rect.rect.width.0 * scale,
+                    rect.rect.height.0 * scale,
+                    rect.color,
+                );
+                vertices.extend_from_slice(&rect_verts);
+            }
+
+            // Create temporary buffer
+            let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Selection Vertex Buffer"),
+                size: vertices.len() as u64 * std::mem::size_of::<crate::gpu::RectVertex>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            ctx.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+            render_pass.set_pipeline(ctx.gpu().rect_pipeline());
+            render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.draw(0..vertices.len() as u32, 0..1);
         }
     }
 
@@ -777,7 +857,7 @@ pub fn diagnostic(
 /// Widget manager - tracks overlay widgets like cursor and selections
 pub struct WidgetManager {
     /// All managed widgets
-    widgets: HashMap<WidgetId, Arc<dyn Widget>>,
+    pub widgets: HashMap<WidgetId, Arc<dyn Widget>>,
     /// Next widget ID to assign
     next_id: WidgetId,
     /// Sorted widget IDs by z-order (priority)

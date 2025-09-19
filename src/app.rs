@@ -9,7 +9,7 @@ use crate::{
     input::InputHandler,
     render::Renderer,
     syntax::SyntaxHighlighter,
-    text_effects::TextStyleProvider,
+    text_effects::{TextEffect, TextStyleProvider},
     tree::{Doc, Point, Rect},
 };
 #[allow(unused)]
@@ -68,6 +68,15 @@ pub trait AppLogic: 'static {
         false
     }
 
+    /// Handle mouse move (for tracking position)
+    fn on_mouse_move(
+        &mut self,
+        _pos: Point,
+        _viewport: &crate::coordinates::Viewport,
+    ) -> bool {
+        false
+    }
+
     /// Get document to render
     fn doc(&self) -> &Doc;
 
@@ -101,6 +110,11 @@ pub trait AppLogic: 'static {
 
     /// Called after setup is complete
     fn on_ready(&mut self) {}
+
+    /// Register custom text effect shaders (shader_id, shader_source, uniform_size)
+    fn register_shaders(&self) -> Vec<(u32, &'static str, u64)> {
+        vec![]
+    }
 
     /// Called before each render (for animations, etc.)
     fn on_update(&mut self) {
@@ -207,7 +221,12 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             );
 
             // Setup GPU renderer
-            let gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
+            let mut gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
+
+            // Register any custom shaders from the app logic
+            for (shader_id, shader_source, uniform_size) in self.logic.register_shaders() {
+                gpu_renderer.register_text_effect_shader(shader_id, shader_source, uniform_size);
+            }
 
             // Setup font system
             let font_system = Arc::new(SharedFontSystem::new());
@@ -293,6 +312,22 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some(position);
+
+                // Call on_mouse_move for tracking
+                if let (Some(window), Some(cpu_renderer)) = (&self.window, &self.cpu_renderer) {
+                    let scale = window.scale_factor() as f32;
+                    let logical_x = position.x as f32 / scale;
+                    let logical_y = position.y as f32 / scale;
+
+                    let point = Point {
+                        x: LogicalPixels(logical_x),
+                        y: LogicalPixels(logical_y),
+                    };
+
+                    if self.logic.on_mouse_move(point, cpu_renderer.viewport()) {
+                        window.request_redraw();
+                    }
+                }
 
                 // Check for drag if mouse is pressed
                 if self.mouse_pressed {
@@ -440,9 +475,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 if let Some(gpu_renderer) = &mut self.gpu_renderer {
                     gpu_renderer.resize(new_size);
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                // Render immediately to prevent stretching during resize
+                self.render_frame();
             }
 
             _ => {}
@@ -547,6 +581,36 @@ impl<T: AppLogic> TinyApp<T> {
     }
 }
 
+/// Combined text style provider that merges multiple providers
+struct CombinedTextStyles<'a> {
+    providers: Vec<&'a dyn TextStyleProvider>,
+}
+
+impl<'a> TextStyleProvider for CombinedTextStyles<'a> {
+    fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<TextEffect> {
+        let mut effects = Vec::new();
+        for provider in &self.providers {
+            effects.extend(provider.get_effects_in_range(range.clone()));
+        }
+        effects
+    }
+
+    fn request_update(&self, text: &str, version: u64) {
+        for provider in &self.providers {
+            provider.request_update(text, version);
+        }
+    }
+
+    fn name(&self) -> &str {
+        "combined"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Can't return self due to lifetime, return a static unit type
+        &()
+    }
+}
+
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {
     pub doc: Doc,
@@ -554,9 +618,16 @@ pub struct EditorLogic {
     pub syntax_highlighter: Option<Box<dyn TextStyleProvider>>,
     /// Flag to indicate widgets need updating
     widgets_dirty: bool,
+    /// Extra text style providers (e.g., for effects)
+    pub extra_text_styles: Vec<Box<dyn TextStyleProvider>>,
 }
 
 impl EditorLogic {
+    pub fn with_text_style(mut self, style: Box<dyn TextStyleProvider>) -> Self {
+        self.extra_text_styles.push(style);
+        self
+    }
+
     pub fn new(doc: Doc) -> Self {
         // Always enable Rust syntax highlighting
         let syntax_highlighter: Box<dyn TextStyleProvider> =
@@ -598,6 +669,7 @@ impl EditorLogic {
             input,
             syntax_highlighter: Some(syntax_highlighter),
             widgets_dirty: true,
+            extra_text_styles: Vec::new(),
         }
     }
 }

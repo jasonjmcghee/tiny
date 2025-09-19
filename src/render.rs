@@ -266,6 +266,18 @@ impl Renderer {
         selections: &[crate::input::Selection],
         mut render_pass: Option<&mut wgpu::RenderPass>,
     ) -> Vec<BatchedDraw> {
+        self.render_with_pass_and_context(tree, viewport, selections, render_pass, None)
+    }
+
+    /// Render tree with optional direct GPU render pass and optional widget paint context
+    pub fn render_with_pass_and_context(
+        &mut self,
+        tree: &Tree,
+        viewport: Rect,
+        selections: &[crate::input::Selection],
+        mut render_pass: Option<&mut wgpu::RenderPass>,
+        widget_paint_context: Option<&crate::widget::PaintContext>,
+    ) -> Vec<BatchedDraw> {
         // Clear previous frame
         self.commands.clear();
         self.clip_stack.clear();
@@ -279,23 +291,42 @@ impl Renderer {
 
         // Render selections FIRST (behind text)
         if let Some(ref mut pass) = render_pass {
-            let gpu_renderer_ptr = self.gpu_renderer;
-            if let (Some(font_system), Some(gpu_renderer)) = (&self.font_system, gpu_renderer_ptr.map(|ptr| unsafe { &*ptr })) {
-                let ctx = crate::widget::PaintContext {
-                    viewport: &self.viewport,
-                    device: gpu_renderer.device(),
-                    queue: gpu_renderer.queue(),
-                    uniform_bind_group: gpu_renderer.uniform_bind_group(),
-                    gpu_renderer,
-                    font_system,
-                    text_styles: self.text_styles.as_deref(),
-                };
-
+            // Use provided context or create our own
+            if let Some(ctx) = widget_paint_context {
+                println!("render_with_pass_and_context: Using provided context for selection widgets");
                 // Paint only selection widgets (negative priority) BEFORE text
                 let widgets = self.widget_manager.widgets_in_order();
                 for widget in &widgets {
                     if widget.priority() < 0 { // Only selections
-                        widget.paint(&ctx, pass);
+                        widget.paint(ctx, pass);
+                    }
+                }
+            } else {
+                let gpu_renderer_ptr = self.gpu_renderer;
+                if let Some(font_system) = &self.font_system {
+                    if let Some(gpu_renderer_ptr) = gpu_renderer_ptr {
+                        let gpu_renderer = unsafe { &*gpu_renderer_ptr };
+                        let device_arc = gpu_renderer.device_arc();
+                        let queue_arc = gpu_renderer.queue_arc();
+                        let uniform_bind_group = gpu_renderer.uniform_bind_group();
+
+                        let ctx = crate::widget::PaintContext::new(
+                            &self.viewport,
+                            device_arc,
+                            queue_arc,
+                            uniform_bind_group,
+                            gpu_renderer_ptr as *mut _,
+                            font_system,
+                            self.text_styles.as_deref(),
+                        );
+
+                        // Paint only selection widgets (negative priority) BEFORE text
+                        let widgets = self.widget_manager.widgets_in_order();
+                        for widget in &widgets {
+                            if widget.priority() < 0 { // Only selections
+                                widget.paint(&ctx, pass);
+                            }
+                        }
                     }
                 }
             }
@@ -314,23 +345,42 @@ impl Renderer {
 
         // Render cursor and other widgets AFTER text (on top)
         if let Some(ref mut pass) = render_pass {
-            let gpu_renderer_ptr = self.gpu_renderer;
-            if let (Some(font_system), Some(gpu_renderer)) = (&self.font_system, gpu_renderer_ptr.map(|ptr| unsafe { &*ptr })) {
-                let ctx = crate::widget::PaintContext {
-                    viewport: &self.viewport,
-                    device: gpu_renderer.device(),
-                    queue: gpu_renderer.queue(),
-                    uniform_bind_group: gpu_renderer.uniform_bind_group(),
-                    gpu_renderer,
-                    font_system,
-                    text_styles: self.text_styles.as_deref(),
-                };
-
+            // Use provided context or create our own
+            if let Some(ctx) = widget_paint_context {
+                println!("render_with_pass_and_context: Using provided context for cursor widgets");
                 // Paint cursor and other widgets (positive priority) AFTER text
                 let widgets = self.widget_manager.widgets_in_order();
                 for widget in &widgets {
                     if widget.priority() >= 0 { // Cursor and others
-                        widget.paint(&ctx, pass);
+                        widget.paint(ctx, pass);
+                    }
+                }
+            } else {
+                let gpu_renderer_ptr = self.gpu_renderer;
+                if let Some(font_system) = &self.font_system {
+                    if let Some(gpu_renderer_ptr) = gpu_renderer_ptr {
+                        let gpu_renderer = unsafe { &*gpu_renderer_ptr };
+                        let device_arc = gpu_renderer.device_arc();
+                        let queue_arc = gpu_renderer.queue_arc();
+                        let uniform_bind_group = gpu_renderer.uniform_bind_group();
+
+                        let ctx = crate::widget::PaintContext::new(
+                            &self.viewport,
+                            device_arc,
+                            queue_arc,
+                            uniform_bind_group,
+                            gpu_renderer_ptr as *mut _,
+                            font_system,
+                            self.text_styles.as_deref(),
+                        );
+
+                        // Paint cursor and other widgets (positive priority) AFTER text
+                        let widgets = self.widget_manager.widgets_in_order();
+                        for widget in &widgets {
+                            if widget.priority() >= 0 { // Cursor and others
+                                widget.paint(&ctx, pass);
+                            }
+                        }
                     }
                 }
             }
@@ -363,22 +413,27 @@ impl Renderer {
                     crate::tree::Span::Widget(widget) => {
                         // If we have a render pass and supporting resources, paint directly
                         if let Some(pass) = render_pass.as_mut() {
-                            if let (Some(font_system), Some(gpu_renderer)) =
-                                (&self.font_system, self.gpu_renderer())
-                            {
-                                // Create paint context for the widget
-                                let ctx = crate::widget::PaintContext {
-                                    viewport: &self.viewport,
-                                    device: gpu_renderer.device(),
-                                    queue: gpu_renderer.queue(),
-                                    uniform_bind_group: gpu_renderer.uniform_bind_group(),
-                                    gpu_renderer,
-                                    font_system,
-                                    text_styles: self.text_styles.as_deref(),
-                                };
+                            if let Some(font_system) = &self.font_system {
+                                if let Some(gpu_renderer_ptr) = self.gpu_renderer {
+                                    let gpu_renderer = unsafe { &*gpu_renderer_ptr };
+                                    let device_arc = gpu_renderer.device_arc();
+                                    let queue_arc = gpu_renderer.queue_arc();
+                                    let uniform_bind_group = gpu_renderer.uniform_bind_group();
 
-                                // Let widget paint directly to GPU
-                                widget.paint(&ctx, pass);
+                                    // Create paint context for the widget
+                                    let ctx = crate::widget::PaintContext::new(
+                                        &self.viewport,
+                                        device_arc,
+                                        queue_arc,
+                                        uniform_bind_group,
+                                        gpu_renderer_ptr as *mut _,
+                                        font_system,
+                                        self.text_styles.as_deref(),
+                                    );
+
+                                    // Let widget paint directly to GPU
+                                    widget.paint(&ctx, pass);
+                                }
                             }
                         }
                     }
@@ -427,44 +482,49 @@ impl Renderer {
 
             // Paint the widget directly
             if let Some(pass) = render_pass.as_mut() {
-                if let (Some(font_system), Some(gpu_renderer)) =
-                    (&self.font_system, self.gpu_renderer())
-                {
-                    // Create a custom text style provider that returns our viewport-specific effects
-                    let viewport_style_provider = if let Some(effects) = visible_effects {
-                        Some(ViewportEffectsProvider {
-                            effects,
-                            byte_offset: byte_range.start,
-                        })
-                    } else {
-                        None
-                    };
+                if let Some(font_system) = &self.font_system {
+                    if let Some(gpu_renderer_ptr) = self.gpu_renderer {
+                        let gpu_renderer = unsafe { &*gpu_renderer_ptr };
+                        let device_arc = gpu_renderer.device_arc();
+                        let queue_arc = gpu_renderer.queue_arc();
+                        let uniform_bind_group = gpu_renderer.uniform_bind_group();
 
-                    // Use the InputEdit-aware syntax highlighter for text styles
-                    let text_styles_for_widget =
-                        if let Some(ref syntax_hl) = self.syntax_highlighter {
-                            // Use the syntax highlighter directly (it implements TextStyleProvider)
-                            // This ensures widgets get InputEdit-aware effects
-                            Some(syntax_hl.as_ref() as &dyn crate::text_effects::TextStyleProvider)
-                        } else if let Some(ref viewport_provider) = viewport_style_provider {
-                            // Use viewport-specific effects if available
-                            Some(viewport_provider as &dyn crate::text_effects::TextStyleProvider)
+                        // Create a custom text style provider that returns our viewport-specific effects
+                        let viewport_style_provider = if let Some(effects) = visible_effects {
+                            Some(ViewportEffectsProvider {
+                                effects,
+                                byte_offset: byte_range.start,
+                            })
                         } else {
-                            // Fallback to static text styles
-                            self.text_styles.as_deref()
+                            None
                         };
 
-                    let ctx = crate::widget::PaintContext {
-                        viewport: &self.viewport,
-                        device: gpu_renderer.device(),
-                        queue: gpu_renderer.queue(),
-                        uniform_bind_group: gpu_renderer.uniform_bind_group(),
-                        gpu_renderer,
-                        font_system,
-                        text_styles: text_styles_for_widget,
-                    };
+                        // Use the InputEdit-aware syntax highlighter for text styles
+                        let text_styles_for_widget =
+                            if let Some(ref syntax_hl) = self.syntax_highlighter {
+                                // Use the syntax highlighter directly (it implements TextStyleProvider)
+                                // This ensures widgets get InputEdit-aware effects
+                                Some(syntax_hl.as_ref() as &dyn crate::text_effects::TextStyleProvider)
+                            } else if let Some(ref viewport_provider) = viewport_style_provider {
+                                // Use viewport-specific effects if available
+                                Some(viewport_provider as &dyn crate::text_effects::TextStyleProvider)
+                            } else {
+                                // Fallback to static text styles
+                                self.text_styles.as_deref()
+                            };
 
-                    text_widget.paint(&ctx, pass);
+                        let ctx = crate::widget::PaintContext::new(
+                            &self.viewport,
+                            device_arc,
+                            queue_arc,
+                            uniform_bind_group,
+                            gpu_renderer_ptr as *mut _,
+                            font_system,
+                            text_styles_for_widget,
+                        );
+
+                        text_widget.paint(&ctx, pass);
+                    }
                 }
             }
         }
@@ -742,6 +802,16 @@ impl Renderer {
     /// Update animation for overlay widgets
     pub fn update_widgets(&mut self, dt: f32) -> bool {
         self.widget_manager.update_all(dt)
+    }
+
+    /// Get widget manager for manual widget painting
+    pub fn widget_manager(&self) -> &WidgetManager {
+        &self.widget_manager
+    }
+
+    /// Get mutable widget manager for manual widget painting
+    pub fn widget_manager_mut(&mut self) -> &mut WidgetManager {
+        &mut self.widget_manager
     }
 
     /// Update widgets from current selections

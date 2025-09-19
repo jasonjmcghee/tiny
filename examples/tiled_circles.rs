@@ -8,13 +8,13 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use tiny_editor::{
+    app::{AppLogic, EditorLogic},
     coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport},
     font::SharedFontSystem,
     gpu::GpuRenderer,
-    input::InputHandler,
     render::Renderer,
     text_effects::{priority, EffectType, TextEffect, TextStyleProvider},
-    tree::Doc,
+    tree::{Doc, Point},
     widget::{EventResponse, LayoutConstraints, LayoutResult, Widget, WidgetEvent, WidgetId},
 };
 use winit::{
@@ -374,7 +374,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             if let Some(bg_buffer) = &resources.background_vertex_buffer {
                 ctx.queue
                     .write_buffer(bg_buffer, 0, bytemuck::cast_slice(&vertices));
-                render_pass.set_pipeline(ctx.gpu_renderer.rect_pipeline());
+                render_pass.set_pipeline(ctx.gpu().rect_pipeline());
                 render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bg_buffer.slice(..));
                 render_pass.draw(0..vertices.len() as u32, 0..1);
@@ -437,26 +437,13 @@ impl Widget for CircleTracker {
     fn handle_event(&mut self, event: &WidgetEvent) -> EventResponse {
         match event {
             WidgetEvent::MouseMove(pos) => {
-                println!(
-                    "Widget bounds: ({:.1},{:.1}) {}x{}, mouse: ({:.1},{:.1}), contains: {}",
-                    self.bounds.x.0,
-                    self.bounds.y.0,
-                    self.bounds.width.0,
-                    self.bounds.height.0,
-                    pos.x.0,
-                    pos.y.0,
-                    self.contains_point(*pos)
-                );
-
                 if self.contains_point(*pos) {
                     self.mouse_pos = Some(*pos);
                     if !self.is_hovered {
-                        println!("Mouse entered widget");
                         self.is_hovered = true;
                     }
                     EventResponse::Redraw
                 } else if self.is_hovered {
-                    println!("Mouse left widget");
                     self.is_hovered = false;
                     // Keep mouse_pos - don't clear it! Circle should stay at last position
                     EventResponse::Redraw
@@ -465,19 +452,16 @@ impl Widget for CircleTracker {
                 }
             }
             WidgetEvent::MouseEnter => {
-                println!("MouseEnter event received");
                 self.is_hovered = true;
                 EventResponse::Redraw
             }
             WidgetEvent::MouseLeave => {
-                println!("MouseLeave event received");
                 self.is_hovered = false;
                 // Keep mouse_pos - circle should persist at last position
                 EventResponse::Redraw
             }
             WidgetEvent::MouseClick(pos, _button) => {
                 if self.contains_point(*pos) {
-                    println!("Circle clicked at ({:.1}, {:.1})", pos.x.0, pos.y.0);
                     EventResponse::Handled
                 } else {
                     EventResponse::Ignored
@@ -509,10 +493,6 @@ impl Widget for CircleTracker {
 
         // Draw SDF circle directly to GPU
         if let Some(mouse_pos) = self.mouse_pos {
-            println!(
-                "Drawing circle at ({:.1}, {:.1})",
-                mouse_pos.x.0, mouse_pos.y.0
-            );
             let radius = 20.0;
 
             // Create quad vertices around mouse position (convert to physical coordinates)
@@ -567,15 +547,12 @@ impl Widget for CircleTracker {
                 &resources.vertex_buffer,
                 &resources.circle_bind_group,
             ) {
-                println!("Rendering circle with custom pipeline");
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]); // Viewport uniforms
                 render_pass.set_bind_group(1, circle_bind_group.as_ref(), &[]); // Circle uniforms
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..4, 0..1); // Triangle strip
-                println!("Circle draw call completed");
             } else {
-                println!("Circle pipeline not ready!");
             }
         }
     }
@@ -642,10 +619,6 @@ unsafe impl Sync for MouseCircleTextEffect {}
 
 impl TextStyleProvider for MouseCircleTextEffect {
     fn get_effects_in_range(&self, range: Range<usize>) -> Vec<TextEffect> {
-        println!(
-            "MouseCircleTextEffect::get_effects_in_range called for range {}..{}, mouse_pos={:?}",
-            range.start, range.end, self.mouse_pos
-        );
 
         if let Some(mouse_pos) = self.mouse_pos {
             // Use shader effect with mouse position parameters
@@ -662,13 +635,8 @@ impl TextStyleProvider for MouseCircleTextEffect {
                 },
                 priority: priority::SELECTION,
             };
-            println!(
-                "  Returning shader effect for mouse at ({:.1}, {:.1})",
-                mouse_pos.x.0, mouse_pos.y.0
-            );
             vec![effect]
         } else {
-            println!("  No mouse position, returning no effects");
             vec![]
         }
     }
@@ -692,16 +660,18 @@ impl TextStyleProvider for MouseCircleTextEffect {
 struct DocumentEditorWidget {
     id: WidgetId,
     bounds: LayoutRect,
-    doc: Doc,
+    logic: EditorLogic,
     renderer: Rc<RefCell<Renderer>>,
-    input: InputHandler,
     text_effect: MouseCircleTextEffect,
     render_priority: i32,
+    // Track if widgets need updating
+    widgets_dirty: bool,
 }
 
 impl DocumentEditorWidget {
     fn new(id: WidgetId, bounds: LayoutRect, text: &str, viewport: Viewport) -> Self {
         let doc = Doc::from_str(text);
+        let logic = EditorLogic::new(doc);
         let renderer = Rc::new(RefCell::new(Renderer::new(
             (bounds.width.0, bounds.height.0),
             viewport.scale_factor,
@@ -713,11 +683,11 @@ impl DocumentEditorWidget {
         Self {
             id,
             bounds,
-            doc,
+            logic,
             renderer,
-            input: InputHandler::new(),
             text_effect,
             render_priority: 0,
+            widgets_dirty: true,
         }
     }
 
@@ -737,8 +707,22 @@ impl Widget for DocumentEditorWidget {
         self.id
     }
 
-    fn update(&mut self, _dt: f32) -> bool {
-        false
+    fn update(&mut self, dt: f32) -> bool {
+        // Update widgets for animations (cursor blinking)
+        let mut needs_redraw = false;
+        {
+            let mut renderer = self.renderer.borrow_mut();
+            if renderer.update_widgets(dt) {
+                needs_redraw = true;
+            }
+        }
+
+        // Check for pending syntax updates
+        if self.logic.input.should_flush() {
+            self.logic.input.flush_syntax_updates(&self.logic.doc);
+        }
+
+        needs_redraw
     }
 
     fn handle_event(&mut self, event: &WidgetEvent) -> EventResponse {
@@ -749,8 +733,8 @@ impl Widget for DocumentEditorWidget {
                     self.text_effect.update_mouse_pos(Some(*pos));
 
                     // Request text style update to regenerate effects
-                    let text = self.doc.read().flatten_to_string();
-                    let version = self.doc.version();
+                    let text = self.logic.doc.read().flatten_to_string();
+                    let version = self.logic.doc.version();
                     self.text_effect.request_update(&text, version);
 
                     EventResponse::Redraw
@@ -758,37 +742,47 @@ impl Widget for DocumentEditorWidget {
                     self.text_effect.update_mouse_pos(None);
 
                     // Request text style update to clear effects
-                    let text = self.doc.read().flatten_to_string();
-                    let version = self.doc.version();
+                    let text = self.logic.doc.read().flatten_to_string();
+                    let version = self.logic.doc.version();
                     self.text_effect.request_update(&text, version);
 
                     EventResponse::Redraw
                 }
             }
-            WidgetEvent::MouseClick(pos, button) => {
+            WidgetEvent::MouseClick(pos, _button) => {
                 if self.contains_point(*pos) {
-                    // Handle click in document coordinates
-                    self.input.on_mouse_click(
-                        &self.doc,
+                    // Convert to document coordinates
+                    let doc_pos = Point {
+                        x: pos.x - self.bounds.x,
+                        y: pos.y - self.bounds.y,
+                    };
+                    // Use EditorLogic's click handling
+                    if self.logic.on_click(
+                        doc_pos,
                         self.renderer.borrow().viewport(),
-                        *pos,
-                        *button,
-                        false,
-                    );
-                    EventResponse::Redraw
+                        &Default::default(),
+                    ) {
+                        self.widgets_dirty = true;
+                        EventResponse::Redraw
+                    } else {
+                        EventResponse::Ignored
+                    }
                 } else {
                     EventResponse::Ignored
                 }
             }
             WidgetEvent::KeyboardInput(key_event, modifiers) => {
-                // Handle keyboard input using the existing InputHandler
-                self.input.on_key(
-                    &self.doc,
-                    self.renderer.borrow().viewport(),
+                // Use EditorLogic's key handling
+                if self.logic.on_key(
                     key_event,
+                    self.renderer.borrow().viewport(),
                     modifiers,
-                );
-                EventResponse::Redraw
+                ) {
+                    self.widgets_dirty = true;
+                    EventResponse::Redraw
+                } else {
+                    EventResponse::Ignored
+                }
             }
             _ => EventResponse::Ignored,
         }
@@ -814,17 +808,28 @@ impl Widget for DocumentEditorWidget {
         ctx: &tiny_editor::widget::PaintContext<'_>,
         render_pass: &mut wgpu::RenderPass,
     ) {
-        // Set font system and GPU renderer on embedded renderer
+        // Set font system, viewport, and GPU renderer on embedded renderer
         {
             let mut renderer = self.renderer.borrow_mut();
             renderer.set_font_system(ctx.font_system.clone());
-            renderer.set_gpu_renderer(ctx.gpu_renderer);
+
+            // Update viewport to match widget bounds (not the full viewport)
+            renderer.update_viewport(self.bounds.width.0, self.bounds.height.0, ctx.viewport.scale_factor);
+
+            // CRITICAL: Set GPU renderer so render_with_pass can paint widgets
+            renderer.set_gpu_renderer(ctx.gpu());
+
+            // Update selection widgets for proper cursor/selection rendering
+            renderer.set_selection_widgets(&self.logic.input, &self.logic.doc);
+
+            // Debug: Check if widgets were actually created
+            let widget_count = renderer.widget_manager().widgets.len();
         }
 
         // Upload font atlas for this render pass
         let atlas_data = ctx.font_system.atlas_data();
         let (atlas_width, atlas_height) = ctx.font_system.atlas_size();
-        ctx.gpu_renderer
+        ctx.gpu()
             .upload_font_atlas(&atlas_data, atlas_width, atlas_height);
 
         // Create viewport rect for this widget (relative to widget bounds)
@@ -835,62 +840,80 @@ impl Widget for DocumentEditorWidget {
             height: self.bounds.height,
         };
 
-        // Always enable Rust syntax highlighting combined with mouse effects
-        let syntax_highlighter = tiny_editor::syntax::SyntaxHighlighter::new_rust();
-        let text = self.doc.read().flatten_to_string();
-        syntax_highlighter.request_update(&text, self.doc.version());
+        // Set text styles on renderer combining syntax highlighting with mouse effects
+        // Clone the syntax highlighter if it's the Rust one
+        if let Some(ref syntax_highlighter) = self.logic.syntax_highlighter {
+            if let Some(rust_hl) = syntax_highlighter
+                .as_any()
+                .downcast_ref::<tiny_editor::syntax::SyntaxHighlighter>()
+            {
+                // Create a wrapper that owns a cloned syntax highlighter
+                struct CombinedTextStylesOwned {
+                    syntax: tiny_editor::syntax::SyntaxHighlighter,
+                    mouse_effect: MouseCircleTextEffect,
+                }
 
-        // Create a combined text style provider
-        struct CombinedTextStyles {
-            syntax: tiny_editor::syntax::SyntaxHighlighter,
-            mouse_effect: MouseCircleTextEffect,
+                impl tiny_editor::text_effects::TextStyleProvider for CombinedTextStylesOwned {
+                    fn get_effects_in_range(
+                        &self,
+                        range: std::ops::Range<usize>,
+                    ) -> Vec<tiny_editor::text_effects::TextEffect> {
+                        // Get syntax highlighting first
+                        let mut effects = self.syntax.get_effects_in_range(range.clone());
+                        // Then overlay mouse effects with higher priority
+                        let mut mouse_effects = self.mouse_effect.get_effects_in_range(range);
+                        for effect in &mut mouse_effects {
+                            // Ensure mouse effects have higher priority than syntax
+                            effect.priority = tiny_editor::text_effects::priority::SELECTION + 10;
+                        }
+                        effects.extend(mouse_effects);
+                        effects
+                    }
+
+                    fn request_update(&self, text: &str, version: u64) {
+                        self.syntax.request_update(text, version);
+                    }
+
+                    fn name(&self) -> &str {
+                        "combined_styles"
+                    }
+
+                    fn as_any(&self) -> &dyn std::any::Any {
+                        self
+                    }
+                }
+
+                let combined_styles = CombinedTextStylesOwned {
+                    syntax: rust_hl.clone(),
+                    mouse_effect: self.text_effect.clone(),
+                };
+
+                self.renderer
+                    .borrow_mut()
+                    .set_text_styles(Box::new(combined_styles));
+            }
         }
 
-        impl tiny_editor::text_effects::TextStyleProvider for CombinedTextStyles {
-            fn get_effects_in_range(
-                &self,
-                range: std::ops::Range<usize>,
-            ) -> Vec<tiny_editor::text_effects::TextEffect> {
-                // Get syntax highlighting first
-                let mut effects = self.syntax.get_effects_in_range(range.clone());
-                // Then overlay mouse effects
-                effects.extend(self.mouse_effect.get_effects_in_range(range));
-                effects
-            }
-
-            fn request_update(&self, text: &str, version: u64) {
-                self.syntax.request_update(text, version);
-            }
-
-            fn name(&self) -> &str {
-                "combined_styles"
-            }
-
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let combined_styles = CombinedTextStyles {
-            syntax: syntax_highlighter,
-            mouse_effect: self.text_effect.clone(),
-        };
-
-        self.renderer
-            .borrow_mut()
-            .set_text_styles(Box::new(combined_styles));
-
-        // Use the new hybrid rendering with direct widget painting
-        let selections = self.input.selections();
-        let batches = self.renderer.borrow_mut().render_with_pass(
-            &self.doc.read(),
+        // Render text WITHOUT widgets first (we'll paint them manually)
+        let selections = self.logic.input.selections();
+        let _batches = self.renderer.borrow_mut().render_with_pass_and_context(
+            &self.logic.doc.read(),
             widget_viewport,
             selections,
             Some(render_pass),
+            None,  // Don't pass context - we'll paint widgets manually
         );
 
-        // The hybrid renderer handles widget painting directly now
-        // We just need to handle our custom mouse circle shader effect
+        // Now manually paint the widgets from the embedded renderer's widget_manager
+        {
+            let mut renderer = self.renderer.borrow_mut();
+            let widgets = renderer.widget_manager_mut().widgets_in_order();
+            for widget in widgets {
+                widget.paint(ctx, render_pass);
+            }
+        }
+
+        // Update mouse circle shader effect parameters
         if let Some(mouse_pos) = self.text_effect.mouse_pos {
             // Update mouse uniform data in the GPU renderer's effect buffer
             let mouse_data: [f32; 4] = [
@@ -901,16 +924,11 @@ impl Widget for DocumentEditorWidget {
             ];
 
             // Update the effect uniform buffer directly
-            if let Some(effect_buffer) = ctx.gpu_renderer.effect_uniform_buffer(1) {
+            if let Some(effect_buffer) = ctx.gpu().effect_uniform_buffer(1) {
                 ctx.queue
                     .write_buffer(effect_buffer, 0, bytemuck::cast_slice(&mouse_data));
             }
         }
-
-        println!(
-            "Document editor widget painted using hybrid renderer with {} batches!",
-            batches.len()
-        );
     }
 
     fn bounds(&self) -> LayoutRect {
@@ -934,12 +952,18 @@ impl Widget for DocumentEditorWidget {
 
 // === Tiled Layout Widget ===
 
-/// Simple horizontal tiling layout
+/// Simple horizontal tiling layout with resizable divider
 struct TiledLayout {
     id: WidgetId,
     bounds: LayoutRect,
     text_widget: Option<DocumentEditorWidget>, // Left widget: document editor with effects
     circle_widget: Option<CircleTracker>,      // Right widget: circle tracker
+
+    // Divider state
+    split_position: f32,     // Position of divider (0.0 to 1.0)
+    is_dragging_divider: bool,
+    divider_hover: bool,
+    divider_width: f32,
 }
 
 impl TiledLayout {
@@ -949,6 +973,10 @@ impl TiledLayout {
             bounds,
             text_widget: None,
             circle_widget: None,
+            split_position: 0.5, // Start with equal split
+            is_dragging_divider: false,
+            divider_hover: false,
+            divider_width: 6.0,  // 6 pixel wide divider for easy grabbing
         }
     }
 
@@ -994,21 +1022,71 @@ impl Widget for TiledLayout {
         let mut handled = false;
         let mut needs_redraw = false;
 
-        // Route to text widget
-        if let Some(text_widget) = &mut self.text_widget {
-            match text_widget.handle_event(event) {
-                EventResponse::Handled => handled = true,
-                EventResponse::Redraw => needs_redraw = true,
-                EventResponse::Ignored => {}
+        // Handle divider interaction first
+        match event {
+            WidgetEvent::MouseMove(pos) => {
+                let divider_x = self.bounds.x.0 + self.bounds.width.0 * self.split_position;
+                let mouse_over_divider = (pos.x.0 - divider_x).abs() <= self.divider_width / 2.0;
+
+                // Update hover state
+                let was_hovering = self.divider_hover;
+                self.divider_hover = mouse_over_divider && !self.is_dragging_divider;
+                if was_hovering != self.divider_hover {
+                    needs_redraw = true;
+                }
+
+                // Handle dragging
+                if self.is_dragging_divider {
+                    // Calculate new split position
+                    let relative_x = pos.x.0 - self.bounds.x.0;
+                    let new_split = (relative_x / self.bounds.width.0).clamp(0.2, 0.8);
+                    if (new_split - self.split_position).abs() > 0.001 {
+                        self.split_position = new_split;
+                        needs_redraw = true;
+
+                        // Re-layout widgets with new split
+                        let constraints = LayoutConstraints {
+                            max_width: self.bounds.width,
+                            max_height: self.bounds.height,
+                        };
+                        self.layout(constraints);
+                    }
+                    return EventResponse::Handled;
+                }
             }
+            WidgetEvent::MouseClick(pos, _button) => {
+                let divider_x = self.bounds.x.0 + self.bounds.width.0 * self.split_position;
+                if (pos.x.0 - divider_x).abs() <= self.divider_width / 2.0 {
+                    self.is_dragging_divider = true;
+                    return EventResponse::Handled;
+                }
+            }
+            WidgetEvent::MouseLeave => {
+                self.is_dragging_divider = false;
+                self.divider_hover = false;
+                needs_redraw = true;
+            }
+            _ => {}
         }
 
-        // Route to circle widget
-        if let Some(circle_widget) = &mut self.circle_widget {
-            match circle_widget.handle_event(event) {
-                EventResponse::Handled => handled = true,
-                EventResponse::Redraw => needs_redraw = true,
-                EventResponse::Ignored => {}
+        // Only route events to widgets if not handling divider
+        if !self.is_dragging_divider {
+            // Route to text widget
+            if let Some(text_widget) = &mut self.text_widget {
+                match text_widget.handle_event(event) {
+                    EventResponse::Handled => handled = true,
+                    EventResponse::Redraw => needs_redraw = true,
+                    EventResponse::Ignored => {}
+                }
+            }
+
+            // Route to circle widget
+            if let Some(circle_widget) = &mut self.circle_widget {
+                match circle_widget.handle_event(event) {
+                    EventResponse::Handled => handled = true,
+                    EventResponse::Redraw => needs_redraw = true,
+                    EventResponse::Ignored => {}
+                }
             }
         }
 
@@ -1022,33 +1100,40 @@ impl Widget for TiledLayout {
     }
 
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
-        // Divide width in half
-        let half_width = self.bounds.width.0 / 2.0;
-        let widget_constraints = LayoutConstraints {
-            max_width: LogicalPixels(half_width),
-            max_height: self.bounds.height,
-        };
+        // Calculate widget widths based on split position
+        let total_width = self.bounds.width.0;
+        let divider_space = self.divider_width;
+        let left_width = total_width * self.split_position - divider_space / 2.0;
+        let right_width = total_width * (1.0 - self.split_position) - divider_space / 2.0;
 
         // Layout text widget on left
         if let Some(text_widget) = &mut self.text_widget {
             text_widget.bounds = LayoutRect {
                 x: self.bounds.x,
                 y: self.bounds.y,
-                width: LogicalPixels(half_width),
+                width: LogicalPixels(left_width.max(100.0)), // Min width of 100px
                 height: self.bounds.height,
             };
-            text_widget.layout(widget_constraints);
+            let left_constraints = LayoutConstraints {
+                max_width: LogicalPixels(left_width.max(100.0)),
+                max_height: self.bounds.height,
+            };
+            text_widget.layout(left_constraints);
         }
 
         // Layout circle widget on right
         if let Some(circle_widget) = &mut self.circle_widget {
             circle_widget.bounds = LayoutRect {
-                x: self.bounds.x + LogicalPixels(half_width),
+                x: self.bounds.x + LogicalPixels(left_width + divider_space),
                 y: self.bounds.y,
-                width: LogicalPixels(half_width),
+                width: LogicalPixels(right_width.max(100.0)), // Min width of 100px
                 height: self.bounds.height,
             };
-            circle_widget.layout(widget_constraints);
+            let right_constraints = LayoutConstraints {
+                max_width: LogicalPixels(right_width.max(100.0)),
+                max_height: self.bounds.height,
+            };
+            circle_widget.layout(right_constraints);
         }
 
         LayoutResult {
@@ -1067,40 +1152,40 @@ impl Widget for TiledLayout {
         // Paint widgets directly without collecting mutable references
         // Paint text widget first (lower priority)
         if let Some(text_widget) = &self.text_widget {
-            if text_widget.clips_to_bounds() {
-                let bounds = text_widget.bounds();
-                let scale = ctx.viewport.scale_factor;
-                let scissor_x = (bounds.x.0 * scale) as u32;
-                let scissor_y = (bounds.y.0 * scale) as u32;
-                let scissor_width = (bounds.width.0 * scale) as u32;
-                let scissor_height = (bounds.height.0 * scale) as u32;
-                render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
-            }
+            // Don't clip - let the text widget and its cursor render properly
             text_widget.paint(ctx, render_pass);
-            if text_widget.clips_to_bounds() {
-                let viewport_width = ctx.viewport.physical_size.width;
-                let viewport_height = ctx.viewport.physical_size.height;
-                render_pass.set_scissor_rect(0, 0, viewport_width, viewport_height);
-            }
         }
+
+        // Paint divider
+        let divider_x = self.bounds.x.0 + self.bounds.width.0 * self.split_position - self.divider_width / 2.0;
+        let divider_color = if self.is_dragging_divider {
+            0x888888FF // Bright when dragging
+        } else if self.divider_hover {
+            0x666666FF // Medium when hovering
+        } else {
+            0x444444FF // Subtle when normal
+        };
+
+        let divider_rect = tiny_editor::render::RectInstance {
+            rect: LayoutRect::new(
+                divider_x,
+                self.bounds.y.0,
+                self.divider_width,
+                self.bounds.height.0,
+            ),
+            color: divider_color,
+        };
+
+        ctx.gpu().draw_rects(
+            render_pass,
+            &[divider_rect],
+            ctx.viewport.scale_factor,
+        );
 
         // Paint circle widget second (higher priority)
         if let Some(circle_widget) = &self.circle_widget {
-            if circle_widget.clips_to_bounds() {
-                let bounds = circle_widget.bounds();
-                let scale = ctx.viewport.scale_factor;
-                let scissor_x = (bounds.x.0 * scale) as u32;
-                let scissor_y = (bounds.y.0 * scale) as u32;
-                let scissor_width = (bounds.width.0 * scale) as u32;
-                let scissor_height = (bounds.height.0 * scale) as u32;
-                render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
-            }
+            // Don't clip - let the widget render properly
             circle_widget.paint(ctx, render_pass);
-            if circle_widget.clips_to_bounds() {
-                let viewport_width = ctx.viewport.physical_size.width;
-                let viewport_height = ctx.viewport.physical_size.height;
-                render_pass.set_scissor_rect(0, 0, viewport_width, viewport_height);
-            }
         }
     }
 
@@ -1131,6 +1216,10 @@ struct CircleApp {
     root_widget: Option<TiledLayout>,
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
     modifiers: winit::event::Modifiers, // Track modifier keys
+
+    // Track mouse drag
+    mouse_pressed: bool,
+    drag_start: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 
 impl ApplicationHandler for CircleApp {
@@ -1267,43 +1356,143 @@ impl ApplicationHandler for CircleApp {
 
                     let layout_pos = LayoutPos::new(logical_x, logical_y);
 
-                    // Send mouse move event to all widgets
+                    // Always send mouse move events to the root widget first
+                    // This allows the divider to handle dragging
                     let event = WidgetEvent::MouseMove(layout_pos);
-                    match root_widget.handle_event(&event) {
-                        EventResponse::Redraw | EventResponse::Handled => {
-                            window.request_redraw();
+                    let response = root_widget.handle_event(&event);
+
+                    // Handle widget response
+                    if matches!(response, EventResponse::Handled) || matches!(response, EventResponse::Redraw) {
+                        window.request_redraw();
+                    }
+
+                    // Handle text widget dragging (independent of widget response)
+                    // Only skip if divider is being dragged
+                    if self.mouse_pressed && !root_widget.is_dragging_divider {
+                        if let Some(start_pos) = self.drag_start {
+                            // Send drag event to document editor
+                            if let Some(text_widget) = &mut root_widget.text_widget {
+                                let start_logical_x = start_pos.x as f32 / scale;
+                                let start_logical_y = start_pos.y as f32 / scale;
+
+                                let from_point = Point {
+                                    x: LogicalPixels(start_logical_x - text_widget.bounds.x.0),
+                                    y: LogicalPixels(start_logical_y - text_widget.bounds.y.0),
+                                };
+
+                                let to_point = Point {
+                                    x: LogicalPixels(logical_x - text_widget.bounds.x.0),
+                                    y: LogicalPixels(logical_y - text_widget.bounds.y.0),
+                                };
+
+                                // Use EditorLogic's drag handling
+                                let alt_held = self.modifiers.state().alt_key();
+                                text_widget.logic.input.on_mouse_drag(
+                                    &text_widget.logic.doc,
+                                    text_widget.renderer.borrow().viewport(),
+                                    from_point,
+                                    to_point,
+                                    alt_held,
+                                );
+
+                                // Update selection widgets after drag
+                                {
+                                    let mut renderer = text_widget.renderer.borrow_mut();
+                                    renderer.set_selection_widgets(&text_widget.logic.input, &text_widget.logic.doc);
+                                }
+
+                                text_widget.widgets_dirty = true;
+                                window.request_redraw();
+                            }
                         }
-                        EventResponse::Ignored => {}
                     }
                 }
             }
 
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
+                state,
+                button: winit::event::MouseButton::Left,
                 ..
             } => {
-                if let (Some(window), Some(root_widget), Some(position)) =
-                    (&self.window, &mut self.root_widget, self.cursor_position)
-                {
-                    let scale = window.scale_factor() as f32;
-                    let logical_x = position.x as f32 / scale;
-                    let logical_y = position.y as f32 / scale;
+                match state {
+                    ElementState::Pressed => {
+                        // ALWAYS set mouse_pressed and drag_start, regardless of widget handling
+                        self.mouse_pressed = true;
+                        self.drag_start = self.cursor_position;
+                        println!("Mouse pressed! drag_start: {:?}", self.drag_start);
 
-                    let layout_pos = LayoutPos::new(logical_x, logical_y);
-                    let event = WidgetEvent::MouseClick(layout_pos, button);
+                        if let (Some(window), Some(root_widget), Some(position)) =
+                            (&self.window, &mut self.root_widget, self.cursor_position)
+                        {
+                            let scale = window.scale_factor() as f32;
+                            let logical_x = position.x as f32 / scale;
+                            let logical_y = position.y as f32 / scale;
 
-                    match root_widget.handle_event(&event) {
-                        EventResponse::Handled | EventResponse::Redraw => {
-                            window.request_redraw();
+                            let layout_pos = LayoutPos::new(logical_x, logical_y);
+                            let event = WidgetEvent::MouseClick(layout_pos, winit::event::MouseButton::Left);
+
+                            match root_widget.handle_event(&event) {
+                                EventResponse::Handled | EventResponse::Redraw => {
+                                    window.request_redraw();
+                                }
+                                EventResponse::Ignored => {}
+                            }
                         }
-                        EventResponse::Ignored => {}
+                    }
+                    ElementState::Released => {
+                        println!("Mouse released!");
+                        self.mouse_pressed = false;
+                        self.drag_start = None;
+
+                        // Stop dragging the divider
+                        if let Some(root_widget) = &mut self.root_widget {
+                            if root_widget.is_dragging_divider {
+                                root_widget.is_dragging_divider = false;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
                     }
                 }
             }
 
             WindowEvent::RedrawRequested => {
                 self.render_frame();
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Handle scroll for the text editor widget
+                if let Some(root_widget) = &mut self.root_widget {
+                    if let Some(text_widget) = &mut root_widget.text_widget {
+                        let mut renderer = text_widget.renderer.borrow_mut();
+                        let viewport = renderer.viewport_mut();
+
+                        let (scroll_x, scroll_y) = match delta {
+                            winit::event::MouseScrollDelta::LineDelta(x, y) => (
+                                x * viewport.metrics.space_width,
+                                y * viewport.metrics.line_height,
+                            ),
+                            winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                                (pos.x as f32, pos.y as f32)
+                            }
+                        };
+
+                        // Apply scroll (note: values are inverted)
+                        let new_scroll_y = viewport.scroll.y.0 - scroll_y;
+                        let new_scroll_x = viewport.scroll.x.0 - scroll_x;
+                        viewport.scroll.y = LogicalPixels(new_scroll_y);
+                        viewport.scroll.x = LogicalPixels(new_scroll_x);
+
+                        // Apply document-based scroll bounds
+                        let tree = text_widget.logic.doc.read();
+                        viewport.clamp_scroll_to_bounds(&tree);
+
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
             }
 
             WindowEvent::Resized(new_size) => {
@@ -1333,7 +1522,8 @@ impl ApplicationHandler for CircleApp {
                         max_height: LogicalPixels(logical_height),
                     });
 
-                    window.request_redraw();
+                    // Render immediately to prevent stretching during resize
+                    self.render_frame();
                 }
             }
 
@@ -1409,16 +1599,23 @@ impl CircleApp {
                     occlusion_query_set: None,
                 });
 
-                let paint_ctx = tiny_editor::widget::PaintContext {
+                // Get Arc values first (these clone the Arc, so no borrowing)
+                let device = gpu_renderer.device_arc();
+                let queue = gpu_renderer.queue_arc();
+
+                // Create raw pointer first, then get bind_group through it
+                let gpu_ptr = gpu_renderer as *mut tiny_editor::gpu::GpuRenderer;
+                let bind_group = unsafe { (*gpu_ptr).uniform_bind_group() };
+
+                let paint_ctx = tiny_editor::widget::PaintContext::new(
                     viewport,
-                    device: gpu_renderer.device(),
-                    queue: gpu_renderer.queue(),
-                    uniform_bind_group: gpu_renderer.uniform_bind_group(),
-                    gpu_renderer,
+                    device,
+                    queue,
+                    bind_group,
+                    gpu_ptr,
                     font_system,
-                    text_styles: None, // No global text styles, widgets provide their own
-                    layout_pos: LayoutPos::new(0.0, 0.0), // Legacy field
-                };
+                    None, // No global text styles, widgets provide their own
+                );
 
                 // Let widgets paint directly to the render pass
                 root_widget.paint(&paint_ctx, &mut render_pass);

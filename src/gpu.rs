@@ -68,7 +68,7 @@ pub struct GpuRenderer {
 }
 
 /// Helper to create 6 vertices (2 triangles) for a rectangle
-fn create_rect_vertices(x: f32, y: f32, width: f32, height: f32, color: u32) -> [RectVertex; 6] {
+pub fn create_rect_vertices(x: f32, y: f32, width: f32, height: f32, color: u32) -> [RectVertex; 6] {
     let x1 = x;
     let y1 = y;
     let x2 = x + width;
@@ -168,6 +168,16 @@ impl GpuRenderer {
     /// Get queue for custom widget rendering
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Get device Arc for custom widget rendering
+    pub fn device_arc(&self) -> std::sync::Arc<wgpu::Device> {
+        std::sync::Arc::clone(&self.device)
+    }
+
+    /// Get queue Arc for custom widget rendering
+    pub fn queue_arc(&self) -> std::sync::Arc<wgpu::Queue> {
+        std::sync::Arc::clone(&self.queue)
     }
 
     /// Get uniform bind group for viewport transforms
@@ -1008,6 +1018,9 @@ impl GpuRenderer {
     /// Resize surface when window changes
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
+            // Ensure any pending operations complete before reconfiguring
+            self.device.poll(wgpu::PollType::Wait);
+
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
