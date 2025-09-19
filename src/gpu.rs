@@ -717,9 +717,9 @@ impl GpuRenderer {
     ) {
         // Update uniform buffer - extract values we need before mutable borrow
         
-        let physical_width = cpu_renderer.viewport().physical_size.width;
-        let physical_height = cpu_renderer.viewport().physical_size.height;
-        let scale_factor = cpu_renderer.viewport().scale_factor;
+        let physical_width = cpu_renderer.viewport.physical_size.width;
+        let physical_height = cpu_renderer.viewport.physical_size.height;
+        let _scale_factor = cpu_renderer.viewport.scale_factor;
 
         let uniforms = ShaderUniforms {
             viewport_size: [
@@ -774,8 +774,8 @@ impl GpuRenderer {
             cpu_renderer.set_gpu_renderer(self);
 
             // Ensure cached doc text is updated before rendering
-            cpu_renderer.set_cached_doc_text(tree.flatten_to_string());
-            cpu_renderer.set_cached_doc_version(tree.version);
+            cpu_renderer.cached_doc_text = Some(tree.flatten_to_string());
+            cpu_renderer.cached_doc_version = tree.version;
 
             // Widget updates will be handled by passing selections to render_with_pass
             // The renderer will update widgets based on current selections
@@ -801,7 +801,7 @@ impl GpuRenderer {
 
         // Generate vertices for rectangles (transform view → physical)
         let mut vertices = Vec::with_capacity(instances.len() * 6);
-        for (i, rect) in instances.iter().enumerate() {
+        for (_i, rect) in instances.iter().enumerate() {
             // Apply scale factor to transform from view to physical coordinates
             let physical_x = rect.rect.x.0 * scale_factor;
             let physical_y = rect.rect.y.0 * scale_factor;
@@ -902,7 +902,7 @@ impl GpuRenderer {
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             // Ensure any pending operations complete before reconfiguring
-            self.device.poll(wgpu::PollType::Wait);
+            let _ = self.device.poll(wgpu::PollType::Wait);
 
             self.config.width = new_size.width;
             self.config.height = new_size.height;

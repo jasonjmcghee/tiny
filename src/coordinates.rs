@@ -792,7 +792,7 @@ impl Viewport {
     pub fn visible_line_content(
         &self,
         line_text: &str,
-        line_num: u32,
+        _line_num: u32,
         token_boundaries: Option<&[usize]>,
     ) -> VisibleLineContent {
         // Use the actual scroll.x value instead of the line_mode's stored value
@@ -804,7 +804,7 @@ impl Viewport {
                 let horizontal_scroll = self.scroll.x.0;
 
                 // Extract visible range
-                let (start_byte, end_byte, x_offset) = if let Some(font_system) = &self.font_system
+                let (start_byte, end_byte, x_offset) = if let Some(_font_system) = &self.font_system
                 {
                     let (start, end, offset) = self.calculate_visible_range(
                         line_text,

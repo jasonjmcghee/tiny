@@ -71,14 +71,6 @@ name = "debug_font"
 path = "examples/debug_font.rs"
 
 [[example]]
-name = "debug_widget"
-path = "examples/debug_widget.rs"
-
-[[example]]
-name = "debug_pipeline"
-path = "examples/debug_pipeline.rs"
-
-[[example]]
 name = "debug_gpu"
 path = "examples/debug_gpu.rs"
 

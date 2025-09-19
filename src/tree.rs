@@ -742,7 +742,7 @@ mod tests {
         // Using cursor widget as an example, though cursors are now rendered as overlays
         doc.edit(Edit::Insert {
             pos: 2,
-            content: Content::Widget(crate::widget::cursor()),
+            content: Content::Widget(crate::widget::cursor(LayoutPos::new(0.0, 0.0))),
         });
         doc.flush();
 

@@ -9,7 +9,7 @@ use crate::{
     input::InputHandler,
     render::Renderer,
     syntax::SyntaxHighlighter,
-    text_effects::{TextEffect, TextStyleProvider},
+    text_effects::TextStyleProvider,
     tree::{Doc, Point, Rect},
 };
 #[allow(unused)]
@@ -296,7 +296,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     if let Some(cpu_renderer) = &self.cpu_renderer {
                         let should_redraw =
                             self.logic
-                                .on_key(&event, cpu_renderer.viewport(), &self.modifiers);
+                                .on_key(&event, &cpu_renderer.viewport, &self.modifiers);
                         if should_redraw {
                             if let Some(window) = &self.window {
                                 window.request_redraw();
@@ -324,7 +324,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                         y: LogicalPixels(logical_y),
                     };
 
-                    if self.logic.on_mouse_move(point, cpu_renderer.viewport()) {
+                    if self.logic.on_mouse_move(point, &cpu_renderer.viewport) {
                         window.request_redraw();
                     }
                 }
@@ -357,7 +357,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                         let should_redraw = self.logic.on_drag(
                             from_point,
                             to_point,
-                            cpu_renderer.viewport(),
+                            &cpu_renderer.viewport,
                             &self.modifiers,
                         );
                         if should_redraw {
@@ -392,7 +392,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                             let should_redraw = self.logic.on_click(
                                 point,
-                                cpu_renderer.viewport(),
+                                &cpu_renderer.viewport,
                                 &self.modifiers,
                             );
                             if should_redraw {
@@ -415,8 +415,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let (scroll_x, scroll_y) = match delta {
                         winit::event::MouseScrollDelta::LineDelta(x, y) => (
-                            x * cpu_renderer.viewport().metrics.space_width,
-                            y * cpu_renderer.viewport().metrics.line_height,
+                            x * &cpu_renderer.viewport.metrics.space_width,
+                            y * &cpu_renderer.viewport.metrics.line_height,
                         ),
                         winit::event::MouseScrollDelta::PixelDelta(pos) => {
                             (pos.x as f32, pos.y as f32)
@@ -452,7 +452,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     };
 
                     // Update scroll in viewport
-                    let viewport = cpu_renderer.viewport_mut();
+                    let viewport = &mut cpu_renderer.viewport;
 
                     // Apply the scroll amounts (note: scroll values are inverted)
                     let new_scroll_y = viewport.scroll.y.0 - final_scroll_y;
@@ -513,8 +513,8 @@ impl<T: AppLogic> TinyApp<T> {
                 // Only scroll to cursor if it moved via keyboard, not every frame
                 // This prevents fighting with manual mouse wheel scrolling
                 if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
-                    let layout_pos = cpu_renderer.viewport().doc_to_layout(cursor_pos);
-                    cpu_renderer.viewport_mut().ensure_visible(layout_pos);
+                    let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
+                    cpu_renderer.viewport.ensure_visible(layout_pos);
                 }
             }
 
@@ -527,24 +527,20 @@ impl<T: AppLogic> TinyApp<T> {
             // Update CPU renderer viewport - this is where scale factor should be handled
             cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
 
-            // Set up syntax highlighter for InputEdit-aware rendering
+            // Set up text styles/syntax highlighter
             if let Some(text_styles) = self.logic.text_styles() {
+                // If it's a SyntaxHighlighter, clone it and set both fields
                 if let Some(syntax_hl) = text_styles
                     .as_any()
                     .downcast_ref::<crate::syntax::SyntaxHighlighter>()
                 {
-                    // Use the same syntax highlighter instance that gets InputEdit updates
-                    let shared_highlighter = Arc::new(syntax_hl.clone());
-                    cpu_renderer.set_syntax_highlighter(shared_highlighter);
-
-                    // Also set as backup (renderer will prioritize syntax_highlighter)
-                    cpu_renderer.set_text_styles_ref(text_styles);
-                    // println!("APP: Set InputEdit-aware syntax highlighter with fallback");
-                } else {
-                    // Fallback for other text style providers
-                    cpu_renderer.set_text_styles_ref(text_styles);
-                    println!("APP: Using legacy text styles provider");
+                    let highlighter = Arc::new(syntax_hl.clone());
+                    cpu_renderer.set_syntax_highlighter(highlighter.clone());
+                    // SyntaxHighlighter implements TextStyleProvider
+                    cpu_renderer.text_styles = Some(Box::new(syntax_hl.clone()));
                 }
+                // For other TextStyleProvider types, we can't clone them (trait objects)
+                // so we'll rely on the syntax_highlighter field if it was set
             }
 
             // Define viewport for rendering
@@ -581,35 +577,6 @@ impl<T: AppLogic> TinyApp<T> {
     }
 }
 
-/// Combined text style provider that merges multiple providers
-struct CombinedTextStyles<'a> {
-    providers: Vec<&'a dyn TextStyleProvider>,
-}
-
-impl<'a> TextStyleProvider for CombinedTextStyles<'a> {
-    fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<TextEffect> {
-        let mut effects = Vec::new();
-        for provider in &self.providers {
-            effects.extend(provider.get_effects_in_range(range.clone()));
-        }
-        effects
-    }
-
-    fn request_update(&self, text: &str, version: u64) {
-        for provider in &self.providers {
-            provider.request_update(text, version);
-        }
-    }
-
-    fn name(&self) -> &str {
-        "combined"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        // Can't return self due to lifetime, return a static unit type
-        &()
-    }
-}
 
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {

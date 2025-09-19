@@ -58,7 +58,7 @@ impl Selection {
             return Vec::new();
         }
 
-        let tree = doc.read();
+        let _tree = doc.read();
         let mut rectangles = Vec::new();
 
         // Get start and end positions, ensuring start comes before end
@@ -157,8 +157,6 @@ pub struct InputHandler {
     last_edit_time: Option<Instant>,
     /// Syntax highlighter reference for InputEdit coordination
     syntax_highlighter: Option<Arc<SyntaxHighlighter>>,
-    /// Syntax color at cursor when typing started (for color extension)
-    typing_color: Option<u32>,
     /// Accumulated TextEdits for tree-sitter (sent on debounce)
     pending_text_edits: Vec<crate::syntax::TextEdit>,
     /// Whether we have unflushed syntax updates
@@ -179,7 +177,6 @@ impl InputHandler {
             pending_edits: Vec::new(),
             last_edit_time: None,
             syntax_highlighter: None,
-            typing_color: None,
             pending_text_edits: Vec::new(),
             has_pending_syntax_update: false,
         }
@@ -286,7 +283,7 @@ impl InputHandler {
         doc: &Doc,
         _viewport: &Viewport,
         event: &KeyEvent,
-        modifiers: &winit::event::Modifiers,
+        _modifiers: &winit::event::Modifiers,
     ) -> Vec<crate::tree::Edit> {
         use crate::tree::{Content, Edit};
 

@@ -66,6 +66,7 @@ pub struct SyntaxHighlighter {
     /// Cached tree for viewport queries
     cached_tree: Arc<ArcSwap<Option<TSTree>>>,
     /// Language for creating queries
+    #[allow(dead_code)]
     language: Language,
     /// Highlight query
     query: Arc<Query>,
@@ -85,6 +86,7 @@ pub struct TextEdit {
 /// Parse request for background thread
 struct ParseRequest {
     text: String,
+    #[allow(dead_code)]
     version: u64,
     /// Edit information for incremental parsing
     edit: Option<TextEdit>,

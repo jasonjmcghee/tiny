@@ -2,7 +2,7 @@
 
 use tiny_editor::app::{AppLogic, TinyApp};
 use tiny_editor::coordinates::DocPos;
-use tiny_editor::tree::{Content, Doc, Edit};
+use tiny_editor::tree::Doc;
 
 struct ScrollTestApp {
     doc: Doc,
@@ -30,7 +30,12 @@ impl AppLogic for ScrollTestApp {
         &self.doc
     }
 
-    fn on_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+    fn on_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        _viewport: &tiny_editor::coordinates::Viewport,
+        _modifiers: &winit::event::Modifiers,
+    ) -> bool {
         use winit::keyboard::{Key, NamedKey};
 
         if let Key::Named(NamedKey::ArrowDown) = event.logical_key {

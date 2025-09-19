@@ -759,7 +759,7 @@ impl Widget for DocumentEditorWidget {
                     // Use EditorLogic's click handling
                     if self.logic.on_click(
                         doc_pos,
-                        self.renderer.borrow().viewport(),
+                        &self.renderer.borrow().viewport,
                         &Default::default(),
                     ) {
                         self.widgets_dirty = true;
@@ -775,7 +775,7 @@ impl Widget for DocumentEditorWidget {
                 // Use EditorLogic's key handling
                 if self.logic.on_key(
                     key_event,
-                    self.renderer.borrow().viewport(),
+                    &self.renderer.borrow().viewport,
                     modifiers,
                 ) {
                     self.widgets_dirty = true;
@@ -792,7 +792,7 @@ impl Widget for DocumentEditorWidget {
         // Update renderer viewport to match widget bounds
         {
             let mut renderer = self.renderer.borrow_mut();
-            let scale_factor = renderer.viewport().scale_factor;
+            let scale_factor = renderer.viewport.scale_factor;
             renderer.update_viewport(self.bounds.width.0, self.bounds.height.0, scale_factor);
         }
         LayoutResult {
@@ -1377,7 +1377,7 @@ impl ApplicationHandler for CircleApp {
                                 let alt_held = self.modifiers.state().alt_key();
                                 text_widget.logic.input.on_mouse_drag(
                                     &text_widget.logic.doc,
-                                    text_widget.renderer.borrow().viewport(),
+                                    &text_widget.renderer.borrow().viewport,
                                     from_point,
                                     to_point,
                                     alt_held,
@@ -1452,7 +1452,7 @@ impl ApplicationHandler for CircleApp {
                 if let Some(root_widget) = &mut self.root_widget {
                     if let Some(text_widget) = &mut root_widget.text_widget {
                         let mut renderer = text_widget.renderer.borrow_mut();
-                        let viewport = renderer.viewport_mut();
+                        let viewport = &mut renderer.viewport;
 
                         let (scroll_x, scroll_y) = match delta {
                             winit::event::MouseScrollDelta::LineDelta(x, y) => (
