@@ -1295,8 +1295,6 @@ impl ApplicationHandler for CircleApp {
             self.viewport = Some(viewport);
             self.root_widget = Some(root_widget);
 
-            println!("Setup complete!");
-
             // Initial render
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -1312,7 +1310,6 @@ impl ApplicationHandler for CircleApp {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                println!("👋 Goodbye!");
                 event_loop.exit();
             }
 
@@ -1410,7 +1407,6 @@ impl ApplicationHandler for CircleApp {
                         // ALWAYS set mouse_pressed and drag_start, regardless of widget handling
                         self.mouse_pressed = true;
                         self.drag_start = self.cursor_position;
-                        println!("Mouse pressed! drag_start: {:?}", self.drag_start);
 
                         if let (Some(window), Some(root_widget), Some(position)) =
                             (&self.window, &mut self.root_widget, self.cursor_position)
@@ -1431,7 +1427,6 @@ impl ApplicationHandler for CircleApp {
                         }
                     }
                     ElementState::Released => {
-                        println!("Mouse released!");
                         self.mouse_pressed = false;
                         self.drag_start = None;
 

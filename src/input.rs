@@ -820,7 +820,7 @@ impl InputHandler {
 
         // Convert click position to document coordinates using viewport and tree
         // The pos is already window-relative logical pixels, so we need to add scroll offset
-        let layout_pos = crate::coordinates::LayoutPos {
+        let layout_pos = LayoutPos {
             x: pos.x + viewport.scroll.x,
             y: pos.y + viewport.scroll.y,
         };

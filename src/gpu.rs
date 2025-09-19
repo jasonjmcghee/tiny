@@ -1,9 +1,8 @@
 //! GPU rendering implementation using wgpu
 //!
-//! Converts render commands to actual GPU draw calls
+//! Provides GPU resources and methods for widget rendering
 
-use crate::coordinates::Viewport;
-use crate::render::{BatchedDraw, GlyphInstance, RectInstance};
+use crate::render::{GlyphInstance, RectInstance};
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 #[allow(unused)]
@@ -782,129 +781,13 @@ impl GpuRenderer {
             // The renderer will update widgets based on current selections
 
             // Render with pass - this will paint both text and widgets
-            let batches = cpu_renderer.render_with_pass(tree, viewport_rect, selections, Some(&mut render_pass));
-
-            // Also execute any batched commands (for legacy rendering)
-            for batch in &batches {
-                match batch {
-                    BatchedDraw::RectBatch { instances } => {
-                        if !instances.is_empty() {
-                            self.draw_rects(&mut render_pass, instances, scale_factor);
-                        }
-                    }
-                    BatchedDraw::GlyphBatch { instances, .. } => {
-                        if !instances.is_empty() {
-                            self.draw_glyphs(&mut render_pass, instances, None);
-                        }
-                    }
-                    BatchedDraw::SetClip(rect) => {
-                        let physical_x = (rect.x.0 * scale_factor) as u32;
-                        let physical_y = (rect.y.0 * scale_factor) as u32;
-                        let physical_width = (rect.width.0 * scale_factor) as u32;
-                        let physical_height = (rect.height.0 * scale_factor) as u32;
-
-                        render_pass.set_scissor_rect(
-                            physical_x,
-                            physical_y,
-                            physical_width,
-                            physical_height,
-                        );
-                    }
-                }
-            }
+            cpu_renderer.render_with_pass(tree, viewport_rect, selections, Some(&mut render_pass));
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }
 
-    /// Execute batched draw commands (transforms view → physical)
-    pub unsafe fn render(&mut self, batches: &[BatchedDraw], viewport: &Viewport) {
-        // Update uniform buffer with PHYSICAL viewport size
-        // Since glyphs are in physical pixels, shaders need physical dimensions
-        let uniforms = ShaderUniforms {
-            viewport_size: [
-                viewport.physical_size.width as f32,
-                viewport.physical_size.height as f32,
-            ],
-            _padding: [0.0, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-
-        let output = match self.surface.get_current_texture() {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Failed to get surface texture: {:?}", e);
-                return;
-            }
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            // Process each batch (transform view → physical)
-            for batch in batches {
-                match batch {
-                    BatchedDraw::RectBatch { instances } => {
-                        if !instances.is_empty() {
-                            self.draw_rects(&mut render_pass, instances, viewport.scale_factor);
-                        }
-                    }
-                    BatchedDraw::GlyphBatch { instances, .. } => {
-                        if !instances.is_empty() {
-                            self.draw_glyphs(&mut render_pass, instances, None);
-                        }
-                    }
-                    BatchedDraw::SetClip(rect) => {
-                        // Transform clip rect from view to physical
-                        let physical_x = (rect.x.0 * viewport.scale_factor) as u32;
-                        let physical_y = (rect.y.0 * viewport.scale_factor) as u32;
-                        let physical_width = (rect.width.0 * viewport.scale_factor) as u32;
-                        let physical_height = (rect.height.0 * viewport.scale_factor) as u32;
-
-                        render_pass.set_scissor_rect(
-                            physical_x,
-                            physical_y,
-                            physical_width,
-                            physical_height,
-                        );
-                    }
-                }
-            }
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-    }
 
     pub fn draw_rects(
         &self,
