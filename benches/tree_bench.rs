@@ -6,12 +6,11 @@
 //! - Edit batching (16ms of keystrokes)
 //! - Rendering traversal (visible content only)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tiny_editor::tree::{Content, Doc, Edit};
-use tiny_editor::tree_nav;
 
 /// Generate a realistic document with mixed content
 fn generate_document(lines: usize) -> String {
@@ -51,7 +50,7 @@ fn bench_single_insert(c: &mut Criterion) {
                 });
                 doc.flush();
 
-                black_box(doc.read());
+                std::hint::black_box(doc.read());
             });
         });
     }
@@ -81,7 +80,7 @@ fn bench_batched_edits(c: &mut Criterion) {
                 // Single flush for all edits (RCU batch)
                 doc.flush();
 
-                black_box(doc.read());
+                std::hint::black_box(doc.read());
             });
         });
     }
@@ -103,7 +102,7 @@ fn bench_navigation(c: &mut Criterion) {
 
             b.iter(|| {
                 for &pos in &positions {
-                    black_box(tree.byte_to_line(pos));
+                    std::hint::black_box(tree.byte_to_line(pos));
                 }
             });
         });
@@ -115,7 +114,7 @@ fn bench_navigation(c: &mut Criterion) {
 
             b.iter(|| {
                 for &line in &lines {
-                    black_box(tree.line_to_byte(line));
+                    std::hint::black_box(tree.line_to_byte(line));
                 }
             });
         });
@@ -126,8 +125,8 @@ fn bench_navigation(c: &mut Criterion) {
 
             b.iter(|| {
                 for &pos in &positions {
-                    black_box(tree.find_next_newline(pos));
-                    black_box(tree.find_prev_newline(pos));
+                    std::hint::black_box(tree.find_next_newline(pos));
+                    std::hint::black_box(tree.find_prev_newline(pos));
                 }
             });
         });
@@ -153,7 +152,7 @@ fn bench_text_extraction(c: &mut Criterion) {
             b.iter(|| {
                 for &pos in &positions {
                     let end = (pos + viewport_size).min(text.len());
-                    black_box(tree.get_text_slice(pos..end));
+                    std::hint::black_box(tree.get_text_slice(pos..end));
                 }
             });
         });
@@ -164,7 +163,7 @@ fn bench_text_extraction(c: &mut Criterion) {
 
             b.iter(|| {
                 for &pos in &positions {
-                    black_box(tree.get_line_at(pos));
+                    std::hint::black_box(tree.get_line_at(pos));
                 }
             });
         });
@@ -209,7 +208,7 @@ fn bench_rcu_concurrency(c: &mut Criterion) {
                 }
             }
 
-            black_box(reader.join().unwrap());
+            std::hint::black_box(reader.join().unwrap());
         });
     });
 
@@ -234,7 +233,7 @@ fn bench_deletion(c: &mut Criterion) {
                 });
                 doc.flush();
 
-                black_box(doc.read());
+                std::hint::black_box(doc.read());
             });
         });
 
@@ -254,7 +253,7 @@ fn bench_deletion(c: &mut Criterion) {
                 });
                 doc.flush();
 
-                black_box(doc.read());
+                std::hint::black_box(doc.read());
             });
         });
     }
@@ -273,7 +272,7 @@ fn bench_tree_traversal(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("to_string", size), size, |b, _| {
             let tree = doc.read();
             b.iter(|| {
-                black_box(tree.flatten_to_string());
+                std::hint::black_box(tree.flatten_to_string());
             });
         });
     }
@@ -291,7 +290,7 @@ fn bench_memory_usage(c: &mut Criterion) {
         let tree = doc.read();
 
         b.iter(|| {
-            black_box(Arc::clone(&tree));
+            std::hint::black_box(Arc::clone(&tree));
         });
     });
 
@@ -300,7 +299,7 @@ fn bench_memory_usage(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("tree_creation", size), size, |b, _| {
             let text = generate_document(*size);
             b.iter(|| {
-                black_box(Doc::from_str(&text));
+                std::hint::black_box(Doc::from_str(&text));
             });
         });
     }
@@ -335,7 +334,7 @@ fn bench_realistic_session(c: &mut Criterion) {
                 }
             }
 
-            black_box(doc.read());
+            std::hint::black_box(doc.read());
         });
     });
 
@@ -357,7 +356,7 @@ fn bench_realistic_session(c: &mut Criterion) {
             }
 
             doc.flush();
-            black_box(doc.read());
+            std::hint::black_box(doc.read());
         });
     });
 

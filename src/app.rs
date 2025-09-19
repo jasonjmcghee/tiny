@@ -6,12 +6,14 @@ use crate::coordinates::{DocPos, LogicalPixels};
 use crate::{
     font::SharedFontSystem,
     gpu::GpuRenderer,
-    input::InputHandler,
+    input::{InputAction, InputHandler},
+    io,
     render::Renderer,
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
     tree::{Doc, Point, Rect},
 };
+use std::path::PathBuf;
 #[allow(unused)]
 use std::io::BufRead;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
@@ -254,6 +256,13 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             self.logic.on_ready();
 
+            // Set initial window title if using EditorLogic
+            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                if let Some(window) = &self.window {
+                    window.set_title(&editor.title());
+                }
+            }
+
             // Initial render
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -298,6 +307,13 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             self.logic
                                 .on_key(&event, &cpu_renderer.viewport, &self.modifiers);
                         if should_redraw {
+                            // Update window title if using EditorLogic
+                            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                                if let Some(window) = &self.window {
+                                    window.set_title(&editor.title());
+                                }
+                            }
+
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
@@ -587,12 +603,50 @@ pub struct EditorLogic {
     widgets_dirty: bool,
     /// Extra text style providers (e.g., for effects)
     pub extra_text_styles: Vec<Box<dyn TextStyleProvider>>,
+    /// File path if loaded from file
+    pub file_path: Option<PathBuf>,
+    /// Whether document has unsaved changes
+    pub is_modified: bool,
+    /// Whether to show line numbers
+    pub show_line_numbers: bool,
 }
 
 impl EditorLogic {
     pub fn with_text_style(mut self, style: Box<dyn TextStyleProvider>) -> Self {
         self.extra_text_styles.push(style);
         self
+    }
+
+    pub fn with_file(mut self, path: PathBuf) -> Self {
+        self.file_path = Some(path);
+        self
+    }
+
+    pub fn save(&mut self) -> std::io::Result<()> {
+        if let Some(ref path) = self.file_path {
+            io::autosave(&self.doc, path)?;
+            self.is_modified = false;
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No file path set",
+            ))
+        }
+    }
+
+    pub fn title(&self) -> String {
+        let filename = if let Some(ref path) = self.file_path {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled")
+                .to_string()
+        } else {
+            "Demo Text".to_string()
+        };
+
+        let modified_marker = if self.is_modified { " (modified)" } else { "" };
+        format!("{}{} - Tiny Editor", filename, modified_marker)
     }
 
     pub fn new(doc: Doc) -> Self {
@@ -637,6 +691,9 @@ impl EditorLogic {
             syntax_highlighter: Some(syntax_highlighter),
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
+            file_path: None,
+            is_modified: false,
+            show_line_numbers: true, // Enable by default
         }
     }
 }
@@ -652,11 +709,40 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &winit::event::Modifiers,
     ) -> bool {
-        let result = self.input.on_key(&self.doc, viewport, event, modifiers);
-        if result {
-            self.widgets_dirty = true; // Mark widgets for update
+        let action = self.input.on_key(&self.doc, viewport, event, modifiers);
+
+        match action {
+            InputAction::Save => {
+                if let Err(e) = self.save() {
+                    eprintln!("Failed to save: {}", e);
+                }
+                true // Redraw to update title
+            }
+            InputAction::Undo => {
+                if self.input.undo(&self.doc) {
+                    self.widgets_dirty = true;
+                    self.is_modified = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            InputAction::Redo => {
+                if self.input.redo(&self.doc) {
+                    self.widgets_dirty = true;
+                    self.is_modified = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            InputAction::Redraw => {
+                self.widgets_dirty = true;
+                self.is_modified = true;
+                true
+            }
+            InputAction::None => false,
         }
-        result
     }
 
     fn on_click(

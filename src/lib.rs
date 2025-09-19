@@ -14,7 +14,6 @@ pub mod render;
 pub mod syntax;
 pub mod text_effects;
 pub mod tree;
-pub mod tree_nav; // O(log n) navigation methods
 pub mod widget;
 
 // Re-export core types

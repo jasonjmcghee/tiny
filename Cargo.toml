@@ -22,10 +22,11 @@ swash = "0.2.5"
 
 # Core data structures
 parking_lot = "0.12"
-memchr = "2.7"  # For fast newline counting in rope
+memchr = "2.7"  # SIMD-optimized byte searching (uses NEON on ARM)
 lazy_static = "1.4"  # For global statics
 arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
 crossbeam = "0.8"  # Lock-free data structures
+ahash = "0.8.12"
 
 # Syntax highlighting
 tree-sitter = "0.25"

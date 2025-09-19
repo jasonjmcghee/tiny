@@ -3,6 +3,7 @@
 //! Provides GPU resources and methods for widget rendering
 
 use crate::render::{GlyphInstance, RectInstance};
+use ahash::HashMap;
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 #[allow(unused)]
@@ -45,9 +46,9 @@ pub struct GpuRenderer {
     glyph_pipeline: wgpu::RenderPipeline,
 
     // Text effect shader pipelines
-    effect_pipelines: std::collections::HashMap<u32, wgpu::RenderPipeline>,
-    effect_uniform_buffers: std::collections::HashMap<u32, wgpu::Buffer>,
-    effect_bind_groups: std::collections::HashMap<u32, wgpu::BindGroup>,
+    effect_pipelines: HashMap<u32, wgpu::RenderPipeline>,
+    effect_uniform_buffers: HashMap<u32, wgpu::Buffer>,
+    effect_bind_groups: HashMap<u32, wgpu::BindGroup>,
 
     // Uniform buffer
     uniform_buffer: wgpu::Buffer,
@@ -67,7 +68,13 @@ pub struct GpuRenderer {
 }
 
 /// Helper to create 6 vertices (2 triangles) for a rectangle
-pub fn create_rect_vertices(x: f32, y: f32, width: f32, height: f32, color: u32) -> [RectVertex; 6] {
+pub fn create_rect_vertices(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    color: u32,
+) -> [RectVertex; 6] {
     let x1 = x;
     let y1 = y;
     let x2 = x + width;
@@ -697,9 +704,9 @@ impl GpuRenderer {
             glyph_bind_group,
             rect_vertex_buffer,
             glyph_vertex_buffer,
-            effect_pipelines: std::collections::HashMap::new(),
-            effect_uniform_buffers: std::collections::HashMap::new(),
-            effect_bind_groups: std::collections::HashMap::new(),
+            effect_pipelines: HashMap::default(),
+            effect_uniform_buffers: HashMap::default(),
+            effect_bind_groups: HashMap::default(),
         };
 
         // Start with empty shader registry - widgets will register their own
@@ -716,16 +723,13 @@ impl GpuRenderer {
         cpu_renderer: &mut crate::render::Renderer,
     ) {
         // Update uniform buffer - extract values we need before mutable borrow
-        
+
         let physical_width = cpu_renderer.viewport.physical_size.width;
         let physical_height = cpu_renderer.viewport.physical_size.height;
         let _scale_factor = cpu_renderer.viewport.scale_factor;
 
         let uniforms = ShaderUniforms {
-            viewport_size: [
-                physical_width as f32,
-                physical_height as f32,
-            ],
+            viewport_size: [physical_width as f32, physical_height as f32],
             _padding: [0.0, 0.0],
         };
         self.queue
@@ -787,7 +791,6 @@ impl GpuRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }
-
 
     pub fn draw_rects(
         &self,

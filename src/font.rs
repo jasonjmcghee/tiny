@@ -6,7 +6,7 @@ use crate::coordinates::{PhysicalPos, PhysicalSizeF};
 use crate::render::GlyphInstance;
 use fontdue::layout::{CoordinateSystem, Layout, TextStyle};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use ahash::HashMap;
 use std::sync::Arc;
 
 /// Information about a positioned glyph ready for rendering
@@ -79,7 +79,7 @@ impl FontSystem {
             layout,
             atlas_data,
             atlas_size,
-            glyph_cache: HashMap::new(),
+            glyph_cache: HashMap::default(),
             next_x: 0,
             next_y: 0,
             row_height: 0,

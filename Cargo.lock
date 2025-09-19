@@ -2683,6 +2683,7 @@ dependencies = [
 name = "tiny-editor"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arboard",
  "arc-swap",
  "bytecount",

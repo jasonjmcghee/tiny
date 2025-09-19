@@ -1,18 +1,18 @@
-//! Core document tree with RCU (Read-Copy-Update) for lock-free reads
+//! Unified document tree with iterative operations and lock-free reads
 //!
-//! Everything is a span in a B-tree with summed metadata for O(log n) queries.
+//! Everything consolidated into one file for simplicity and performance.
 
-use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels};
+use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels};
 use crate::widget::Widget;
 use arc_swap::ArcSwap;
 use crossbeam::queue::SegQueue;
+use memchr::{memchr, memrchr};
 use simdutf8::basic::from_utf8;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Maximum spans per leaf node (tuned for cache line)
-#[allow(dead_code)]
 const MAX_SPANS: usize = 16;
 
 /// Auto-flush pending edits after this many operations
@@ -21,12 +21,10 @@ const FLUSH_THRESHOLD: usize = 16;
 // === Core Types ===
 
 /// The document - readers get immutable snapshots, writers buffer edits
-///
-/// ArcSwap provides truly lock-free reads - perfect for RCU pattern!
 pub struct Doc {
     /// Current immutable snapshot for readers (lock-free!)
     snapshot: ArcSwap<Tree>,
-    /// Buffered edits waiting to be applied (lock-free!)
+    /// Buffered edits waiting to be applied
     pending: SegQueue<Edit>,
     /// Approximate count of pending edits for auto-flush
     pending_count: AtomicUsize,
@@ -48,6 +46,51 @@ pub enum Node {
     Internal { children: Vec<Node>, sums: Sums },
 }
 
+impl Node {
+    /// Create a leaf node with auto-computed sums
+    fn leaf(spans: Vec<Span>) -> Self {
+        let sums = compute_sums(&spans);
+        Node::Leaf { spans, sums }
+    }
+
+    /// Create an internal node with auto-computed sums
+    fn internal(children: Vec<Node>) -> Self {
+        let sums = compute_node_sums(&children);
+        Node::Internal { children, sums }
+    }
+
+    /// Check if node needs splitting
+    fn needs_split(&self) -> bool {
+        match self {
+            Node::Leaf { spans, .. } => spans.len() > MAX_SPANS,
+            Node::Internal { children, .. } => children.len() > MAX_SPANS,
+        }
+    }
+
+    /// Split node if it exceeds MAX_SPANS
+    fn split_if_needed(self) -> Self {
+        match self {
+            Node::Leaf { spans, sums } if spans.len() > MAX_SPANS => {
+                let mid = spans.len() / 2;
+                let (left, right) = spans.split_at(mid);
+                Node::internal(vec![
+                    Node::leaf(left.to_vec()),
+                    Node::leaf(right.to_vec()),
+                ])
+            }
+            Node::Internal { children, sums } if children.len() > MAX_SPANS => {
+                let mid = children.len() / 2;
+                let (left, right) = children.split_at(mid);
+                Node::internal(vec![
+                    Node::internal(left.to_vec()),
+                    Node::internal(right.to_vec()),
+                ])
+            }
+            node => node,
+        }
+    }
+}
+
 /// Content spans - text or widgets
 #[derive(Clone)]
 pub enum Span {
@@ -60,30 +103,18 @@ pub enum Span {
 /// Aggregated metadata for O(log n) queries
 #[derive(Clone, Default)]
 pub struct Sums {
-    /// Total byte count
     pub bytes: usize,
-    /// Total line count
     pub lines: u32,
-    /// Spatial bounding box
     pub bounds: Rect,
-    /// Maximum z-index in subtree
     pub max_z: i32,
 }
 
 /// Edit operations
 #[derive(Clone)]
 pub enum Edit {
-    Insert {
-        pos: usize,
-        content: Content,
-    },
-    Delete {
-        range: Range<usize>,
-    },
-    Replace {
-        range: Range<usize>,
-        content: Content,
-    },
+    Insert { pos: usize, content: Content },
+    Delete { range: Range<usize> },
+    Replace { range: Range<usize>, content: Content },
 }
 
 /// Content to insert
@@ -93,16 +124,12 @@ pub enum Content {
     Widget(Arc<dyn Widget>),
 }
 
-/// Rectangle for spatial queries (in layout space)
 pub type Rect = LayoutRect;
-
-/// Point for hit testing (in layout space)
 pub type Point = LayoutPos;
 
-// === Implementation ===
+// === Document Implementation ===
 
 impl Doc {
-    /// Create empty document
     pub fn new() -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(Tree::new()),
@@ -112,7 +139,6 @@ impl Doc {
         }
     }
 
-    /// Create document from text
     pub fn from_str(text: &str) -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(Tree::from_str(text)),
@@ -122,25 +148,20 @@ impl Doc {
         }
     }
 
-    /// Get current immutable snapshot (lock-free!)
     pub fn read(&self) -> Arc<Tree> {
         self.snapshot.load_full()
     }
 
-    /// Buffer an edit
     pub fn edit(&self, edit: Edit) {
         self.pending.push(edit);
         let count = self.pending_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Auto-flush if too many pending
         if count >= FLUSH_THRESHOLD {
             self.flush();
         }
     }
 
-    /// Apply all pending edits
     pub fn flush(&self) {
-        // Collect all pending edits
         let mut edits = Vec::new();
         while let Some(edit) = self.pending.pop() {
             edits.push(edit);
@@ -150,29 +171,29 @@ impl Doc {
             return;
         }
 
-        // Reset the pending count
         self.pending_count.store(0, Ordering::Relaxed);
 
-        // Create new tree with edits applied
         let current = self.snapshot.load();
         let new_tree = current.apply_edits(&edits);
-        let new_version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.version.store(new_tree.version, Ordering::Relaxed);
 
-        // Atomic swap of snapshot (lock-free!)
-        self.snapshot.store(Arc::new(Tree {
-            root: new_tree.root,
-            version: new_version,
-        }));
+        self.snapshot.store(Arc::new(new_tree));
     }
 
-    /// Get current version
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)
     }
+
+    /// Replace the current tree with a new one (for undo/redo)
+    pub fn replace_tree(&self, tree: Arc<Tree>) {
+        self.snapshot.store(tree);
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
+// === Tree Implementation ===
+
 impl Tree {
-    /// Create empty tree
     pub fn new() -> Self {
         Self {
             root: Node::Leaf {
@@ -183,456 +204,1234 @@ impl Tree {
         }
     }
 
-    /// Create tree from text
     pub fn from_str(text: &str) -> Self {
-        let mut spans = Vec::new();
         let bytes = text.as_bytes();
 
-        // Split into reasonably sized chunks
+        if bytes.is_empty() {
+            return Self {
+                root: Node::Leaf {
+                    spans: Vec::new(),
+                    sums: Sums::default(),
+                },
+                version: 0,
+            };
+        }
+
+        // Build leaves, each with up to MAX_SPANS spans
+        let mut all_leaves = Vec::new();
+        let mut current_leaf_spans = Vec::<Span>::new();
+
         const CHUNK_SIZE: usize = 1024;
         let mut pos = 0;
 
         while pos < bytes.len() {
             let end = (pos + CHUNK_SIZE).min(bytes.len());
-            // Don't split UTF-8 sequences - use SIMD for boundary detection
-            let end = if end < bytes.len() {
-                // Find a safe UTF-8 boundary backwards from end
-                let mut e = end;
-                // Check if we're at a continuation byte (10xxxxxx)
+            // Find safe UTF-8 boundary
+            let mut e = end;
+            if e < bytes.len() {
+                // Only need to find boundary if not at end
                 while e > pos && (bytes[e] & 0b11000000) == 0b10000000 {
                     e -= 1;
                 }
-                // Validate that we found a proper boundary
-                if e > pos && from_utf8(&bytes[pos..e]).is_ok() {
-                    e
-                } else {
-                    // Fall back to the original end if validation fails
-                    end
-                }
-            } else {
-                end
-            };
+            }
 
-            let chunk = &bytes[pos..end];
+            // Ensure we make progress
+            if e <= pos {
+                e = end; // Force progress even if boundary detection fails
+            }
+
+            let chunk = &bytes[pos..e];
             let lines = bytecount::count(chunk, b'\n') as u32;
-            spans.push(Span::Text {
+            current_leaf_spans.push(Span::Text {
                 bytes: Arc::from(chunk),
                 lines,
             });
-            pos = end;
+
+            // If leaf is full, create it and start a new one
+            if current_leaf_spans.len() >= MAX_SPANS {
+                all_leaves.push(Node::leaf(current_leaf_spans.clone()));
+                current_leaf_spans = Vec::new();
+            }
+
+            pos = e;
         }
 
-        let sums = Self::compute_sums(&spans);
+        // Don't forget the last leaf if it has spans
+        if !current_leaf_spans.is_empty() {
+            all_leaves.push(Node::leaf(current_leaf_spans));
+        }
+
+        // If only one leaf, use it as root
+        if all_leaves.len() == 1 {
+            return Self {
+                root: all_leaves.into_iter().next().unwrap(),
+                version: 0,
+            };
+        }
+
+        // Build internal nodes bottom-up
+        let mut nodes = all_leaves;
+        while nodes.len() > 1 {
+            let mut next_level = Vec::new();
+            let mut current_children = Vec::new();
+
+            for node in nodes {
+                current_children.push(node);
+                if current_children.len() >= MAX_SPANS {
+                    next_level.push(Node::internal(current_children.clone()));
+                    current_children = Vec::new();
+                }
+            }
+
+            if !current_children.is_empty() {
+                next_level.push(Node::internal(current_children));
+            }
+
+            nodes = next_level;
+        }
 
         Self {
-            root: Node::Leaf { spans, sums },
+            root: nodes.into_iter().next().unwrap(),
             version: 0,
         }
     }
 
-    /// Apply edits to create new tree
+    /// Apply edits using incremental path-based approach
     pub fn apply_edits(&self, edits: &[Edit]) -> Self {
-        let mut root = self.root.clone();
+        // For single edit, use incremental approach
+        if edits.len() == 1 {
+            return self.apply_edit_incremental(&edits[0]);
+        }
 
+        // For multiple edits, batch by locality if possible
+        let mut new_root = self.root.clone();
         for edit in edits {
-            root = self.apply_edit(root, edit);
+            new_root = Self::apply_edit_to_node(new_root, edit);
         }
 
         Self {
-            root,
+            root: new_root,
             version: self.version + 1,
         }
     }
 
-    /// Apply single edit to node
-    fn apply_edit(&self, node: Node, edit: &Edit) -> Node {
+    /// Apply single edit incrementally
+    fn apply_edit_incremental(&self, edit: &Edit) -> Self {
+        let new_root = Self::apply_edit_to_node(self.root.clone(), edit);
+        Self {
+            root: new_root,
+            version: self.version + 1,
+        }
+    }
+
+    /// Apply edit to a node, returning new node (copy-on-write)
+    fn apply_edit_to_node(node: Node, edit: &Edit) -> Node {
         match edit {
-            Edit::Insert { pos, content } => self.insert_at(node, *pos, content.clone()),
-            Edit::Delete { range } => self.delete_range(node, range.clone()),
+            Edit::Insert { pos, content } => Self::insert_at_node(node, *pos, content),
+            Edit::Delete { range } => Self::delete_from_node(node, range),
             Edit::Replace { range, content } => {
-                let node = self.delete_range(node, range.clone());
-                self.insert_at(node, range.start, content.clone())
+                let node = Self::delete_from_node(node, range);
+                Self::insert_at_node(node, range.start, content)
             }
         }
     }
 
-    /// Insert content at position
-    fn insert_at(&self, node: Node, pos: usize, content: Content) -> Node {
+    /// Helper: Insert span at index in spans vec
+    fn insert_span_at(spans: &[Span], index: usize, new_span: Span) -> Vec<Span> {
+        let mut result = Vec::with_capacity(spans.len() + 1);
+        result.extend_from_slice(&spans[..index]);
+        result.push(new_span);
+        result.extend_from_slice(&spans[index..]);
+        result
+    }
+
+    /// Insert content at position in node
+    fn insert_at_node(node: Node, pos: usize, content: &Content) -> Node {
         match node {
             Node::Leaf { mut spans, .. } => {
-                // Find position in spans
-                let mut byte_offset = 0;
-                let mut insert_idx = 0;
-
-                for (i, span) in spans.iter().enumerate() {
-                    let span_bytes = self.span_bytes(span);
-                    if byte_offset + span_bytes > pos {
-                        // Insert within this span
-                        if let Span::Text { bytes: text, .. } = span {
-                            let offset_in_span = pos - byte_offset;
-
-                            // Split text span
-                            let mut new_spans = Vec::new();
-                            if offset_in_span > 0 {
-                                let prefix = &text[..offset_in_span];
-                                let prefix_lines = bytecount::count(prefix, b'\n') as u32;
-                                new_spans.push(Span::Text {
-                                    bytes: Arc::from(prefix),
-                                    lines: prefix_lines,
-                                });
-                            }
-
-                            // Add new content
-                            match content {
-                                Content::Text(s) => {
-                                    let bytes = s.as_bytes();
-                                    let lines = bytecount::count(bytes, b'\n') as u32;
-                                    new_spans.push(Span::Text {
-                                        bytes: Arc::from(bytes),
-                                        lines,
-                                    });
-                                }
-                                Content::Widget(w) => {
-                                    new_spans.push(Span::Widget(w));
-                                }
-                            }
-
-                            if offset_in_span < text.len() {
-                                let suffix = &text[offset_in_span..];
-                                let suffix_lines = bytecount::count(suffix, b'\n') as u32;
-                                new_spans.push(Span::Text {
-                                    bytes: Arc::from(suffix),
-                                    lines: suffix_lines,
-                                });
-                            }
-
-                            // Replace span with split version
-                            spans.splice(i..=i, new_spans);
-
-                            let sums = Self::compute_sums(&spans);
-                            return Node::Leaf { spans, sums };
-                        }
-                    }
-
-                    if byte_offset >= pos {
-                        insert_idx = i;
-                        break;
-                    }
-
-                    byte_offset += span_bytes;
-                    insert_idx = i + 1;
-                }
-
-                // Insert at found position
                 let new_span = match content {
                     Content::Text(s) => {
                         let bytes = s.as_bytes();
                         let lines = bytecount::count(bytes, b'\n') as u32;
                         Span::Text {
-                            bytes: Arc::from(bytes),
+                            bytes: bytes.into(),
                             lines,
                         }
                     }
-                    Content::Widget(w) => Span::Widget(w),
+                    Content::Widget(w) => Span::Widget(w.clone()),
                 };
-                spans.insert(insert_idx, new_span);
 
-                let sums = Self::compute_sums(&spans);
-                Node::Leaf { spans, sums }
-            }
-            Node::Internal { children, .. } => {
-                // Recursively find child to insert into
-                let mut new_children = Vec::new();
                 let mut byte_offset = 0;
+                for (i, span) in spans.iter().enumerate() {
+                    let span_bytes = span_bytes(span);
 
-                for child in children {
-                    let child_bytes = self.node_bytes(&child);
+                    if byte_offset <= pos && pos <= byte_offset + span_bytes {
+                        if let Span::Text { bytes, .. } = span {
+                            let split_pos = pos - byte_offset;
 
-                    if byte_offset <= pos && pos < byte_offset + child_bytes {
-                        // Insert in this child
-                        let child_pos = pos - byte_offset;
-                        new_children.push(self.insert_at(child, child_pos, content.clone()));
-                    } else {
-                        new_children.push(child);
+                            if split_pos > 0 && split_pos < bytes.len() {
+                                // Split span
+                                let prefix = &bytes[..split_pos];
+                                let suffix = &bytes[split_pos..];
+
+                                let mut new_spans = Vec::with_capacity(spans.len() + 2);
+                                new_spans.extend_from_slice(&spans[..i]);
+
+                                if !prefix.is_empty() {
+                                    new_spans.push(Span::Text {
+                                        bytes: prefix.into(),
+                                        lines: bytecount::count(prefix, b'\n') as u32,
+                                    });
+                                }
+                                new_spans.push(new_span);
+                                if !suffix.is_empty() {
+                                    new_spans.push(Span::Text {
+                                        bytes: suffix.into(),
+                                        lines: bytecount::count(suffix, b'\n') as u32,
+                                    });
+                                }
+                                new_spans.extend_from_slice(&spans[(i + 1)..]);
+
+                                return Node::leaf(new_spans).split_if_needed();
+                            } else if byte_offset == pos {
+                                // Insert before this span
+                                spans.insert(i, new_span);
+                                return Node::leaf(spans).split_if_needed();
+                            } else if byte_offset + span_bytes == pos {
+                                // Insert after this span
+                                if i + 1 < spans.len() {
+                                    spans.insert(i + 1, new_span);
+                                } else {
+                                    spans.push(new_span);
+                                }
+                                return Node::leaf(spans).split_if_needed();
+                            }
+                        } else {
+                            // Widget span - insert before or after
+                            let idx = if byte_offset == pos { i } else { i + 1 };
+                            spans.insert(idx, new_span);
+                            return Node::leaf(spans).split_if_needed();
+                        }
                     }
 
-                    byte_offset += child_bytes;
+                    byte_offset += span_bytes;
                 }
 
-                let sums = Self::compute_node_sums(&new_children);
-                Node::Internal {
-                    children: new_children,
-                    sums,
+                // Insert at end
+                spans.push(new_span);
+                Node::leaf(spans).split_if_needed()
+            }
+            Node::Internal { mut children, .. } => {
+                let mut byte_offset = 0;
+                for i in 0..children.len() {
+                    let (bytes, _) = node_metrics(&children[i]);
+                    if byte_offset + bytes >= pos {
+                        // Edit goes in this child
+                        let old_child = std::mem::replace(&mut children[i], Node::Leaf { spans: Vec::new(), sums: Sums::default() });
+                        let new_child = Self::apply_edit_to_node(
+                            old_child,
+                            &Edit::Insert {
+                                pos: pos - byte_offset,
+                                content: content.clone(),
+                            },
+                        );
+                        children[i] = new_child;
+
+                        // Check if child needs to be split
+                        if children[i].needs_split() {
+                            let node_to_split = std::mem::replace(&mut children[i], Node::Leaf { spans: Vec::new(), sums: Sums::default() });
+                            let (left, right) = Self::split_node(node_to_split);
+                            children[i] = left;
+                            if i + 1 < children.len() {
+                                children.insert(i + 1, right);
+                            } else {
+                                children.push(right);
+                            }
+                        }
+
+                        return Node::internal(children).split_if_needed();
+                    }
+                    byte_offset += bytes;
                 }
+
+                // Shouldn't reach here
+                Node::internal(children)
             }
         }
     }
 
     /// Delete range from node
-    fn delete_range(&self, node: Node, range: Range<usize>) -> Node {
-        // Simplified for brevity - would handle cross-span deletes
+    fn delete_from_node(node: Node, range: &Range<usize>) -> Node {
+        if range.is_empty() {
+            return node;
+        }
+
         match node {
             Node::Leaf { spans, .. } => {
                 let mut new_spans = Vec::new();
                 let mut byte_offset = 0;
 
-                for span in spans {
-                    let span_bytes = self.span_bytes(&span);
+                for span in &spans {
+                    let span_bytes = span_bytes(span);
                     let span_end = byte_offset + span_bytes;
 
                     if span_end <= range.start || byte_offset >= range.end {
-                        // Span outside delete range
-                        new_spans.push(span);
+                        // Span is outside delete range
+                        new_spans.push(span.clone());
                     } else if byte_offset >= range.start && span_end <= range.end {
-                        // Span entirely within delete range - skip it
-                    } else {
-                        // Partial deletion
-                        if let Span::Text { bytes: text, .. } = &span {
-                            let start_in_span = range.start.saturating_sub(byte_offset);
-                            let end_in_span = (range.end - byte_offset).min(text.len());
+                        // Span is entirely within delete range - skip it
+                    } else if let Span::Text { bytes, .. } = span {
+                        // Span partially overlaps - need to split
+                        let start_in_span = range.start.saturating_sub(byte_offset);
+                        let end_in_span = (range.end - byte_offset).min(bytes.len());
 
-                            if start_in_span > 0 {
-                                let prefix = &text[..start_in_span];
-                                let prefix_lines = bytecount::count(prefix, b'\n') as u32;
-                                new_spans.push(Span::Text {
-                                    bytes: Arc::from(prefix),
-                                    lines: prefix_lines,
-                                });
-                            }
-                            if end_in_span < text.len() {
-                                let suffix = &text[end_in_span..];
-                                let suffix_lines = bytecount::count(suffix, b'\n') as u32;
-                                new_spans.push(Span::Text {
-                                    bytes: Arc::from(suffix),
-                                    lines: suffix_lines,
-                                });
-                            }
+                        if start_in_span > 0 {
+                            let prefix = &bytes[..start_in_span];
+                            new_spans.push(Span::Text {
+                                bytes: prefix.into(),
+                                lines: bytecount::count(prefix, b'\n') as u32,
+                            });
+                        }
+
+                        if end_in_span < bytes.len() {
+                            let suffix = &bytes[end_in_span..];
+                            new_spans.push(Span::Text {
+                                bytes: suffix.into(),
+                                lines: bytecount::count(suffix, b'\n') as u32,
+                            });
+                        }
+                    } else {
+                        // Widget span - keep or remove entirely
+                        if byte_offset < range.start || byte_offset >= range.end {
+                            new_spans.push(span.clone());
                         }
                     }
 
                     byte_offset = span_end;
                 }
 
-                let sums = Self::compute_sums(&new_spans);
-                Node::Leaf {
-                    spans: new_spans,
-                    sums,
-                }
+                Node::leaf(new_spans)
             }
-            Node::Internal { .. } => {
-                // Would recursively handle internal nodes
-                node
+            Node::Internal { children, .. } => {
+                let mut byte_offset = 0;
+                let mut new_children = Vec::new();
+
+                for child in &children {
+                    let (bytes, _) = node_metrics(child);
+                    let child_end = byte_offset + bytes;
+
+                    if child_end <= range.start || byte_offset >= range.end {
+                        // Child is outside delete range
+                        new_children.push(child.clone());
+                    } else if byte_offset >= range.start && child_end <= range.end {
+                        // Child is entirely within delete range - skip it
+                    } else {
+                        // Child partially overlaps - recurse
+                        let adjusted_range = Range {
+                            start: range.start.saturating_sub(byte_offset),
+                            end: (range.end - byte_offset).min(bytes),
+                        };
+                        let modified_child = Self::delete_from_node(child.clone(), &adjusted_range);
+                        new_children.push(modified_child);
+                    }
+
+                    byte_offset = child_end;
+                }
+
+                // Merge underfull children if needed
+                if new_children.len() < MAX_SPANS / 2 && new_children.len() > 1 {
+                    // Simple merge strategy - could be more sophisticated
+                    new_children = Self::merge_children(new_children);
+                }
+
+                Node::internal(new_children)
             }
         }
     }
 
-    /// Compute sums for spans
-    fn compute_sums(spans: &[Span]) -> Sums {
-        let mut sums = Sums::default();
 
-        for span in spans {
-            match span {
-                Span::Text { bytes, lines } => {
-                    sums.bytes += bytes.len();
-                    sums.lines += lines; // Use cached count!
-                }
-                Span::Widget(w) => {
-                    let size = w.measure();
-                    sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(size.width.0));
-                    sums.bounds.height = LogicalPixels(sums.bounds.height.0 + size.height.0);
-                    sums.max_z = sums.max_z.max(w.z_index());
-                }
-            }
-        }
-
-        sums
-    }
-
-    /// Compute sums for child nodes
-    fn compute_node_sums(children: &[Node]) -> Sums {
-        let mut sums = Sums::default();
-
-        for child in children {
-            let child_sums = match child {
-                Node::Leaf { sums, .. } => sums,
-                Node::Internal { sums, .. } => sums,
-            };
-
-            sums.bytes += child_sums.bytes;
-            sums.lines += child_sums.lines;
-            sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(child_sums.bounds.width.0));
-            sums.bounds.height = LogicalPixels(sums.bounds.height.0 + child_sums.bounds.height.0);
-            sums.max_z = sums.max_z.max(child_sums.max_z);
-        }
-
-        sums
-    }
-
-    /// Get byte count of span
-    fn span_bytes(&self, span: &Span) -> usize {
-        match span {
-            Span::Text { bytes, .. } => bytes.len(),
-            Span::Widget(_) => 0,
-        }
-    }
-
-    /// Get byte count of node
-    fn node_bytes(&self, node: &Node) -> usize {
+    fn split_node(node: Node) -> (Node, Node) {
         match node {
-            Node::Leaf { sums, .. } => sums.bytes,
-            Node::Internal { sums, .. } => sums.bytes,
+            Node::Leaf { spans, .. } => {
+                let mid = spans.len() / 2;
+                let (left, right) = spans.split_at(mid);
+                (Node::leaf(left.to_vec()), Node::leaf(right.to_vec()))
+            }
+            Node::Internal { children, .. } => {
+                let mid = children.len() / 2;
+                let (left, right) = children.split_at(mid);
+                (Node::internal(left.to_vec()), Node::internal(right.to_vec()))
+            }
         }
     }
 
-    /// Convert to string for debugging/saving
+    fn merge_children(children: Vec<Node>) -> Vec<Node> {
+        // If we have enough children, no need to merge
+        if children.len() >= MAX_SPANS / 2 {
+            return children;
+        }
+
+        // Try to merge small adjacent nodes
+        let mut merged = Vec::new();
+        let mut i = 0;
+
+        while i < children.len() {
+            let current = children[i].clone();
+
+            // Check if we can merge with next node
+            if i + 1 < children.len() {
+                let next = &children[i + 1];
+
+                // Attempt to merge two leaves
+                if let (Node::Leaf { spans: s1, .. }, Node::Leaf { spans: s2, .. }) = (&current, next) {
+                    if s1.len() + s2.len() <= MAX_SPANS {
+                        // Merge the two leaves
+                        let mut merged_spans = s1.clone();
+                        merged_spans.extend_from_slice(s2);
+                        merged.push(Node::leaf(merged_spans));
+                        i += 2; // Skip both nodes
+                        continue;
+                    }
+                }
+
+                // Attempt to merge two internal nodes
+                if let (Node::Internal { children: c1, .. }, Node::Internal { children: c2, .. }) = (&current, next) {
+                    if c1.len() + c2.len() <= MAX_SPANS {
+                        // Merge the two internal nodes
+                        let mut merged_children = c1.clone();
+                        merged_children.extend_from_slice(c2);
+                        merged.push(Node::internal(merged_children));
+                        i += 2; // Skip both nodes
+                        continue;
+                    }
+                }
+            }
+
+            // No merge possible, just add current node
+            merged.push(current);
+            i += 1;
+        }
+
+        merged
+    }
+
     pub fn flatten_to_string(&self) -> String {
-        // Pre-allocate with total byte count to avoid reallocations
         let capacity = match &self.root {
             Node::Leaf { sums, .. } => sums.bytes,
             Node::Internal { sums, .. } => sums.bytes,
         };
         let mut result = String::with_capacity(capacity);
-        self.collect_text(&self.root, &mut result);
+        collect_text(&self.root, &mut result);
         result
     }
 
-    /// Collect just the byte slices without copying
-    #[allow(dead_code)]
-    fn collect_spans<'a>(&'a self, node: &'a Node, out: &mut Vec<&'a [u8]>) {
-        match node {
-            Node::Leaf { spans, .. } => {
-                for span in spans {
-                    if let Span::Text { bytes, .. } = span {
-                        out.push(bytes);
-                    }
-                }
-            }
-            Node::Internal { children, .. } => {
-                for child in children {
-                    self.collect_spans(child, out);
-                }
-            }
+    // === Navigation Methods (Iterative) ===
+
+    pub fn cursor(&self) -> TreeCursor {
+        TreeCursor::new(self)
+    }
+
+    pub fn byte_count(&self) -> usize {
+        match &self.root {
+            Node::Leaf { sums, .. } => sums.bytes,
+            Node::Internal { sums, .. } => sums.bytes,
         }
     }
 
-    /// Recursively collect text content
-    fn collect_text(&self, node: &Node, out: &mut String) {
-        match node {
-            Node::Leaf { spans, .. } => {
-                for span in spans {
-                    if let Span::Text { bytes, .. } = span {
-                        // SAFETY: All Text spans contain valid UTF-8:
-                        // - Initial text comes from &str (guaranteed valid)
-                        // - Insertions come from String (guaranteed valid)
-                        // - Splits preserve UTF-8 boundaries correctly
-                        let text = unsafe { std::str::from_utf8_unchecked(bytes) };
-                        out.push_str(text);
-                    }
-                }
-            }
-            Node::Internal { children, .. } => {
-                for child in children {
-                    self.collect_text(child, out);
-                }
-            }
+    pub fn line_count(&self) -> u32 {
+        match &self.root {
+            Node::Leaf { sums, .. } => sums.lines,
+            Node::Internal { sums, .. } => sums.lines,
         }
     }
 
-    /// Find position at byte offset - O(log n)
-    pub fn find_at_byte(&self, target: usize) -> TreePos {
-        self.find_byte_in_node(&self.root, target, 0)
+    pub fn line_to_byte(&self, line: u32) -> Option<usize> {
+        let mut cursor = self.cursor();
+        cursor.seek_line(line)
     }
 
-    fn find_byte_in_node(&self, node: &Node, target: usize, base: usize) -> TreePos {
-        match node {
-            Node::Leaf { spans, .. } => {
-                let mut offset = base;
-                for (i, span) in spans.iter().enumerate() {
-                    let bytes = self.span_bytes(span);
-                    if offset + bytes > target {
-                        return TreePos {
-                            span_idx: i,
-                            offset_in_span: target - offset,
-                        };
-                    }
-                    offset += bytes;
+    pub fn byte_to_line(&self, byte: usize) -> u32 {
+        let mut cursor = self.cursor();
+        cursor.seek_byte(byte);
+        cursor.current_line()
+    }
+
+    pub fn find_next_newline(&self, pos: usize) -> Option<usize> {
+        let mut cursor = self.cursor();
+        cursor.seek_byte(pos);
+        cursor.find_byte(b'\n', true)
+    }
+
+    pub fn find_prev_newline(&self, pos: usize) -> Option<usize> {
+        let mut cursor = self.cursor();
+        cursor.seek_byte(pos);
+        cursor.find_byte(b'\n', false)
+    }
+
+    pub fn get_text_slice(&self, range: Range<usize>) -> String {
+        let mut cursor = self.cursor();
+        cursor.seek_byte(range.start);
+        cursor.read_text(range.len())
+    }
+
+    pub fn find_line_start_at(&self, pos: usize) -> usize {
+        self.find_prev_newline(pos).map(|p| p + 1).unwrap_or(0)
+    }
+
+    pub fn find_line_end_at(&self, pos: usize) -> usize {
+        self.find_next_newline(pos).unwrap_or_else(|| self.byte_count())
+    }
+
+    pub fn get_line_at(&self, pos: usize) -> String {
+        let start = self.find_prev_newline(pos).map(|p| p + 1).unwrap_or(0);
+        let end = self.find_next_newline(pos).unwrap_or_else(|| self.byte_count());
+        self.get_text_slice(start..end)
+    }
+
+    pub fn char_count(&self) -> usize {
+        let mut cursor = self.cursor();
+        cursor.count_chars()
+    }
+
+    pub fn doc_pos_to_byte(&self, pos: DocPos) -> usize {
+        if let Some(line_start) = self.line_to_byte(pos.line) {
+            let line_end = self.line_to_byte(pos.line + 1).unwrap_or(self.byte_count());
+            let line_text = self.get_text_slice(line_start..line_end);
+
+            let mut byte_offset = 0;
+            let mut visual_column = 0;
+
+            for ch in line_text.chars() {
+                if visual_column >= pos.column {
+                    break;
                 }
-                TreePos::default()
-            }
-            Node::Internal { children, .. } => {
-                let mut offset = base;
-                for child in children {
-                    let bytes = self.node_bytes(child);
-                    if offset + bytes > target {
-                        return self.find_byte_in_node(child, target, offset);
-                    }
-                    offset += bytes;
+                if ch == '\t' {
+                    visual_column = ((visual_column / 4) + 1) * 4;
+                } else {
+                    visual_column += 1;
                 }
-                TreePos::default()
+                byte_offset += ch.len_utf8();
             }
+
+            line_start + byte_offset
+        } else {
+            pos.byte_offset
         }
     }
 
-    /// Find at point - O(log n) spatial query
-    pub fn find_at_point(&self, pt: Point) -> TreePos {
-        self.find_point_in_node(&self.root, pt)
+    pub fn walk_visible_range<F>(&self, byte_range: Range<usize>, mut callback: F)
+    where
+        F: FnMut(&[Span], usize, usize),
+    {
+        let mut cursor = self.cursor();
+        cursor.walk_range(byte_range, callback);
+    }
+}
+
+// === Tree Cursor (Iterative Navigation) ===
+
+pub struct TreeCursor<'a> {
+    tree: &'a Tree,
+    stack: Vec<CursorFrame<'a>>, // Stack frames for traversal
+    current_spans: Vec<(&'a Span, usize)>, // spans with byte offsets
+    span_idx: usize,
+    byte_pos: usize,
+    line_pos: u32,
+}
+
+/// Stack frame for cursor traversal
+struct CursorFrame<'a> {
+    node: &'a Node,
+    byte_offset: usize,
+    line_offset: u32,
+    child_index: usize, // Current child being processed
+    children_offsets: Vec<(usize, u32)>, // Pre-computed child offsets
+}
+
+impl<'a> CursorFrame<'a> {
+    fn new(node: &'a Node, byte_offset: usize, line_offset: u32) -> Self {
+        let mut children_offsets = Vec::new();
+
+        // Pre-compute child offsets
+        if let Node::Internal { children, .. } = node {
+            let mut byte_off = byte_offset;
+            let mut line_off = line_offset;
+            for child in children.iter() {
+                children_offsets.push((byte_off, line_off));
+                let (bytes, lines) = node_metrics(child);
+                byte_off += bytes;
+                line_off += lines;
+            }
+        }
+
+        Self {
+            node,
+            byte_offset,
+            line_offset,
+            child_index: 0,
+            children_offsets,
+        }
     }
 
-    fn find_point_in_node(&self, node: &Node, pt: Point) -> TreePos {
-        match node {
-            Node::Leaf { spans, .. } => {
-                // Check spans for hit
-                for (i, span) in spans.iter().enumerate() {
-                    if let Span::Widget(w) = span {
-                        if w.hit_test(pt) {
-                            return TreePos {
-                                span_idx: i,
-                                offset_in_span: 0,
-                            };
+    fn has_next_child(&self) -> bool {
+        if let Node::Internal { children, .. } = self.node {
+            self.child_index < children.len()
+        } else {
+            false
+        }
+    }
+
+    fn advance_to_next_child(&mut self) -> Option<(&'a Node, usize, u32)> {
+        if let Node::Internal { children, .. } = self.node {
+            if self.child_index < children.len() {
+                let child = &children[self.child_index];
+                let (byte_off, line_off) = self.children_offsets[self.child_index];
+                self.child_index += 1;
+                return Some((child, byte_off, line_off));
+            }
+        }
+        None
+    }
+}
+
+impl<'a> TreeCursor<'a> {
+    fn new(tree: &'a Tree) -> Self {
+        let mut cursor = Self {
+            tree,
+            stack: Vec::new(),
+            current_spans: Vec::new(),
+            span_idx: 0,
+            byte_pos: 0,
+            line_pos: 0,
+        };
+        cursor.reset();
+        cursor
+    }
+
+    fn reset(&mut self) {
+        self.stack.clear();
+        self.current_spans.clear();
+        self.span_idx = 0;
+        self.byte_pos = 0;
+        self.line_pos = 0;
+
+        // Create initial frame
+        let frame = CursorFrame::new(&self.tree.root, 0, 0);
+        self.stack.push(frame);
+        self.descend_to_leaf();
+    }
+
+    fn descend_to_leaf(&mut self) {
+        while let Some(mut frame) = self.stack.pop() {
+            match frame.node {
+                Node::Leaf { spans, .. } => {
+                    self.current_spans.clear();
+                    let mut offset = frame.byte_offset;
+                    for span in spans {
+                        self.current_spans.push((span, offset));
+                        offset += span_bytes(span);
+                    }
+                    self.byte_pos = frame.byte_offset;
+                    self.line_pos = frame.line_offset;
+                    self.span_idx = 0;
+
+                    // Put frame back for later traversal
+                    self.stack.push(frame);
+                    return;
+                }
+                Node::Internal { .. } => {
+                    // Put frame back
+                    self.stack.push(frame);
+
+                    // Get leftmost unvisited child
+                    if let Some(frame) = self.stack.last_mut() {
+                        if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
+                            let child_frame = CursorFrame::new(child, byte_off, line_off);
+                            self.stack.push(child_frame);
+                        } else {
+                            // No more children, pop this frame
+                            self.stack.pop();
                         }
                     }
                 }
-                TreePos::default()
             }
-            Node::Internal { children, .. } => {
-                // Check child bounds
-                for child in children {
-                    let bounds = match child {
-                        Node::Leaf { sums, .. } => &sums.bounds,
-                        Node::Internal { sums, .. } => &sums.bounds,
-                    };
+        }
+    }
 
-                    if bounds.contains(pt) {
-                        return self.find_point_in_node(child, pt);
+    pub fn seek_byte(&mut self, target: usize) -> bool {
+        // Clear and set up stack
+        self.stack.clear();
+        self.current_spans.clear();
+        self.span_idx = 0;
+        self.byte_pos = 0;
+        self.line_pos = 0;
+
+        let frame = CursorFrame::new(&self.tree.root, 0, 0);
+        self.stack.push(frame);
+
+        if target == 0 {
+            self.descend_to_leaf();
+            return true;
+        }
+
+        while let Some(mut frame) = self.stack.pop() {
+            match frame.node {
+                Node::Leaf { spans, .. } => {
+                    // Set up current spans for this leaf
+                    self.current_spans.clear();
+                    let mut span_offset = frame.byte_offset;
+                    for s in spans {
+                        self.current_spans.push((s, span_offset));
+                        span_offset += span_bytes(s);
+                    }
+
+                    // Now find which span contains our target
+                    let mut current_byte = frame.byte_offset;
+                    let mut current_line = frame.line_offset;
+
+                    for (i, span) in spans.iter().enumerate() {
+                        let span_size = span_bytes(span);
+
+                        if target < current_byte + span_size {
+                            // Target is in this span
+                            self.byte_pos = target;
+                            self.span_idx = i;
+
+                            // Count lines from start of span to target
+                            let offset_in_span = target - current_byte;
+                            self.line_pos = current_line + count_lines_to(span, offset_in_span);
+
+                            // Keep frame for later traversal
+                            self.stack.push(frame);
+                            return true;
+                        }
+
+                        current_byte += span_size;
+                        current_line += span_lines(span);
+                    }
+
+                    // Check if target is exactly at end of this leaf
+                    if target == current_byte {
+                        self.byte_pos = target;
+                        self.line_pos = current_line;
+                        self.span_idx = spans.len().saturating_sub(1);
+                        self.stack.push(frame);
+                        return true;
                     }
                 }
-                TreePos::default()
+                Node::Internal { children, .. } => {
+                    // Find child containing target
+                    for (i, &(byte_off, line_off)) in frame.children_offsets.iter().enumerate() {
+                        let child = &children[i];
+                        let (bytes, _) = node_metrics(child);
+                        if byte_off + bytes > target {
+                            // Target is in this child
+                            let child_frame = CursorFrame::new(child, byte_off, line_off);
+                            self.stack.push(child_frame);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn seek_line(&mut self, target_line: u32) -> Option<usize> {
+        if target_line == 0 { return Some(0); }
+        if target_line > self.tree.line_count() { return None; }
+
+        self.reset();
+        let mut current_line = 0;
+
+        loop {
+            if self.current_spans.is_empty() {
+                self.descend_to_leaf();
+                if self.current_spans.is_empty() {
+                    break;
+                }
+            }
+
+            for (span, offset) in self.current_spans.iter() {
+                if let Span::Text { bytes, lines } = span {
+                    if current_line + lines >= target_line {
+                        let lines_to_skip = target_line - current_line;
+                        if lines_to_skip == 0 {
+                            return Some(*offset);
+                        }
+
+                        let mut newline_count = 0;
+                        for (i, &b) in bytes.iter().enumerate() {
+                            if b == b'\n' {
+                                newline_count += 1;
+                                if newline_count == lines_to_skip {
+                                    return Some(*offset + i + 1);
+                                }
+                            }
+                        }
+                    }
+                    current_line += lines;
+                }
+            }
+
+            if !self.advance_leaf() {
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn find_byte(&mut self, target: u8, forward: bool) -> Option<usize> {
+        let start_idx = self.span_idx;
+        let start_pos = self.byte_pos;
+
+        if forward {
+            if let Some((span, offset)) = self.current_spans.get(start_idx) {
+                if let Some(pos) = find_in_span(span, target, start_pos - offset, true) {
+                    return Some(*offset + pos);
+                }
+            }
+
+            for i in (start_idx + 1)..self.current_spans.len() {
+                if let Some((span, offset)) = self.current_spans.get(i) {
+                    if let Some(pos) = find_in_span(span, target, 0, true) {
+                        return Some(*offset + pos);
+                    }
+                }
+            }
+
+            while self.advance_leaf() {
+                for (span, offset) in &self.current_spans {
+                    if let Some(pos) = find_in_span(span, target, 0, true) {
+                        return Some(*offset + pos);
+                    }
+                }
+            }
+        } else {
+            if let Some((span, offset)) = self.current_spans.get(start_idx) {
+                let pos_in_span = start_pos.saturating_sub(*offset);
+                if pos_in_span > 0 {
+                    if let Some(pos) = find_in_span(span, target, pos_in_span, false) {
+                        return Some(*offset + pos);
+                    }
+                }
+            }
+
+            for i in (0..start_idx).rev() {
+                if let Some((span, offset)) = self.current_spans.get(i) {
+                    if let Some(pos) = find_in_span(span, target, span_bytes(span), false) {
+                        return Some(*offset + pos);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn advance_leaf(&mut self) -> bool {
+        // Pop current leaf frame if at a leaf
+        if !self.stack.is_empty() {
+            if let Some(frame) = self.stack.last() {
+                if matches!(frame.node, Node::Leaf { .. }) {
+                    self.stack.pop();
+                }
+            }
+        }
+
+        // Now find next leaf by continuing traversal
+        loop {
+            // Try to advance in current frame
+            if let Some(frame) = self.stack.last_mut() {
+                if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
+                    // Found next child, descend into it
+                    let child_frame = CursorFrame::new(child, byte_off, line_off);
+                    self.stack.push(child_frame);
+
+                    // Descend to leaf
+                    while let Some(frame) = self.stack.last() {
+                        match frame.node {
+                            Node::Leaf { spans, .. } => {
+                                // Found a leaf!
+                                self.current_spans.clear();
+                                let mut offset = frame.byte_offset;
+                                for span in spans {
+                                    self.current_spans.push((span, offset));
+                                    offset += span_bytes(span);
+                                }
+                                self.byte_pos = frame.byte_offset;
+                                self.line_pos = frame.line_offset;
+                                self.span_idx = 0;
+                                return true;
+                            }
+                            Node::Internal { .. } => {
+                                // Need to go deeper - get leftmost child
+                                if let Some(mut new_frame) = self.stack.pop() {
+                                    self.stack.push(new_frame);
+                                    if let Some(frame) = self.stack.last_mut() {
+                                        if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
+                                            let child_frame = CursorFrame::new(child, byte_off, line_off);
+                                            self.stack.push(child_frame);
+                                        } else {
+                                            return false;
+                                        }
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // No more children at this level, go up
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return false; // Reached end of tree
+                    }
+                }
+            } else {
+                return false; // Stack empty
+            }
+        }
+    }
+
+    pub fn current_line(&self) -> u32 {
+        self.line_pos
+    }
+
+    pub fn read_text(&mut self, len: usize) -> String {
+        let mut result = String::with_capacity(len);
+        let mut remaining = len;
+        let mut idx = self.span_idx;
+        let mut pos_in_span = self.byte_pos - self.current_spans.get(idx).map(|(_, o)| *o).unwrap_or(0);
+
+        while remaining > 0 && idx < self.current_spans.len() {
+            if let Some((span, _)) = self.current_spans.get(idx) {
+                if let Span::Text { bytes, .. } = span {
+                    let available = bytes.len() - pos_in_span;
+                    let to_read = remaining.min(available);
+                    let slice = &bytes[pos_in_span..pos_in_span + to_read];
+                    // SAFETY: We maintain UTF-8 invariant
+                    let text = unsafe { from_utf8(slice).unwrap_unchecked() };
+                    result.push_str(text);
+                    remaining -= to_read;
+                    pos_in_span = 0;
+                }
+            }
+            idx += 1;
+        }
+        result
+    }
+
+    pub fn count_chars(&mut self) -> usize {
+        let mut count = 0;
+        self.reset();
+
+        loop {
+            if self.current_spans.is_empty() {
+                self.descend_to_leaf();
+                if self.current_spans.is_empty() {
+                    break;
+                }
+            }
+
+            for (span, _) in self.current_spans.iter() {
+                if let Span::Text { bytes, .. } = span {
+                    let s = unsafe { from_utf8(bytes).unwrap_unchecked() };
+                    count += s.chars().count();
+                }
+            }
+
+            if !self.advance_leaf() {
+                break;
+            }
+        }
+        count
+    }
+
+    pub fn walk_range<F>(&mut self, byte_range: Range<usize>, mut callback: F)
+    where
+        F: FnMut(&[Span], usize, usize),
+    {
+        self.seek_byte(byte_range.start);
+
+        loop {
+            if self.current_spans.is_empty() {
+                break;
+            }
+
+            let leaf_start = self.current_spans.first().map(|(_, o)| *o).unwrap_or(0);
+            let leaf_end = self.current_spans.last()
+                .map(|(span, offset)| offset + span_bytes(span))
+                .unwrap_or(leaf_start);
+
+            if leaf_start >= byte_range.end {
+                break;
+            }
+
+            if leaf_end > byte_range.start {
+                let mut spans = Vec::new();
+                for (span, _) in self.current_spans.iter() {
+                    spans.push((*span).clone());
+                }
+
+                let intersect_start = leaf_start.max(byte_range.start);
+                let intersect_end = leaf_end.min(byte_range.end);
+                callback(&spans, intersect_start, intersect_end);
+            }
+
+            if !self.advance_leaf() {
+                break;
             }
         }
     }
 }
 
-/// Position in tree
+
+// === Helper Functions ===
+
+fn span_bytes(span: &Span) -> usize {
+    match span {
+        Span::Text { bytes, .. } => bytes.len(),
+        Span::Widget(_) => 0,
+    }
+}
+
+fn span_lines(span: &Span) -> u32 {
+    match span {
+        Span::Text { lines, .. } => *lines,
+        Span::Widget(_) => 0,
+    }
+}
+
+fn node_metrics(node: &Node) -> (usize, u32) {
+    match node {
+        Node::Leaf { sums, .. } => (sums.bytes, sums.lines),
+        Node::Internal { sums, .. } => (sums.bytes, sums.lines),
+    }
+}
+
+fn count_lines_to(span: &Span, byte_offset: usize) -> u32 {
+    match span {
+        Span::Text { bytes, .. } => {
+            bytecount::count(&bytes[..byte_offset.min(bytes.len())], b'\n') as u32
+        }
+        Span::Widget(_) => 0,
+    }
+}
+
+fn find_in_span(span: &Span, target: u8, start: usize, forward: bool) -> Option<usize> {
+    match span {
+        Span::Text { bytes, .. } => {
+            if forward {
+                // Use SIMD-optimized memchr for forward search
+                memchr(target, &bytes[start..])
+                    .map(|p| start + p)
+            } else {
+                // Use SIMD-optimized memrchr for reverse search
+                memrchr(target, &bytes[..start])
+            }
+        }
+        Span::Widget(_) => None,
+    }
+}
+
+fn compute_sums(spans: &[Span]) -> Sums {
+    let mut sums = Sums::default();
+
+    for span in spans {
+        match span {
+            Span::Text { bytes, lines } => {
+                sums.bytes += bytes.len();
+                sums.lines += lines;
+            }
+            Span::Widget(w) => {
+                let size = w.measure();
+                sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(size.width.0));
+                sums.bounds.height = LogicalPixels(sums.bounds.height.0 + size.height.0);
+                sums.max_z = sums.max_z.max(w.z_index());
+            }
+        }
+    }
+
+    sums
+}
+
+fn compute_node_sums(nodes: &[Node]) -> Sums {
+    let mut sums = Sums::default();
+
+    for node in nodes {
+        let node_sums = match node {
+            Node::Leaf { sums, .. } => sums,
+            Node::Internal { sums, .. } => sums,
+        };
+
+        sums.bytes += node_sums.bytes;
+        sums.lines += node_sums.lines;
+        sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(node_sums.bounds.width.0));
+        sums.bounds.height = LogicalPixels(sums.bounds.height.0 + node_sums.bounds.height.0);
+        sums.max_z = sums.max_z.max(node_sums.max_z);
+    }
+
+    sums
+}
+
+fn collect_text(node: &Node, out: &mut String) {
+    match node {
+        Node::Leaf { spans, .. } => {
+            for span in spans {
+                if let Span::Text { bytes, .. } = span {
+                    let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
+                    out.push_str(text);
+                }
+            }
+        }
+        Node::Internal { children, .. } => {
+            for child in children {
+                collect_text(child, out);
+            }
+        }
+    }
+}
+
+// === Position Types ===
+
 #[derive(Default)]
 pub struct TreePos {
     pub span_idx: usize,
     pub offset_in_span: usize,
 }
 
-// Rect::contains is now implemented in coordinates.rs for LayoutRect
+// === Tests ===
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn test_byte_and_line_counts() {
+        let doc = Doc::from_str("Hello\nWorld\n!");
+        let tree = doc.read();
+
+        assert_eq!(tree.byte_count(), 13);
+        assert_eq!(tree.line_count(), 2);
+    }
+
+    #[test]
+    fn test_line_to_byte() {
+        let doc = Doc::from_str("Line 1\nLine 2\nLine 3\n");
+        let tree = doc.read();
+
+        assert_eq!(tree.line_to_byte(0), Some(0));
+        assert_eq!(tree.line_to_byte(1), Some(7));
+        assert_eq!(tree.line_to_byte(2), Some(14));
+        assert_eq!(tree.line_to_byte(3), Some(21));
+        assert_eq!(tree.line_to_byte(4), None);
+    }
+
+    #[test]
+    fn test_byte_to_line() {
+        let doc = Doc::from_str("Line 1\nLine 2\nLine 3\n");
+        let tree = doc.read();
+
+        // Total: "Line 1\n" (7 bytes) "Line 2\n" (7 bytes) "Line 3\n" (7 bytes)
+        assert_eq!(tree.byte_to_line(0), 0);  // Start of file
+        assert_eq!(tree.byte_to_line(5), 0);  // In "Line 1"
+        assert_eq!(tree.byte_to_line(7), 1);  // Start of "Line 2"
+        assert_eq!(tree.byte_to_line(10), 1); // In "Line 2"
+        assert_eq!(tree.byte_to_line(14), 2); // Start of "Line 3"
+        assert_eq!(tree.byte_to_line(20), 2); // In "Line 3"
+    }
+
+    #[test]
+    fn test_find_newlines() {
+        let doc = Doc::from_str("Hello\nWorld\n!");
+        let tree = doc.read();
+
+        assert_eq!(tree.find_next_newline(0), Some(5));
+        assert_eq!(tree.find_next_newline(6), Some(11));
+        assert_eq!(tree.find_next_newline(12), None);
+
+        assert_eq!(tree.find_prev_newline(0), None);
+        assert_eq!(tree.find_prev_newline(6), Some(5));
+        assert_eq!(tree.find_prev_newline(12), Some(11));
+    }
+
+    #[test]
+    fn test_get_text_slice() {
+        let doc = Doc::from_str("Hello, World!");
+        let tree = doc.read();
+
+        assert_eq!(tree.get_text_slice(0..5), "Hello");
+        assert_eq!(tree.get_text_slice(7..12), "World");
+        assert_eq!(tree.get_text_slice(0..13), "Hello, World!");
+        assert_eq!(tree.get_text_slice(5..5), "");
+    }
+
+    #[test]
+    fn test_line_navigation() {
+        let doc = Doc::from_str("First line\nSecond line\nThird line");
+        let tree = doc.read();
+
+        assert_eq!(tree.find_line_start_at(5), 0);
+        assert_eq!(tree.find_line_start_at(15), 11);
+
+        assert_eq!(tree.find_line_end_at(5), 10);
+        assert_eq!(tree.find_line_end_at(15), 22);
+
+        assert_eq!(tree.get_line_at(5), "First line");
+        assert_eq!(tree.get_line_at(15), "Second line");
+    }
+
+    #[test]
+    fn test_with_edits() {
+        let doc = Doc::from_str("Line 1\n");
+
+        doc.edit(Edit::Insert {
+            pos: 7,
+            content: Content::Text("Line 2\n".to_string()),
+        });
+        doc.flush();
+
+        let tree = doc.read();
+        assert_eq!(tree.line_count(), 2);
+        assert_eq!(tree.byte_to_line(8), 1);
+    }
+
+    #[test]
+    fn test_large_document() {
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("Line {}\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        assert_eq!(tree.line_count(), 100);
+
+        let line_50_start = tree.line_to_byte(50).unwrap();
+        assert!(tree.get_line_at(line_50_start).starts_with("Line 50"));
+    }
+
+    #[test]
+    fn test_unicode() {
+        let doc = Doc::from_str("你好\n世界\n");
+        let tree = doc.read();
+
+        assert_eq!(tree.byte_count(), 14);
+        assert_eq!(tree.line_count(), 2);
+        assert_eq!(tree.char_count(), 6);
+
+        assert_eq!(tree.get_line_at(0), "你好");
+        assert_eq!(tree.get_line_at(8), "世界");
+    }
+
+    #[test]
     fn test_document_operations() {
-        // Empty document
         let doc = Doc::from_str("");
         assert_eq!(doc.read().flatten_to_string(), "");
         assert_eq!(doc.read().byte_count(), 0);
 
-        // Insert at beginning
         doc.edit(Edit::Insert {
             pos: 0,
             content: Content::Text("A".to_string()),
@@ -640,7 +1439,6 @@ mod tests {
         doc.flush();
         assert_eq!(doc.read().flatten_to_string(), "A");
 
-        // Insert at end
         doc.edit(Edit::Insert {
             pos: 1,
             content: Content::Text("C".to_string()),
@@ -648,7 +1446,6 @@ mod tests {
         doc.flush();
         assert_eq!(doc.read().flatten_to_string(), "AC");
 
-        // Insert in middle
         doc.edit(Edit::Insert {
             pos: 1,
             content: Content::Text("B".to_string()),
@@ -656,7 +1453,6 @@ mod tests {
         doc.flush();
         assert_eq!(doc.read().flatten_to_string(), "ABC");
 
-        // Delete middle character
         doc.edit(Edit::Delete { range: 1..2 });
         doc.flush();
         assert_eq!(doc.read().flatten_to_string(), "AC");
@@ -666,7 +1462,6 @@ mod tests {
     fn test_typing_simulation() {
         let doc = Doc::from_str("");
 
-        // Simulate typing character by character
         for (i, ch) in "Hello, World!".chars().enumerate() {
             doc.edit(Edit::Insert {
                 pos: i,
@@ -680,57 +1475,14 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_document() {
-        let doc = Doc::from_str("Line 1\nLine 2\nLine 3");
-        assert_eq!(doc.read().flatten_to_string(), "Line 1\nLine 2\nLine 3");
-
-        // Insert at beginning of line 2 (after "Line 1\n")
-        doc.edit(Edit::Insert {
-            pos: 7,
-            content: Content::Text("Start of ".to_string()),
-        });
-        doc.flush();
-        assert_eq!(
-            doc.read().flatten_to_string(),
-            "Line 1\nStart of Line 2\nLine 3"
-        );
-    }
-
-    #[test]
-    fn test_edit_buffering() {
-        let doc = Doc::from_str("");
-
-        // Queue multiple edits before flush
-        doc.edit(Edit::Insert {
-            pos: 0,
-            content: Content::Text("A".to_string()),
-        });
-        doc.edit(Edit::Insert {
-            pos: 1,
-            content: Content::Text("B".to_string()),
-        });
-        doc.edit(Edit::Insert {
-            pos: 2,
-            content: Content::Text("C".to_string()),
-        });
-
-        // All edits applied at once
-        doc.flush();
-        assert_eq!(doc.read().flatten_to_string(), "ABC");
-    }
-
-    #[test]
     fn test_concurrent_readers() {
         let doc = Doc::from_str("Shared");
 
-        // Multiple readers should work without blocking
         let tree1 = doc.read();
         let tree2 = doc.read();
 
         assert_eq!(tree1.flatten_to_string(), "Shared");
         assert_eq!(tree2.flatten_to_string(), "Shared");
-
-        // Both readers see same content
         assert_eq!(tree1.byte_count(), tree2.byte_count());
     }
 
@@ -738,15 +1490,251 @@ mod tests {
     fn test_widget_insertion() {
         let doc = Doc::from_str("Text");
 
-        // Insert a widget (doesn't affect text content)
-        // Using cursor widget as an example, though cursors are now rendered as overlays
         doc.edit(Edit::Insert {
             pos: 2,
             content: Content::Widget(crate::widget::cursor(LayoutPos::new(0.0, 0.0))),
         });
         doc.flush();
 
-        // Text content unchanged
         assert_eq!(doc.read().flatten_to_string(), "Text");
+    }
+
+    #[test]
+    fn test_multi_leaf_creation() {
+        // Create text that will span multiple leaves
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("This is line {} with some content to fill up space.\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        // Verify tree structure has multiple leaves
+        match &tree.root {
+            Node::Leaf { spans, .. } => {
+                // Small text might still fit in one leaf
+                assert!(spans.len() <= MAX_SPANS);
+            }
+            Node::Internal { children, .. } => {
+                // Large text should create internal nodes
+                assert!(children.len() > 0);
+                for child in children {
+                    if let Node::Leaf { spans, .. } = child {
+                        assert!(spans.len() <= MAX_SPANS);
+                    }
+                }
+            }
+        }
+
+        // Verify content is preserved
+        assert_eq!(tree.flatten_to_string(), text);
+    }
+
+    #[test]
+    fn test_multi_leaf_traversal() {
+        // Create document with multiple leaves
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&format!("Line {:03}\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        // Test cursor can traverse all leaves
+        let mut cursor = tree.cursor();
+        let mut found_lines = 0;
+
+        loop {
+            for (span, _) in cursor.current_spans.iter() {
+                if let Span::Text { lines, .. } = span {
+                    found_lines += lines;
+                }
+            }
+            if !cursor.advance_leaf() {
+                break;
+            }
+        }
+
+        assert_eq!(found_lines, 50);
+    }
+
+    #[test]
+    fn test_incremental_edit_in_multi_leaf() {
+        // Create multi-leaf document
+        let mut text = String::new();
+        for i in 0..30 {
+            text.push_str(&format!("Original line {}\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+
+        // Insert in middle of document
+        doc.edit(Edit::Insert {
+            pos: text.len() / 2,
+            content: Content::Text("INSERTED TEXT\n".to_string()),
+        });
+        doc.flush();
+
+        let result = doc.read().flatten_to_string();
+        assert!(result.contains("INSERTED TEXT"));
+
+        // Delete across leaf boundaries
+        doc.edit(Edit::Delete {
+            range: (text.len() / 3)..(text.len() * 2 / 3),
+        });
+        doc.flush();
+
+        let tree = doc.read();
+        assert!(tree.byte_count() < text.len());
+    }
+
+    #[test]
+    fn test_leaf_splitting() {
+        let doc = Doc::from_str("Initial");
+
+        // Insert enough content to force a split
+        for i in 0..MAX_SPANS + 5 {
+            doc.edit(Edit::Insert {
+                pos: 0,
+                content: Content::Text(format!("Span {}\n", i)),
+            });
+        }
+        doc.flush();
+
+        let tree = doc.read();
+
+        // Should have created internal node with multiple leaves
+        match &tree.root {
+            Node::Internal { children, .. } => {
+                assert!(children.len() > 1, "Should have split into multiple nodes");
+            }
+            Node::Leaf { spans, .. } => {
+                assert!(spans.len() <= MAX_SPANS, "Leaf should not exceed MAX_SPANS");
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_merging() {
+        // Create document with multiple leaves
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!("Line to delete {}\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+
+        // Delete most content to trigger merging
+        doc.edit(Edit::Delete {
+            range: 100..text.len() - 100,
+        });
+        doc.flush();
+
+        let tree = doc.read();
+
+        // Verify structure is still valid
+        match &tree.root {
+            Node::Leaf { spans, .. } => {
+                assert!(spans.len() <= MAX_SPANS);
+            }
+            Node::Internal { children, .. } => {
+                // Should have merged some children
+                assert!(children.len() <= MAX_SPANS);
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_leaf_efficiency() {
+        // Create multi-leaf document - need enough data to span multiple 1KB chunks
+        // and then multiple leaves (16 chunks per leaf)
+        let mut text = String::new();
+        // Create 20KB of data to ensure multiple leaves
+        for i in 0..500 {
+            text.push_str(&format!("This is line number {} with some padding text to make it longer\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+        let mut cursor = tree.cursor();
+
+        // Advance through all leaves and verify we visit each exactly once
+        let mut leaves_visited = 0;
+        let mut total_bytes = 0;
+
+        loop {
+            leaves_visited += 1;
+            for (span, offset) in cursor.current_spans.iter() {
+                total_bytes = total_bytes.max(*offset + span_bytes(span));
+            }
+            if !cursor.advance_leaf() {
+                break;
+            }
+        }
+
+        assert_eq!(total_bytes, tree.byte_count());
+        assert!(leaves_visited > 1, "Should have multiple leaves for large doc (visited {} leaves, {} bytes)", leaves_visited, text.len());
+    }
+
+    #[test]
+    fn test_seek_in_multi_leaf() {
+        // Create predictable multi-leaf structure
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&format!("Line {:04}\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+        let mut cursor = tree.cursor();
+
+        // Seek to various positions
+        let positions = vec![0, 100, 250, text.len() / 2, text.len() - 1];
+
+        for pos in positions {
+            assert!(cursor.seek_byte(pos));
+            assert_eq!(cursor.byte_pos, pos);
+
+            // Verify we can read from seeked position
+            let remaining = tree.byte_count() - pos;
+            let read_len = remaining.min(10);
+            let content = cursor.read_text(read_len);
+            assert_eq!(content, tree.get_text_slice(pos..pos + read_len));
+        }
+    }
+
+    #[test]
+    fn test_line_navigation_multi_leaf() {
+        // Create document where lines span multiple leaves
+        let mut text = String::new();
+        let lines_per_leaf = 20;
+        let total_lines = 60;
+
+        for i in 0..total_lines {
+            text.push_str(&format!("Line number {:03}\n", i));
+        }
+
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        // Test line_to_byte for lines in different leaves
+        for line in (0..total_lines).step_by(10) {
+            let byte_pos = tree.line_to_byte(line);
+            assert!(byte_pos.is_some());
+
+            // Verify the position is correct
+            let line_text = tree.get_line_at(byte_pos.unwrap());
+            assert!(line_text.contains(&format!("Line number {:03}", line)));
+        }
+
+        // Test byte_to_line across leaves
+        for pos in (0..text.len()).step_by(100) {
+            let line = tree.byte_to_line(pos);
+            let byte_back = tree.line_to_byte(line);
+            assert!(byte_back.is_some());
+            assert!(byte_back.unwrap() <= pos);
+        }
     }
 }

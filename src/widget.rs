@@ -3,7 +3,7 @@
 //! Text rendering uses the consolidated FontSystem from font.rs
 
 use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
-use std::collections::HashMap;
+use ahash::HashMap;
 use std::sync::Arc;
 
 /// Widget identifier for texture access
@@ -861,7 +861,7 @@ pub struct WidgetManager {
 impl WidgetManager {
     pub fn new() -> Self {
         Self {
-            widgets: HashMap::new(),
+            widgets: HashMap::default(),
             next_id: 1000,
             sorted_ids: Vec::new(),
             needs_sort: false,
@@ -932,15 +932,20 @@ impl WidgetManager {
             println!("PAINTING {} widgets", widgets.len());
             for widget in &widgets {
                 println!(
-                    "  Widget type: {}, priority: {}",
+                    "  Widget ID: {}, priority: {}, type: {}",
+                    widget.widget_id(),
+                    widget.priority(),
                     if widget.widget_id() == 1 {
                         "CURSOR"
                     } else if widget.widget_id() == 2 {
                         "SELECTION"
+                    } else if widget.widget_id() == 5000 {
+                        "LINE_NUMBERS"
+                    } else if widget.widget_id() == 1000 {
+                        "DOCUMENT"
                     } else {
                         "OTHER"
-                    },
-                    widget.priority()
+                    }
                 );
                 widget.paint(ctx, render_pass);
             }

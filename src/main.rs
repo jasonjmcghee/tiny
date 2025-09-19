@@ -1,11 +1,32 @@
+use std::env;
+use std::path::PathBuf;
 use tiny_editor::app::{EditorLogic, TinyApp};
-use tiny_editor::tree::Doc;
+use tiny_editor::{io, tree::Doc};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let doc = Doc::from_str(&include_str!("../assets/sample.rs").repeat(10));
+    let args: Vec<String> = env::args().collect();
 
-    TinyApp::new(EditorLogic::new(doc))
-        .with_title("Tiny Editor - Ultra-Minimal")
+    let editor_logic = if args.len() > 1 {
+        // Load file from path!
+        let path = PathBuf::from(&args[1]);
+        match io::load(&path) {
+            Ok(doc) => {
+                EditorLogic::new(doc).with_file(path)
+            }
+            Err(e) => {
+                eprintln!("Failed to load file: {}", e);
+                eprintln!("Creating new file instead...");
+                let doc = Doc::new();
+                EditorLogic::new(doc).with_file(path)
+            }
+        }
+    } else {
+        // Use demo text
+        let doc = Doc::from_str(&include_str!("../assets/sample.rs").repeat(10));
+        EditorLogic::new(doc)
+    };
+
+    TinyApp::new(editor_logic)
         .with_size(800.0, 600.0)
         .with_font_size(14.0)
         .run()

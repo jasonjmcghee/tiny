@@ -3,6 +3,7 @@
 //! Handles keyboard, mouse, and multi-cursor selections
 
 use crate::coordinates::{DocPos, LayoutPos, LayoutRect, Viewport};
+use crate::history::{DocumentHistory, DocumentSnapshot, SelectionHistory};
 use crate::syntax::SyntaxHighlighter;
 use crate::tree::{Content, Doc, Edit, Point};
 use std::ops::Range;
@@ -10,6 +11,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::event::{ElementState, KeyEvent, MouseButton};
 use winit::keyboard::{Key, NamedKey};
+
+/// Actions that can be triggered by input
+pub enum InputAction {
+    None,
+    Redraw,
+    Save,
+    Undo,
+    Redo,
+}
+
 
 /// Selection with cursor and anchor in document coordinates
 #[derive(Clone)]
@@ -161,6 +172,10 @@ pub struct InputHandler {
     pending_text_edits: Vec<crate::syntax::TextEdit>,
     /// Whether we have unflushed syntax updates
     has_pending_syntax_update: bool,
+    /// History for undo/redo (document + selections)
+    history: DocumentHistory,
+    /// Navigation history for cursor positions (Cmd+[/])
+    nav_history: SelectionHistory,
 }
 
 impl InputHandler {
@@ -179,6 +194,8 @@ impl InputHandler {
             syntax_highlighter: None,
             pending_text_edits: Vec::new(),
             has_pending_syntax_update: false,
+            history: DocumentHistory::new(),
+            nav_history: SelectionHistory::with_max_size(50),
         }
     }
 
@@ -371,17 +388,102 @@ impl InputHandler {
         _viewport: &Viewport,
         event: &KeyEvent,
         modifiers: &winit::event::Modifiers,
-    ) -> bool {
+    ) -> InputAction {
         if event.state != ElementState::Pressed {
-            return false;
+            return InputAction::None;
         }
 
         let shift_held = modifiers.state().shift_key();
 
+        // Platform-specific command key
+        #[cfg(target_os = "macos")]
+        let cmd_held = modifiers.state().super_key();
+        #[cfg(not(target_os = "macos"))]
+        let cmd_held = modifiers.state().control_key();
+
+        // Check for command shortcuts first
+        if cmd_held {
+            match &event.logical_key {
+                Key::Character(ch) => {
+                    match ch.to_lowercase().as_str() {
+                        "z" if shift_held => {
+                            // Cmd+Shift+Z: Redo
+                            return InputAction::Redo;
+                        }
+                        "z" if !shift_held => {
+                            // Cmd+Z: Undo
+                            return InputAction::Undo;
+                        }
+                        "c" => {
+                            // Cmd+C: Copy
+                            self.copy(doc);
+                            return InputAction::None;
+                        }
+                        "x" => {
+                            // Cmd+X: Cut
+                            self.cut(doc);
+                            return InputAction::Redraw;
+                        }
+                        "v" => {
+                            // Cmd+V: Paste
+                            self.paste(doc);
+                            return InputAction::Redraw;
+                        }
+                        "s" => {
+                            // Cmd+S: Save
+                            return InputAction::Save;
+                        }
+                        "a" => {
+                            // Cmd+A: Select All
+                            self.select_all(doc);
+                            return InputAction::Redraw;
+                        }
+                        "[" => {
+                            // Cmd+[: Navigate back
+                            let current_pos = self.primary_cursor_doc_pos(doc);
+                            if let Some(prev_pos) = self.nav_history.undo(current_pos) {
+                                // Set cursor to previous position
+                                self.selections.clear();
+                                self.selections.push(Selection {
+                                    cursor: prev_pos,
+                                    anchor: prev_pos,
+                                    id: self.next_id,
+                                });
+                                self.next_id += 1;
+                                return InputAction::Redraw;
+                            }
+                            return InputAction::None;
+                        }
+                        "]" => {
+                            // Cmd+]: Navigate forward
+                            let current_pos = self.primary_cursor_doc_pos(doc);
+                            if let Some(next_pos) = self.nav_history.redo(current_pos) {
+                                // Set cursor to next position
+                                self.selections.clear();
+                                self.selections.push(Selection {
+                                    cursor: next_pos,
+                                    anchor: next_pos,
+                                    id: self.next_id,
+                                });
+                                self.next_id += 1;
+                                return InputAction::Redraw;
+                            }
+                            return InputAction::None;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match &event.logical_key {
-            Key::Character(ch) => {
+            Key::Character(ch) if !cmd_held => {
                 // Type character at all cursors
                 self.goal_column = None; // Reset goal column when typing
+
+                // Save snapshot before edit
+                self.save_snapshot_to_history(doc);
 
                 // Prepare edits
                 for sel in &self.selections {
@@ -415,10 +517,13 @@ impl InputHandler {
                     sel.anchor = sel.cursor;
                 }
 
-                // Return true to trigger redraw
-                return true;
+                // Return redraw action
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::Backspace) => {
+                // Save snapshot before edit
+                self.save_snapshot_to_history(doc);
+
                 // Delete before cursor
                 for sel in &self.selections {
                     if !sel.is_cursor() {
@@ -463,8 +568,11 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::Delete) => {
+                // Save snapshot before edit
+                self.save_snapshot_to_history(doc);
                 // Delete after cursor
                 for sel in &self.selections {
                     if !sel.is_cursor() {
@@ -485,6 +593,7 @@ impl InputHandler {
 
                 // Immediately flush WITH syntax coordination
                 self.flush_pending_edits(doc);
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 // Move left in document space
@@ -510,6 +619,7 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowRight) => {
                 // Move right in document space
@@ -544,6 +654,7 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowUp) => {
                 // Move up in document space
@@ -574,6 +685,7 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowDown) => {
                 // Move down in document space
@@ -611,6 +723,7 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::Home) => {
                 // Move to line start
@@ -621,6 +734,7 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::End) => {
                 // Move to line end
@@ -638,8 +752,11 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::Enter) => {
+                // Save snapshot before edit
+                self.save_snapshot_to_history(doc);
                 // Insert newline
                 for sel in &self.selections {
                     if !sel.is_cursor() {
@@ -668,8 +785,11 @@ impl InputHandler {
                     sel.cursor.column = 0;
                     sel.anchor = sel.cursor;
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::Tab) => {
+                // Save snapshot before edit
+                self.save_snapshot_to_history(doc);
                 // Insert tab character
                 for sel in &self.selections {
                     if !sel.is_cursor() {
@@ -698,8 +818,12 @@ impl InputHandler {
                     sel.cursor.column = ((sel.cursor.column / 4) + 1) * 4;
                     sel.anchor = sel.cursor;
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::PageUp) => {
+                // Save position before page jump
+                self.nav_history.checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
+
                 // Move cursor up by viewport height worth of lines
                 // Set goal column if not already set
                 if self.goal_column.is_none() && !self.selections.is_empty() {
@@ -728,8 +852,12 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::PageDown) => {
+                // Save position before page jump
+                self.nav_history.checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
+
                 // Move cursor down by viewport height worth of lines
                 // Set goal column if not already set
                 if self.goal_column.is_none() && !self.selections.is_empty() {
@@ -759,8 +887,11 @@ impl InputHandler {
                         sel.anchor = sel.cursor;
                     }
                 }
+                return InputAction::Redraw;
             }
             Key::Named(NamedKey::Space) => {
+                // Save snapshot before edit
+                self.save_snapshot_to_history(doc);
                 // Handle space explicitly since it's not in Key::Character
                 for sel in &self.selections {
                     if !sel.is_cursor() {
@@ -788,12 +919,15 @@ impl InputHandler {
                     sel.cursor.column += 1;
                     sel.anchor = sel.cursor;
                 }
+                return InputAction::Redraw;
             }
-            _ => {}
+            _ => {
+                return InputAction::None;
+            }
         }
 
-        // Return true to indicate potential scrolling needed
-        true
+        // Default: potential scrolling needed
+        InputAction::Redraw
     }
 
     /// Handle mouse click
@@ -812,6 +946,9 @@ impl InputHandler {
         // Flush any pending syntax updates before handling click
         self.flush_syntax_updates(doc);
 
+        // Save current position to navigation history before jumping
+        let current_pos = self.primary_cursor_doc_pos(doc);
+
         // Reset goal column when clicking
         self.goal_column = None;
 
@@ -823,6 +960,16 @@ impl InputHandler {
         };
         let tree = doc.read();
         let doc_pos = viewport.layout_to_doc_with_tree(layout_pos, &tree);
+
+        // Only save to navigation history if we're jumping a significant distance
+        let distance = if current_pos.line > doc_pos.line {
+            current_pos.line - doc_pos.line
+        } else {
+            doc_pos.line - current_pos.line
+        };
+        if distance > 5 {
+            self.nav_history.checkpoint_if_changed(current_pos);
+        }
 
         if alt_held {
             // Alt+click adds new cursor
@@ -1085,5 +1232,81 @@ impl InputHandler {
         }
 
         (selection_widgets, cursor_widget)
+    }
+
+    /// Save current document state to history before making an edit
+    fn save_snapshot_to_history(&mut self, doc: &Doc) {
+        // Only save if we have pending edits or this is a new operation
+        if self.pending_edits.is_empty() || self.last_edit_time.is_none() ||
+           self.last_edit_time.map(|t| t.elapsed().as_millis() > 500).unwrap_or(true) {
+            // Save current state with selections
+            let snapshot = DocumentSnapshot {
+                tree: doc.read(),
+                selections: self.selections.clone(),
+            };
+            self.history.checkpoint(snapshot);
+        }
+    }
+
+    /// Perform undo operation
+    pub fn undo(&mut self, doc: &Doc) -> bool {
+        // Flush any pending edits first
+        self.flush_pending_edits(doc);
+        self.flush_syntax_updates(doc);
+
+        // Create current snapshot
+        let current_snapshot = DocumentSnapshot {
+            tree: doc.read(),
+            selections: self.selections.clone(),
+        };
+
+        if let Some(previous_snapshot) = self.history.undo(current_snapshot) {
+            // Replace the tree
+            doc.replace_tree(previous_snapshot.tree);
+
+            // Restore selections
+            self.selections = previous_snapshot.selections;
+
+            // Update next_id to be higher than any restored selection
+            self.next_id = self.selections
+                .iter()
+                .map(|s| s.id)
+                .max()
+                .unwrap_or(0) + 1;
+
+            return true;
+        }
+        false
+    }
+
+    /// Perform redo operation
+    pub fn redo(&mut self, doc: &Doc) -> bool {
+        // Flush any pending edits first
+        self.flush_pending_edits(doc);
+        self.flush_syntax_updates(doc);
+
+        // Create current snapshot
+        let current_snapshot = DocumentSnapshot {
+            tree: doc.read(),
+            selections: self.selections.clone(),
+        };
+
+        if let Some(next_snapshot) = self.history.redo(current_snapshot) {
+            // Replace the tree
+            doc.replace_tree(next_snapshot.tree);
+
+            // Restore selections
+            self.selections = next_snapshot.selections;
+
+            // Update next_id to be higher than any restored selection
+            self.next_id = self.selections
+                .iter()
+                .map(|s| s.id)
+                .max()
+                .unwrap_or(0) + 1;
+
+            return true;
+        }
+        false
     }
 }
