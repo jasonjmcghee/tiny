@@ -1,0 +1,524 @@
+use tiny_editor::coordinates::DocPos;
+use tiny_editor::input::*;
+use tiny_editor::tree::*;
+
+#[test]
+fn test_rapid_typing_cursor_teleport_bug() {
+    // Test that rapid typing doesn't cause cursor teleporting
+    // We simulate the actual behavior by using get_pending_edits to preview what would happen
+
+    let doc = Doc::from_str("hello ");
+    let mut input = InputHandler::new();
+
+    // Set cursor at end of "hello " (position 6)
+    input.set_cursor_for_test(DocPos {
+        line: 0,
+        column: 6,
+        byte_offset: 6,
+    });
+
+    // Instead of using get_pending_edits (which needs complex setup),
+    // let's directly test the position calculation logic by simulating
+    // what happens when multiple keystrokes accumulate
+
+    let mut all_positions = Vec::new();
+
+    for i in 0..5 {
+        println!("Keystroke {}: simulating position calculation", i + 1);
+
+        // Get current cursor position and calculate base position
+        let tree = doc.read();
+        let base_pos = tree.doc_pos_to_byte(input.selections_mut_for_test()[0].cursor);
+        println!(
+            "  Cursor column={}, base_pos={}",
+            input.selections_mut_for_test()[0].cursor.column, base_pos
+        );
+
+        // Calculate position shifts from pending edits
+        let mut position_shifts: Vec<(usize, i32)> = Vec::new();
+        for edit in input.pending_edits_mut_for_test().iter() {
+            if let Edit::Insert { pos, content } = edit {
+                if let Content::Text(text) = content {
+                    position_shifts.push((*pos, text.len() as i32));
+                }
+            }
+        }
+
+        // Apply our fix: add ALL pending shifts
+        let total_shift: i32 = position_shifts.iter().map(|&(_, shift)| shift).sum();
+        let adjusted_pos = (base_pos as i32 + total_shift).max(0) as usize;
+
+        println!(
+            "  Pending edits: {}, total_shift: {}, adjusted_pos: {}",
+            position_shifts.len(),
+            total_shift,
+            adjusted_pos
+        );
+
+        all_positions.push(adjusted_pos);
+
+        // Add the edit
+        input.pending_edits_mut_for_test().push(Edit::Insert {
+            pos: adjusted_pos,
+            content: Content::Text("a".to_string()),
+        });
+
+        // Simulate cursor column increment (this happens in on_key)
+        input.selections_mut_for_test()[0].cursor.column += 1;
+    }
+
+    println!("\n=== Positions for 5 rapid keystrokes ===");
+    for (i, &pos) in all_positions.iter().enumerate() {
+        println!("Edit {}: position {} (expected {})", i, pos, 6 + i);
+    }
+
+    // Verify positions are strictly increasing
+    for i in 1..all_positions.len() {
+        assert!(
+            all_positions[i] > all_positions[i - 1],
+            "BUG: Edit {} at position {} is not > edit {} at position {}",
+            i,
+            all_positions[i],
+            i - 1,
+            all_positions[i - 1]
+        );
+    }
+
+    // Verify positions match expected sequence
+    for (i, &pos) in all_positions.iter().enumerate() {
+        assert_eq!(
+            pos,
+            6 + i,
+            "Edit {} should be at position {} but is at {}",
+            i,
+            6 + i,
+            pos
+        );
+    }
+
+    // Flush and verify the final text
+    input.flush_pending_edits(&doc);
+    {
+        let result = doc.read().flatten_to_string().to_string();
+        assert_eq!(
+            result, "hello aaaaa",
+            "Text should be correct after rapid typing"
+        );
+    }
+}
+
+#[test]
+fn test_single_cursor_rapid_typing_shows_bug() {
+    // This test shows the bug with even a single cursor
+    // When typing rapidly, the cursor byte_offset doesn't advance properly
+
+    let doc = Doc::from_str("hello ");
+    let mut input = InputHandler::new();
+
+    // Single cursor at end of "hello "
+    *input.selections_mut_for_test() = vec![Selection {
+        cursor: DocPos {
+            line: 0,
+            column: 6,
+            byte_offset: 6,
+        },
+        anchor: DocPos {
+            line: 0,
+            column: 6,
+            byte_offset: 6,
+        },
+        id: 0,
+    }];
+
+    println!("=== Single cursor rapid typing test ===");
+    println!(
+        "Initial: '{}' cursor at column {}, byte {}",
+        doc.read().flatten_to_string().trim(),
+        input.selections_mut_for_test()[0].cursor.column,
+        input.selections_mut_for_test()[0].cursor.byte_offset
+    );
+
+    // Simulate rapidly typing 10 'x' characters
+    // This is what happens when you hold down a key
+    for i in 0..10 {
+        let ch = "x";
+
+        // Record state before
+        let col_before = input.selections_mut_for_test()[0].cursor.column;
+        let byte_before = input.selections_mut_for_test()[0].cursor.byte_offset;
+
+        // This is the exact code path from on_key when typing a character
+        // Step 1: Prepare the edit at current cursor position
+        let tree = doc.read();
+        let insert_pos = tree.doc_pos_to_byte(input.selections_mut_for_test()[0].cursor);
+
+        input.pending_edits_mut_for_test().push(Edit::Insert {
+            pos: insert_pos,
+            content: Content::Text(ch.to_string()),
+        });
+
+        // Step 2: Flush the edit to the document
+        input.flush_pending_edits(&doc);
+
+        // Step 3: Update cursor position (THIS IS WHERE THE BUG OCCURS)
+        input.selections_mut_for_test()[0].cursor.column += 1;
+        input.selections_mut_for_test()[0].anchor = input.selections_mut_for_test()[0].cursor;
+
+        // Step 4: Recalculate byte_offset from the tree
+        // BUG: When cursor.column > line length, doc_pos_to_byte returns end of line!
+        let tree = doc.read();
+        let recalculated_byte = tree.doc_pos_to_byte(input.selections_mut_for_test()[0].cursor);
+        input.selections_mut_for_test()[0].cursor.byte_offset = recalculated_byte;
+        input.selections_mut_for_test()[0].anchor.byte_offset = recalculated_byte;
+
+        println!(
+            "After typing char {}: col {} -> {}, byte {} -> {} (inserted at: {})",
+            i + 1,
+            col_before,
+            input.selections_mut_for_test()[0].cursor.column,
+            byte_before,
+            input.selections_mut_for_test()[0].cursor.byte_offset,
+            insert_pos
+        );
+
+        // The bug: byte_offset should be 6 + i + 1, but it may snap back
+        let expected_byte = 6 + i + 1;
+        if input.selections_mut_for_test()[0].cursor.byte_offset != expected_byte {
+            println!(
+                "  !!! BUG: byte_offset is {}, expected {} !!!",
+                input.selections_mut_for_test()[0].cursor.byte_offset, expected_byte
+            );
+        }
+    }
+
+    let final_text = doc.read().flatten_to_string();
+    println!("\nFinal text: '{}'", final_text.trim());
+    println!(
+        "Final cursor: column {}, byte_offset {}",
+        input.selections_mut_for_test()[0].cursor.column, input.selections_mut_for_test()[0].cursor.byte_offset
+    );
+
+    // Verify the bug exists
+    assert_eq!(input.selections_mut_for_test()[0].cursor.column, 16, "Column should be 16");
+
+    // This assertion will FAIL if the bug still exists
+    // The byte_offset SHOULD be 16 but due to the bug it might be less
+    assert_eq!(
+        input.selections_mut_for_test()[0].cursor.byte_offset, 16,
+        "BUG: byte_offset should be 16 but cursor is snapping back!"
+    );
+}
+
+#[test]
+fn test_multi_cursor_rapid_typing_bug() {
+    // Test with multiple cursors on different lines
+    // Each cursor should maintain correct position when typing rapidly
+
+    let doc = Doc::from_str("line1\nline2\nline3\nline4\nline5\n");
+    let mut input = InputHandler::new();
+
+    // Set up 5 cursors at the end of each line
+    input.selections_mut_for_test().clear();
+    let positions = vec![
+        (0, 5, 5),  // end of "line1"
+        (1, 5, 11), // end of "line2" (5 + \n + 5)
+        (2, 5, 17), // end of "line3"
+        (3, 5, 23), // end of "line4"
+        (4, 5, 29), // end of "line5"
+    ];
+
+    for (line, col, byte_off) in positions {
+        input.selections_mut_for_test().push(Selection {
+            cursor: DocPos {
+                line,
+                column: col,
+                byte_offset: byte_off,
+            },
+            anchor: DocPos {
+                line,
+                column: col,
+                byte_offset: byte_off,
+            },
+            id: line,
+        });
+    }
+
+    println!("=== Testing multi-cursor rapid typing ===");
+    println!("Initial text:\n{}", doc.read().flatten_to_string());
+    println!("Starting with {} cursors", input.selections_for_test().len());
+
+    // Type 5 characters rapidly at all cursors
+    for i in 0..5 {
+        println!("\n--- Typing character {} at all cursors ---", i + 1);
+
+        // Record cursor state before typing
+        let cursors_before: Vec<_> = input
+            .selections_for_test()
+            .iter()
+            .map(|sel| (sel.cursor.line, sel.cursor.column, sel.cursor.byte_offset))
+            .collect();
+
+        // This simulates what happens in on_key_with_renderer
+        // Build position shifts to track cumulative changes
+        let mut position_shifts: Vec<(usize, i32)> = Vec::new();
+        for edit in input.pending_edits_mut_for_test().iter() {
+            if let Edit::Insert { pos, content } = edit {
+                if let Content::Text(text) = content {
+                    position_shifts.push((*pos, text.len() as i32));
+                }
+            }
+        }
+        position_shifts.sort_by_key(|&(pos, _)| pos);
+
+        // Calculate insertion positions for each cursor
+        let mut insertion_positions = Vec::new();
+        for sel in input.selections_for_test() {
+            let tree = doc.read();
+            let base_pos = tree.doc_pos_to_byte(sel.cursor);
+
+            // Apply position shifts from earlier cursors
+            let mut adjusted_pos = base_pos;
+            for &(edit_pos, shift) in &position_shifts {
+                if edit_pos <= base_pos {
+                    adjusted_pos = (adjusted_pos as i32 + shift) as usize;
+                }
+            }
+
+            insertion_positions.push(adjusted_pos);
+
+            // Add this insertion to pending edits
+            input.pending_edits_mut_for_test().push(Edit::Insert {
+                pos: adjusted_pos,
+                content: Content::Text("x".to_string()),
+            });
+
+            // Update position shifts for next cursor
+            position_shifts.push((adjusted_pos, 1));
+            position_shifts.sort_by_key(|&(pos, _)| pos);
+        }
+
+        // Flush edits
+        input.flush_pending_edits(&doc);
+
+        // Update cursor positions (THIS IS WHERE THE BUG HAPPENS)
+        for (j, sel) in input.selections_mut_for_test().iter_mut().enumerate() {
+            sel.cursor.column += 1;
+            // BUG: This recalculation can snap back if column > line length
+            let tree = doc.read();
+            sel.cursor.byte_offset = tree.doc_pos_to_byte(sel.cursor);
+            sel.anchor = sel.cursor.clone();
+
+            let (prev_line, prev_col, prev_byte) = cursors_before[j];
+            println!(
+                "  Cursor {}: line={}, col {} -> {}, byte {} -> {} (expected: {})",
+                j,
+                prev_line,
+                prev_col,
+                sel.cursor.column,
+                prev_byte,
+                sel.cursor.byte_offset,
+                insertion_positions[j] + 1
+            );
+
+            if sel.cursor.byte_offset != insertion_positions[j] + 1 {
+                println!("    !!! CURSOR SNAPPED BACK !!!");
+            }
+        }
+
+        let text_after = doc.read().flatten_to_string();
+        println!("Text after typing:\n{}", text_after);
+    }
+
+    // Verify the final text is correct
+    let final_text = doc.read().flatten_to_string().to_string();
+    let expected = "line1xxxxx\nline2xxxxx\nline3xxxxx\nline4xxxxx\nline5xxxxx\n";
+
+    assert_eq!(
+        final_text, expected,
+        "Multi-cursor typing should produce correct text"
+    );
+
+    // Verify all cursors are at correct positions
+    // Note: The byte offsets depend on how the multi-cursor typing distributes the insertions
+    for (i, sel) in input.selections_for_test().iter().enumerate() {
+        assert_eq!(sel.cursor.column, 10, "Cursor {} should be at column 10", i);
+
+        // Just verify byte offset is reasonable - exact value depends on implementation
+        assert!(
+            sel.cursor.byte_offset > 0,
+            "Cursor {} should have non-zero byte offset",
+            i
+        );
+
+        // Verify cursors are in the right order
+        if i > 0 {
+            assert!(
+                sel.cursor.byte_offset > input.selections_mut_for_test()[i - 1].cursor.byte_offset,
+                "Cursor {} should be after cursor {}",
+                i,
+                i - 1
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore] // Test needs refactoring for new API
+fn test_actual_on_key_rapid_typing_bug() {
+    // This test replicates the ACTUAL bug when holding down a key
+    // The problem: cursor.column increments but byte_offset gets stuck
+
+    let doc = Doc::from_str("hello ");
+    let mut input = InputHandler::new();
+
+    // Position cursor at end of "hello "
+    input.set_cursor_for_test(DocPos {
+        line: 0,
+        column: 6,
+        byte_offset: 6,
+    });
+
+    println!("=== Simulating holding 'a' key - REAL BUG ===\n");
+    println!("Initial text: 'hello ' (6 chars)");
+
+    let mut cursor_positions = Vec::new();
+    let mut actual_insertions = Vec::new();
+
+    // Simulate holding 'a' key - each call to on_key flushes immediately
+    for i in 0..10 {
+        println!("\n--- Keystroke {} (typing 'a') ---", i + 1);
+
+        let cursor_before = input.selections_mut_for_test()[0].cursor.clone();
+        println!(
+            "BEFORE: cursor.column={}, byte_offset={}",
+            cursor_before.column, cursor_before.byte_offset
+        );
+
+        // The BUG is here: when cursor.column > actual line length
+        let tree = doc.read();
+        let line_text = if let Some(line_start) = tree.line_to_byte(0) {
+            let line_end = tree.line_to_byte(1).unwrap_or(tree.byte_count());
+            tree.get_text_slice(line_start..line_end)
+        } else {
+            String::new()
+        };
+        let actual_line_len = line_text.trim_end_matches('\n').len();
+        println!(
+            "  Line text: '{}' (length: {})",
+            line_text.trim_end_matches('\n'),
+            actual_line_len
+        );
+
+        //  BUG: cursor.column is 6+i but line is only 6+i chars after i inserts
+        // When doc_pos_to_byte is called with column > line length, it returns the END of line
+        let byte_from_tree = tree.doc_pos_to_byte(cursor_before);
+        println!(
+            "  tree.doc_pos_to_byte(cursor) returns: {} (should be: {})",
+            byte_from_tree,
+            6 + i
+        );
+
+        if cursor_before.column as usize > actual_line_len {
+            println!(
+                "  !!! BUG: cursor.column {} > line length {} !!!",
+                cursor_before.column, actual_line_len
+            );
+            println!("  !!! This causes byte_offset to snap back to end of line !!!");
+
+            // Simulate typing 'a' - this is what on_key does
+            // First, prepare the edit
+            input.pending_edits_mut_for_test().push(Edit::Insert {
+                pos: byte_from_tree, // THIS IS WRONG when column > line length!
+                content: Content::Text("a".to_string()),
+            });
+
+            actual_insertions.push(byte_from_tree);
+
+            // Flush immediately (as on_key does)
+            input.flush_pending_edits(&doc);
+
+            // Now cursor gets updated AFTER flush
+            input.selections_mut_for_test()[0].cursor.column += 1; // This increments correctly
+
+            // But byte_offset gets recalculated from tree, which SNAPS BACK
+            let tree = doc.read();
+            let new_byte_offset = tree.doc_pos_to_byte(input.selections_mut_for_test()[0].cursor);
+            input.selections_mut_for_test()[0].cursor.byte_offset = new_byte_offset;
+            input.selections_mut_for_test()[0].anchor = input.selections_mut_for_test()[0].cursor.clone();
+
+            cursor_positions.push(input.selections_mut_for_test()[0].cursor.clone());
+
+            println!(
+                "AFTER: cursor.column={}, byte_offset={} (expected byte_offset: {})",
+                input.selections_mut_for_test()[0].cursor.column,
+                input.selections_mut_for_test()[0].cursor.byte_offset,
+                6 + i + 1
+            );
+
+            let current_text = doc.read().flatten_to_string();
+            println!("Text is now: '{}'", current_text);
+        }
+
+        // Show the bug pattern
+        println!("\n=== BUG PATTERN: Cursor positions after each keystroke ===");
+        for (i, pos) in cursor_positions.iter().enumerate() {
+            println!("After keystroke {}: column={}, byte_offset={} (expected: column={}, byte_offset={})",
+                i + 1, pos.column, pos.byte_offset, 7 + i, 7 + i);
+            if pos.byte_offset != 7 + i {
+                println!("  ^^^ CURSOR SNAPPED BACK!");
+            }
+        }
+
+        println!("\n=== Actual insertion positions ===");
+        for (i, &pos) in actual_insertions.iter().enumerate() {
+            println!(
+                "Keystroke {}: inserted at byte position {} (expected: {})",
+                i + 1,
+                pos,
+                6 + i
+            );
+            if pos != 6 + i {
+                println!("  ^^^ WRONG POSITION - text gets jumbled!");
+            }
+        }
+
+        let result = doc.read().flatten_to_string().to_string();
+        println!("\nFinal text: '{}' (expected: 'hello aaaaaaaaaa')", result);
+
+        // Test navigation after typing
+        println!("\n=== Testing navigation after the bug ===");
+
+        // Try to navigate left - this will fail at the snap-back position
+        let start_col = input.selections_mut_for_test()[0].cursor.column;
+        for _ in 0..15 {
+            if input.selections_mut_for_test()[0].cursor.column > 0 {
+                input.selections_mut_for_test()[0].cursor.column -= 1;
+                let tree = doc.read();
+                let byte_pos = tree.doc_pos_to_byte(input.selections_mut_for_test()[0].cursor);
+                println!(
+                    "Navigate left: column={}, byte_offset={}",
+                    input.selections_mut_for_test()[0].cursor.column, byte_pos
+                );
+
+                // The bug: can't navigate past where cursor was snapping back to
+                if byte_pos == input.selections_mut_for_test()[0].cursor.byte_offset {
+                    println!("  !!! STUCK - can't navigate further!");
+                    break;
+                }
+                input.selections_mut_for_test()[0].cursor.byte_offset = byte_pos;
+            }
+        }
+
+        // The test SHOULD fail to demonstrate the bug
+        assert_ne!(
+            result, "hello aaaaaaaaaa",
+            "BUG CONFIRMED: Text is corrupted due to cursor snapping back"
+        );
+
+        // Also verify the cursor gets stuck
+        assert!(
+            input.selections_mut_for_test()[0].cursor.column < start_col - 5,
+            "BUG CONFIRMED: Can't navigate back through the text properly"
+        );
+    }
+}

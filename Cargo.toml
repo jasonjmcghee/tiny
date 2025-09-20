@@ -47,18 +47,22 @@ simdutf8 = "0.1.5"
 bytecount = "0.6.9"
 mimalloc = "0.1.48"
 
+[features]
+test-support = []
+
 [dev-dependencies]
 criterion = "0.7"  # Benchmarking
-proptest = "1.6"   # Property testing
 pollster = "0.3"   # Async executor for examples
 
 [profile.release]
 # lto = true
 # codegen-units = 1
 opt-level = 3
+debug = true
 
 [profile.dev]
 opt-level = 1  # Faster compilation, still decent perf
+
 
 [[bench]]
 name = "tree_bench"
