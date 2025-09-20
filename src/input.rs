@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::event::{ElementState, KeyEvent, MouseButton};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, NamedKey};
 
 /// Actions that can be triggered by input
 pub enum InputAction {
@@ -194,6 +194,495 @@ impl InputHandler {
             has_pending_syntax_update: false,
             history: DocumentHistory::new(),
             nav_history: SelectionHistory::with_max_size(50),
+        }
+    }
+
+    /// Calculate position shifts from pending edits
+    fn calculate_position_shifts(&self) -> Vec<(usize, i32)> {
+        let mut shifts = Vec::new();
+        for edit in &self.pending_edits {
+            match edit {
+                Edit::Insert { pos, content } => {
+                    if let Content::Text(text) = content {
+                        shifts.push((*pos, text.len() as i32));
+                    }
+                }
+                Edit::Delete { range } => {
+                    shifts.push((range.start, -(range.end as i32 - range.start as i32)));
+                }
+                Edit::Replace { range, content } => {
+                    let insert_len = if let Content::Text(text) = content {
+                        text.len() as i32
+                    } else {
+                        0
+                    };
+                    let delete_len = range.end as i32 - range.start as i32;
+                    shifts.push((range.start, insert_len - delete_len));
+                }
+            }
+        }
+        shifts.sort_by_key(|&(pos, _)| pos);
+        shifts
+    }
+
+    /// Handle character typing with optional renderer
+    fn handle_character_input(
+        &mut self,
+        doc: &Doc,
+        ch: &str,
+        renderer: Option<&mut crate::render::Renderer>,
+    ) -> InputAction {
+        self.goal_column = None;
+        self.save_snapshot_to_history(doc);
+
+        let mut position_shifts = self.calculate_position_shifts();
+        let mut insertion_positions = Vec::new();
+
+        for sel in &self.selections {
+            if !sel.is_cursor() {
+                let del_range = sel.byte_range(doc);
+                let mut adjusted_start = del_range.start;
+                let mut adjusted_end = del_range.end;
+                for &(edit_pos, shift) in &position_shifts {
+                    if edit_pos <= del_range.start {
+                        adjusted_start = (adjusted_start as i32 + shift).max(0) as usize;
+                        adjusted_end = (adjusted_end as i32 + shift).max(0) as usize;
+                    } else if edit_pos < del_range.end {
+                        adjusted_end = (adjusted_end as i32 + shift).max(0) as usize;
+                    }
+                }
+
+                self.pending_edits.push(Edit::Delete {
+                    range: adjusted_start..adjusted_end,
+                });
+                position_shifts.push((
+                    adjusted_start,
+                    -(adjusted_end as i32 - adjusted_start as i32),
+                ));
+                position_shifts.sort_by_key(|&(pos, _)| pos);
+            }
+
+            let tree = doc.read();
+            let cursor_pos = sel.min_pos();
+            let line_byte_start = tree.line_to_byte(cursor_pos.line).unwrap_or(0);
+            let line_byte_end = tree
+                .line_to_byte(cursor_pos.line + 1)
+                .unwrap_or(tree.byte_count());
+            let line_text = tree.get_text_slice(line_byte_start..line_byte_end);
+            let line_char_count = line_text.trim_end_matches('\n').chars().count() as u32;
+
+            let adjusted_pos = if cursor_pos.column > line_char_count {
+                let line_end_byte = line_byte_start + line_text.trim_end_matches('\n').len();
+                let total_pending: i32 = position_shifts.iter().map(|&(_, shift)| shift).sum();
+                (line_end_byte as i32 + total_pending).max(0) as usize
+            } else {
+                let base_pos = tree.doc_pos_to_byte(cursor_pos);
+                let total_shift: i32 = position_shifts
+                    .iter()
+                    .filter(|&&(pos, _)| pos <= base_pos)
+                    .map(|&(_, shift)| shift)
+                    .sum();
+                (base_pos as i32 + total_shift).max(0) as usize
+            };
+
+            insertion_positions.push(adjusted_pos);
+            self.pending_edits.push(Edit::Insert {
+                pos: adjusted_pos,
+                content: Content::Text(ch.to_string()),
+            });
+            position_shifts.push((adjusted_pos, ch.len() as i32));
+            position_shifts.sort_by_key(|&(pos, _)| pos);
+        }
+
+        self.flush_pending_edits_with_renderer(doc, renderer);
+
+        let ch_len = ch.len() as u32;
+        for (i, sel) in self.selections.iter_mut().enumerate() {
+            if !sel.is_cursor() {
+                sel.cursor = sel.min_pos();
+            }
+            sel.cursor.column += ch_len;
+            sel.anchor = sel.cursor;
+            sel.cursor.byte_offset = insertion_positions[i] + ch.len();
+            sel.anchor.byte_offset = sel.cursor.byte_offset;
+        }
+
+        InputAction::Redraw
+    }
+
+    /// Move cursor vertically (up/down)
+    fn move_cursor_vertical(&mut self, doc: &Doc, direction: i32, shift_held: bool) {
+        if self.goal_column.is_none() && !self.selections.is_empty() {
+            self.goal_column = Some(self.selections[0].cursor.column);
+        }
+
+        for sel in &mut self.selections {
+            let tree = doc.read();
+            if direction < 0 && sel.cursor.line > 0 {
+                sel.cursor.line -= 1;
+            } else if direction > 0 && tree.line_to_byte(sel.cursor.line + 1).is_some() {
+                sel.cursor.line += 1;
+            } else {
+                continue;
+            }
+
+            if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
+                let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
+                let line_text = tree.get_text_slice(line_start..line_end);
+                let line_text_trimmed = line_text.trim_end_matches('\n');
+                let line_length = line_text_trimmed.chars().count() as u32;
+                let target_column = self.goal_column.unwrap_or(sel.cursor.column);
+                sel.cursor.column = target_column.min(line_length);
+            }
+
+            if !shift_held {
+                sel.anchor = sel.cursor;
+            }
+        }
+    }
+
+    /// Move cursor horizontally (left/right)
+    fn move_cursor_horizontal(&mut self, doc: &Doc, direction: i32, shift_held: bool) {
+        self.goal_column = None;
+
+        for sel in &mut self.selections {
+            let tree = doc.read();
+
+            if direction < 0 {
+                if sel.cursor.column > 0 {
+                    sel.cursor.column -= 1;
+                } else if sel.cursor.line > 0 {
+                    sel.cursor.line -= 1;
+                    if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
+                        let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
+                        let line_text = tree.get_text_slice(line_start..line_end);
+                        let line_text_trimmed = line_text.trim_end_matches('\n');
+                        sel.cursor.column = line_text_trimmed.chars().count() as u32;
+                    }
+                }
+            } else {
+                if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
+                    let line_end = tree.line_to_byte(sel.cursor.line + 1).unwrap_or(tree.byte_count());
+                    let line_text = tree.get_text_slice(line_start..line_end);
+                    let line_text_trimmed = line_text.trim_end_matches('\n');
+                    let line_length = line_text_trimmed.chars().count() as u32;
+
+                    if sel.cursor.column < line_length {
+                        sel.cursor.column += 1;
+                    } else {
+                        sel.cursor.line += 1;
+                        sel.cursor.column = 0;
+                        if tree.line_to_byte(sel.cursor.line).is_none() {
+                            sel.cursor.line -= 1;
+                            sel.cursor.column = line_length;
+                        }
+                    }
+                }
+            }
+
+            if !shift_held {
+                sel.anchor = sel.cursor;
+            }
+        }
+    }
+
+    /// Delete at cursor position (forward or backward)
+    fn delete_at_cursor(&mut self, doc: &Doc, forward: bool) -> InputAction {
+        self.save_snapshot_to_history(doc);
+
+        if forward {
+            // Delete key behavior
+            for sel in &self.selections {
+                if !sel.is_cursor() {
+                    self.pending_edits.push(Edit::Delete {
+                        range: sel.byte_range(doc),
+                    });
+                } else {
+                    let tree = doc.read();
+                    let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
+                    if cursor_byte < tree.byte_count() {
+                        self.pending_edits.push(Edit::Delete {
+                            range: cursor_byte..cursor_byte + 1,
+                        });
+                    }
+                }
+            }
+            self.flush_pending_edits(doc);
+        } else {
+            // Backspace behavior - more complex due to cursor movement
+            struct DeleteInfo {
+                deleted_char: Option<String>,
+                prev_line_end_col: Option<u32>,
+            }
+            let mut delete_info = Vec::new();
+
+            for sel in &self.selections {
+                if !sel.is_cursor() {
+                    self.pending_edits.push(Edit::Delete {
+                        range: sel.byte_range(doc),
+                    });
+                    delete_info.push(DeleteInfo {
+                        deleted_char: None,
+                        prev_line_end_col: None,
+                    });
+                } else if sel.cursor.line > 0 || sel.cursor.column > 0 {
+                    let tree = doc.read();
+                    let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
+                    if cursor_byte > 0 {
+                        let delete_range = cursor_byte - 1..cursor_byte;
+                        let deleted_char = tree.get_text_slice(delete_range.clone());
+
+                        let prev_line_end_col = if deleted_char == "\n" && sel.cursor.line > 0 {
+                            if let Some(line_start) = tree.line_to_byte(sel.cursor.line - 1) {
+                                let line_end = tree.line_to_byte(sel.cursor.line).unwrap_or(tree.byte_count());
+                                let line_text = tree.get_text_slice(line_start..line_end - 1);
+                                let mut visual_column = 0u32;
+                                const TAB_WIDTH: u32 = 4;
+                                for ch in line_text.chars() {
+                                    if ch == '\t' {
+                                        visual_column = ((visual_column / TAB_WIDTH) + 1) * TAB_WIDTH;
+                                    } else if ch != '\n' {
+                                        visual_column += 1;
+                                    }
+                                }
+                                Some(visual_column)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        delete_info.push(DeleteInfo {
+                            deleted_char: Some(deleted_char.clone()),
+                            prev_line_end_col,
+                        });
+
+                        self.pending_edits.push(Edit::Delete {
+                            range: delete_range,
+                        });
+                    } else {
+                        delete_info.push(DeleteInfo {
+                            deleted_char: None,
+                            prev_line_end_col: None,
+                        });
+                    }
+                } else {
+                    delete_info.push(DeleteInfo {
+                        deleted_char: None,
+                        prev_line_end_col: None,
+                    });
+                }
+            }
+
+            self.flush_pending_edits(doc);
+
+            // Move cursors back for backspace
+            for (i, sel) in self.selections.iter_mut().enumerate() {
+                let info = delete_info.get(i);
+
+                if !sel.is_cursor() {
+                    sel.cursor = sel.min_pos();
+                    sel.anchor = sel.cursor;
+                } else if sel.cursor.column > 0 {
+                    if let Some(info) = info {
+                        if let Some(ref deleted) = info.deleted_char {
+                            if deleted == "\t" {
+                                const TAB_WIDTH: u32 = 4;
+                                let current_tab_stop = (sel.cursor.column + TAB_WIDTH - 1) / TAB_WIDTH;
+                                sel.cursor.column = (current_tab_stop - 1) * TAB_WIDTH;
+                            } else {
+                                sel.cursor.column -= 1;
+                            }
+                        } else {
+                            sel.cursor.column -= 1;
+                        }
+                    } else {
+                        sel.cursor.column -= 1;
+                    }
+                    sel.anchor = sel.cursor;
+                } else if sel.cursor.line > 0 {
+                    sel.cursor.line -= 1;
+                    if let Some(info) = info {
+                        if let Some(ref deleted) = info.deleted_char {
+                            if deleted == "\n" {
+                                if let Some(col) = info.prev_line_end_col {
+                                    sel.cursor.column = col;
+                                } else {
+                                    sel.cursor.column = 0;
+                                }
+                            } else {
+                                sel.cursor.column = 0;
+                            }
+                        } else {
+                            sel.cursor.column = 0;
+                        }
+                    } else {
+                        sel.cursor.column = 0;
+                    }
+                    sel.anchor = sel.cursor;
+                }
+            }
+        }
+
+        InputAction::Redraw
+    }
+
+    /// Insert text at cursor positions
+    fn insert_text(&mut self, doc: &Doc, text: &str) -> InputAction {
+        self.save_snapshot_to_history(doc);
+
+        for sel in &self.selections {
+            if !sel.is_cursor() {
+                self.pending_edits.push(Edit::Delete {
+                    range: sel.byte_range(doc),
+                });
+            }
+            let tree = doc.read();
+            let insert_pos = tree.doc_pos_to_byte(sel.min_pos());
+            self.pending_edits.push(Edit::Insert {
+                pos: insert_pos,
+                content: Content::Text(text.to_string()),
+            });
+        }
+
+        self.flush_pending_edits(doc);
+
+        // Update cursor positions based on inserted text
+        let text_chars = text.chars().count() as u32;
+        let is_newline = text == "\n";
+        let is_tab = text == "\t";
+
+        for sel in &mut self.selections {
+            if !sel.is_cursor() {
+                sel.cursor = sel.min_pos();
+                sel.anchor = sel.cursor;
+            }
+
+            if is_newline {
+                sel.cursor.line += 1;
+                sel.cursor.column = 0;
+            } else if is_tab {
+                sel.cursor.column = ((sel.cursor.column / 4) + 1) * 4;
+            } else {
+                sel.cursor.column += text_chars;
+            }
+            sel.anchor = sel.cursor;
+        }
+
+        InputAction::Redraw
+    }
+
+    /// Get line length for a given line number
+    fn get_line_length(doc: &Doc, line: u32) -> u32 {
+        let tree = doc.read();
+        if let Some(line_start) = tree.line_to_byte(line) {
+            let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
+            let line_text = tree.get_text_slice(line_start..line_end);
+            line_text.trim_end_matches('\n').chars().count() as u32
+        } else {
+            0
+        }
+    }
+
+    /// Move cursor to start or end of line
+    fn move_to_line_edge(&mut self, doc: &Doc, to_end: bool, shift_held: bool) {
+        self.goal_column = None;
+
+        for sel in &mut self.selections {
+            if to_end {
+                sel.cursor.column = Self::get_line_length(doc, sel.cursor.line);
+            } else {
+                sel.cursor.column = 0;
+            }
+
+            if !shift_held {
+                sel.anchor = sel.cursor;
+            }
+        }
+    }
+
+    /// Page navigation (up/down)
+    fn page_jump(&mut self, doc: &Doc, up: bool, shift_held: bool) {
+        self.nav_history.checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
+
+        if self.goal_column.is_none() && !self.selections.is_empty() {
+            self.goal_column = Some(self.selections[0].cursor.column);
+        }
+
+        for sel in &mut self.selections {
+            let tree = doc.read();
+            let total_lines = tree.line_count();
+            const PAGE_SIZE: u32 = 20;
+
+            if up {
+                sel.cursor.line = sel.cursor.line.saturating_sub(PAGE_SIZE);
+            } else {
+                sel.cursor.line = (sel.cursor.line + PAGE_SIZE).min(total_lines.saturating_sub(1));
+            }
+
+            let line_length = Self::get_line_length(doc, sel.cursor.line);
+            let target_column = self.goal_column.unwrap_or(sel.cursor.column);
+            sel.cursor.column = target_column.min(line_length);
+
+            if !shift_held {
+                sel.anchor = sel.cursor;
+            }
+        }
+    }
+
+    /// Handle command key combinations
+    fn handle_command_key(&mut self, doc: &Doc, ch: &str, shift_held: bool) -> InputAction {
+        match ch {
+            "z" if shift_held => InputAction::Redo,
+            "z" => InputAction::Undo,
+            "c" => {
+                self.copy(doc);
+                InputAction::None
+            }
+            "x" => {
+                self.cut(doc);
+                InputAction::Redraw
+            }
+            "v" => {
+                self.paste(doc);
+                InputAction::Redraw
+            }
+            "s" => InputAction::Save,
+            "a" => {
+                self.select_all(doc);
+                InputAction::Redraw
+            }
+            "[" => {
+                self.navigate_history(doc, true)
+            }
+            "]" => {
+                self.navigate_history(doc, false)
+            }
+            _ => InputAction::None,
+        }
+    }
+
+    /// Navigate through cursor history
+    fn navigate_history(&mut self, doc: &Doc, back: bool) -> InputAction {
+        let current_pos = self.primary_cursor_doc_pos(doc);
+        let new_pos = if back {
+            self.nav_history.undo(current_pos)
+        } else {
+            self.nav_history.redo(current_pos)
+        };
+
+        if let Some(pos) = new_pos {
+            self.selections.clear();
+            self.selections.push(Selection {
+                cursor: pos,
+                anchor: pos,
+                id: self.next_id,
+            });
+            self.next_id += 1;
+            InputAction::Redraw
+        } else {
+            InputAction::None
         }
     }
 
@@ -423,189 +912,33 @@ impl InputHandler {
     pub fn on_key_with_renderer(
         &mut self,
         doc: &Doc,
-        _viewport: &Viewport,
+        viewport: &Viewport,
         event: &KeyEvent,
         modifiers: &winit::event::Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> InputAction {
-        if event.state != ElementState::Pressed {
-            return InputAction::None;
-        }
-
-        let cmd_held = modifiers.state().contains(ModifiersState::SUPER)
-            || modifiers.state().contains(ModifiersState::CONTROL);
-
-        match &event.logical_key {
-            Key::Character(ch) if !cmd_held => {
-                // Type character at all cursors
-                self.goal_column = None; // Reset goal column when typing
-
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-
-                // Calculate cumulative offset from existing pending edits
-                // This is critical for correct positioning when buffering multiple keystrokes
-                let mut position_shifts: Vec<(usize, i32)> = Vec::new();
-                for edit in &self.pending_edits {
-                    match edit {
-                        Edit::Insert { pos, content } => {
-                            if let Content::Text(text) = content {
-                                position_shifts.push((*pos, text.len() as i32));
-                            }
-                        }
-                        Edit::Delete { range } => {
-                            position_shifts
-                                .push((range.start, -(range.end as i32 - range.start as i32)));
-                        }
-                        Edit::Replace { range, content } => {
-                            let insert_len = if let Content::Text(text) = content {
-                                text.len() as i32
-                            } else {
-                                0
-                            };
-                            let delete_len = range.end as i32 - range.start as i32;
-                            position_shifts.push((range.start, insert_len - delete_len));
-                        }
-                    }
-                }
-                position_shifts.sort_by_key(|&(pos, _)| pos);
-
-                // Track where we insert each character for accurate cursor updates
-                let mut insertion_positions = Vec::new();
-
-                // Prepare edits with adjusted positions
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        // Delete selection first
-                        let del_range = sel.byte_range(doc);
-                        // Adjust range based on previous pending edits
-                        let mut adjusted_start = del_range.start;
-                        let mut adjusted_end = del_range.end;
-                        for &(edit_pos, shift) in &position_shifts {
-                            if edit_pos <= del_range.start {
-                                adjusted_start = (adjusted_start as i32 + shift).max(0) as usize;
-                                adjusted_end = (adjusted_end as i32 + shift).max(0) as usize;
-                            } else if edit_pos < del_range.end {
-                                adjusted_end = (adjusted_end as i32 + shift).max(0) as usize;
-                            }
-                        }
-
-                        self.pending_edits.push(Edit::Delete {
-                            range: adjusted_start..adjusted_end,
-                        });
-                        // Add this delete to our position shifts
-                        position_shifts.push((
-                            adjusted_start,
-                            -(adjusted_end as i32 - adjusted_start as i32),
-                        ));
-                        position_shifts.sort_by_key(|&(pos, _)| pos);
-                    }
-
-                    // Convert cursor position to byte offset for insertion
-                    let tree = doc.read();
-                    let cursor_pos = sel.min_pos();
-
-                    // Check if cursor is beyond the current line in the tree
-                    // This happens when typing rapidly - cursor.column increments but tree isn't updated yet
-                    let line_byte_start = tree.line_to_byte(cursor_pos.line).unwrap_or(0);
-                    let line_byte_end = tree
-                        .line_to_byte(cursor_pos.line + 1)
-                        .unwrap_or(tree.byte_count());
-                    let line_text = tree.get_text_slice(line_byte_start..line_byte_end);
-                    let line_char_count = line_text.trim_end_matches('\n').chars().count() as u32;
-
-                    let adjusted_pos = if cursor_pos.column > line_char_count {
-                        // Cursor is beyond line end - this means we're typing at the end
-                        // Insert at actual end of line plus any pending edits
-                        let line_end_byte =
-                            line_byte_start + line_text.trim_end_matches('\n').len();
-                        let total_pending: i32 =
-                            position_shifts.iter().map(|&(_, shift)| shift).sum();
-                        (line_end_byte as i32 + total_pending).max(0) as usize
-                    } else {
-                        // Normal case - cursor is within the line
-                        let base_pos = tree.doc_pos_to_byte(cursor_pos);
-                        let total_shift: i32 = position_shifts
-                            .iter()
-                            .filter(|&&(pos, _)| pos <= base_pos)
-                            .map(|&(_, shift)| shift)
-                            .sum();
-                        (base_pos as i32 + total_shift).max(0) as usize
-                    };
-
-                    // Remember where we're inserting for this cursor
-                    insertion_positions.push(adjusted_pos);
-
-                    self.pending_edits.push(Edit::Insert {
-                        pos: adjusted_pos,
-                        content: Content::Text(ch.to_string()),
-                    });
-                    // Add this insert to position shifts for next iteration
-                    position_shifts.push((adjusted_pos, ch.len() as i32));
-                    position_shifts.sort_by_key(|&(pos, _)| pos);
-                }
-
-                // Flush immediately WITH renderer for incremental updates
-                let _needs_redraw = self.flush_pending_edits_with_renderer(doc, renderer);
-
-                // Update cursors using the actual insertion positions
-                // This avoids the bug where doc_pos_to_byte clamps to line end
-                let ch_len = ch.len() as u32;
-
-                // Collect debug info before mutating selections
-                let debug_info: Vec<_> = if self.selections.len() > 1 {
-                    let tree = doc.read();
-                    self.selections
-                        .iter()
-                        .enumerate()
-                        .map(|(i, sel)| {
-                            let mut test_cursor = sel.cursor;
-                            test_cursor.column += ch_len;
-                            let would_be = tree.doc_pos_to_byte(test_cursor);
-                            let correct = insertion_positions[i] + ch.len();
-                            (would_be, correct, would_be != correct)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                for (i, sel) in self.selections.iter_mut().enumerate() {
-                    // Update column
-                    if !sel.is_cursor() {
-                        sel.cursor = sel.min_pos();
-                    }
-                    sel.cursor.column += ch_len;
-                    sel.anchor = sel.cursor;
-
-                    // Calculate byte_offset based on where we actually inserted
-                    // insertion_positions[i] is the byte position where we inserted the character
-                    // After insertion, cursor should be one position past that
-                    sel.cursor.byte_offset = insertion_positions[i] + ch.len();
-                    sel.anchor.byte_offset = sel.cursor.byte_offset;
-
-                    // Debug output
-                    if !debug_info.is_empty() && debug_info[i].2 {
-                        println!("!!! AVOIDING BUG: Cursor {} col={}, our byte={}, doc_pos_to_byte would return={}",
-                            i, sel.cursor.column, sel.cursor.byte_offset, debug_info[i].0);
-                    }
-                }
-
-                // Return redraw action
-                return InputAction::Redraw;
-            }
-            // For other keys, fall back to original implementation
-            _ => return self.on_key(doc, _viewport, event, modifiers),
-        }
+        self.on_key_internal(doc, viewport, event, modifiers, renderer)
     }
 
     /// Handle keyboard input
     pub fn on_key(
         &mut self,
         doc: &Doc,
+        viewport: &Viewport,
+        event: &KeyEvent,
+        modifiers: &winit::event::Modifiers,
+    ) -> InputAction {
+        self.on_key_internal(doc, viewport, event, modifiers, None)
+    }
+
+    /// Internal key handling with optional renderer
+    fn on_key_internal(
+        &mut self,
+        doc: &Doc,
         _viewport: &Viewport,
         event: &KeyEvent,
         modifiers: &winit::event::Modifiers,
+        renderer: Option<&mut crate::render::Renderer>,
     ) -> InputAction {
         if event.state != ElementState::Pressed {
             return InputAction::None;
@@ -621,719 +954,61 @@ impl InputHandler {
 
         // Check for command shortcuts first
         if cmd_held {
-            match &event.logical_key {
-                Key::Character(ch) => {
-                    match ch.to_lowercase().as_str() {
-                        "z" if shift_held => {
-                            // Cmd+Shift+Z: Redo
-                            return InputAction::Redo;
-                        }
-                        "z" if !shift_held => {
-                            // Cmd+Z: Undo
-                            return InputAction::Undo;
-                        }
-                        "c" => {
-                            // Cmd+C: Copy
-                            self.copy(doc);
-                            return InputAction::None;
-                        }
-                        "x" => {
-                            // Cmd+X: Cut
-                            self.cut(doc);
-                            return InputAction::Redraw;
-                        }
-                        "v" => {
-                            // Cmd+V: Paste
-                            self.paste(doc);
-                            return InputAction::Redraw;
-                        }
-                        "s" => {
-                            // Cmd+S: Save
-                            return InputAction::Save;
-                        }
-                        "a" => {
-                            // Cmd+A: Select All
-                            self.select_all(doc);
-                            return InputAction::Redraw;
-                        }
-                        "[" => {
-                            // Cmd+[: Navigate back
-                            let current_pos = self.primary_cursor_doc_pos(doc);
-                            if let Some(prev_pos) = self.nav_history.undo(current_pos) {
-                                // Set cursor to previous position
-                                self.selections.clear();
-                                self.selections.push(Selection {
-                                    cursor: prev_pos,
-                                    anchor: prev_pos,
-                                    id: self.next_id,
-                                });
-                                self.next_id += 1;
-                                return InputAction::Redraw;
-                            }
-                            return InputAction::None;
-                        }
-                        "]" => {
-                            // Cmd+]: Navigate forward
-                            let current_pos = self.primary_cursor_doc_pos(doc);
-                            if let Some(next_pos) = self.nav_history.redo(current_pos) {
-                                // Set cursor to next position
-                                self.selections.clear();
-                                self.selections.push(Selection {
-                                    cursor: next_pos,
-                                    anchor: next_pos,
-                                    id: self.next_id,
-                                });
-                                self.next_id += 1;
-                                return InputAction::Redraw;
-                            }
-                            return InputAction::None;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+            if let Key::Character(ch) = &event.logical_key {
+                return self.handle_command_key(doc, ch.to_lowercase().as_str(), shift_held);
             }
         }
 
         match &event.logical_key {
             Key::Character(ch) if !cmd_held => {
-                // Type character at all cursors
-                self.goal_column = None; // Reset goal column when typing
-
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-
-                // Calculate cumulative offset from existing pending edits
-                // This is critical for correct positioning when buffering multiple keystrokes
-                let mut position_shifts: Vec<(usize, i32)> = Vec::new();
-                for edit in &self.pending_edits {
-                    match edit {
-                        Edit::Insert { pos, content } => {
-                            if let Content::Text(text) = content {
-                                position_shifts.push((*pos, text.len() as i32));
-                            }
-                        }
-                        Edit::Delete { range } => {
-                            position_shifts
-                                .push((range.start, -(range.end as i32 - range.start as i32)));
-                        }
-                        Edit::Replace { range, content } => {
-                            let insert_len = if let Content::Text(text) = content {
-                                text.len() as i32
-                            } else {
-                                0
-                            };
-                            let delete_len = range.end as i32 - range.start as i32;
-                            position_shifts.push((range.start, insert_len - delete_len));
-                        }
-                    }
-                }
-                position_shifts.sort_by_key(|&(pos, _)| pos);
-
-                // Track where we insert each character for accurate cursor updates
-                let mut insertion_positions = Vec::new();
-
-                // Prepare edits with adjusted positions
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        // Delete selection first
-                        let del_range = sel.byte_range(doc);
-                        // Adjust range based on previous pending edits
-                        let mut adjusted_start = del_range.start;
-                        let mut adjusted_end = del_range.end;
-                        for &(edit_pos, shift) in &position_shifts {
-                            if edit_pos <= del_range.start {
-                                adjusted_start = (adjusted_start as i32 + shift).max(0) as usize;
-                                adjusted_end = (adjusted_end as i32 + shift).max(0) as usize;
-                            } else if edit_pos < del_range.end {
-                                adjusted_end = (adjusted_end as i32 + shift).max(0) as usize;
-                            }
-                        }
-
-                        self.pending_edits.push(Edit::Delete {
-                            range: adjusted_start..adjusted_end,
-                        });
-                        // Add this delete to our position shifts
-                        position_shifts.push((
-                            adjusted_start,
-                            -(adjusted_end as i32 - adjusted_start as i32),
-                        ));
-                        position_shifts.sort_by_key(|&(pos, _)| pos);
-                    }
-
-                    // Convert cursor position to byte offset for insertion
-                    let tree = doc.read();
-                    let cursor_pos = sel.min_pos();
-
-                    // Check if cursor is beyond the current line in the tree
-                    // This happens when typing rapidly - cursor.column increments but tree isn't updated yet
-                    let line_byte_start = tree.line_to_byte(cursor_pos.line).unwrap_or(0);
-                    let line_byte_end = tree
-                        .line_to_byte(cursor_pos.line + 1)
-                        .unwrap_or(tree.byte_count());
-                    let line_text = tree.get_text_slice(line_byte_start..line_byte_end);
-                    let line_char_count = line_text.trim_end_matches('\n').chars().count() as u32;
-
-                    let adjusted_pos = if cursor_pos.column > line_char_count {
-                        // Cursor is beyond line end - this means we're typing at the end
-                        // Insert at actual end of line plus any pending edits
-                        let line_end_byte =
-                            line_byte_start + line_text.trim_end_matches('\n').len();
-                        let total_pending: i32 =
-                            position_shifts.iter().map(|&(_, shift)| shift).sum();
-                        (line_end_byte as i32 + total_pending).max(0) as usize
-                    } else {
-                        // Normal case - cursor is within the line
-                        let base_pos = tree.doc_pos_to_byte(cursor_pos);
-                        let total_shift: i32 = position_shifts
-                            .iter()
-                            .filter(|&&(pos, _)| pos <= base_pos)
-                            .map(|&(_, shift)| shift)
-                            .sum();
-                        (base_pos as i32 + total_shift).max(0) as usize
-                    };
-
-                    // Remember where we're inserting for this cursor
-                    insertion_positions.push(adjusted_pos);
-
-                    self.pending_edits.push(Edit::Insert {
-                        pos: adjusted_pos,
-                        content: Content::Text(ch.to_string()),
-                    });
-                    // Add this insert to position shifts for next iteration
-                    position_shifts.push((adjusted_pos, ch.len() as i32));
-                    position_shifts.sort_by_key(|&(pos, _)| pos);
-                }
-
-                // Flush immediately WITH syntax coordination
-                let _needs_redraw = self.flush_pending_edits(doc);
-
-                // Update cursors using the actual insertion positions
-                // This avoids the bug where doc_pos_to_byte clamps to line end
-                let ch_len = ch.len() as u32;
-                for (i, sel) in self.selections.iter_mut().enumerate() {
-                    // Update column
-                    if !sel.is_cursor() {
-                        sel.cursor = sel.min_pos();
-                    }
-                    sel.cursor.column += ch_len;
-                    sel.anchor = sel.cursor;
-
-                    // Calculate byte_offset based on where we actually inserted
-                    // insertion_positions already accounts for shifts from earlier cursors
-                    sel.cursor.byte_offset = insertion_positions[i] + ch.len();
-                    sel.anchor.byte_offset = sel.cursor.byte_offset;
-                }
-
-                // Return redraw action
-                return InputAction::Redraw;
+                return self.handle_character_input(doc, ch, renderer);
             }
             Key::Named(NamedKey::Backspace) => {
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-
-                // Track what characters we're deleting and where for cursor adjustment
-                struct DeleteInfo {
-                    deleted_char: Option<String>,
-                    prev_line_end_col: Option<u32>, // For newline deletion
-                }
-                let mut delete_info = Vec::new();
-
-                // Delete before cursor
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        self.pending_edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                        delete_info.push(DeleteInfo {
-                            deleted_char: None,
-                            prev_line_end_col: None,
-                        });
-                    } else if sel.cursor.line > 0 || sel.cursor.column > 0 {
-                        let tree = doc.read();
-                        let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
-                        if cursor_byte > 0 {
-                            let delete_range = cursor_byte - 1..cursor_byte;
-
-                            // Store the character we're about to delete
-                            let deleted_char = tree.get_text_slice(delete_range.clone());
-
-                            // If we're deleting a newline, store where the previous line ends
-                            let prev_line_end_col = if deleted_char == "\n" && sel.cursor.line > 0 {
-                                // Find the length of the previous line
-                                if let Some(line_start) = tree.line_to_byte(sel.cursor.line - 1) {
-                                    let line_end = tree
-                                        .line_to_byte(sel.cursor.line)
-                                        .unwrap_or(tree.byte_count());
-                                    let line_text = tree.get_text_slice(line_start..line_end - 1); // -1 to exclude newline
-
-                                    // Count visual columns
-                                    let mut visual_column = 0u32;
-                                    const TAB_WIDTH: u32 = 4;
-                                    for ch in line_text.chars() {
-                                        if ch == '\t' {
-                                            visual_column =
-                                                ((visual_column / TAB_WIDTH) + 1) * TAB_WIDTH;
-                                        } else if ch != '\n' {
-                                            visual_column += 1;
-                                        }
-                                    }
-                                    Some(visual_column)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            delete_info.push(DeleteInfo {
-                                deleted_char: Some(deleted_char.clone()),
-                                prev_line_end_col,
-                            });
-
-                            eprintln!("DEBUG: Deleting '{}' at byte range {:?}, cursor pos line {} col {}",
-                                     deleted_char.escape_debug(), delete_range, sel.cursor.line, sel.cursor.column);
-                            self.pending_edits.push(Edit::Delete {
-                                range: delete_range,
-                            });
-                        } else {
-                            delete_info.push(DeleteInfo {
-                                deleted_char: None,
-                                prev_line_end_col: None,
-                            });
-                        }
-                    } else {
-                        delete_info.push(DeleteInfo {
-                            deleted_char: None,
-                            prev_line_end_col: None,
-                        });
-                    }
-                }
-
-                // Immediately flush WITH syntax coordination
-                self.flush_pending_edits(doc);
-
-                // Move cursors back
-                for (i, sel) in self.selections.iter_mut().enumerate() {
-                    let info = delete_info.get(i);
-
-                    if !sel.is_cursor() {
-                        sel.cursor = sel.min_pos();
-                        sel.anchor = sel.cursor;
-                    } else if sel.cursor.column > 0 {
-                        // Check what character we just deleted to move cursor appropriately
-                        if let Some(info) = info {
-                            if let Some(ref deleted) = info.deleted_char {
-                                if deleted == "\t" {
-                                    // We deleted a tab - move back to previous tab stop
-                                    const TAB_WIDTH: u32 = 4;
-                                    // Find which tab stop we're at
-                                    let current_tab_stop =
-                                        (sel.cursor.column + TAB_WIDTH - 1) / TAB_WIDTH;
-                                    // Move to previous tab stop
-                                    sel.cursor.column = (current_tab_stop - 1) * TAB_WIDTH;
-                                    eprintln!(
-                                        "DEBUG: Deleted tab, moved from col {} to col {}",
-                                        current_tab_stop * TAB_WIDTH,
-                                        sel.cursor.column
-                                    );
-                                } else {
-                                    // Normal character - just move back one column
-                                    sel.cursor.column -= 1;
-                                }
-                            } else {
-                                // Fallback
-                                sel.cursor.column -= 1;
-                            }
-                        } else {
-                            // Fallback
-                            sel.cursor.column -= 1;
-                        }
-                        sel.anchor = sel.cursor;
-                    } else if sel.cursor.line > 0 {
-                        // We're at the beginning of a line and deleted something (probably newline)
-                        // Move to previous line
-                        sel.cursor.line -= 1;
-
-                        if let Some(info) = info {
-                            if let Some(ref deleted) = info.deleted_char {
-                                if deleted == "\n" {
-                                    // We deleted a newline - use the stored column position
-                                    if let Some(col) = info.prev_line_end_col {
-                                        sel.cursor.column = col;
-                                        eprintln!("DEBUG: Deleted newline - cursor at end of prev line: line {} col {}",
-                                                 sel.cursor.line, sel.cursor.column);
-                                    } else {
-                                        // Fallback - shouldn't happen
-                                        sel.cursor.column = 0;
-                                    }
-                                } else {
-                                    // Deleted something else at line start?
-                                    sel.cursor.column = 0;
-                                }
-                            } else {
-                                sel.cursor.column = 0;
-                            }
-                        } else {
-                            sel.cursor.column = 0;
-                        }
-                        sel.anchor = sel.cursor;
-                    }
-                }
-                return InputAction::Redraw;
+                return self.delete_at_cursor(doc, false);
             }
             Key::Named(NamedKey::Delete) => {
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-                // Delete after cursor
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        self.pending_edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    } else {
-                        let tree = doc.read();
-                        let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
-                        let text_len = tree.byte_count();
-                        if cursor_byte < text_len {
-                            self.pending_edits.push(Edit::Delete {
-                                range: cursor_byte..cursor_byte + 1,
-                            });
-                        }
-                    }
-                }
-
-                // Immediately flush WITH syntax coordination
-                self.flush_pending_edits(doc);
-                return InputAction::Redraw;
+                return self.delete_at_cursor(doc, true);
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                // Move left in document space
-                self.goal_column = None; // Reset goal column for horizontal movement
-                for sel in &mut self.selections {
-                    if sel.cursor.column > 0 {
-                        sel.cursor.column -= 1;
-                    } else if sel.cursor.line > 0 {
-                        // Move to end of previous line
-                        sel.cursor.line -= 1;
-                        let tree = doc.read();
-                        if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                            let line_end = tree
-                                .line_to_byte(sel.cursor.line + 1)
-                                .unwrap_or(tree.byte_count());
-                            let line_text = tree.get_text_slice(line_start..line_end);
-                            // Strip trailing newline before counting characters
-                            let line_text_trimmed = line_text.trim_end_matches('\n');
-                            sel.cursor.column = line_text_trimmed.chars().count() as u32;
-                        }
-                    }
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.move_cursor_horizontal(doc, -1, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowRight) => {
-                // Move right in document space
-                self.goal_column = None; // Reset goal column for horizontal movement
-                for sel in &mut self.selections {
-                    let tree = doc.read();
-                    // Get current line info
-                    if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                        let line_end = tree
-                            .line_to_byte(sel.cursor.line + 1)
-                            .unwrap_or(tree.byte_count());
-                        let line_text = tree.get_text_slice(line_start..line_end);
-                        // Strip trailing newline before counting characters
-                        let line_text_trimmed = line_text.trim_end_matches('\n');
-                        let line_length = line_text_trimmed.chars().count() as u32;
-
-                        if sel.cursor.column < line_length {
-                            sel.cursor.column += 1;
-                        } else {
-                            // Move to start of next line
-                            sel.cursor.line += 1;
-                            sel.cursor.column = 0;
-                            // Check if next line exists
-                            if tree.line_to_byte(sel.cursor.line).is_none() {
-                                // No next line, stay at end of current line
-                                sel.cursor.line -= 1;
-                                sel.cursor.column = line_length;
-                            }
-                        }
-                    }
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.move_cursor_horizontal(doc, 1, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowUp) => {
-                // Move up in document space
-                // Set goal column if not already set
-                if self.goal_column.is_none() && !self.selections.is_empty() {
-                    self.goal_column = Some(self.selections[0].cursor.column);
-                }
-
-                for sel in &mut self.selections {
-                    if sel.cursor.line > 0 {
-                        sel.cursor.line -= 1;
-                        // Use goal column but clamp to line length
-                        let tree = doc.read();
-                        if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                            let line_end = tree
-                                .line_to_byte(sel.cursor.line + 1)
-                                .unwrap_or(tree.byte_count());
-                            let line_text = tree.get_text_slice(line_start..line_end);
-                            // Strip trailing newline before counting characters
-                            let line_text_trimmed = line_text.trim_end_matches('\n');
-                            let line_length = line_text_trimmed.chars().count() as u32;
-                            // Use goal column if set, otherwise current column
-                            let target_column = self.goal_column.unwrap_or(sel.cursor.column);
-                            sel.cursor.column = target_column.min(line_length);
-                        }
-                    }
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.move_cursor_vertical(doc, -1, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::ArrowDown) => {
-                // Move down in document space
-                // Set goal column if not already set
-                if self.goal_column.is_none() && !self.selections.is_empty() {
-                    self.goal_column = Some(self.selections[0].cursor.column);
-                }
-
-                for sel in &mut self.selections {
-                    let tree = doc.read();
-                    println!(
-                        "ARROW_DOWN: current_line={}, total_lines={}",
-                        sel.cursor.line,
-                        tree.line_count()
-                    );
-                    // Check if next line exists
-                    if tree.line_to_byte(sel.cursor.line + 1).is_some() {
-                        sel.cursor.line += 1;
-                        println!("  -> moved to line {}", sel.cursor.line);
-                        // Use goal column but clamp to line length
-                        if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                            let line_end = tree
-                                .line_to_byte(sel.cursor.line + 1)
-                                .unwrap_or(tree.byte_count());
-                            let line_text = tree.get_text_slice(line_start..line_end);
-                            // Strip trailing newline before counting characters
-                            let line_text_trimmed = line_text.trim_end_matches('\n');
-                            let line_length = line_text_trimmed.chars().count() as u32;
-                            // Use goal column if set, otherwise current column
-                            let target_column = self.goal_column.unwrap_or(sel.cursor.column);
-                            sel.cursor.column = target_column.min(line_length);
-                        }
-                    }
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.move_cursor_vertical(doc, 1, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::Home) => {
-                // Move to line start
-                self.goal_column = None; // Reset goal column
-                for sel in &mut self.selections {
-                    sel.cursor.column = 0;
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.move_to_line_edge(doc, false, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::End) => {
-                // Move to line end
-                self.goal_column = None; // Reset goal column
-                for sel in &mut self.selections {
-                    let tree = doc.read();
-                    if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                        let line_end = tree
-                            .line_to_byte(sel.cursor.line + 1)
-                            .unwrap_or(tree.byte_count());
-                        let line_text = tree.get_text_slice(line_start..line_end);
-                        sel.cursor.column = line_text.chars().count() as u32;
-                    }
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.move_to_line_edge(doc, true, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::Enter) => {
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-                // Insert newline
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        self.pending_edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    }
-                    let tree = doc.read();
-                    let insert_pos = tree.doc_pos_to_byte(sel.min_pos());
-                    self.pending_edits.push(Edit::Insert {
-                        pos: insert_pos,
-                        content: Content::Text("\n".to_string()),
-                    });
-                }
-
-                // Immediately flush WITH syntax coordination
-                self.flush_pending_edits(doc);
-
-                // Advance cursors - move to next line, column 0
-                for sel in &mut self.selections {
-                    if !sel.is_cursor() {
-                        sel.cursor = sel.min_pos();
-                        sel.anchor = sel.cursor;
-                    }
-                    sel.cursor.line += 1;
-                    sel.cursor.column = 0;
-                    sel.anchor = sel.cursor;
-                }
-                return InputAction::Redraw;
+                return self.insert_text(doc, "\n");
             }
             Key::Named(NamedKey::Tab) => {
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-                // Insert tab character
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        self.pending_edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    }
-                    let tree = doc.read();
-                    let insert_pos = tree.doc_pos_to_byte(sel.min_pos());
-                    self.pending_edits.push(Edit::Insert {
-                        pos: insert_pos,
-                        content: Content::Text("\t".to_string()),
-                    });
-                }
-
-                // Immediately flush WITH syntax coordination
-                self.flush_pending_edits(doc);
-
-                // Advance cursors - tab moves to next tab stop
-                for sel in &mut self.selections {
-                    if !sel.is_cursor() {
-                        sel.cursor = sel.min_pos();
-                        sel.anchor = sel.cursor;
-                    }
-                    // Tab advances to next tab stop (4 spaces)
-                    sel.cursor.column = ((sel.cursor.column / 4) + 1) * 4;
-                    sel.anchor = sel.cursor;
-                }
-                return InputAction::Redraw;
+                return self.insert_text(doc, "\t");
             }
             Key::Named(NamedKey::PageUp) => {
-                // Save position before page jump
-                self.nav_history
-                    .checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
-
-                // Move cursor up by viewport height worth of lines
-                // Set goal column if not already set
-                if self.goal_column.is_none() && !self.selections.is_empty() {
-                    self.goal_column = Some(self.selections[0].cursor.column);
-                }
-
-                for sel in &mut self.selections {
-                    // Move up approximately 20 lines (would use viewport)
-                    sel.cursor.line = sel.cursor.line.saturating_sub(20);
-
-                    // Use goal column but clamp to line length
-                    let tree = doc.read();
-                    if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                        let line_end = tree
-                            .line_to_byte(sel.cursor.line + 1)
-                            .unwrap_or(tree.byte_count());
-                        let line_text = tree.get_text_slice(line_start..line_end);
-                        let line_length = line_text.chars().count() as u32;
-                        let target_column = self.goal_column.unwrap_or(sel.cursor.column);
-                        sel.cursor.column = target_column.min(line_length);
-                    } else {
-                        sel.cursor.column = 0;
-                    }
-
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.page_jump(doc, true, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::PageDown) => {
-                // Save position before page jump
-                self.nav_history
-                    .checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
-
-                // Move cursor down by viewport height worth of lines
-                // Set goal column if not already set
-                if self.goal_column.is_none() && !self.selections.is_empty() {
-                    self.goal_column = Some(self.selections[0].cursor.column);
-                }
-
-                for sel in &mut self.selections {
-                    let tree = doc.read();
-                    let total_lines = tree.line_count();
-                    // Move down approximately 20 lines (would use viewport)
-                    sel.cursor.line = (sel.cursor.line + 20).min(total_lines.saturating_sub(1));
-
-                    // Use goal column but clamp to line length
-                    if let Some(line_start) = tree.line_to_byte(sel.cursor.line) {
-                        let line_end = tree
-                            .line_to_byte(sel.cursor.line + 1)
-                            .unwrap_or(tree.byte_count());
-                        let line_text = tree.get_text_slice(line_start..line_end);
-                        let line_length = line_text.chars().count() as u32;
-                        let target_column = self.goal_column.unwrap_or(sel.cursor.column);
-                        sel.cursor.column = target_column.min(line_length);
-                    } else {
-                        sel.cursor.column = 0;
-                    }
-
-                    if !shift_held {
-                        sel.anchor = sel.cursor;
-                    }
-                }
+                self.page_jump(doc, false, shift_held);
                 return InputAction::Redraw;
             }
             Key::Named(NamedKey::Space) => {
-                // Save snapshot before edit
-                self.save_snapshot_to_history(doc);
-                // Handle space explicitly since it's not in Key::Character
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        self.pending_edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    }
-                    let tree = doc.read();
-                    let insert_pos = tree.doc_pos_to_byte(sel.min_pos());
-                    self.pending_edits.push(Edit::Insert {
-                        pos: insert_pos,
-                        content: Content::Text(" ".to_string()),
-                    });
-                }
-
-                // Immediately flush WITH syntax coordination
-                self.flush_pending_edits(doc);
-
-                // Advance cursors
-                for sel in &mut self.selections {
-                    if !sel.is_cursor() {
-                        sel.cursor = sel.min_pos();
-                        sel.anchor = sel.cursor;
-                    }
-                    sel.cursor.column += 1;
-                    sel.anchor = sel.cursor;
-                }
-                return InputAction::Redraw;
+                return self.insert_text(doc, " ");
             }
             _ => {
                 return InputAction::None;
@@ -1457,7 +1132,6 @@ impl InputHandler {
 
     /// Copy selection to clipboard
     pub fn copy(&mut self, doc: &Doc) {
-        // No need to flush syntax updates immediately
         if let Some(sel) = self.selections.first() {
             if !sel.is_cursor() {
                 let text = doc.read().flatten_to_string();
@@ -1465,8 +1139,6 @@ impl InputHandler {
                 if range.end <= text.len() {
                     let selected = &text[range];
                     self.clipboard = Some(selected.to_string());
-
-                    // Also copy to system clipboard
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(selected);
                     }
@@ -1477,14 +1149,9 @@ impl InputHandler {
 
     /// Cut selection to clipboard
     pub fn cut(&mut self, doc: &Doc) {
-        // No need to flush syntax updates immediately
-
         self.copy(doc);
-
-        // Save snapshot for undo
         self.save_snapshot_to_history(doc);
 
-        // Delete selection using pending edits system
         for sel in &self.selections {
             if !sel.is_cursor() {
                 self.pending_edits.push(Edit::Delete {
@@ -1493,14 +1160,11 @@ impl InputHandler {
             }
         }
 
-        // Flush edits which will trigger syntax update
         self.flush_pending_edits(doc);
 
-        // Collapse selections
         for sel in &mut self.selections {
             sel.cursor = sel.min_pos();
             sel.anchor = sel.cursor;
-            // Update byte offsets
             let tree = doc.read();
             sel.cursor.byte_offset = tree.doc_pos_to_byte(sel.cursor);
             sel.anchor.byte_offset = sel.cursor.byte_offset;
@@ -1509,21 +1173,14 @@ impl InputHandler {
 
     /// Paste from clipboard
     pub fn paste(&mut self, doc: &Doc) {
-        // No need to flush syntax updates immediately
-
-        // Try system clipboard first
-        let text = if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            clipboard.get_text().ok()
-        } else {
-            None
-        }
-        .or_else(|| self.clipboard.clone());
+        let text = arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut c| c.get_text().ok())
+            .or_else(|| self.clipboard.clone());
 
         if let Some(text) = text {
-            // Save snapshot for undo
             self.save_snapshot_to_history(doc);
 
-            // Use pending_edits system like typing does
             for sel in &self.selections {
                 if !sel.is_cursor() {
                     self.pending_edits.push(Edit::Delete {
@@ -1538,10 +1195,8 @@ impl InputHandler {
                 });
             }
 
-            // Flush pending edits through the proper system
             self.flush_pending_edits(doc);
 
-            // Advance cursors by text length in columns
             let advance_chars = text.chars().count() as u32;
             for sel in &mut self.selections {
                 sel.cursor = sel.min_pos();
@@ -1553,13 +1208,9 @@ impl InputHandler {
 
     /// Select all text
     pub fn select_all(&mut self, doc: &Doc) {
-        // No need to flush syntax updates immediately
         let tree = doc.read();
         let last_line = tree.line_count().saturating_sub(1);
-        let last_line_start = tree.line_to_byte(last_line).unwrap_or(0);
-        let last_line_end = tree.byte_count();
-        let last_line_text = tree.get_text_slice(last_line_start..last_line_end);
-        let last_column = last_line_text.chars().count() as u32;
+        let last_column = Self::get_line_length(doc, last_line);
 
         self.selections.clear();
         self.selections.push(Selection {
@@ -1572,7 +1223,6 @@ impl InputHandler {
             id: self.next_id,
         });
         self.next_id += 1;
-
         self.update_selection_widgets(doc);
     }
 

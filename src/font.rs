@@ -520,7 +520,6 @@ pub fn create_glyph_instances(
                     if effect.range.start <= doc_pos && doc_pos < effect.range.end {
                         if let crate::text_effects::EffectType::Token(token_id) = effect.effect {
                             found_token_id = Some(token_id);
-                            println!("token: {}", token_id);
                             break;
                         }
                     }
