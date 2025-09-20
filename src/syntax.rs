@@ -334,14 +334,23 @@ impl SyntaxHighlighter {
                 if let Some(ref ts_tree) = tree {
                     // Compile query on first use (lazy initialization)
                     if query.is_none() {
-                        println!("SYNTAX [{}]: Compiling tree-sitter query on background thread...", language_name);
+                        println!(
+                            "SYNTAX [{}]: Compiling tree-sitter query on background thread...",
+                            language_name
+                        );
                         match Query::new(&language_clone, highlights_query_clone) {
                             Ok(compiled_query) => {
-                                println!("SYNTAX [{}]: Query compilation successful", language_name);
+                                println!(
+                                    "SYNTAX [{}]: Query compilation successful",
+                                    language_name
+                                );
                                 query = Some(compiled_query);
                             }
                             Err(e) => {
-                                println!("SYNTAX [{}]: Failed to compile query: {:?}", language_name, e);
+                                println!(
+                                    "SYNTAX [{}]: Failed to compile query: {:?}",
+                                    language_name, e
+                                );
                                 continue;
                             }
                         }

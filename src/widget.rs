@@ -302,7 +302,7 @@ impl Widget for TextWidget {
         // Add margin to align with cursor/selection coordinate system
         let layout_pos = crate::coordinates::LayoutPos::new(
             ctx.viewport.margin.x.0 + x_base_offset,
-            ctx.viewport.margin.y.0
+            ctx.viewport.margin.y.0,
         );
 
         // Get effects for this text if available
@@ -357,9 +357,16 @@ impl Widget for TextWidget {
                             if let Some(params) = params {
                                 println!("TextWidget: Writing shader params: {:?}", params);
                                 if let Some(effect_buffer) = ctx.gpu().effect_uniform_buffer(*id) {
-                                    ctx.queue.write_buffer(effect_buffer, 0, bytemuck::cast_slice(params.as_ref()));
+                                    ctx.queue.write_buffer(
+                                        effect_buffer,
+                                        0,
+                                        bytemuck::cast_slice(params.as_ref()),
+                                    );
                                 } else {
-                                    println!("TextWidget: No effect buffer found for shader ID {}", id);
+                                    println!(
+                                        "TextWidget: No effect buffer found for shader ID {}",
+                                        id
+                                    );
                                 }
                             }
                         }
@@ -463,10 +470,7 @@ impl Widget for CursorWidget {
         let view_pos = ctx.viewport.layout_to_view(self.position);
 
         // Apply 2px left shift for better alignment
-        let adjusted_view_pos = crate::coordinates::ViewPos::new(
-            view_pos.x.0 - 2.0,
-            view_pos.y.0
-        );
+        let adjusted_view_pos = crate::coordinates::ViewPos::new(view_pos.x.0 - 2.0, view_pos.y.0);
 
         // Create view-space rectangle for GPU rendering
         let view_rect = crate::coordinates::ViewRect::new(
@@ -505,7 +509,8 @@ impl Widget for CursorWidget {
             mapped_at_creation: false,
         });
 
-        ctx.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        ctx.queue
+            .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
         render_pass.set_pipeline(ctx.gpu().rect_pipeline());
         render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
         render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -619,7 +624,8 @@ impl Widget for SelectionWidget {
                 mapped_at_creation: false,
             });
 
-            ctx.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+            ctx.queue
+                .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
             render_pass.set_pipeline(ctx.gpu().rect_pipeline());
             render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));

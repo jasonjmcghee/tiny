@@ -619,7 +619,6 @@ unsafe impl Sync for MouseCircleTextEffect {}
 
 impl TextStyleProvider for MouseCircleTextEffect {
     fn get_effects_in_range(&self, range: Range<usize>) -> Vec<TextEffect> {
-
         if let Some(mouse_pos) = self.mouse_pos {
             // Use shader effect with mouse position parameters
             let effect = TextEffect {
@@ -773,11 +772,10 @@ impl Widget for DocumentEditorWidget {
             }
             WidgetEvent::KeyboardInput(key_event, modifiers) => {
                 // Use EditorLogic's key handling
-                if self.logic.on_key(
-                    key_event,
-                    &self.renderer.borrow().viewport,
-                    modifiers,
-                ) {
+                if self
+                    .logic
+                    .on_key(key_event, &self.renderer.borrow().viewport, modifiers)
+                {
                     self.widgets_dirty = true;
                     EventResponse::Redraw
                 } else {
@@ -814,7 +812,11 @@ impl Widget for DocumentEditorWidget {
             renderer.set_font_system(ctx.font_system.clone());
 
             // Update viewport to match widget bounds (not the full viewport)
-            renderer.update_viewport(self.bounds.width.0, self.bounds.height.0, ctx.viewport.scale_factor);
+            renderer.update_viewport(
+                self.bounds.width.0,
+                self.bounds.height.0,
+                ctx.viewport.scale_factor,
+            );
 
             // CRITICAL: Set GPU renderer so render_with_pass can paint widgets
             renderer.set_gpu_renderer(ctx.gpu());
@@ -951,7 +953,7 @@ struct TiledLayout {
     circle_widget: Option<CircleTracker>,      // Right widget: circle tracker
 
     // Divider state
-    split_position: f32,     // Position of divider (0.0 to 1.0)
+    split_position: f32, // Position of divider (0.0 to 1.0)
     is_dragging_divider: bool,
     divider_hover: bool,
     divider_width: f32,
@@ -967,7 +969,7 @@ impl TiledLayout {
             split_position: 0.5, // Start with equal split
             is_dragging_divider: false,
             divider_hover: false,
-            divider_width: 6.0,  // 6 pixel wide divider for easy grabbing
+            divider_width: 6.0, // 6 pixel wide divider for easy grabbing
         }
     }
 
@@ -1148,7 +1150,8 @@ impl Widget for TiledLayout {
         }
 
         // Paint divider
-        let divider_x = self.bounds.x.0 + self.bounds.width.0 * self.split_position - self.divider_width / 2.0;
+        let divider_x =
+            self.bounds.x.0 + self.bounds.width.0 * self.split_position - self.divider_width / 2.0;
         let divider_color = if self.is_dragging_divider {
             0x888888FF // Bright when dragging
         } else if self.divider_hover {
@@ -1167,11 +1170,8 @@ impl Widget for TiledLayout {
             color: divider_color,
         };
 
-        ctx.gpu().draw_rects(
-            render_pass,
-            &[divider_rect],
-            ctx.viewport.scale_factor,
-        );
+        ctx.gpu()
+            .draw_rects(render_pass, &[divider_rect], ctx.viewport.scale_factor);
 
         // Paint circle widget second (higher priority)
         if let Some(circle_widget) = &self.circle_widget {
@@ -1350,7 +1350,9 @@ impl ApplicationHandler for CircleApp {
                     let response = root_widget.handle_event(&event);
 
                     // Handle widget response
-                    if matches!(response, EventResponse::Handled) || matches!(response, EventResponse::Redraw) {
+                    if matches!(response, EventResponse::Handled)
+                        || matches!(response, EventResponse::Redraw)
+                    {
                         window.request_redraw();
                     }
 
@@ -1386,7 +1388,10 @@ impl ApplicationHandler for CircleApp {
                                 // Update selection widgets after drag
                                 {
                                     let mut renderer = text_widget.renderer.borrow_mut();
-                                    renderer.set_selection_widgets(&text_widget.logic.input, &text_widget.logic.doc);
+                                    renderer.set_selection_widgets(
+                                        &text_widget.logic.input,
+                                        &text_widget.logic.doc,
+                                    );
                                 }
 
                                 text_widget.widgets_dirty = true;
@@ -1416,7 +1421,10 @@ impl ApplicationHandler for CircleApp {
                             let logical_y = position.y as f32 / scale;
 
                             let layout_pos = LayoutPos::new(logical_x, logical_y);
-                            let event = WidgetEvent::MouseClick(layout_pos, winit::event::MouseButton::Left);
+                            let event = WidgetEvent::MouseClick(
+                                layout_pos,
+                                winit::event::MouseButton::Left,
+                            );
 
                             match root_widget.handle_event(&event) {
                                 EventResponse::Handled | EventResponse::Redraw => {

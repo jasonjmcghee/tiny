@@ -398,9 +398,9 @@ impl Viewport {
             logical_size: LogicalSize::new(logical_width, logical_height),
             physical_size,
             scale_factor,
-            metrics: TextMetrics::new(13.0),  // Default 14pt font
+            metrics: TextMetrics::new(13.0),    // Default 14pt font
             margin: LayoutPos::new(16.0, 16.0), // 4px margin left and top
-            line_mode: LineMode::default(),   // Default to no wrap
+            line_mode: LineMode::default(),     // Default to no wrap
             cached_doc_bounds: None,
             cached_bounds_version: 0,
             cached_longest_line_chars: 0,

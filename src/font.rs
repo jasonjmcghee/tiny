@@ -4,9 +4,9 @@
 
 use crate::coordinates::{PhysicalPos, PhysicalSizeF};
 use crate::render::GlyphInstance;
+use ahash::HashMap;
 use fontdue::layout::{CoordinateSystem, Layout, TextStyle};
 use parking_lot::Mutex;
-use ahash::HashMap;
 use std::sync::Arc;
 
 /// Helper to expand tabs to spaces
@@ -138,8 +138,10 @@ impl FontSystem {
         let expanded_text = expand_tabs(text);
 
         // Layout the text at the requested size
-        self.layout
-            .append(&[&self.font], &TextStyle::new(&expanded_text, font_size_px, 0));
+        self.layout.append(
+            &[&self.font],
+            &TextStyle::new(&expanded_text, font_size_px, 0),
+        );
 
         // Collect glyph info first to avoid borrow issues
         let glyph_info: Vec<_> = self
@@ -500,7 +502,6 @@ pub fn create_glyph_instances(
     let mut all_glyph_instances = Vec::new();
     let mut y_offset = 0.0;
     let mut global_byte_pos = 0;
-
 
     for line_text in lines.iter() {
         // Layout this single line

@@ -245,7 +245,6 @@ impl GpuRenderer {
         }
     }
 
-
     /// Create rect pipeline with given shader module
     fn create_rect_pipeline(&self, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
         let layout = self

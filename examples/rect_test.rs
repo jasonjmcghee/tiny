@@ -7,7 +7,9 @@ use tiny_editor::coordinates::{LayoutRect, LogicalSize};
 use tiny_editor::{
     app::{AppLogic, TinyApp},
     tree::Doc,
-    widget::{LayoutConstraints, LayoutResult, PaintContext, Widget, WidgetEvent, EventResponse, WidgetId},
+    widget::{
+        EventResponse, LayoutConstraints, LayoutResult, PaintContext, Widget, WidgetEvent, WidgetId,
+    },
 };
 
 /// Simple red rectangle widget for testing
@@ -115,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pos: 0,
         content: tiny_editor::tree::Content::Widget(Arc::new(TestRect::new(
             50.0, 25.0, // x, y position
-            100.0, 50.0, // width, height
+            100.0, 50.0,       // width, height
             0xFF0000FF, // Red with full alpha
         ))),
     });

@@ -10,9 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Load file from path!
         let path = PathBuf::from(&args[1]);
         match io::load(&path) {
-            Ok(doc) => {
-                EditorLogic::new(doc).with_file(path)
-            }
+            Ok(doc) => EditorLogic::new(doc).with_file(path),
             Err(e) => {
                 eprintln!("Failed to load file: {}", e);
                 eprintln!("Creating new file instead...");

@@ -2,9 +2,9 @@
 //!
 //! Provides a reusable history stack for any cloneable type
 
-use std::sync::Arc;
-use crate::input::Selection;
 use crate::coordinates::DocPos;
+use crate::input::Selection;
+use std::sync::Arc;
 
 /// Generic history tracker for undo/redo operations
 pub struct History<T> {

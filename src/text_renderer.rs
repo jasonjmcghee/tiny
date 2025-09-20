@@ -553,4 +553,3 @@ pub fn token_type_to_id(token: crate::syntax::TokenType) -> u16 {
     // Use the centralized function from syntax.rs
     crate::syntax::SyntaxHighlighter::token_type_to_id(token) as u16
 }
-
