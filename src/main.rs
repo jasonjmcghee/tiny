@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     TinyApp::new(editor_logic)
         .with_size(800.0, 600.0)
-        .with_font_size(14.0)
+        .with_font_size(24.0)
+        .with_continuous_rendering(true)
         .run()
 }

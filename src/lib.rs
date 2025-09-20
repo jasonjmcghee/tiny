@@ -13,8 +13,22 @@ pub mod io;
 pub mod render;
 pub mod syntax;
 pub mod text_effects;
+pub mod text_renderer;
+pub mod theme;
 pub mod tree;
 pub mod widget;
+
+#[cfg(test)]
+mod syntax_test;
+
+#[cfg(test)]
+mod syntax_alignment_test;
+
+#[cfg(test)]
+mod token_shift_test;
+
+#[cfg(test)]
+mod newline_debug_test;
 
 // Re-export core types
 pub use history::History;

@@ -9,6 +9,31 @@ use parking_lot::Mutex;
 use ahash::HashMap;
 use std::sync::Arc;
 
+/// Helper to expand tabs to spaces
+fn expand_tabs(text: &str) -> String {
+    const TAB_WIDTH: usize = 4;
+    let mut result = String::new();
+    let mut column = 0;
+
+    for ch in text.chars() {
+        if ch == '\t' {
+            let spaces_needed = TAB_WIDTH - (column % TAB_WIDTH);
+            for _ in 0..spaces_needed {
+                result.push(' ');
+            }
+            column += spaces_needed;
+        } else if ch == '\n' {
+            result.push(ch);
+            column = 0;
+        } else {
+            result.push(ch);
+            column += 1;
+        }
+    }
+
+    result
+}
+
 /// Information about a positioned glyph ready for rendering
 #[derive(Clone, Debug)]
 pub struct PositionedGlyph {
@@ -109,9 +134,12 @@ impl FontSystem {
         // Clear previous layout
         self.layout.clear();
 
+        // Expand tabs to spaces for proper layout
+        let expanded_text = expand_tabs(text);
+
         // Layout the text at the requested size
         self.layout
-            .append(&[&self.font], &TextStyle::new(text, font_size_px, 0));
+            .append(&[&self.font], &TextStyle::new(&expanded_text, font_size_px, 0));
 
         // Collect glyph info first to avoid borrow issues
         let glyph_info: Vec<_> = self
@@ -127,28 +155,8 @@ impl FontSystem {
 
         // Process each glyph
         for (ch, x, y) in glyph_info {
-            // Handle tab character specially
-            if ch == '\t' {
-                // Tab should advance by 4 space widths but not render a glyph
-                // Get space width from font metrics
-                let space_entry = self.get_or_rasterize(' ', font_size_px as u32);
-                let tab_width = space_entry.advance * 4.0; // 4 spaces
-
-                positioned_glyphs.push(PositionedGlyph {
-                    char: ch,
-                    pos: PhysicalPos::new(x, y),
-                    size: PhysicalSizeF::new(tab_width, space_entry.height),
-                    tex_coords: [0.0, 0.0, 0.0, 0.0], // No texture for tab
-                    color: 0x00000000,                // Transparent
-                });
-
-                max_x = max_x.max(x + tab_width);
-                max_y = max_y.max(y + space_entry.height);
-                continue;
-            }
-
-            // Skip other non-printable characters
-            if ch.is_control() {
+            // Skip non-printable characters (tabs are already expanded to spaces)
+            if ch.is_control() && ch != ' ' {
                 continue;
             }
 
@@ -375,6 +383,26 @@ impl SharedFontSystem {
 
         let target_x_physical = target_x * scale_factor; // Convert to physical pixels
 
+        // Map glyph positions back to original character positions
+        // We need this because tabs are expanded to spaces in layout
+        let mut char_map = Vec::new(); // Maps expanded position -> original position
+        let mut orig_pos = 0;
+        let mut exp_pos = 0;
+
+        for orig_ch in line_text.chars() {
+            if orig_ch == '\t' {
+                let spaces_needed = 4 - (exp_pos % 4);
+                for _ in 0..spaces_needed {
+                    char_map.push(orig_pos);
+                    exp_pos += 1;
+                }
+            } else {
+                char_map.push(orig_pos);
+                exp_pos += 1;
+            }
+            orig_pos += 1;
+        }
+
         // Binary search through glyph positions
         let mut left = 0;
         let mut right = full_layout.glyphs.len();
@@ -391,8 +419,14 @@ impl SharedFontSystem {
             }
         }
 
-        // Return character position (not glyph position - could differ with ligatures)
-        left as u32
+        // Map back to original character position
+        if left < char_map.len() {
+            char_map[left] as u32
+        } else if !char_map.is_empty() {
+            *char_map.last().unwrap() as u32 + 1
+        } else {
+            left as u32
+        }
     }
 
     /// Find which column corresponds to a pixel position
@@ -483,8 +517,25 @@ pub fn create_glyph_instances(
 
                 for effect in effects {
                     if effect.range.start <= doc_pos && doc_pos < effect.range.end {
-                        if let crate::text_effects::EffectType::Color(new_color) = effect.effect {
-                            color = new_color;
+                        if let crate::text_effects::EffectType::Token(token_id) = effect.effect {
+                            // Map token ID to color - this will be replaced by theme lookup
+                            color = match token_id {
+                                1 => 0xC678DDFF,  // Keyword - purple
+                                2 => 0x61AFEFFF,  // Function - blue
+                                3 => 0xE5C07BFF,  // Type - yellow-orange
+                                4 => 0x98C379FF,  // String - green
+                                5 => 0xD19A66FF,  // Number - orange
+                                6 => 0x5C6370FF,  // Comment - gray
+                                7 => 0xD19A66FF,  // Constant - orange
+                                8 => 0x56B6C2FF,  // Operator - cyan
+                                9 => 0xABB2BFFF,  // Punctuation - gray
+                                10 => 0xABB2BFFF, // Variable - gray
+                                11 => 0xE06C75FF, // Attribute - red
+                                12 => 0x61AFEFFF, // Namespace - blue
+                                13 => 0xE5C07BFF, // Property - yellow
+                                14 => 0xABB2BFFF, // Parameter - gray
+                                _ => 0xFFFFFFFF,  // Default - white
+                            };
                             break;
                         }
                     }
@@ -504,6 +555,8 @@ pub fn create_glyph_instances(
                 ),
                 color,
                 tex_coords: glyph.tex_coords,
+                token_id: 0, // Default for font rendering (no syntax highlighting)
+                relative_pos: 0.0,
             });
         }
 

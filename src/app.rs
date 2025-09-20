@@ -13,10 +13,13 @@ use crate::{
     text_effects::TextStyleProvider,
     tree::{Doc, Point, Rect},
 };
-use std::path::PathBuf;
 #[allow(unused)]
 use std::io::BufRead;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -36,6 +39,18 @@ pub trait AppLogic: 'static {
     fn as_any(&self) -> &dyn std::any::Any {
         // Default implementation returns empty reference
         &()
+    }
+
+    /// Handle keyboard input with optional renderer for incremental updates
+    fn on_key_with_renderer(
+        &mut self,
+        _key: &winit::event::KeyEvent,
+        _viewport: &crate::coordinates::Viewport,
+        _modifiers: &winit::event::Modifiers,
+        _renderer: Option<&mut crate::render::Renderer>,
+    ) -> bool {
+        // Default fallback to regular on_key
+        self.on_key(_key, _viewport, _modifiers)
     }
 
     /// Handle keyboard input
@@ -71,11 +86,7 @@ pub trait AppLogic: 'static {
     }
 
     /// Handle mouse move (for tracking position)
-    fn on_mouse_move(
-        &mut self,
-        _pos: Point,
-        _viewport: &crate::coordinates::Viewport,
-    ) -> bool {
+    fn on_mouse_move(&mut self, _pos: Point, _viewport: &crate::coordinates::Viewport) -> bool {
         false
     }
 
@@ -131,6 +142,8 @@ pub struct TinyApp<T: AppLogic> {
     gpu_renderer: Option<GpuRenderer>,
     font_system: Option<Arc<SharedFontSystem>>,
     cpu_renderer: Option<Renderer>,
+    _shader_watcher: Option<notify::RecommendedWatcher>,
+    shader_reload_pending: Arc<AtomicBool>,
 
     // Application-specific logic
     logic: T,
@@ -159,6 +172,9 @@ pub struct TinyApp<T: AppLogic> {
 
     // Animation timer
     animation_timer_started: Arc<AtomicBool>,
+
+    // Continuous rendering for animations
+    continuous_rendering: bool,
 }
 
 impl<T: AppLogic> TinyApp<T> {
@@ -168,6 +184,8 @@ impl<T: AppLogic> TinyApp<T> {
             gpu_renderer: None,
             font_system: None,
             cpu_renderer: None,
+            _shader_watcher: None,
+            shader_reload_pending: Arc::new(AtomicBool::new(false)),
             logic,
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
@@ -180,6 +198,7 @@ impl<T: AppLogic> TinyApp<T> {
             drag_start: None,
             just_pressed_key: false,
             animation_timer_started: Arc::new(AtomicBool::new(false)),
+            continuous_rendering: false,
         }
     }
 
@@ -195,6 +214,11 @@ impl<T: AppLogic> TinyApp<T> {
 
     pub fn with_font_size(mut self, size: f32) -> Self {
         self.font_size = size;
+        self
+    }
+
+    pub fn with_continuous_rendering(mut self, enabled: bool) -> Self {
+        self.continuous_rendering = enabled;
         self
     }
 
@@ -225,6 +249,28 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             // Setup GPU renderer
             let mut gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
 
+            // Initialize theme for syntax highlighting
+            // Option 1: Single theme
+            // let theme = crate::theme::Themes::one_dark();
+            // gpu_renderer.init_themed_pipeline(&theme);
+
+            // Option 2: Rainbow theme with multi-color tokens
+            let theme = crate::theme::Themes::one_dark(); // Load One Dark for shine effect
+            gpu_renderer.init_themed_pipeline(&theme);
+
+            // Set theme mode:
+            // 0 = Pastel Rainbow
+            // 1 = Vibrant Rainbow
+            // 2 = Theme with Shine (One Dark with shine effect)
+            // 3 = Static Theme
+            // 4 = Theme Interpolation
+            gpu_renderer.set_theme_mode(2); // Use shine effect!
+
+            // Option 3: Interpolate between two themes (animated!)
+            let _theme1 = crate::theme::Themes::monokai();
+            let theme2 = crate::theme::Themes::one_dark();
+            // gpu_renderer.init_themed_interpolation(&theme1, &theme2);
+
             // Register any custom shaders from the app logic
             for (shader_id, shader_source, uniform_size) in self.logic.register_shaders() {
                 gpu_renderer.register_text_effect_shader(shader_id, shader_source, uniform_size);
@@ -245,6 +291,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             // Setup CPU renderer
             let mut cpu_renderer = Renderer::new(self.window_size, scale_factor);
+            cpu_renderer.set_font_size(self.font_size);
             cpu_renderer.set_font_system(font_system.clone());
             // Font size is now managed by viewport metrics (defaults to 14.0)
 
@@ -253,6 +300,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             self.gpu_renderer = Some(gpu_renderer);
             self.font_system = Some(font_system);
             self.cpu_renderer = Some(cpu_renderer);
+
+            // Setup shader hot-reloading
+            self.setup_shader_watcher();
 
             self.logic.on_ready();
 
@@ -302,13 +352,19 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                         return;
                     }
 
-                    if let Some(cpu_renderer) = &self.cpu_renderer {
-                        let should_redraw =
-                            self.logic
-                                .on_key(&event, &cpu_renderer.viewport, &self.modifiers);
+                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                        // Extract viewport to avoid borrow conflicts
+                        let viewport = cpu_renderer.viewport.clone();
+                        let should_redraw = self.logic.on_key_with_renderer(
+                            &event,
+                            &viewport,
+                            &self.modifiers,
+                            Some(cpu_renderer),
+                        );
                         if should_redraw {
                             // Update window title if using EditorLogic
-                            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>()
+                            {
                                 if let Some(window) = &self.window {
                                     window.set_title(&editor.title());
                                 }
@@ -406,11 +462,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                 y: LogicalPixels(logical_y),
                             };
 
-                            let should_redraw = self.logic.on_click(
-                                point,
-                                &cpu_renderer.viewport,
-                                &self.modifiers,
-                            );
+                            let should_redraw =
+                                self.logic
+                                    .on_click(point, &cpu_renderer.viewport, &self.modifiers);
                             if should_redraw {
                                 window.request_redraw();
                             }
@@ -501,7 +555,72 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 }
 
 impl<T: AppLogic> TinyApp<T> {
+    fn setup_shader_watcher(&mut self) {
+        use notify::{RecommendedWatcher, Watcher, RecursiveMode, Event};
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = channel();
+
+        // Create watcher
+        let mut watcher = match RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    // Only care about modifications to .wgsl files
+                    if event.kind.is_modify() &&
+                       event.paths.iter().any(|p| p.extension().map_or(false, |ext| ext == "wgsl")) {
+                        let _ = tx.send(());
+                    }
+                }
+            },
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Failed to create file watcher: {}. Shader hot-reload disabled.", e);
+                return;
+            }
+        };
+
+        // Watch the shaders directory
+        let shader_path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("src/shaders");
+
+        if let Err(e) = watcher.watch(&shader_path, RecursiveMode::NonRecursive) {
+            eprintln!("Failed to watch shader directory {:?}: {}. Shader hot-reload disabled.", shader_path, e);
+            return;
+        }
+
+        eprintln!("✨ Shader hot-reload enabled! Watching: {:?}", shader_path);
+
+        // Simple debounce thread
+        let reload_flag = self.shader_reload_pending.clone();
+        std::thread::spawn(move || {
+            let mut last_reload = Instant::now();
+            for _ in rx {
+                // Simple 200ms debounce
+                if last_reload.elapsed() > Duration::from_millis(50) {
+                    reload_flag.store(true, Ordering::Relaxed);
+                    last_reload = Instant::now();
+                    eprintln!("Shader change detected, triggering reload...");
+                }
+            }
+        });
+
+        // Store the watcher (it needs to stay alive)
+        self._shader_watcher = Some(watcher);
+    }
+
     fn render_frame(&mut self) {
+        // Check for pending shader reload
+        if self.shader_reload_pending.load(Ordering::Relaxed) {
+            if let Some(gpu_renderer) = &mut self.gpu_renderer {
+                gpu_renderer.reload_shaders();
+                self.shader_reload_pending.store(false, Ordering::Relaxed);
+            }
+        }
+
         if let (Some(window), Some(gpu_renderer), Some(cpu_renderer)) =
             (&self.window, &mut self.gpu_renderer, &mut self.cpu_renderer)
         {
@@ -512,15 +631,28 @@ impl<T: AppLogic> TinyApp<T> {
             let dt = 0.016; // ~60fps frame time
             cpu_renderer.update_widgets(dt);
 
-            // Start animation timer once
-            if !self.animation_timer_started.load(Ordering::Relaxed) {
+            // Update GPU time for theme animations
+            gpu_renderer.update_time(dt);
+
+            // Start animation timer if continuous rendering is enabled
+            if self.continuous_rendering && !self.animation_timer_started.load(Ordering::Relaxed) {
                 self.animation_timer_started.store(true, Ordering::Relaxed);
                 let window_clone = window.clone();
                 std::thread::spawn(move || {
                     loop {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
                         window_clone.request_redraw();
                     }
+                });
+            } else if !self.continuous_rendering
+                && !self.animation_timer_started.load(Ordering::Relaxed)
+            {
+                // For non-continuous mode, still update occasionally for cursor blink
+                self.animation_timer_started.store(true, Ordering::Relaxed);
+                let window_clone = window.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    window_clone.request_redraw();
                 });
             }
 
@@ -593,7 +725,6 @@ impl<T: AppLogic> TinyApp<T> {
     }
 }
 
-
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {
     pub doc: Doc,
@@ -618,6 +749,40 @@ impl EditorLogic {
     }
 
     pub fn with_file(mut self, path: PathBuf) -> Self {
+        // Update syntax highlighter based on file extension
+        if let Some(path_str) = path.to_str() {
+            println!("EditorLogic: Checking file extension for {}", path_str);
+            if let Some(new_highlighter) = crate::syntax::SyntaxHighlighter::from_file_path(path_str) {
+                println!("EditorLogic: Selected {} syntax highlighter for {}", new_highlighter.name(), path_str);
+                let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
+
+                // Update the syntax highlighter
+                self.syntax_highlighter = Some(syntax_highlighter);
+
+                // Now get a reference to the newly set highlighter and connect it properly
+                if let Some(ref syntax_highlighter) = self.syntax_highlighter {
+                    // Request initial highlight with the correct language
+                    let text = self.doc.read().flatten_to_string();
+
+                    if let Some(syntax_hl) = syntax_highlighter
+                        .as_any()
+                        .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                    {
+                        println!("EditorLogic: Connecting {} highlighter to InputHandler", syntax_hl.name());
+
+                        // Update input handler with new syntax highlighter - this is CRITICAL!
+                        let shared_highlighter = Arc::new(syntax_hl.clone());
+                        self.input.set_syntax_highlighter(shared_highlighter);
+
+                        // Now request the initial parse
+                        syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
+                    }
+                }
+            } else {
+                println!("EditorLogic: No syntax highlighter available for {}, using default Rust", path_str);
+            }
+        }
+
         self.file_path = Some(path);
         self
     }
@@ -650,7 +815,7 @@ impl EditorLogic {
     }
 
     pub fn new(doc: Doc) -> Self {
-        // Always enable Rust syntax highlighting
+        // Default to Rust syntax highlighting (can be overridden by with_file)
         let syntax_highlighter: Box<dyn TextStyleProvider> =
             Box::new(SyntaxHighlighter::new_rust());
 
@@ -701,6 +866,51 @@ impl EditorLogic {
 impl AppLogic for EditorLogic {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn on_key_with_renderer(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        viewport: &crate::coordinates::Viewport,
+        modifiers: &winit::event::Modifiers,
+        renderer: Option<&mut crate::render::Renderer>,
+    ) -> bool {
+        let action = self
+            .input
+            .on_key_with_renderer(&self.doc, viewport, event, modifiers, renderer);
+
+        match action {
+            InputAction::Save => {
+                if let Err(e) = self.save() {
+                    eprintln!("Failed to save: {}", e);
+                }
+                true // Redraw to update title
+            }
+            InputAction::Undo => {
+                if self.input.undo(&self.doc) {
+                    self.widgets_dirty = true;
+                    self.is_modified = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            InputAction::Redo => {
+                if self.input.redo(&self.doc) {
+                    self.widgets_dirty = true;
+                    self.is_modified = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            InputAction::Redraw => {
+                self.widgets_dirty = true;
+                self.is_modified = true;
+                true
+            }
+            InputAction::None => false,
+        }
     }
 
     fn on_key(

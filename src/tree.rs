@@ -37,6 +37,8 @@ pub struct Doc {
 pub struct Tree {
     pub root: Node,
     pub version: u64,
+    /// Cached flattened text representation for performance
+    cached_flattened_text: Option<String>,
 }
 
 /// Tree node - either leaf with spans or internal with children
@@ -70,7 +72,7 @@ impl Node {
     /// Split node if it exceeds MAX_SPANS
     fn split_if_needed(self) -> Self {
         match self {
-            Node::Leaf { spans, sums } if spans.len() > MAX_SPANS => {
+            Node::Leaf { spans, sums: _ } if spans.len() > MAX_SPANS => {
                 let mid = spans.len() / 2;
                 let (left, right) = spans.split_at(mid);
                 Node::internal(vec![
@@ -78,7 +80,7 @@ impl Node {
                     Node::leaf(right.to_vec()),
                 ])
             }
-            Node::Internal { children, sums } if children.len() > MAX_SPANS => {
+            Node::Internal { children, sums: _ } if children.len() > MAX_SPANS => {
                 let mid = children.len() / 2;
                 let (left, right) = children.split_at(mid);
                 Node::internal(vec![
@@ -110,7 +112,7 @@ pub struct Sums {
 }
 
 /// Edit operations
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Edit {
     Insert { pos: usize, content: Content },
     Delete { range: Range<usize> },
@@ -122,6 +124,15 @@ pub enum Edit {
 pub enum Content {
     Text(String),
     Widget(Arc<dyn Widget>),
+}
+
+impl std::fmt::Debug for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Content::Text(s) => write!(f, "Text({:?})", s),
+            Content::Widget(_) => write!(f, "Widget(...)"),
+        }
+    }
 }
 
 pub type Rect = LayoutRect;
@@ -201,6 +212,7 @@ impl Tree {
                 sums: Sums::default(),
             },
             version: 0,
+            cached_flattened_text: Some(String::new()), // Empty tree = empty string
         }
     }
 
@@ -214,6 +226,7 @@ impl Tree {
                     sums: Sums::default(),
                 },
                 version: 0,
+                cached_flattened_text: Some(String::new()),
             };
         }
 
@@ -266,6 +279,7 @@ impl Tree {
             return Self {
                 root: all_leaves.into_iter().next().unwrap(),
                 version: 0,
+                cached_flattened_text: Some(text.to_string()),
             };
         }
 
@@ -293,6 +307,7 @@ impl Tree {
         Self {
             root: nodes.into_iter().next().unwrap(),
             version: 0,
+            cached_flattened_text: Some(text.to_string()),
         }
     }
 
@@ -307,20 +322,27 @@ impl Tree {
         let mut new_root = self.root.clone();
         for edit in edits {
             new_root = Self::apply_edit_to_node(new_root, edit);
+            debug_assert!(validate_tree_structure(&new_root), "Tree structure invalid after edit: {:?}", edit);
         }
 
         Self {
             root: new_root,
             version: self.version + 1,
+            cached_flattened_text: None, // Cache invalidated by edits
         }
     }
 
     /// Apply single edit incrementally
     fn apply_edit_incremental(&self, edit: &Edit) -> Self {
         let new_root = Self::apply_edit_to_node(self.root.clone(), edit);
+
+        // Validate tree structure in debug builds
+        debug_assert!(validate_tree_structure(&new_root), "Tree structure invalid after edit: {:?}", edit);
+
         Self {
             root: new_root,
             version: self.version + 1,
+            cached_flattened_text: None, // Cache invalidated by edits
         }
     }
 
@@ -337,6 +359,7 @@ impl Tree {
     }
 
     /// Helper: Insert span at index in spans vec
+    #[allow(dead_code)]
     fn insert_span_at(spans: &[Span], index: usize, new_span: Span) -> Vec<Span> {
         let mut result = Vec::with_capacity(spans.len() + 1);
         result.extend_from_slice(&spans[..index]);
@@ -347,8 +370,40 @@ impl Tree {
 
     /// Insert content at position in node
     fn insert_at_node(node: Node, pos: usize, content: &Content) -> Node {
+        // Validate position is within bounds
+        let total_bytes = match &node {
+            Node::Leaf { sums, .. } => sums.bytes,
+            Node::Internal { sums, .. } => sums.bytes,
+        };
+        debug_assert!(pos <= total_bytes, "Insert position {} exceeds node size {}", pos, total_bytes);
+
         match node {
             Node::Leaf { mut spans, .. } => {
+                // Special case: optimize sequential typing at the end of all content
+                if let Content::Text(text) = content {
+                    let total_bytes: usize = spans.iter().map(span_bytes).sum();
+
+                    // If inserting at the very end and we have spans
+                    if pos == total_bytes && !spans.is_empty() {
+                        // Try to extend the last text span instead of creating a new one
+                        let last_idx = spans.len() - 1;
+                        if let Span::Text { bytes, lines } = &spans[last_idx] {
+                            // Merge with the last span
+                            let mut combined = Vec::with_capacity(bytes.len() + text.len());
+                            combined.extend_from_slice(bytes);
+                            combined.extend_from_slice(text.as_bytes());
+
+                            let new_lines = lines + bytecount::count(text.as_bytes(), b'\n') as u32;
+                            spans[last_idx] = Span::Text {
+                                bytes: combined.into(),
+                                lines: new_lines,
+                            };
+                            return Node::leaf(spans).split_if_needed();
+                        }
+                    }
+                }
+
+                // Create the new span for regular insertion
                 let new_span = match content {
                     Content::Text(s) => {
                         let bytes = s.as_bytes();
@@ -366,11 +421,39 @@ impl Tree {
                     let span_bytes = span_bytes(span);
 
                     if byte_offset <= pos && pos <= byte_offset + span_bytes {
-                        if let Span::Text { bytes, .. } = span {
+                        if let Span::Text { bytes, lines } = span {
                             let split_pos = pos - byte_offset;
 
-                            if split_pos > 0 && split_pos < bytes.len() {
-                                // Split span
+                            // Handle three cases: insert before (split_pos=0), in middle, or after (split_pos=len)
+                            if split_pos == 0 {
+                                // Insert before this span
+                                spans.insert(i, new_span);
+                                return Node::leaf(spans).split_if_needed();
+                            } else if split_pos == bytes.len() {
+                                // Insert after this span - try to merge if both are text
+                                if let (Content::Text(new_text), Span::Text { .. }) = (content, &new_span) {
+                                    // Merge with current span instead of creating a new one
+                                    let mut combined = Vec::with_capacity(bytes.len() + new_text.len());
+                                    combined.extend_from_slice(bytes);
+                                    combined.extend_from_slice(new_text.as_bytes());
+
+                                    let new_lines = lines + bytecount::count(new_text.as_bytes(), b'\n') as u32;
+                                    spans[i] = Span::Text {
+                                        bytes: combined.into(),
+                                        lines: new_lines,
+                                    };
+                                    return Node::leaf(spans).split_if_needed();
+                                } else {
+                                    // Can't merge, insert as separate span
+                                    if i + 1 < spans.len() {
+                                        spans.insert(i + 1, new_span);
+                                    } else {
+                                        spans.push(new_span);
+                                    }
+                                    return Node::leaf(spans).split_if_needed();
+                                }
+                            } else {
+                                // Split in the middle
                                 let prefix = &bytes[..split_pos];
                                 let suffix = &bytes[split_pos..];
 
@@ -393,23 +476,20 @@ impl Tree {
                                 new_spans.extend_from_slice(&spans[(i + 1)..]);
 
                                 return Node::leaf(new_spans).split_if_needed();
-                            } else if byte_offset == pos {
-                                // Insert before this span
+                            }
+                        } else {
+                            // Widget span - insert before or after based on position
+                            let split_pos = pos - byte_offset;
+                            if split_pos == 0 {
                                 spans.insert(i, new_span);
-                                return Node::leaf(spans).split_if_needed();
-                            } else if byte_offset + span_bytes == pos {
-                                // Insert after this span
+                            } else {
+                                // Insert after the widget
                                 if i + 1 < spans.len() {
                                     spans.insert(i + 1, new_span);
                                 } else {
                                     spans.push(new_span);
                                 }
-                                return Node::leaf(spans).split_if_needed();
                             }
-                        } else {
-                            // Widget span - insert before or after
-                            let idx = if byte_offset == pos { i } else { i + 1 };
-                            spans.insert(idx, new_span);
                             return Node::leaf(spans).split_if_needed();
                         }
                     }
@@ -616,6 +696,11 @@ impl Tree {
     }
 
     pub fn flatten_to_string(&self) -> String {
+        if let Some(ref cached) = self.cached_flattened_text {
+            return cached.clone();
+        }
+
+        // This shouldn't happen if we initialize the cache properly, but fallback to computing
         let capacity = match &self.root {
             Node::Leaf { sums, .. } => sums.bytes,
             Node::Internal { sums, .. } => sums.bytes,
@@ -627,7 +712,7 @@ impl Tree {
 
     // === Navigation Methods (Iterative) ===
 
-    pub fn cursor(&self) -> TreeCursor {
+    pub fn cursor(&self) -> TreeCursor<'_> {
         TreeCursor::new(self)
     }
 
@@ -694,6 +779,10 @@ impl Tree {
     }
 
     pub fn doc_pos_to_byte(&self, pos: DocPos) -> usize {
+        self.doc_pos_to_byte_with_tab_width(pos, 4) // Default tab width
+    }
+
+    pub fn doc_pos_to_byte_with_tab_width(&self, pos: DocPos, tab_width: u32) -> usize {
         if let Some(line_start) = self.line_to_byte(pos.line) {
             let line_end = self.line_to_byte(pos.line + 1).unwrap_or(self.byte_count());
             let line_text = self.get_text_slice(line_start..line_end);
@@ -706,7 +795,7 @@ impl Tree {
                     break;
                 }
                 if ch == '\t' {
-                    visual_column = ((visual_column / 4) + 1) * 4;
+                    visual_column = ((visual_column / tab_width) + 1) * tab_width;
                 } else {
                     visual_column += 1;
                 }
@@ -719,7 +808,7 @@ impl Tree {
         }
     }
 
-    pub fn walk_visible_range<F>(&self, byte_range: Range<usize>, mut callback: F)
+    pub fn walk_visible_range<F>(&self, byte_range: Range<usize>, callback: F)
     where
         F: FnMut(&[Span], usize, usize),
     {
@@ -773,6 +862,7 @@ impl<'a> CursorFrame<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn has_next_child(&self) -> bool {
         if let Node::Internal { children, .. } = self.node {
             self.child_index < children.len()
@@ -822,7 +912,7 @@ impl<'a> TreeCursor<'a> {
     }
 
     fn descend_to_leaf(&mut self) {
-        while let Some(mut frame) = self.stack.pop() {
+        while let Some(frame) = self.stack.pop() {
             match frame.node {
                 Node::Leaf { spans, .. } => {
                     self.current_spans.clear();
@@ -874,7 +964,7 @@ impl<'a> TreeCursor<'a> {
             return true;
         }
 
-        while let Some(mut frame) = self.stack.pop() {
+        while let Some(frame) = self.stack.pop() {
             match frame.node {
                 Node::Leaf { spans, .. } => {
                     // Set up current spans for this leaf
@@ -1065,7 +1155,7 @@ impl<'a> TreeCursor<'a> {
                             }
                             Node::Internal { .. } => {
                                 // Need to go deeper - get leftmost child
-                                if let Some(mut new_frame) = self.stack.pop() {
+                                if let Some(new_frame) = self.stack.pop() {
                                     self.stack.push(new_frame);
                                     if let Some(frame) = self.stack.last_mut() {
                                         if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
@@ -1291,6 +1381,59 @@ fn collect_text(node: &Node, out: &mut String) {
             }
         }
     }
+}
+
+/// Validate tree structure invariants (debug builds only)
+#[cfg(debug_assertions)]
+fn validate_tree_structure(node: &Node) -> bool {
+    match node {
+        Node::Leaf { spans, sums } => {
+            // Check spans don't exceed MAX_SPANS
+            if spans.len() > MAX_SPANS {
+                eprintln!("Leaf has {} spans, exceeds MAX_SPANS ({})", spans.len(), MAX_SPANS);
+                return false;
+            }
+
+            // Verify sums match actual content
+            let computed_sums = compute_sums(spans);
+            if sums.bytes != computed_sums.bytes || sums.lines != computed_sums.lines {
+                eprintln!("Leaf sums mismatch: stored ({} bytes, {} lines) vs computed ({} bytes, {} lines)",
+                    sums.bytes, sums.lines, computed_sums.bytes, computed_sums.lines);
+                return false;
+            }
+
+            true
+        }
+        Node::Internal { children, sums } => {
+            // Check children don't exceed MAX_SPANS
+            if children.len() > MAX_SPANS {
+                eprintln!("Internal node has {} children, exceeds MAX_SPANS ({})", children.len(), MAX_SPANS);
+                return false;
+            }
+
+            // Recursively validate children
+            for child in children {
+                if !validate_tree_structure(child) {
+                    return false;
+                }
+            }
+
+            // Verify sums match children
+            let computed_sums = compute_node_sums(children);
+            if sums.bytes != computed_sums.bytes || sums.lines != computed_sums.lines {
+                eprintln!("Internal node sums mismatch: stored ({} bytes, {} lines) vs computed ({} bytes, {} lines)",
+                    sums.bytes, sums.lines, computed_sums.bytes, computed_sums.lines);
+                return false;
+            }
+
+            true
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn validate_tree_structure(_node: &Node) -> bool {
+    true // No-op in release builds
 }
 
 // === Position Types ===

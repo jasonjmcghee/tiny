@@ -399,13 +399,17 @@ impl Viewport {
             physical_size,
             scale_factor,
             metrics: TextMetrics::new(13.0),  // Default 14pt font
-            margin: LayoutPos::new(4.0, 4.0), // 4px margin left and top
+            margin: LayoutPos::new(16.0, 16.0), // 4px margin left and top
             line_mode: LineMode::default(),   // Default to no wrap
             cached_doc_bounds: None,
             cached_bounds_version: 0,
             cached_longest_line_chars: 0,
             font_system: None,
         }
+    }
+
+    pub fn set_font_size(&mut self, font_size: f32) {
+        self.metrics = TextMetrics::new(font_size);
     }
 
     /// Set font system for accurate text measurement

@@ -4,7 +4,6 @@
 //! seamlessly with the render graph for maximum performance.
 
 use std::ops::Range;
-use std::sync::Arc;
 
 // === Core Trait ===
 
@@ -36,16 +35,16 @@ pub struct TextEffect {
 }
 
 /// Types of visual effects that can be applied to text
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EffectType {
-    /// Change text color
-    Color(u32),
+    /// Token with ID for theme lookup
+    Token(u8),
+    /// Custom shader effect
+    Shader { id: u32 },
     /// Change font weight
     Weight(FontWeight),
     /// Make text italic
     Italic(bool),
-    /// Apply custom GPU shader
-    Shader { id: u32, params: Arc<[f32]> },
     /// Transform text (scale, rotation, etc.)
     Transform(TextTransform),
     /// Background color (rectangle behind text)
@@ -56,7 +55,7 @@ pub enum EffectType {
     Strikethrough(u32),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FontWeight {
     Thin = 100,
     Light = 300,
@@ -66,7 +65,7 @@ pub enum FontWeight {
     Black = 900,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TextTransform {
     pub scale_x: f32,
     pub scale_y: f32,
@@ -75,7 +74,7 @@ pub struct TextTransform {
     pub offset_y: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UnderlineStyle {
     Solid,
     Dashed,
@@ -209,7 +208,7 @@ mod tests {
         let provider = MockProvider {
             effects: vec![TextEffect {
                 range: 0..10,
-                effect: EffectType::Color(0xFF0000FF),
+                effect: EffectType::Token(1), // Token ID 1
                 priority: priority::SYNTAX,
             }],
         };
@@ -227,12 +226,12 @@ mod tests {
             effects: vec![
                 TextEffect {
                     range: 0..10,
-                    effect: EffectType::Color(0xFF0000FF),
+                    effect: EffectType::Token(1), // Token ID 1
                     priority: priority::SYNTAX,
                 },
                 TextEffect {
                     range: 20..30,
-                    effect: EffectType::Color(0x00FF00FF),
+                    effect: EffectType::Token(2), // Token ID 2
                     priority: priority::SYNTAX,
                 },
             ],

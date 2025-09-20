@@ -4,11 +4,58 @@
 
 use crate::text_effects::{priority, EffectType, TextEffect, TextStyleProvider};
 use arc_swap::ArcSwap;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tree_sitter::{
     InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree as TSTree,
+    WasmStore,
 };
+
+// Global WasmStore that lives forever
+lazy_static::lazy_static! {
+    static ref WASM_STORE: Mutex<Option<Box<WasmStore>>> = Mutex::new(None);
+    static ref WGSL_LANGUAGE: Mutex<Option<Language>> = Mutex::new(None);
+}
+
+fn get_wgsl_language() -> Language {
+    // Check if already loaded
+    {
+        let lang_guard = WGSL_LANGUAGE.lock().unwrap();
+        if let Some(lang) = lang_guard.as_ref() {
+            return lang.clone();
+        }
+    }
+
+    // Need to load it
+    let mut store_guard = WASM_STORE.lock().unwrap();
+
+    // Initialize store if needed
+    if store_guard.is_none() {
+        let engine = tree_sitter::wasmtime::Engine::default();
+        let store = Box::new(WasmStore::new(&engine).expect("Failed to create WasmStore"));
+        // Leak the box to make it live forever - this ensures the WasmStore outlives any Language references
+        let store_ptr: &'static mut WasmStore = Box::leak(store);
+        unsafe {
+            *store_guard = Some(Box::from_raw(store_ptr));
+        }
+    }
+
+    // Load language
+    const WGSL_WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
+    println!("Loading WGSL from WASM ({} bytes)...", WGSL_WASM.len());
+
+    let store = store_guard.as_mut().unwrap();
+    let language = store.load_language("wgsl", WGSL_WASM)
+        .expect("Failed to load WGSL language");
+
+    // Cache the language
+    let mut lang_guard = WGSL_LANGUAGE.lock().unwrap();
+    *lang_guard = Some(language.clone());
+
+    println!("WGSL language loaded and cached");
+    language
+}
 
 /// Language configuration for syntax highlighting
 pub struct LanguageConfig {
@@ -30,6 +77,19 @@ impl Languages {
         }
     }
 
+    /// WGSL language configuration (loads from WASM)
+    pub fn wgsl() -> LanguageConfig {
+        const WGSL_HIGHLIGHTS: &str = include_str!("../assets/grammars/wgsl/highlights.scm");
+
+        let language = get_wgsl_language();
+
+        LanguageConfig {
+            language,
+            highlights_query: WGSL_HIGHLIGHTS,
+            name: "wgsl",
+        }
+    }
+
     // Future languages can be added here:
     // pub fn javascript() -> LanguageConfig { ... }
     // pub fn python() -> LanguageConfig { ... }
@@ -38,20 +98,76 @@ impl Languages {
 /// Token types (universal across languages)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenType {
-    Keyword,
-    Function,
-    Type,
-    String,
-    Number,
-    Comment,
-    Constant,
-    Operator,
-    Punctuation,
-    Variable,
-    Attribute,
-    Namespace,
-    Property,
-    Parameter,
+    // Basic tokens (0-14) - keep existing for compatibility
+    Keyword,        // 1
+    Function,       // 2
+    Type,          // 3
+    String,        // 4
+    Number,        // 5
+    Comment,       // 6
+    Constant,      // 7
+    Operator,      // 8
+    Punctuation,   // 9
+    Variable,      // 10
+    Attribute,     // 11
+    Namespace,     // 12
+    Property,      // 13
+    Parameter,     // 14
+
+    // Extended tokens for richer syntax highlighting (15+)
+    Method,           // 15
+    Field,            // 16
+    Constructor,      // 17
+    Enum,             // 18
+    EnumMember,       // 19
+    Interface,        // 20
+    Struct,           // 21
+    Class,            // 22
+    Module,           // 23
+    Macro,            // 24
+    Label,            // 25
+    KeywordControl,   // 26 - if, else, match, loop, etc.
+
+    // String variants
+    StringEscape,     // 27
+    StringInterpolation, // 28
+    Regex,            // 29
+
+    // Literal variants
+    Boolean,          // 30
+    Character,        // 31
+    Float,            // 32
+
+    // Comment variants
+    CommentDoc,       // 33
+    CommentTodo,      // 34
+
+    // Operator variants
+    ComparisonOp,     // 35
+    LogicalOp,        // 36
+    ArithmeticOp,     // 37
+
+    // Punctuation variants
+    Bracket,          // 38 - [], <>
+    Brace,            // 39 - {}
+    Parenthesis,      // 40 - ()
+    Delimiter,        // 41 - ::, ->
+    Semicolon,        // 42
+    Comma,            // 43
+
+    // Special highlighting
+    Error,            // 44
+    Warning,          // 45
+    Deprecated,       // 46
+    Unused,           // 47
+
+    // Rust-specific semantic tokens
+    SelfKeyword,      // 48
+    Lifetime,         // 49
+    TypeParameter,    // 50
+    Generic,          // 51
+    Trait,            // 52
+    Derive,           // 53
 }
 
 /// Background syntax highlighter with debouncing
@@ -65,6 +181,10 @@ pub struct SyntaxHighlighter {
     name: &'static str,
     /// Cached tree for viewport queries
     cached_tree: Arc<ArcSwap<Option<TSTree>>>,
+    /// Cached text that corresponds to the cached tree
+    cached_text: Arc<ArcSwap<Option<String>>>,
+    /// Version of the cached text/tree
+    cached_version: Arc<AtomicU64>,
     /// Language for creating queries
     #[allow(dead_code)]
     language: Language,
@@ -127,8 +247,26 @@ impl SyntaxHighlighter {
 
     /// Create highlighter for any language with background parsing
     pub fn new(config: LanguageConfig) -> Result<Self, tree_sitter::LanguageError> {
+        // Create the parser with proper setup here, then move to thread
         let mut parser = Parser::new();
-        parser.set_language(&config.language)?;
+
+        // For WGSL, we need special handling
+        if config.name == "wgsl" {
+            // Create engine and store here
+            let engine = Box::leak(Box::new(tree_sitter::wasmtime::Engine::default()));
+            let mut store = WasmStore::new(engine).expect("Failed to create WasmStore");
+
+            // Load the language into the store
+            const WGSL_WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
+            let language = store.load_language("wgsl", WGSL_WASM)
+                .expect("Failed to load WGSL language");
+
+            // Set up the parser
+            parser.set_wasm_store(store).expect("Failed to set WasmStore");
+            parser.set_language(&language)?;
+        } else {
+            parser.set_language(&config.language)?;
+        }
 
         let query = Arc::new(
             Query::new(&config.language, config.highlights_query)
@@ -140,12 +278,19 @@ impl SyntaxHighlighter {
         let highlights_clone = highlights.clone();
         let cached_tree = Arc::new(ArcSwap::from_pointee(None));
         let cached_tree_clone = cached_tree.clone();
+        let cached_text = Arc::new(ArcSwap::from_pointee(None));
+        let cached_text_clone = cached_text.clone();
+        let cached_version = Arc::new(AtomicU64::new(0));
+        let cached_version_clone = cached_version.clone();
 
         let (tx, rx) = mpsc::channel::<ParseRequest>();
 
-        // Background parsing thread with debouncing
+        let language_name = config.name;
+
+        // Background parsing thread with debouncing - move parser into it
         thread::spawn(move || {
-            println!("SYNTAX: Background thread started");
+            println!("SYNTAX: Background thread started for {}", language_name);
+
             let mut tree: Option<TSTree> = None;
             let mut cursor = QueryCursor::new();
             let mut last_text = String::new();
@@ -190,12 +335,17 @@ impl SyntaxHighlighter {
                 }
 
                 println!(
-                    "SYNTAX: Parsing {} bytes with tree-sitter (incremental={})",
+                    "SYNTAX [{}]: Parsing {} bytes with tree-sitter (incremental={})",
+                    language_name,
                     final_request.text.len(),
                     final_request.edit.is_some()
                 );
                 // Parse with tree-sitter (incremental if we have existing tree)
                 tree = parser.parse(&final_request.text, tree.as_ref());
+
+                if tree.is_none() {
+                    println!("SYNTAX [{}]: WARNING - Failed to parse!", language_name);
+                }
 
                 if let Some(ref ts_tree) = tree {
                     let mut effects = Vec::new();
@@ -231,7 +381,7 @@ impl SyntaxHighlighter {
                             if let Some(token) = Self::capture_name_to_token_type(capture_name) {
                                 effects.push(TextEffect {
                                     range: capture.node.start_byte()..capture.node.end_byte(),
-                                    effect: EffectType::Color(Self::token_type_to_color(token)),
+                                    effect: EffectType::Token(Self::token_type_to_id(token)),
                                     priority: priority::SYNTAX,
                                 });
                             } else if capture_count <= 10 {
@@ -256,8 +406,10 @@ impl SyntaxHighlighter {
                     // Atomic swap - readers never block! Old highlighting stays until this completes
                     highlights_clone.store(Arc::new(cleaned));
 
-                    // Store the tree for viewport queries
+                    // Store the tree and corresponding text for viewport queries
                     cached_tree_clone.store(Arc::new(Some(ts_tree.clone())));
+                    cached_text_clone.store(Arc::new(Some(final_request.text.clone())));
+                    cached_version_clone.store(final_request.version, Ordering::Relaxed);
 
                     // Mark first parse as complete
                     is_first_parse = false;
@@ -270,6 +422,8 @@ impl SyntaxHighlighter {
             tx,
             name: config.name,
             cached_tree,
+            cached_text,
+            cached_version,
             language: config.language,
             query,
         })
@@ -278,6 +432,28 @@ impl SyntaxHighlighter {
     /// Create highlighter for Rust (convenience method)
     pub fn new_rust() -> Self {
         Self::new(Languages::rust()).expect("Failed to create Rust highlighter")
+    }
+
+    /// Create highlighter for WGSL (convenience method)
+    pub fn new_wgsl() -> Self {
+        Self::new(Languages::wgsl()).expect("Failed to create WGSL highlighter")
+    }
+
+    /// Create highlighter based on file extension
+    pub fn from_file_extension(extension: &str) -> Option<Self> {
+        match extension.to_lowercase().as_str() {
+            "rs" => Some(Self::new_rust()),
+            "wgsl" => Some(Self::new_wgsl()),
+            _ => None,
+        }
+    }
+
+    /// Create highlighter based on file path
+    pub fn from_file_path(path: &str) -> Option<Self> {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(Self::from_file_extension)
     }
 
     /// Map tree-sitter capture names to token types
@@ -299,16 +475,22 @@ impl SyntaxHighlighter {
             | "keyword.storage.modifier" => Some(TokenType::Keyword),
 
             // Functions
-            "function" | "function.builtin" | "function.call" | "function.macro"
+            "function" | "function.builtin" | "function.call"
             | "function.method" | "method" | "method.call" => Some(TokenType::Function),
+
+            // Macros get special treatment
+            "function.macro" => Some(TokenType::Macro),
 
             // Types
             "type" | "type.builtin" | "type.primitive" | "type.qualifier" | "class"
             | "storage.type" => Some(TokenType::Type),
 
-            // Strings
+            // Strings and escape sequences
             "string" | "string.quoted" | "string.template" | "string.regex" | "string.special"
             | "string.escape" | "char" | "character" => Some(TokenType::String),
+
+            // Escape sequences get special treatment
+            "escape" => Some(TokenType::StringEscape),
 
             // Numbers
             "number"
@@ -318,16 +500,17 @@ impl SyntaxHighlighter {
             | "float" => Some(TokenType::Number),
 
             // Comments
-            "comment" | "comment.line" | "comment.block" | "comment.documentation" => {
-                Some(TokenType::Comment)
-            }
+            "comment" | "comment.line" | "comment.block" => Some(TokenType::Comment),
+            "comment.documentation" => Some(TokenType::CommentDoc),
 
-            // Constants
+            // Constants - keep separate from numbers for proper semantic highlighting
             "constant"
-            | "constant.builtin"
             | "constant.language"
             | "boolean"
             | "constant.builtin.boolean" => Some(TokenType::Constant),
+
+            // constant.builtin in Rust is often numbers, but could be other things
+            "constant.builtin" => Some(TokenType::Number),
 
             // Operators
             "operator"
@@ -350,43 +533,188 @@ impl SyntaxHighlighter {
             | "variable.other"
             | "variable.other.member" => Some(TokenType::Variable),
 
-            // Attributes
-            "attribute" | "decorator" | "annotation" => Some(TokenType::Attribute),
+            // Attributes - including derive in Rust
+            "attribute" | "decorator" | "annotation" | "attribute.builtin" => Some(TokenType::Attribute),
 
-            // Namespaces
+            // Special Rust attributes
+            "derive" => Some(TokenType::Derive),
+
+            // Namespaces and modules
             "namespace" | "module" => Some(TokenType::Namespace),
 
-            // Properties
+            // Properties and fields
             "property" | "field" => Some(TokenType::Property),
 
-            // Parameters
-            "parameter" | "label" => Some(TokenType::Parameter),
+            // Parameters and labels
+            "parameter" => Some(TokenType::Parameter),
+            "label" => Some(TokenType::Label),
 
+            // Constructor
+            "constructor" => Some(TokenType::Constructor),
+
+            // Enums and enum members
+            "enum" => Some(TokenType::Enum),
+            "enum.member" | "enummember" => Some(TokenType::EnumMember),
+
+            // Structs, classes, interfaces
+            "struct" => Some(TokenType::Struct),
+            "class" | "class.builtin" => Some(TokenType::Class),
+            "interface" => Some(TokenType::Interface),
+
+            // Traits (Rust-specific but useful)
+            "trait" => Some(TokenType::Trait),
+
+            // Lifetimes (Rust-specific)
+            "lifetime" => Some(TokenType::Lifetime),
+
+            // Type parameters and generics
+            "type.parameter" | "typeparameter" | "generic" => Some(TokenType::TypeParameter),
+
+            // Self keyword (Rust/Python)
+            "self" | "keyword.self" => Some(TokenType::SelfKeyword),
+
+            // Error and warning markers
+            "error" => Some(TokenType::Error),
+            "warning" => Some(TokenType::Warning),
+
+            // Additional string types
+            "string.documentation" => Some(TokenType::CommentDoc),
+            "regex" | "regexp" => Some(TokenType::Regex),
+            "char.literal" | "character.literal" => Some(TokenType::Character),
+
+            // Additional operators
+            "operator.comparison" => Some(TokenType::ComparisonOp),
+            "operator.logical" => Some(TokenType::LogicalOp),
+            "operator.arithmetic" => Some(TokenType::ArithmeticOp),
+
+            // Additional punctuation
+            "bracket" => Some(TokenType::Bracket),
+            "brace" => Some(TokenType::Brace),
+            "parenthesis" | "paren" => Some(TokenType::Parenthesis),
+            "delimiter" => Some(TokenType::Delimiter),
+            "semicolon" => Some(TokenType::Semicolon),
+            "comma" => Some(TokenType::Comma),
+
+            // Tag names (for HTML/XML/JSX)
+            "tag" | "tag.builtin" => Some(TokenType::Type),
+            "tag.attribute" => Some(TokenType::Attribute),
+
+            // JSON/YAML/TOML keys
+            "key" => Some(TokenType::Property),
+
+            // SQL keywords
+            "keyword.sql" => Some(TokenType::Keyword),
+
+            // Markdown headers
+            "heading" | "title" => Some(TokenType::Keyword),
+
+            // WGSL-specific captures
+            "storageclass" => Some(TokenType::Keyword),
+            "structure" => Some(TokenType::Struct),
+            "repeat" => Some(TokenType::Keyword),
+            "conditional" => Some(TokenType::Keyword),
+            "keyword.function" => Some(TokenType::Keyword),
+            "keyword.return" => Some(TokenType::Keyword),
+            "function.call" => Some(TokenType::Function),
+
+            // Catch-all for unrecognized names - return None to skip
             _ => None,
         }
     }
 
-    /// Convert token type to color (RGBA format)
-    pub fn token_type_to_color(token: TokenType) -> u32 {
-        match token {
-            TokenType::Keyword => 0xC678DDFF,     // Purple
-            TokenType::Function => 0x61AFEFFF,    // Blue
-            TokenType::Type => 0xE5C07BFF,        // Yellow-orange
-            TokenType::String => 0x98C379FF,      // Green
-            TokenType::Number => 0xD19A66FF,      // Orange
-            TokenType::Comment => 0x5C6370FF,     // Gray
-            TokenType::Constant => 0xD19A66FF,    // Orange
-            TokenType::Operator => 0x56B6C2FF,    // Cyan
-            TokenType::Punctuation => 0xABB2BFFF, // Gray
-            TokenType::Variable => 0xABB2BFFF,    // Default gray
-            TokenType::Attribute => 0xE06C75FF,   // Red
-            TokenType::Namespace => 0x61AFEFFF,   // Blue
-            TokenType::Property => 0xE5C07BFF,    // Yellow
-            TokenType::Parameter => 0xABB2BFFF,   // Gray
+    /// Convert color back to token type (for debugging and conversion)
+    pub fn color_to_token_type(color: u32) -> TokenType {
+        match color {
+            0xC678DDFF => TokenType::Keyword,
+            0x61AFEFFF => TokenType::Function,
+            0xE5C07BFF => TokenType::Type,
+            0x98C379FF => TokenType::String,
+            0xD19A66FF => TokenType::Number,
+            0x5C6370FF => TokenType::Comment,
+            0x56B6C2FF => TokenType::Operator,
+            0xABB2BFFF => TokenType::Punctuation,
+            0xE06C75FF => TokenType::Attribute,
+            _ => TokenType::Variable, // Default
         }
     }
 
-    /// Coalesce adjacent effects with the same color
+    /// Convert token type to token ID for theme lookup
+    pub fn token_type_to_id(token: TokenType) -> u8 {
+        match token {
+            // Basic tokens (1-14) - maintain compatibility
+            TokenType::Keyword => 1,
+            TokenType::Function => 2,
+            TokenType::Type => 3,
+            TokenType::String => 4,
+            TokenType::Number => 5,
+            TokenType::Comment => 6,
+            TokenType::Constant => 7,
+            TokenType::Operator => 8,
+            TokenType::Punctuation => 9,
+            TokenType::Variable => 10,
+            TokenType::Attribute => 11,
+            TokenType::Namespace => 12,
+            TokenType::Property => 13,
+            TokenType::Parameter => 14,
+
+            // Extended tokens (15+)
+            TokenType::Method => 15,
+            TokenType::Field => 16,
+            TokenType::Constructor => 17,
+            TokenType::Enum => 18,
+            TokenType::EnumMember => 19,
+            TokenType::Interface => 20,
+            TokenType::Struct => 21,
+            TokenType::Class => 22,
+            TokenType::Module => 23,
+            TokenType::Macro => 24,
+            TokenType::Label => 25,
+            TokenType::KeywordControl => 26,
+
+            // String variants
+            TokenType::StringEscape => 27,
+            TokenType::StringInterpolation => 28,
+            TokenType::Regex => 29,
+
+            // Literal variants
+            TokenType::Boolean => 30,
+            TokenType::Character => 31,
+            TokenType::Float => 32,
+
+            // Comment variants
+            TokenType::CommentDoc => 33,
+            TokenType::CommentTodo => 34,
+
+            // Operator variants
+            TokenType::ComparisonOp => 35,
+            TokenType::LogicalOp => 36,
+            TokenType::ArithmeticOp => 37,
+
+            // Punctuation variants
+            TokenType::Bracket => 38,
+            TokenType::Brace => 39,
+            TokenType::Parenthesis => 40,
+            TokenType::Delimiter => 41,
+            TokenType::Semicolon => 42,
+            TokenType::Comma => 43,
+
+            // Special highlighting
+            TokenType::Error => 44,
+            TokenType::Warning => 45,
+            TokenType::Deprecated => 46,
+            TokenType::Unused => 47,
+
+            // Rust-specific semantic tokens
+            TokenType::SelfKeyword => 48,
+            TokenType::Lifetime => 49,
+            TokenType::TypeParameter => 50,
+            TokenType::Generic => 51,
+            TokenType::Trait => 52,
+            TokenType::Derive => 53,
+        }
+    }
+
+    /// Coalesce adjacent effects with the same shader and params
     pub fn coalesce_effects(effects: Vec<TextEffect>) -> Vec<TextEffect> {
         if effects.is_empty() {
             return effects;
@@ -395,13 +723,14 @@ impl SyntaxHighlighter {
         let mut coalesced = Vec::with_capacity(effects.len() / 2); // Estimate
         let mut current_effect: Option<TextEffect> = None;
 
-        for effect in effects {
+        for mut effect in effects {
             if let Some(ref mut curr) = current_effect {
                 // Check if we can coalesce with current effect
-                if curr.range.end == effect.range.start
+                let can_coalesce = curr.range.end == effect.range.start
                     && curr.priority == effect.priority
-                    && matches!(&curr.effect, EffectType::Color(c1) if matches!(&effect.effect, EffectType::Color(c2) if c1 == c2))
-                {
+                    && curr.effect == effect.effect;
+
+                if can_coalesce {
                     // Extend current effect
                     curr.range.end = effect.range.end;
                 } else {
@@ -423,18 +752,25 @@ impl SyntaxHighlighter {
         coalesced
     }
 
+    /// Get the version of the cached syntax data
+    pub fn cached_version(&self) -> u64 {
+        self.cached_version.load(Ordering::Relaxed)
+    }
+
     /// Get syntax effects for only the visible byte range - O(visible nodes)
     pub fn get_visible_effects(
         &self,
-        text: &str,
+        _text: &str,  // Ignore the passed-in text
         byte_range: std::ops::Range<usize>,
     ) -> Vec<TextEffect> {
-        // Get the cached tree if available
+        // Get the cached tree and text - they must match!
         let tree_guard = self.cached_tree.load();
-        let tree = match tree_guard.as_ref() {
-            Some(tree) => tree,
-            None => {
-                // No tree yet, return empty
+        let text_guard = self.cached_text.load();
+
+        let (tree, cached_text) = match (tree_guard.as_ref(), text_guard.as_ref()) {
+            (Some(tree), Some(text)) => (tree, text),
+            _ => {
+                // No tree or text yet, return empty
                 return Vec::new();
             }
         };
@@ -447,7 +783,8 @@ impl SyntaxHighlighter {
         cursor.set_byte_range(byte_range.clone());
 
         let capture_names = self.query.capture_names();
-        let mut matches = cursor.matches(&self.query, tree.root_node(), text.as_bytes());
+        // Use the CACHED text that corresponds to the tree!
+        let mut matches = cursor.matches(&self.query, tree.root_node(), cached_text.as_bytes());
 
         // Process only the visible matches
         while let Some(match_) = matches.next() {
@@ -465,7 +802,7 @@ impl SyntaxHighlighter {
                 if let Some(token) = Self::capture_name_to_token_type(capture_name) {
                     effects.push(TextEffect {
                         range: node_start..node_end,
-                        effect: EffectType::Color(Self::token_type_to_color(token)),
+                        effect: EffectType::Token(Self::token_type_to_id(token)),
                         priority: priority::SYNTAX,
                     });
                 }
@@ -519,7 +856,7 @@ impl SyntaxHighlighter {
         if let Some(token) = self.node_kind_to_token_type(node_kind) {
             effects.push(TextEffect {
                 range: node_start..node_end,
-                effect: EffectType::Color(Self::token_type_to_color(token)),
+                effect: EffectType::Token(Self::token_type_to_id(token)),
                 priority: priority::SYNTAX,
             });
         }
@@ -740,6 +1077,19 @@ pub fn create_rust_highlighter() -> Box<dyn TextStyleProvider> {
     Box::new(SyntaxHighlighter::new_rust())
 }
 
+/// Helper to create WGSL syntax highlighter
+pub fn create_wgsl_highlighter() -> Box<dyn TextStyleProvider> {
+    Box::new(SyntaxHighlighter::new_wgsl())
+}
+
+/// Helper to create syntax highlighter based on file extension
+/// Falls back to Rust if extension is not recognized
+pub fn create_highlighter_for_file(path: &str) -> Box<dyn TextStyleProvider> {
+    SyntaxHighlighter::from_file_path(path)
+        .map(|h| Box::new(h) as Box<dyn TextStyleProvider>)
+        .unwrap_or_else(|| create_rust_highlighter())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +1128,189 @@ mod tests {
 
         // Should not crash and should handle rapid updates gracefully
         assert_eq!(highlighter.name(), "rust");
+    }
+
+    #[test]
+    fn test_wgsl_highlighting() {
+        let highlighter = SyntaxHighlighter::new_wgsl();
+
+        // Test basic interface
+        assert_eq!(highlighter.name(), "wgsl");
+
+        // Test that WGSL highlighter was created successfully
+        let wgsl_code = r#"
+@vertex
+fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(position, 1.0);
+}
+"#;
+
+        // Request an update (should not crash)
+        highlighter.request_update(wgsl_code, 1);
+    }
+
+    #[test]
+    fn test_wgsl_capture_names() {
+        use tree_sitter::{Parser, Query, QueryCursor};
+
+        println!("Loading WGSL using proper WasmStore setup...");
+
+        // Create engine and store
+        let engine = tree_sitter::wasmtime::Engine::default();
+        let mut store = WasmStore::new(&engine).expect("Failed to create WasmStore");
+
+        // Load WASM bytes
+        const WGSL_WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
+        println!("WASM size: {} bytes", WGSL_WASM.len());
+
+        // Load language from WASM
+        let language = store.load_language("wgsl", WGSL_WASM)
+            .expect("Failed to load WGSL language");
+
+        println!("Language loaded, version: {:?}", language.version());
+
+        // Create parser and set the store FIRST
+        let mut parser = Parser::new();
+        parser.set_wasm_store(store)
+            .expect("Failed to set WasmStore on parser");
+
+        // Now set the language
+        match parser.set_language(&language) {
+            Ok(()) => println!("Successfully set WGSL language in parser"),
+            Err(e) => {
+                println!("Failed to set language: {:?}", e);
+                return;
+            }
+        }
+
+        // Check if parser has a language set after setting it
+        match parser.language() {
+            Some(lang) => println!("Parser has language set, version: {:?}", lang.version()),
+            None => {
+                println!("ERROR: Parser has no language set!");
+                return;
+            }
+        }
+
+        // Try various WGSL code samples to test parsing
+        let test_cases = vec![
+            "fn main() {}",
+            "let x = 42;",
+            "@vertex fn vs() {}",
+            "var<private> x: f32;",
+            "",  // Empty should parse
+        ];
+
+        for code in test_cases {
+            println!("\nTrying to parse: '{}'", code);
+            let tree = parser.parse(code, None);
+            if let Some(tree) = tree {
+                let root = tree.root_node();
+                println!("  Success! Root node kind: {}", root.kind());
+                if root.has_error() {
+                    println!("  Warning: Tree has errors");
+                }
+            } else {
+                println!("  Failed to parse!");
+            }
+        }
+
+        // Now test with the highlights query
+        let source_code = "@vertex fn main() { let x: f32 = 1.0; }";
+        println!("\nTesting highlights with: '{}'", source_code);
+
+        let tree = parser.parse(source_code, None);
+        if tree.is_none() {
+            println!("Failed to parse WGSL code for highlights!");
+            return;
+        }
+        let tree = tree.unwrap();
+
+        const WGSL_HIGHLIGHTS: &str = include_str!("../assets/grammars/wgsl/highlights.scm");
+        let query = Query::new(&language, WGSL_HIGHLIGHTS).unwrap();
+
+        let mut cursor = QueryCursor::new();
+        let capture_names = query.capture_names();
+
+        println!("Available capture names in tree-sitter-wgsl:");
+        for (i, name) in capture_names.iter().enumerate() {
+            println!("  {}: {}", i, name);
+        }
+
+        println!("\nActual captures in WGSL sample code:");
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        let mut count = 0;
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                if count < 30 {
+                    let capture_name = &capture_names[capture.index as usize];
+                    let node_text = &source_code[capture.node.start_byte()..capture.node.end_byte()];
+                    let token_type = SyntaxHighlighter::capture_name_to_token_type(capture_name);
+                    println!("  '{}' -> '{}' -> {:?}", node_text, capture_name, token_type);
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_extension_detection() {
+        // Test Rust file detection
+        let rust_highlighter = SyntaxHighlighter::from_file_path("main.rs");
+        assert!(rust_highlighter.is_some());
+        assert_eq!(rust_highlighter.unwrap().name(), "rust");
+
+        // Test WGSL file detection
+        let wgsl_highlighter = SyntaxHighlighter::from_file_path("shader.wgsl");
+        assert!(wgsl_highlighter.is_some());
+        assert_eq!(wgsl_highlighter.unwrap().name(), "wgsl");
+
+        // Test unsupported extension
+        let unknown = SyntaxHighlighter::from_file_path("test.txt");
+        assert!(unknown.is_none());
+    }
+
+    #[test]
+    fn test_capture_names() {
+        use tree_sitter::{Parser, Query, QueryCursor};
+
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let source_code = r#"
+fn main() {
+    let x = 42;
+    println!("Hello, {}", x);
+}
+"#;
+
+        let tree = parser.parse(source_code, None).unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            tree_sitter_rust::HIGHLIGHTS_QUERY,
+        ).unwrap();
+
+        let mut cursor = QueryCursor::new();
+        let capture_names = query.capture_names();
+
+        println!("Available capture names in tree-sitter-rust:");
+        for (i, name) in capture_names.iter().enumerate() {
+            println!("  {}: {}", i, name);
+        }
+
+        println!("\nActual captures in sample code:");
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        let mut count = 0;
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                if count < 30 {
+                    let capture_name = &capture_names[capture.index as usize];
+                    let node_text = &source_code[capture.node.start_byte()..capture.node.end_byte()];
+                    let token_type = SyntaxHighlighter::capture_name_to_token_type(capture_name);
+                    println!("  '{}' -> '{}' -> {:?}", node_text, capture_name, token_type);
+                    count += 1;
+                }
+            }
+        }
     }
 }
