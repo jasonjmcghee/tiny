@@ -270,8 +270,8 @@ fn bench_tree_traversal(c: &mut Criterion) {
 
         // Full document conversion (save operation) - original method
         group.bench_with_input(BenchmarkId::new("to_string", size), size, |b, _| {
-            let tree = doc.read();
             b.iter(|| {
+                let tree = doc.read();
                 std::hint::black_box(tree.flatten_to_string());
             });
         });
