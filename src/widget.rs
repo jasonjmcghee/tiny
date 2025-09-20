@@ -349,46 +349,19 @@ impl Widget for TextWidget {
 
                 // Apply color effects to glyphs by updating their colors
                 for effect in &effects {
-                    match effect.effect {
-                        crate::text_effects::EffectType::Token(token_id) => {
-                            // Map token ID to color - this will be replaced by theme lookup
-                            let color = match token_id {
-                                1 => 0xC678DDFF,  // Keyword - purple
-                                2 => 0x61AFEFFF,  // Function - blue
-                                3 => 0xE5C07BFF,  // Type - yellow-orange
-                                4 => 0x98C379FF,  // String - green
-                                5 => 0xD19A66FF,  // Number - orange
-                                6 => 0x5C6370FF,  // Comment - gray
-                                7 => 0xD19A66FF,  // Constant - orange
-                                8 => 0x56B6C2FF,  // Operator - cyan
-                                9 => 0xABB2BFFF,  // Punctuation - gray
-                                10 => 0xABB2BFFF, // Variable - gray
-                                11 => 0xE06C75FF, // Attribute - red
-                                12 => 0x61AFEFFF, // Namespace - blue
-                                13 => 0xE5C07BFF, // Property - yellow
-                                14 => 0xABB2BFFF, // Parameter - gray
-                                _ => 0xFFFFFFFF,  // Default - white
-                            };
-                            // Find glyphs in this effect's range and update their colors
-                            let text_str = std::str::from_utf8(&self.text).unwrap_or("");
-                            let mut byte_pos = self.original_byte_offset;
-                            let mut glyph_idx = 0;
-
-                            for ch in text_str.chars() {
-                                if glyph_idx < all_glyph_instances.len() {
-                                    if byte_pos >= effect.range.start && byte_pos < effect.range.end
-                                    {
-                                        all_glyph_instances[glyph_idx].color = color;
-                                    }
-                                    glyph_idx += 1;
-                                    byte_pos += ch.len_utf8();
+                    match &effect.effect {
+                        crate::text_effects::EffectType::Shader { id, params } => {
+                            shader_id = Some(*id);
+                            println!("TextWidget: Found shader effect with ID: {}", id);
+                            // Pass params to shader via uniform buffer
+                            if let Some(params) = params {
+                                println!("TextWidget: Writing shader params: {:?}", params);
+                                if let Some(effect_buffer) = ctx.gpu().effect_uniform_buffer(*id) {
+                                    ctx.queue.write_buffer(effect_buffer, 0, bytemuck::cast_slice(params.as_ref()));
                                 } else {
-                                    break;
+                                    println!("TextWidget: No effect buffer found for shader ID {}", id);
                                 }
                             }
-                        }
-                        crate::text_effects::EffectType::Shader { id } => {
-                            shader_id = Some(id);
                         }
                         // Ignore other effect types for now (weight, italic, etc.)
                         _ => {}
@@ -398,6 +371,7 @@ impl Widget for TextWidget {
 
             // Render with or without shader effects
             if let Some(id) = shader_id {
+                println!("TextWidget: Rendering with shader effect ID: {}", id);
                 ctx.gpu()
                     .draw_glyphs(render_pass, &all_glyph_instances, Some(id));
             } else {

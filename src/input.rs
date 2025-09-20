@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::event::{ElementState, KeyEvent, MouseButton};
-use winit::keyboard::{Key, NamedKey, ModifiersState};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Actions that can be triggered by input
 pub enum InputAction {
@@ -20,7 +20,6 @@ pub enum InputAction {
     Undo,
     Redo,
 }
-
 
 /// Selection with cursor and anchor in document coordinates
 #[derive(Clone)]
@@ -101,7 +100,6 @@ impl Selection {
             // Multi-line selection
             let start_layout = viewport.doc_to_layout(start);
             let end_layout = viewport.doc_to_layout(end);
-
 
             // First line: from start position to right edge of viewport
             let viewport_right = viewport.logical_size.width.0 - viewport.margin.x.0;
@@ -260,11 +258,7 @@ impl InputHandler {
                     "SYNTAX_FLUSH: Sending single InputEdit - start_byte={}, old_end={}, new_end={}",
                     edit.start_byte, edit.old_end_byte, edit.new_end_byte
                 );
-                syntax_hl.request_update_with_edit(
-                    &text_after,
-                    doc.version(),
-                    Some(edit.clone()),
-                );
+                syntax_hl.request_update_with_edit(&text_after, doc.version(), Some(edit.clone()));
             } else {
                 // Multiple edits - request full reparse
                 println!(
@@ -274,7 +268,7 @@ impl InputHandler {
                 syntax_hl.request_update_with_edit(
                     &text_after,
                     doc.version(),
-                    None,  // No edit = full reparse
+                    None, // No edit = full reparse
                 );
             }
         }
@@ -460,7 +454,8 @@ impl InputHandler {
                             }
                         }
                         Edit::Delete { range } => {
-                            position_shifts.push((range.start, -(range.end as i32 - range.start as i32)));
+                            position_shifts
+                                .push((range.start, -(range.end as i32 - range.start as i32)));
                         }
                         Edit::Replace { range, content } => {
                             let insert_len = if let Content::Text(text) = content {
@@ -499,7 +494,10 @@ impl InputHandler {
                             range: adjusted_start..adjusted_end,
                         });
                         // Add this delete to our position shifts
-                        position_shifts.push((adjusted_start, -(adjusted_end as i32 - adjusted_start as i32)));
+                        position_shifts.push((
+                            adjusted_start,
+                            -(adjusted_end as i32 - adjusted_start as i32),
+                        ));
                         position_shifts.sort_by_key(|&(pos, _)| pos);
                     }
 
@@ -510,7 +508,8 @@ impl InputHandler {
                     // Check if cursor is beyond the current line in the tree
                     // This happens when typing rapidly - cursor.column increments but tree isn't updated yet
                     let line_byte_start = tree.line_to_byte(cursor_pos.line).unwrap_or(0);
-                    let line_byte_end = tree.line_to_byte(cursor_pos.line + 1)
+                    let line_byte_end = tree
+                        .line_to_byte(cursor_pos.line + 1)
                         .unwrap_or(tree.byte_count());
                     let line_text = tree.get_text_slice(line_byte_start..line_byte_end);
                     let line_char_count = line_text.trim_end_matches('\n').chars().count() as u32;
@@ -518,15 +517,16 @@ impl InputHandler {
                     let adjusted_pos = if cursor_pos.column > line_char_count {
                         // Cursor is beyond line end - this means we're typing at the end
                         // Insert at actual end of line plus any pending edits
-                        let line_end_byte = line_byte_start + line_text.trim_end_matches('\n').len();
-                        let total_pending: i32 = position_shifts.iter()
-                            .map(|&(_, shift)| shift)
-                            .sum();
+                        let line_end_byte =
+                            line_byte_start + line_text.trim_end_matches('\n').len();
+                        let total_pending: i32 =
+                            position_shifts.iter().map(|&(_, shift)| shift).sum();
                         (line_end_byte as i32 + total_pending).max(0) as usize
                     } else {
                         // Normal case - cursor is within the line
                         let base_pos = tree.doc_pos_to_byte(cursor_pos);
-                        let total_shift: i32 = position_shifts.iter()
+                        let total_shift: i32 = position_shifts
+                            .iter()
                             .filter(|&&(pos, _)| pos <= base_pos)
                             .map(|&(_, shift)| shift)
                             .sum();
@@ -555,13 +555,17 @@ impl InputHandler {
                 // Collect debug info before mutating selections
                 let debug_info: Vec<_> = if self.selections.len() > 1 {
                     let tree = doc.read();
-                    self.selections.iter().enumerate().map(|(i, sel)| {
-                        let mut test_cursor = sel.cursor;
-                        test_cursor.column += ch_len;
-                        let would_be = tree.doc_pos_to_byte(test_cursor);
-                        let correct = insertion_positions[i] + ch.len();
-                        (would_be, correct, would_be != correct)
-                    }).collect()
+                    self.selections
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sel)| {
+                            let mut test_cursor = sel.cursor;
+                            test_cursor.column += ch_len;
+                            let would_be = tree.doc_pos_to_byte(test_cursor);
+                            let correct = insertion_positions[i] + ch.len();
+                            (would_be, correct, would_be != correct)
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -710,7 +714,8 @@ impl InputHandler {
                             }
                         }
                         Edit::Delete { range } => {
-                            position_shifts.push((range.start, -(range.end as i32 - range.start as i32)));
+                            position_shifts
+                                .push((range.start, -(range.end as i32 - range.start as i32)));
                         }
                         Edit::Replace { range, content } => {
                             let insert_len = if let Content::Text(text) = content {
@@ -749,7 +754,10 @@ impl InputHandler {
                             range: adjusted_start..adjusted_end,
                         });
                         // Add this delete to our position shifts
-                        position_shifts.push((adjusted_start, -(adjusted_end as i32 - adjusted_start as i32)));
+                        position_shifts.push((
+                            adjusted_start,
+                            -(adjusted_end as i32 - adjusted_start as i32),
+                        ));
                         position_shifts.sort_by_key(|&(pos, _)| pos);
                     }
 
@@ -760,7 +768,8 @@ impl InputHandler {
                     // Check if cursor is beyond the current line in the tree
                     // This happens when typing rapidly - cursor.column increments but tree isn't updated yet
                     let line_byte_start = tree.line_to_byte(cursor_pos.line).unwrap_or(0);
-                    let line_byte_end = tree.line_to_byte(cursor_pos.line + 1)
+                    let line_byte_end = tree
+                        .line_to_byte(cursor_pos.line + 1)
                         .unwrap_or(tree.byte_count());
                     let line_text = tree.get_text_slice(line_byte_start..line_byte_end);
                     let line_char_count = line_text.trim_end_matches('\n').chars().count() as u32;
@@ -768,15 +777,16 @@ impl InputHandler {
                     let adjusted_pos = if cursor_pos.column > line_char_count {
                         // Cursor is beyond line end - this means we're typing at the end
                         // Insert at actual end of line plus any pending edits
-                        let line_end_byte = line_byte_start + line_text.trim_end_matches('\n').len();
-                        let total_pending: i32 = position_shifts.iter()
-                            .map(|&(_, shift)| shift)
-                            .sum();
+                        let line_end_byte =
+                            line_byte_start + line_text.trim_end_matches('\n').len();
+                        let total_pending: i32 =
+                            position_shifts.iter().map(|&(_, shift)| shift).sum();
                         (line_end_byte as i32 + total_pending).max(0) as usize
                     } else {
                         // Normal case - cursor is within the line
                         let base_pos = tree.doc_pos_to_byte(cursor_pos);
-                        let total_shift: i32 = position_shifts.iter()
+                        let total_shift: i32 = position_shifts
+                            .iter()
                             .filter(|&&(pos, _)| pos <= base_pos)
                             .map(|&(_, shift)| shift)
                             .sum();
@@ -837,7 +847,7 @@ impl InputHandler {
                         });
                         delete_info.push(DeleteInfo {
                             deleted_char: None,
-                            prev_line_end_col: None
+                            prev_line_end_col: None,
                         });
                     } else if sel.cursor.line > 0 || sel.cursor.column > 0 {
                         let tree = doc.read();
@@ -852,7 +862,9 @@ impl InputHandler {
                             let prev_line_end_col = if deleted_char == "\n" && sel.cursor.line > 0 {
                                 // Find the length of the previous line
                                 if let Some(line_start) = tree.line_to_byte(sel.cursor.line - 1) {
-                                    let line_end = tree.line_to_byte(sel.cursor.line).unwrap_or(tree.byte_count());
+                                    let line_end = tree
+                                        .line_to_byte(sel.cursor.line)
+                                        .unwrap_or(tree.byte_count());
                                     let line_text = tree.get_text_slice(line_start..line_end - 1); // -1 to exclude newline
 
                                     // Count visual columns
@@ -860,7 +872,8 @@ impl InputHandler {
                                     const TAB_WIDTH: u32 = 4;
                                     for ch in line_text.chars() {
                                         if ch == '\t' {
-                                            visual_column = ((visual_column / TAB_WIDTH) + 1) * TAB_WIDTH;
+                                            visual_column =
+                                                ((visual_column / TAB_WIDTH) + 1) * TAB_WIDTH;
                                         } else if ch != '\n' {
                                             visual_column += 1;
                                         }
@@ -915,11 +928,15 @@ impl InputHandler {
                                     // We deleted a tab - move back to previous tab stop
                                     const TAB_WIDTH: u32 = 4;
                                     // Find which tab stop we're at
-                                    let current_tab_stop = (sel.cursor.column + TAB_WIDTH - 1) / TAB_WIDTH;
+                                    let current_tab_stop =
+                                        (sel.cursor.column + TAB_WIDTH - 1) / TAB_WIDTH;
                                     // Move to previous tab stop
                                     sel.cursor.column = (current_tab_stop - 1) * TAB_WIDTH;
-                                    eprintln!("DEBUG: Deleted tab, moved from col {} to col {}",
-                                             current_tab_stop * TAB_WIDTH, sel.cursor.column);
+                                    eprintln!(
+                                        "DEBUG: Deleted tab, moved from col {} to col {}",
+                                        current_tab_stop * TAB_WIDTH,
+                                        sel.cursor.column
+                                    );
                                 } else {
                                     // Normal character - just move back one column
                                     sel.cursor.column -= 1;
@@ -1217,7 +1234,8 @@ impl InputHandler {
             }
             Key::Named(NamedKey::PageUp) => {
                 // Save position before page jump
-                self.nav_history.checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
+                self.nav_history
+                    .checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
 
                 // Move cursor up by viewport height worth of lines
                 // Set goal column if not already set
@@ -1251,7 +1269,8 @@ impl InputHandler {
             }
             Key::Named(NamedKey::PageDown) => {
                 // Save position before page jump
-                self.nav_history.checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
+                self.nav_history
+                    .checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
 
                 // Move cursor down by viewport height worth of lines
                 // Set goal column if not already set
@@ -1593,7 +1612,10 @@ impl InputHandler {
         &self,
         doc: &Doc,
         viewport: &Viewport,
-    ) -> (Vec<Arc<dyn crate::widget::Widget>>, Option<Arc<dyn crate::widget::Widget>>) {
+    ) -> (
+        Vec<Arc<dyn crate::widget::Widget>>,
+        Option<Arc<dyn crate::widget::Widget>>,
+    ) {
         use crate::widget;
 
         let mut selection_widgets = Vec::new();
@@ -1605,8 +1627,7 @@ impl InputHandler {
             if i == 0 {
                 let tree = doc.read();
                 // Get the line text for accurate cursor positioning
-                let line_text = if let Some(line_start) = tree.line_to_byte(selection.cursor.line)
-                {
+                let line_text = if let Some(line_start) = tree.line_to_byte(selection.cursor.line) {
                     let line_end = tree
                         .line_to_byte(selection.cursor.line + 1)
                         .unwrap_or(tree.byte_count());
@@ -1638,8 +1659,13 @@ impl InputHandler {
     /// Save current document state to history before making an edit
     fn save_snapshot_to_history(&mut self, doc: &Doc) {
         // Only save if we have pending edits or this is a new operation
-        if self.pending_edits.is_empty() || self.last_edit_time.is_none() ||
-           self.last_edit_time.map(|t| t.elapsed().as_millis() > 500).unwrap_or(true) {
+        if self.pending_edits.is_empty()
+            || self.last_edit_time.is_none()
+            || self
+                .last_edit_time
+                .map(|t| t.elapsed().as_millis() > 500)
+                .unwrap_or(true)
+        {
             // Save current state with selections
             let snapshot = DocumentSnapshot {
                 tree: doc.read(),
@@ -1669,11 +1695,7 @@ impl InputHandler {
             self.selections = previous_snapshot.selections;
 
             // Update next_id to be higher than any restored selection
-            self.next_id = self.selections
-                .iter()
-                .map(|s| s.id)
-                .max()
-                .unwrap_or(0) + 1;
+            self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
 
             // Queue syntax highlighting update (will be debounced)
             // No need to flush immediately for undo
@@ -1707,11 +1729,7 @@ impl InputHandler {
             self.selections = next_snapshot.selections;
 
             // Update next_id to be higher than any restored selection
-            self.next_id = self.selections
-                .iter()
-                .map(|s| s.id)
-                .max()
-                .unwrap_or(0) + 1;
+            self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
 
             // Queue syntax highlighting update (will be debounced)
             // No need to flush immediately for redo
@@ -1757,7 +1775,10 @@ mod tests {
             // Get current cursor position and calculate base position
             let tree = doc.read();
             let base_pos = tree.doc_pos_to_byte(input.selections[0].cursor);
-            println!("  Cursor column={}, base_pos={}", input.selections[0].cursor.column, base_pos);
+            println!(
+                "  Cursor column={}, base_pos={}",
+                input.selections[0].cursor.column, base_pos
+            );
 
             // Calculate position shifts from pending edits
             let mut position_shifts: Vec<(usize, i32)> = Vec::new();
@@ -1770,13 +1791,15 @@ mod tests {
             }
 
             // Apply our fix: add ALL pending shifts
-            let total_shift: i32 = position_shifts.iter()
-                .map(|&(_, shift)| shift)
-                .sum();
+            let total_shift: i32 = position_shifts.iter().map(|&(_, shift)| shift).sum();
             let adjusted_pos = (base_pos as i32 + total_shift).max(0) as usize;
 
-            println!("  Pending edits: {}, total_shift: {}, adjusted_pos: {}",
-                position_shifts.len(), total_shift, adjusted_pos);
+            println!(
+                "  Pending edits: {}, total_shift: {}, adjusted_pos: {}",
+                position_shifts.len(),
+                total_shift,
+                adjusted_pos
+            );
 
             all_positions.push(adjusted_pos);
 
@@ -1797,22 +1820,37 @@ mod tests {
 
         // Verify positions are strictly increasing
         for i in 1..all_positions.len() {
-            assert!(all_positions[i] > all_positions[i-1],
+            assert!(
+                all_positions[i] > all_positions[i - 1],
                 "BUG: Edit {} at position {} is not > edit {} at position {}",
-                i, all_positions[i], i-1, all_positions[i-1]);
+                i,
+                all_positions[i],
+                i - 1,
+                all_positions[i - 1]
+            );
         }
 
         // Verify positions match expected sequence
         for (i, &pos) in all_positions.iter().enumerate() {
-            assert_eq!(pos, 6 + i,
+            assert_eq!(
+                pos,
+                6 + i,
                 "Edit {} should be at position {} but is at {}",
-                i, 6 + i, pos);
+                i,
+                6 + i,
+                pos
+            );
         }
 
         // Flush and verify the final text
         input.flush_pending_edits(&doc);
-        let result = doc.read().flatten_to_string();
-        assert_eq!(result, "hello aaaaa", "Text should be correct after rapid typing");
+        {
+            let result = doc.read().flatten_to_string().to_string();
+            assert_eq!(
+                result, "hello aaaaa",
+                "Text should be correct after rapid typing"
+            );
+        }
     }
 
     #[test]
@@ -1825,16 +1863,26 @@ mod tests {
 
         // Single cursor at end of "hello "
         input.selections = vec![Selection {
-            cursor: DocPos { line: 0, column: 6, byte_offset: 6 },
-            anchor: DocPos { line: 0, column: 6, byte_offset: 6 },
+            cursor: DocPos {
+                line: 0,
+                column: 6,
+                byte_offset: 6,
+            },
+            anchor: DocPos {
+                line: 0,
+                column: 6,
+                byte_offset: 6,
+            },
             id: 0,
         }];
 
         println!("=== Single cursor rapid typing test ===");
-        println!("Initial: '{}' cursor at column {}, byte {}",
+        println!(
+            "Initial: '{}' cursor at column {}, byte {}",
             doc.read().flatten_to_string().trim(),
             input.selections[0].cursor.column,
-            input.selections[0].cursor.byte_offset);
+            input.selections[0].cursor.byte_offset
+        );
 
         // Simulate rapidly typing 10 'x' characters
         // This is what happens when you hold down a key
@@ -1869,31 +1917,42 @@ mod tests {
             input.selections[0].cursor.byte_offset = recalculated_byte;
             input.selections[0].anchor.byte_offset = recalculated_byte;
 
-            println!("After typing char {}: col {} -> {}, byte {} -> {} (inserted at: {})",
-                i + 1, col_before, input.selections[0].cursor.column,
-                byte_before, input.selections[0].cursor.byte_offset, insert_pos);
+            println!(
+                "After typing char {}: col {} -> {}, byte {} -> {} (inserted at: {})",
+                i + 1,
+                col_before,
+                input.selections[0].cursor.column,
+                byte_before,
+                input.selections[0].cursor.byte_offset,
+                insert_pos
+            );
 
             // The bug: byte_offset should be 6 + i + 1, but it may snap back
             let expected_byte = 6 + i + 1;
             if input.selections[0].cursor.byte_offset != expected_byte {
-                println!("  !!! BUG: byte_offset is {}, expected {} !!!",
-                    input.selections[0].cursor.byte_offset, expected_byte);
+                println!(
+                    "  !!! BUG: byte_offset is {}, expected {} !!!",
+                    input.selections[0].cursor.byte_offset, expected_byte
+                );
             }
         }
 
         let final_text = doc.read().flatten_to_string();
         println!("\nFinal text: '{}'", final_text.trim());
-        println!("Final cursor: column {}, byte_offset {}",
-            input.selections[0].cursor.column,
-            input.selections[0].cursor.byte_offset);
+        println!(
+            "Final cursor: column {}, byte_offset {}",
+            input.selections[0].cursor.column, input.selections[0].cursor.byte_offset
+        );
 
         // Verify the bug exists
         assert_eq!(input.selections[0].cursor.column, 16, "Column should be 16");
 
         // This assertion will FAIL if the bug still exists
         // The byte_offset SHOULD be 16 but due to the bug it might be less
-        assert_eq!(input.selections[0].cursor.byte_offset, 16,
-            "BUG: byte_offset should be 16 but cursor is snapping back!");
+        assert_eq!(
+            input.selections[0].cursor.byte_offset, 16,
+            "BUG: byte_offset should be 16 but cursor is snapping back!"
+        );
     }
 
     #[test]
@@ -1907,17 +1966,25 @@ mod tests {
         // Set up 5 cursors at the end of each line
         input.selections.clear();
         let positions = vec![
-            (0, 5, 5),   // end of "line1"
-            (1, 5, 11),  // end of "line2" (5 + \n + 5)
-            (2, 5, 17),  // end of "line3"
-            (3, 5, 23),  // end of "line4"
-            (4, 5, 29),  // end of "line5"
+            (0, 5, 5),  // end of "line1"
+            (1, 5, 11), // end of "line2" (5 + \n + 5)
+            (2, 5, 17), // end of "line3"
+            (3, 5, 23), // end of "line4"
+            (4, 5, 29), // end of "line5"
         ];
 
         for (line, col, byte_off) in positions {
             input.selections.push(Selection {
-                cursor: DocPos { line, column: col, byte_offset: byte_off },
-                anchor: DocPos { line, column: col, byte_offset: byte_off },
+                cursor: DocPos {
+                    line,
+                    column: col,
+                    byte_offset: byte_off,
+                },
+                anchor: DocPos {
+                    line,
+                    column: col,
+                    byte_offset: byte_off,
+                },
                 id: line,
             });
         }
@@ -1931,7 +1998,9 @@ mod tests {
             println!("\n--- Typing character {} at all cursors ---", i + 1);
 
             // Record cursor state before typing
-            let cursors_before: Vec<_> = input.selections.iter()
+            let cursors_before: Vec<_> = input
+                .selections
+                .iter()
                 .map(|sel| (sel.cursor.line, sel.cursor.column, sel.cursor.byte_offset))
                 .collect();
 
@@ -1986,10 +2055,16 @@ mod tests {
                 sel.anchor = sel.cursor.clone();
 
                 let (prev_line, prev_col, prev_byte) = cursors_before[j];
-                println!("  Cursor {}: line={}, col {} -> {}, byte {} -> {} (expected: {})",
-                    j, prev_line, prev_col, sel.cursor.column,
-                    prev_byte, sel.cursor.byte_offset,
-                    insertion_positions[j] + 1);
+                println!(
+                    "  Cursor {}: line={}, col {} -> {}, byte {} -> {} (expected: {})",
+                    j,
+                    prev_line,
+                    prev_col,
+                    sel.cursor.column,
+                    prev_byte,
+                    sel.cursor.byte_offset,
+                    insertion_positions[j] + 1
+                );
 
                 if sel.cursor.byte_offset != insertion_positions[j] + 1 {
                     println!("    !!! CURSOR SNAPPED BACK !!!");
@@ -2001,26 +2076,34 @@ mod tests {
         }
 
         // Verify the final text is correct
-        let final_text = doc.read().flatten_to_string();
+        let final_text = doc.read().flatten_to_string().to_string();
         let expected = "line1xxxxx\nline2xxxxx\nline3xxxxx\nline4xxxxx\nline5xxxxx\n";
 
-        assert_eq!(final_text, expected,
-            "Multi-cursor typing should produce correct text");
+        assert_eq!(
+            final_text, expected,
+            "Multi-cursor typing should produce correct text"
+        );
 
         // Verify all cursors are at correct positions
         // Note: The byte offsets depend on how the multi-cursor typing distributes the insertions
         for (i, sel) in input.selections.iter().enumerate() {
-            assert_eq!(sel.cursor.column, 10,
-                "Cursor {} should be at column 10", i);
+            assert_eq!(sel.cursor.column, 10, "Cursor {} should be at column 10", i);
 
             // Just verify byte offset is reasonable - exact value depends on implementation
-            assert!(sel.cursor.byte_offset > 0,
-                "Cursor {} should have non-zero byte offset", i);
+            assert!(
+                sel.cursor.byte_offset > 0,
+                "Cursor {} should have non-zero byte offset",
+                i
+            );
 
             // Verify cursors are in the right order
             if i > 0 {
-                assert!(sel.cursor.byte_offset > input.selections[i-1].cursor.byte_offset,
-                    "Cursor {} should be after cursor {}", i, i-1);
+                assert!(
+                    sel.cursor.byte_offset > input.selections[i - 1].cursor.byte_offset,
+                    "Cursor {} should be after cursor {}",
+                    i,
+                    i - 1
+                );
             }
         }
     }
@@ -2051,8 +2134,10 @@ mod tests {
             println!("\n--- Keystroke {} (typing 'a') ---", i + 1);
 
             let cursor_before = input.selections[0].cursor.clone();
-            println!("BEFORE: cursor.column={}, byte_offset={}",
-                cursor_before.column, cursor_before.byte_offset);
+            println!(
+                "BEFORE: cursor.column={}, byte_offset={}",
+                cursor_before.column, cursor_before.byte_offset
+            );
 
             // The BUG is here: when cursor.column > actual line length
             let tree = doc.read();
@@ -2063,24 +2148,33 @@ mod tests {
                 String::new()
             };
             let actual_line_len = line_text.trim_end_matches('\n').len();
-            println!("  Line text: '{}' (length: {})", line_text.trim_end_matches('\n'), actual_line_len);
+            println!(
+                "  Line text: '{}' (length: {})",
+                line_text.trim_end_matches('\n'),
+                actual_line_len
+            );
 
-            // THE KEY BUG: cursor.column is 6+i but line is only 6+i chars after i inserts
+            //  BUG: cursor.column is 6+i but line is only 6+i chars after i inserts
             // When doc_pos_to_byte is called with column > line length, it returns the END of line
             let byte_from_tree = tree.doc_pos_to_byte(cursor_before);
-            println!("  tree.doc_pos_to_byte(cursor) returns: {} (should be: {})",
-                byte_from_tree, 6 + i);
+            println!(
+                "  tree.doc_pos_to_byte(cursor) returns: {} (should be: {})",
+                byte_from_tree,
+                6 + i
+            );
 
             if cursor_before.column as usize > actual_line_len {
-                println!("  !!! BUG: cursor.column {} > line length {} !!!",
-                    cursor_before.column, actual_line_len);
+                println!(
+                    "  !!! BUG: cursor.column {} > line length {} !!!",
+                    cursor_before.column, actual_line_len
+                );
                 println!("  !!! This causes byte_offset to snap back to end of line !!!");
             }
 
             // Simulate typing 'a' - this is what on_key does
             // First, prepare the edit
             input.pending_edits.push(Edit::Insert {
-                pos: byte_from_tree,  // THIS IS WRONG when column > line length!
+                pos: byte_from_tree, // THIS IS WRONG when column > line length!
                 content: Content::Text("a".to_string()),
             });
 
@@ -2090,7 +2184,7 @@ mod tests {
             input.flush_pending_edits(&doc);
 
             // Now cursor gets updated AFTER flush
-            input.selections[0].cursor.column += 1;  // This increments correctly
+            input.selections[0].cursor.column += 1; // This increments correctly
 
             // But byte_offset gets recalculated from tree, which SNAPS BACK
             let tree = doc.read();
@@ -2100,10 +2194,12 @@ mod tests {
 
             cursor_positions.push(input.selections[0].cursor.clone());
 
-            println!("AFTER: cursor.column={}, byte_offset={} (expected byte_offset: {})",
+            println!(
+                "AFTER: cursor.column={}, byte_offset={} (expected byte_offset: {})",
                 input.selections[0].cursor.column,
                 input.selections[0].cursor.byte_offset,
-                6 + i + 1);
+                6 + i + 1
+            );
 
             let current_text = doc.read().flatten_to_string();
             println!("Text is now: '{}'", current_text);
@@ -2121,14 +2217,18 @@ mod tests {
 
         println!("\n=== Actual insertion positions ===");
         for (i, &pos) in actual_insertions.iter().enumerate() {
-            println!("Keystroke {}: inserted at byte position {} (expected: {})",
-                i + 1, pos, 6 + i);
+            println!(
+                "Keystroke {}: inserted at byte position {} (expected: {})",
+                i + 1,
+                pos,
+                6 + i
+            );
             if pos != 6 + i {
                 println!("  ^^^ WRONG POSITION - text gets jumbled!");
             }
         }
 
-        let result = doc.read().flatten_to_string();
+        let result = doc.read().flatten_to_string().to_string();
         println!("\nFinal text: '{}' (expected: 'hello aaaaaaaaaa')", result);
 
         // Test navigation after typing
@@ -2141,8 +2241,10 @@ mod tests {
                 input.selections[0].cursor.column -= 1;
                 let tree = doc.read();
                 let byte_pos = tree.doc_pos_to_byte(input.selections[0].cursor);
-                println!("Navigate left: column={}, byte_offset={}",
-                    input.selections[0].cursor.column, byte_pos);
+                println!(
+                    "Navigate left: column={}, byte_offset={}",
+                    input.selections[0].cursor.column, byte_pos
+                );
 
                 // The bug: can't navigate past where cursor was snapping back to
                 if byte_pos == input.selections[0].cursor.byte_offset {
@@ -2154,11 +2256,15 @@ mod tests {
         }
 
         // The test SHOULD fail to demonstrate the bug
-        assert_ne!(result, "hello aaaaaaaaaa",
-            "BUG CONFIRMED: Text is corrupted due to cursor snapping back");
+        assert_ne!(
+            result, "hello aaaaaaaaaa",
+            "BUG CONFIRMED: Text is corrupted due to cursor snapping back"
+        );
 
         // Also verify the cursor gets stuck
-        assert!(input.selections[0].cursor.column < start_col - 5,
-            "BUG CONFIRMED: Can't navigate back through the text properly");
+        assert!(
+            input.selections[0].cursor.column < start_col - 5,
+            "BUG CONFIRMED: Can't navigate back through the text properly"
+        );
     }
 }

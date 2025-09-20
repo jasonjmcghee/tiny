@@ -622,22 +622,6 @@ impl SyntaxHighlighter {
         }
     }
 
-    /// Convert color back to token type (for debugging and conversion)
-    pub fn color_to_token_type(color: u32) -> TokenType {
-        match color {
-            0xC678DDFF => TokenType::Keyword,
-            0x61AFEFFF => TokenType::Function,
-            0xE5C07BFF => TokenType::Type,
-            0x98C379FF => TokenType::String,
-            0xD19A66FF => TokenType::Number,
-            0x5C6370FF => TokenType::Comment,
-            0x56B6C2FF => TokenType::Operator,
-            0xABB2BFFF => TokenType::Punctuation,
-            0xE06C75FF => TokenType::Attribute,
-            _ => TokenType::Variable, // Default
-        }
-    }
-
     /// Convert token type to token ID for theme lookup
     pub fn token_type_to_id(token: TokenType) -> u8 {
         match token {

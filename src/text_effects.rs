@@ -39,8 +39,11 @@ pub struct TextEffect {
 pub enum EffectType {
     /// Token with ID for theme lookup
     Token(u8),
-    /// Custom shader effect
-    Shader { id: u32 },
+    /// Custom shader effect with optional parameters
+    Shader {
+        id: u32,
+        params: Option<std::sync::Arc<[f32; 4]>>,
+    },
     /// Change font weight
     Weight(FontWeight),
     /// Make text italic

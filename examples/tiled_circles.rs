@@ -198,14 +198,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             }],
         });
 
-        // Get viewport bind group layout from existing uniform
+        // Get viewport bind group layout from existing uniform - match GPU renderer's layout
         let viewport_bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("Viewport Bind Group Layout"),
                     entries: &[wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -626,12 +626,12 @@ impl TextStyleProvider for MouseCircleTextEffect {
                 range: range.clone(),
                 effect: EffectType::Shader {
                     id: 1, // Circle SDF shader ID
-                    params: Arc::new([
+                    params: Some(Arc::new([
                         mouse_pos.x.0,      // Mouse X
                         mouse_pos.y.0,      // Mouse Y
                         self.circle_radius, // Circle radius
                         0.0,                // Padding
-                    ]),
+                    ])),
                 },
                 priority: priority::SELECTION,
             };

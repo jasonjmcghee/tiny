@@ -17,7 +17,6 @@ use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
 pub struct GlyphInstance {
     pub glyph_id: u16,
     pub pos: LayoutPos, // Layout space position (logical pixels)
-    pub color: u32,
     pub tex_coords: [f32; 4], // [u0, v0, u1, v1] in atlas
     pub token_id: u8,         // Token type for theme lookup
     pub relative_pos: f32,    // Position within token (0.0-1.0)
@@ -45,7 +44,7 @@ pub struct Renderer {
     /// GPU renderer reference for widget painting
     gpu_renderer: Option<*const crate::gpu::GpuRenderer>,
     /// Cached document text for syntax queries
-    pub cached_doc_text: Option<String>,
+    pub cached_doc_text: Option<Arc<String>>,
     /// Cached document version
     pub cached_doc_version: u64,
     /// Widget manager for overlay widgets
@@ -206,8 +205,7 @@ impl Renderer {
             }
 
             // Pass fresh_parse flag so text_renderer knows whether to shift tokens
-            self.text_renderer
-                .update_syntax_from_tokens(&tokens, fresh_parse);
+            self.text_renderer.update_syntax(&tokens, fresh_parse);
         }
 
         // Update visible range for culling
@@ -316,33 +314,18 @@ impl Renderer {
 
                 // Convert to GlyphInstances for GPU
                 let mut glyph_instances = Vec::new();
-                for glyph_data in visible_glyphs {
+                for glyph in visible_glyphs {
                     // Transform from layout to physical coordinates
                     let physical_pos = self
                         .viewport
-                        .layout_to_physical(glyph_data.glyph_pos.layout_pos);
-
-                    // Map token ID back to color for now (until we update the shader)
-                    let color = match glyph_data.token_id {
-                        1 => 0xC678DDFF, // Keyword
-                        2 => 0x61AFEFFF, // Function
-                        3 => 0xE5C07BFF, // Type
-                        4 => 0x98C379FF, // String
-                        5 => 0xD19A66FF, // Number
-                        6 => 0x5C6370FF, // Comment
-                        7 => 0x56B6C2FF, // Operator
-                        8 => 0xABB2BFFF, // Punctuation
-                        9 => 0xE06C75FF, // Attribute
-                        _ => 0xFFFFFFFF, // Default white
-                    };
+                        .layout_to_physical(glyph.layout_pos);
 
                     glyph_instances.push(GlyphInstance {
                         glyph_id: 0,
                         pos: LayoutPos::new(physical_pos.x.0, physical_pos.y.0),
-                        color,
-                        tex_coords: glyph_data.glyph_pos.tex_coords,
-                        token_id: glyph_data.token_id,
-                        relative_pos: glyph_data.relative_pos,
+                        tex_coords: glyph.tex_coords,
+                        token_id: glyph.token_id as u8,
+                        relative_pos: glyph.relative_pos,
                     });
                 }
 

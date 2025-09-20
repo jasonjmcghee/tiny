@@ -5,9 +5,9 @@
 use crate::render::{GlyphInstance, RectInstance};
 use ahash::HashMap;
 use bytemuck::{Pod, Zeroable};
-use std::sync::Arc;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Vertex data for rectangles
 #[repr(C)]
@@ -23,7 +23,6 @@ pub struct RectVertex {
 pub struct GlyphVertex {
     pub position: [f32; 2],
     pub tex_coord: [f32; 2],
-    pub color: u32,
     pub token_id: u32,
     pub relative_pos: f32,
     pub _padding: f32, // Align to 32 bytes
@@ -42,13 +41,18 @@ pub struct BasicUniforms {
 pub struct ThemedUniforms {
     pub viewport_size: [f32; 2],
     pub scale_factor: f32,
-    pub time: f32, // For animations
-    pub theme_mode: u32, // Which theme effect to use
+    pub time: f32,          // For animations
+    pub theme_mode: u32,    // Which theme effect to use
     pub _padding: [f32; 3], // Align to 16 bytes
 }
 
-/// Legacy alias for backwards compatibility during refactor
-pub type ShaderUniforms = ThemedUniforms;
+/// Basic shader uniforms for viewport information
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct ShaderUniforms {
+    pub viewport_size: [f32; 2],
+    pub _padding: [f32; 2],
+}
 
 /// GPU renderer that executes batched draw commands
 pub struct GpuRenderer {
@@ -77,7 +81,6 @@ pub struct GpuRenderer {
     effect_bind_groups: HashMap<u32, wgpu::BindGroup>,
 
     style_buffer: Option<wgpu::Buffer>,
-    palette_texture: Option<wgpu::Texture>,
     palette_texture_view: Option<wgpu::TextureView>,
     palette_sampler: Option<wgpu::Sampler>,
     styled_bind_group: Option<wgpu::BindGroup>,
@@ -101,10 +104,6 @@ pub struct GpuRenderer {
 
     // Glyph atlas texture
     glyph_texture: wgpu::Texture,
-    #[allow(dead_code)]
-    glyph_texture_view: wgpu::TextureView,
-    #[allow(dead_code)]
-    glyph_sampler: wgpu::Sampler,
     glyph_bind_group: wgpu::BindGroup,
 
     // Vertex buffers
@@ -165,7 +164,6 @@ fn create_glyph_vertices(
     width: f32,
     height: f32,
     tex_coords: [f32; 4],
-    color: u32,
     token_id: u32,
     relative_pos: f32,
 ) -> [GlyphVertex; 6] {
@@ -181,7 +179,6 @@ fn create_glyph_vertices(
         GlyphVertex {
             position: [x1, y1],
             tex_coord: [u0, v0],
-            color,
             token_id,
             relative_pos,
             _padding: 0.0,
@@ -189,7 +186,6 @@ fn create_glyph_vertices(
         GlyphVertex {
             position: [x2, y1],
             tex_coord: [u1, v0],
-            color,
             token_id,
             relative_pos,
             _padding: 0.0,
@@ -197,7 +193,6 @@ fn create_glyph_vertices(
         GlyphVertex {
             position: [x1, y2],
             tex_coord: [u0, v1],
-            color,
             token_id,
             relative_pos,
             _padding: 0.0,
@@ -206,7 +201,6 @@ fn create_glyph_vertices(
         GlyphVertex {
             position: [x2, y1],
             tex_coord: [u1, v0],
-            color,
             token_id,
             relative_pos,
             _padding: 0.0,
@@ -214,7 +208,6 @@ fn create_glyph_vertices(
         GlyphVertex {
             position: [x2, y2],
             tex_coord: [u1, v1],
-            color,
             token_id,
             relative_pos,
             _padding: 0.0,
@@ -222,7 +215,6 @@ fn create_glyph_vertices(
         GlyphVertex {
             position: [x1, y2],
             tex_coord: [u0, v1],
-            color,
             token_id,
             relative_pos,
             _padding: 0.0,
@@ -245,7 +237,10 @@ impl GpuRenderer {
                 source
             }
             Err(e) => {
-                eprintln!("Failed to load shader from {:?}: {}. Using embedded version.", shader_path, e);
+                eprintln!(
+                    "Failed to load shader from {:?}: {}. Using embedded version.",
+                    shader_path, e
+                );
                 fallback.to_string()
             }
         }
@@ -253,125 +248,129 @@ impl GpuRenderer {
 
     /// Create rect pipeline with given shader module
     fn create_rect_pipeline(&self, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Rect Pipeline Layout"),
-            bind_group_layouts: &[&self.rect_uniform_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Rect Pipeline Layout"),
+                bind_group_layouts: &[&self.rect_uniform_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Rect Pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<RectVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Uint32,
-                        },
-                    ],
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: self.config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        })
+        self.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Rect Pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<RectVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 8,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Uint32,
+                            },
+                        ],
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
     }
 
     /// Create glyph pipeline with given shader module
     fn create_glyph_pipeline(&self, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Glyph Pipeline Layout"),
-            bind_group_layouts: &[&self.rect_uniform_bind_group_layout, &self.glyph_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Glyph Pipeline Layout"),
+                bind_group_layouts: &[
+                    &self.rect_uniform_bind_group_layout,
+                    &self.glyph_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
 
-        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Glyph Pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GlyphVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2, // position
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x2, // tex_coord
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 16,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Uint32, // color
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 20,
-                            shader_location: 3,
-                            format: wgpu::VertexFormat::Uint32, // token_id
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 24,
-                            shader_location: 4,
-                            format: wgpu::VertexFormat::Float32, // relative_pos
-                        },
-                    ],
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: self.config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        })
+        self.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Glyph Pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GlyphVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2, // position
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 8,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x2, // tex_coord
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 16,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Uint32, // token_id
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 20,
+                                shader_location: 3,
+                                format: wgpu::VertexFormat::Float32, // relative_pos
+                            },
+                        ],
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
     }
 
     /// Get device for custom widget rendering
@@ -553,16 +552,11 @@ impl GpuRenderer {
                             wgpu::VertexAttribute {
                                 offset: 16,
                                 shader_location: 2,
-                                format: wgpu::VertexFormat::Uint32, // color
+                                format: wgpu::VertexFormat::Uint32, // token_id
                             },
                             wgpu::VertexAttribute {
                                 offset: 20,
                                 shader_location: 3,
-                                format: wgpu::VertexFormat::Uint32, // token_id
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 24,
-                                shader_location: 4,
                                 format: wgpu::VertexFormat::Float32, // relative_pos
                             },
                         ],
@@ -599,7 +593,12 @@ impl GpuRenderer {
         let buffer_size = (style_data.len() * 4) as u64;
 
         // Create or recreate buffer if size changed
-        if self.style_buffer.as_ref().map(|b| b.size() != buffer_size).unwrap_or(true) {
+        if self
+            .style_buffer
+            .as_ref()
+            .map(|b| b.size() != buffer_size)
+            .unwrap_or(true)
+        {
             self.style_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Style Buffer"),
                 size: buffer_size,
@@ -609,67 +608,74 @@ impl GpuRenderer {
         }
 
         if let Some(buffer) = &self.style_buffer {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
         }
 
         // Always recreate bind group when buffer changes
-        if let (Some(style_buffer), Some(palette_view), Some(palette_sampler)) =
-           (&self.style_buffer, &self.palette_texture_view, &self.palette_sampler) {
-
+        if let (Some(style_buffer), Some(palette_view), Some(palette_sampler)) = (
+            &self.style_buffer,
+            &self.palette_texture_view,
+            &self.palette_sampler,
+        ) {
             // Create bind group layout
-            let style_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Style Buffer Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D1,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+            let style_bind_group_layout =
+                self.device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("Style Buffer Layout"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::VERTEX,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Texture {
+                                    multisampled: false,
+                                    view_dimension: wgpu::TextureViewDimension::D1,
+                                    sample_type: wgpu::TextureSampleType::Float {
+                                        filterable: true,
+                                    },
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 2,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    });
 
-            self.styled_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Style Bind Group"),
-                layout: &style_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: style_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(palette_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(palette_sampler),
-                    },
-                ],
-            }));
+            self.styled_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Style Bind Group"),
+                    layout: &style_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: style_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(palette_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(palette_sampler),
+                        },
+                    ],
+                }));
         }
     }
-
 
     /// Upload font atlas texture to GPU
     pub fn upload_font_atlas(&self, atlas_data: &[u8], width: u32, height: u32) {
@@ -695,22 +701,31 @@ impl GpuRenderer {
     }
 
     /// Initialize themed pipeline with interpolation between two themes
-    pub fn init_themed_interpolation(&mut self, theme1: &crate::theme::Theme, theme2: &crate::theme::Theme) {
+    pub fn init_themed_interpolation(
+        &mut self,
+        theme1: &crate::theme::Theme,
+        theme2: &crate::theme::Theme,
+    ) {
         // Load the themed shader
         let themed_shader_src = Self::load_shader(
             &self.shader_base_path,
             "glyph_themed.wgsl",
-            include_str!("shaders/glyph_themed.wgsl")
+            include_str!("shaders/glyph_themed.wgsl"),
         );
-        let themed_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Themed Glyph Shader"),
-            source: wgpu::ShaderSource::Wgsl(themed_shader_src.into()),
-        });
+        let themed_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Themed Glyph Shader"),
+                source: wgpu::ShaderSource::Wgsl(themed_shader_src.into()),
+            });
 
         // Generate merged theme texture data for interpolation
         let texture_data = crate::theme::Theme::merge_for_interpolation(theme1, theme2);
         let texture_width = 256;
-        let max_colors = theme1.max_colors_per_token.max(theme2.max_colors_per_token).max(1);
+        let max_colors = theme1
+            .max_colors_per_token
+            .max(theme2.max_colors_per_token)
+            .max(1);
         let texture_height = max_colors * 2; // Stack two themes
 
         // Create theme texture
@@ -807,90 +822,88 @@ impl GpuRenderer {
         let themed_layout = self.themed_uniform_bind_group_layout.as_ref()?;
         let theme_layout = self.theme_bind_group_layout.as_ref()?;
 
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Themed Pipeline Layout"),
-            bind_group_layouts: &[
-                themed_layout,
-                &self.glyph_bind_group_layout,
-                theme_layout,
-            ],
-            push_constant_ranges: &[],
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Themed Pipeline Layout"),
+                bind_group_layouts: &[themed_layout, &self.glyph_bind_group_layout, theme_layout],
+                push_constant_ranges: &[],
+            });
 
-        Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Themed Glyph Pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GlyphVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2, // position
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x2, // tex_coord
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 16,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Uint32, // color
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 20,
-                            shader_location: 3,
-                            format: wgpu::VertexFormat::Uint32, // token_id
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 24,
-                            shader_location: 4,
-                            format: wgpu::VertexFormat::Float32, // relative_pos
-                        },
-                    ],
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: self.config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        }))
+        Some(
+            self.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Themed Glyph Pipeline"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<GlyphVertex>() as wgpu::BufferAddress,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    offset: 0,
+                                    shader_location: 0,
+                                    format: wgpu::VertexFormat::Float32x2, // position
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 8,
+                                    shader_location: 1,
+                                    format: wgpu::VertexFormat::Float32x2, // tex_coord
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 16,
+                                    shader_location: 2,
+                                    format: wgpu::VertexFormat::Uint32, // token_id
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 20,
+                                    shader_location: 3,
+                                    format: wgpu::VertexFormat::Float32, // relative_pos
+                                },
+                            ],
+                        }],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: self.config.format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                }),
+        )
     }
 
     /// Complete themed pipeline setup with the given texture
     fn complete_themed_pipeline_setup(&mut self, theme_texture: wgpu::Texture) {
         // Create bind group layouts if not already created
         if self.themed_uniform_bind_group_layout.is_none() {
-            let themed_uniform_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Themed Uniform Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+            let themed_uniform_layout =
+                self.device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("Themed Uniform Bind Group Layout"),
+                        entries: &[wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        }],
+                    });
             self.themed_uniform_bind_group_layout = Some(themed_uniform_layout);
 
             // Create themed uniform buffer and bind group
@@ -901,41 +914,46 @@ impl GpuRenderer {
                 mapped_at_creation: false,
             });
 
-            let themed_uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Themed Uniform Bind Group"),
-                layout: self.themed_uniform_bind_group_layout.as_ref().unwrap(),
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: themed_uniform_buffer.as_entire_binding(),
-                }],
-            });
+            let themed_uniform_bind_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Themed Uniform Bind Group"),
+                    layout: self.themed_uniform_bind_group_layout.as_ref().unwrap(),
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: themed_uniform_buffer.as_entire_binding(),
+                    }],
+                });
 
             self.themed_uniform_buffer = Some(themed_uniform_buffer);
             self.themed_uniform_bind_group = Some(themed_uniform_bind_group);
         }
 
         if self.theme_bind_group_layout.is_none() {
-            let theme_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Theme Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+            let theme_layout =
+                self.device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("Theme Bind Group Layout"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Texture {
+                                    sample_type: wgpu::TextureSampleType::Float {
+                                        filterable: true,
+                                    },
+                                    view_dimension: wgpu::TextureViewDimension::D2,
+                                    multisampled: false,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    });
             self.theme_bind_group_layout = Some(theme_layout);
         }
 
@@ -943,12 +961,14 @@ impl GpuRenderer {
         let themed_shader_src = Self::load_shader(
             &self.shader_base_path,
             "glyph_themed.wgsl",
-            include_str!("shaders/glyph_themed.wgsl")
+            include_str!("shaders/glyph_themed.wgsl"),
         );
-        let themed_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Themed Glyph Shader"),
-            source: wgpu::ShaderSource::Wgsl(themed_shader_src.into()),
-        });
+        let themed_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Themed Glyph Shader"),
+                source: wgpu::ShaderSource::Wgsl(themed_shader_src.into()),
+            });
 
         // Create pipeline using the new method
         if let Some(pipeline) = self.create_themed_pipeline(&themed_shader) {
@@ -1010,10 +1030,12 @@ impl GpuRenderer {
         match wgpu::naga::front::wgsl::parse_str(&source) {
             Ok(_module) => {
                 // WGSL is valid, now create the shader
-                let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("Rectangle Shader (Hot Reload)"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
+                let shader = self
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("Rectangle Shader (Hot Reload)"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    });
 
                 // Create the new pipeline
                 let new_pipeline = self.create_rect_pipeline(&shader);
@@ -1036,10 +1058,12 @@ impl GpuRenderer {
         // Parse and validate WGSL before creating shader module
         match wgpu::naga::front::wgsl::parse_str(&source) {
             Ok(_module) => {
-                let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("Glyph Shader (Hot Reload)"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
+                let shader = self
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("Glyph Shader (Hot Reload)"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    });
 
                 let new_pipeline = self.create_glyph_pipeline(&shader);
 
@@ -1060,10 +1084,12 @@ impl GpuRenderer {
         // Parse and validate WGSL before creating shader module
         match wgpu::naga::front::wgsl::parse_str(&source) {
             Ok(_module) => {
-                let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("Themed Shader (Hot Reload)"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
+                let shader = self
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("Themed Shader (Hot Reload)"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    });
 
                 if let Some(new_pipeline) = self.create_themed_pipeline(&shader) {
                     self.themed_glyph_pipeline = Some(new_pipeline);
@@ -1088,7 +1114,11 @@ impl GpuRenderer {
         let mut any_success = false;
 
         // Try to reload rect shader
-        let rect_src = Self::load_shader(&self.shader_base_path, "rect.wgsl", include_str!("shaders/rect.wgsl"));
+        let rect_src = Self::load_shader(
+            &self.shader_base_path,
+            "rect.wgsl",
+            include_str!("shaders/rect.wgsl"),
+        );
         if self.try_reload_rect_shader(rect_src) {
             any_success = true;
         } else {
@@ -1096,7 +1126,11 @@ impl GpuRenderer {
         }
 
         // Try to reload glyph shader
-        let glyph_src = Self::load_shader(&self.shader_base_path, "glyph.wgsl", include_str!("shaders/glyph.wgsl"));
+        let glyph_src = Self::load_shader(
+            &self.shader_base_path,
+            "glyph.wgsl",
+            include_str!("shaders/glyph.wgsl"),
+        );
         if self.try_reload_glyph_shader(glyph_src) {
             any_success = true;
         } else {
@@ -1105,7 +1139,11 @@ impl GpuRenderer {
 
         // Try to reload themed shader if initialized
         if self.theme_bind_group_layout.is_some() {
-            let themed_src = Self::load_shader(&self.shader_base_path, "glyph_themed.wgsl", include_str!("shaders/glyph_themed.wgsl"));
+            let themed_src = Self::load_shader(
+                &self.shader_base_path,
+                "glyph_themed.wgsl",
+                include_str!("shaders/glyph_themed.wgsl"),
+            );
             if self.try_reload_themed_shader(themed_src) {
                 any_success = true;
             } else {
@@ -1180,7 +1218,7 @@ impl GpuRenderer {
         let rect_shader_src = Self::load_shader(
             &shader_base_path,
             "rect.wgsl",
-            include_str!("shaders/rect.wgsl")
+            include_str!("shaders/rect.wgsl"),
         );
         let rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Rectangle Shader"),
@@ -1190,7 +1228,7 @@ impl GpuRenderer {
         let glyph_shader_src = Self::load_shader(
             &shader_base_path,
             "glyph.wgsl",
-            include_str!("shaders/glyph.wgsl")
+            include_str!("shaders/glyph.wgsl"),
         );
         let glyph_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Glyph Shader"),
@@ -1230,7 +1268,7 @@ impl GpuRenderer {
         // Create uniform buffer for legacy/compatibility
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Uniform Buffer (Legacy)"),
-            size: std::mem::size_of::<ShaderUniforms>() as u64,
+            size: std::mem::size_of::<ThemedUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1403,11 +1441,12 @@ impl GpuRenderer {
             cache: None,
         });
 
-        let glyph_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Initial Glyph Pipeline Layout"),
-            bind_group_layouts: &[&rect_uniform_bind_group_layout, &glyph_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let glyph_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Initial Glyph Pipeline Layout"),
+                bind_group_layouts: &[&rect_uniform_bind_group_layout, &glyph_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Initial Glyph Pipeline"),
@@ -1432,16 +1471,11 @@ impl GpuRenderer {
                         wgpu::VertexAttribute {
                             offset: 16,
                             shader_location: 2,
-                            format: wgpu::VertexFormat::Uint32, // color
+                            format: wgpu::VertexFormat::Uint32, // token_id
                         },
                         wgpu::VertexAttribute {
                             offset: 20,
                             shader_location: 3,
-                            format: wgpu::VertexFormat::Uint32, // token_id
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 24,
-                            shader_location: 4,
                             format: wgpu::VertexFormat::Float32, // relative_pos
                         },
                     ],
@@ -1486,8 +1520,6 @@ impl GpuRenderer {
             themed_uniform_buffer: None,
             themed_uniform_bind_group: None,
             glyph_texture,
-            glyph_texture_view,
-            glyph_sampler,
             glyph_bind_group,
             rect_vertex_buffer,
             glyph_vertex_buffer,
@@ -1495,7 +1527,6 @@ impl GpuRenderer {
             effect_uniform_buffers: HashMap::default(),
             effect_bind_groups: HashMap::default(),
             style_buffer: None,
-            palette_texture: None,
             palette_texture_view: None,
             palette_sampler: None,
             styled_bind_group: None,
@@ -1527,7 +1558,7 @@ impl GpuRenderer {
         let physical_height = cpu_renderer.viewport.physical_size.height;
         let scale_factor = cpu_renderer.viewport.scale_factor;
 
-        let uniforms = ShaderUniforms {
+        let uniforms = ThemedUniforms {
             viewport_size: [physical_width as f32, physical_height as f32],
             scale_factor,
             time: self.current_time,
@@ -1583,9 +1614,6 @@ impl GpuRenderer {
             cpu_renderer.cached_doc_text = Some(tree.flatten_to_string());
             cpu_renderer.cached_doc_version = tree.version;
 
-            // Widget updates will be handled by passing selections to render_with_pass
-            // The renderer will update widgets based on current selections
-
             // Render with pass - this will paint both text and widgets
             cpu_renderer.render_with_pass(tree, viewport_rect, selections, Some(&mut render_pass));
         }
@@ -1608,7 +1636,11 @@ impl GpuRenderer {
         let uniforms = BasicUniforms {
             viewport_size: [self.config.width as f32, self.config.height as f32],
         };
-        self.queue.write_buffer(&self.rect_uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue.write_buffer(
+            &self.rect_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
 
         // Generate vertices for rectangles (transform view → physical)
         let mut vertices = Vec::with_capacity(instances.len() * 6);
@@ -1654,9 +1686,11 @@ impl GpuRenderer {
         }
 
         // Prefer themed pipeline over styled pipeline
-        if let (Some(themed_pipeline), Some(theme_bind_group), Some(themed_bind_group)) =
-            (&self.themed_glyph_pipeline, &self.theme_bind_group, &self.themed_uniform_bind_group)
-        {
+        if let (Some(themed_pipeline), Some(theme_bind_group), Some(themed_bind_group)) = (
+            &self.themed_glyph_pipeline,
+            &self.theme_bind_group,
+            &self.themed_uniform_bind_group,
+        ) {
             // Use themed pipeline with theme texture
             let mut vertices = Vec::with_capacity(instances.len() * 6);
             const ATLAS_SIZE: f32 = 2048.0;
@@ -1671,7 +1705,6 @@ impl GpuRenderer {
                     glyph_width,
                     glyph_height,
                     glyph.tex_coords,
-                    glyph.color,
                     glyph.token_id as u32,
                     glyph.relative_pos,
                 );
@@ -1699,8 +1732,11 @@ impl GpuRenderer {
             };
 
             if let Some(themed_uniform_buffer) = &self.themed_uniform_buffer {
-                self.queue
-                    .write_buffer(themed_uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+                self.queue.write_buffer(
+                    themed_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[uniforms]),
+                );
             }
 
             // Draw with themed pipeline
@@ -1710,8 +1746,10 @@ impl GpuRenderer {
             render_pass.set_bind_group(2, theme_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(..));
             render_pass.draw(0..vertices.len() as u32, 0..1);
+        } else if use_styled_pipeline {
+            panic!("Styled rendering requested but themed pipeline not available! Make sure to call upload_theme_for_interpolation() or upload_theme() first.");
         } else {
-            // Use regular color-based rendering
+            // Use regular color-based rendering (for widgets that don't need syntax highlighting)
             self.draw_glyphs(render_pass, instances, None);
         }
     }
@@ -1731,7 +1769,11 @@ impl GpuRenderer {
         let uniforms = BasicUniforms {
             viewport_size: [self.config.width as f32, self.config.height as f32],
         };
-        self.queue.write_buffer(&self.rect_uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue.write_buffer(
+            &self.rect_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
 
         // Choose pipeline based on shader effect
         let (pipeline, extra_bind_group) = if let Some(id) = shader_id {
@@ -1763,7 +1805,6 @@ impl GpuRenderer {
                 glyph_width,
                 glyph_height,
                 glyph.tex_coords,
-                glyph.color,
                 glyph.token_id as u32,
                 glyph.relative_pos,
             );

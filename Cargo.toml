@@ -53,8 +53,8 @@ proptest = "1.6"   # Property testing
 pollster = "0.3"   # Async executor for examples
 
 [profile.release]
-lto = true
-codegen-units = 1
+# lto = true
+# codegen-units = 1
 opt-level = 3
 
 [profile.dev]
@@ -83,10 +83,6 @@ path = "examples/debug_coordinates.rs"
 [[example]]
 name = "single_char"
 path = "examples/single_char.rs"
-
-[[example]]
-name = "atlas_debug"
-path = "examples/atlas_debug.rs"
 
 [[example]]
 name = "rect_test"

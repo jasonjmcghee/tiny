@@ -16,7 +16,7 @@ pub fn load(path: &Path) -> io::Result<Doc> {
 /// Save document to file
 pub fn save(doc: &Doc, path: &Path) -> io::Result<()> {
     let content = doc.read().flatten_to_string();
-    fs::write(path, content)
+    fs::write(path, content.as_ref())
 }
 
 /// Auto-save to temporary file

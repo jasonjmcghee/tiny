@@ -508,7 +508,7 @@ pub fn create_glyph_instances(
 
         let mut byte_pos = 0;
         for glyph in &layout.glyphs {
-            let mut color = glyph.color;
+            let mut found_token_id = None;
 
             // Apply text effects if available
             if let Some(effects) = effects {
@@ -518,24 +518,8 @@ pub fn create_glyph_instances(
                 for effect in effects {
                     if effect.range.start <= doc_pos && doc_pos < effect.range.end {
                         if let crate::text_effects::EffectType::Token(token_id) = effect.effect {
-                            // Map token ID to color - this will be replaced by theme lookup
-                            color = match token_id {
-                                1 => 0xC678DDFF,  // Keyword - purple
-                                2 => 0x61AFEFFF,  // Function - blue
-                                3 => 0xE5C07BFF,  // Type - yellow-orange
-                                4 => 0x98C379FF,  // String - green
-                                5 => 0xD19A66FF,  // Number - orange
-                                6 => 0x5C6370FF,  // Comment - gray
-                                7 => 0xD19A66FF,  // Constant - orange
-                                8 => 0x56B6C2FF,  // Operator - cyan
-                                9 => 0xABB2BFFF,  // Punctuation - gray
-                                10 => 0xABB2BFFF, // Variable - gray
-                                11 => 0xE06C75FF, // Attribute - red
-                                12 => 0x61AFEFFF, // Namespace - blue
-                                13 => 0xE5C07BFF, // Property - yellow
-                                14 => 0xABB2BFFF, // Parameter - gray
-                                _ => 0xFFFFFFFF,  // Default - white
-                            };
+                            found_token_id = Some(token_id);
+                            println!("token: {}", token_id);
                             break;
                         }
                     }
@@ -553,9 +537,8 @@ pub fn create_glyph_instances(
                     pos.x.0 + glyph_logical_x,
                     pos.y.0 + y_offset + glyph_logical_y,
                 ),
-                color,
                 tex_coords: glyph.tex_coords,
-                token_id: 0, // Default for font rendering (no syntax highlighting)
+                token_id: found_token_id.unwrap_or(0),
                 relative_pos: 0.0,
             });
         }

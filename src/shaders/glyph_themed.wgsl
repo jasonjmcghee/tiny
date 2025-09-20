@@ -43,9 +43,8 @@ fn vs_main(
     @builtin(vertex_index) vertex_idx: u32,
     @location(0) position: vec2<f32>,
     @location(1) tex_coord: vec2<f32>,
-    @location(2) color: u32,
-    @location(3) token_id: u32,
-    @location(4) relative_pos: f32,
+    @location(2) token_id: u32,
+    @location(3) relative_pos: f32,
 ) -> VertexOutput {
     // Convert position from pixel coordinates to normalized device coordinates
     let ndc_x = (position.x / uniforms.viewport_size.x) * 2.0 - 1.0;
@@ -54,7 +53,6 @@ fn vs_main(
     var out: VertexOutput;
     out.clip_position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.tex_coords = tex_coord;
-    out.color = unpack_color(color);
     out.token_id = f32(token_id);
     out.relative_pos = relative_pos;
 

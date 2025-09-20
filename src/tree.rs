@@ -38,7 +38,7 @@ pub struct Tree {
     pub root: Node,
     pub version: u64,
     /// Cached flattened text representation for performance
-    cached_flattened_text: Option<String>,
+    cached_flattened_text: Option<Arc<String>>,
 }
 
 /// Tree node - either leaf with spans or internal with children
@@ -75,10 +75,7 @@ impl Node {
             Node::Leaf { spans, sums: _ } if spans.len() > MAX_SPANS => {
                 let mid = spans.len() / 2;
                 let (left, right) = spans.split_at(mid);
-                Node::internal(vec![
-                    Node::leaf(left.to_vec()),
-                    Node::leaf(right.to_vec()),
-                ])
+                Node::internal(vec![Node::leaf(left.to_vec()), Node::leaf(right.to_vec())])
             }
             Node::Internal { children, sums: _ } if children.len() > MAX_SPANS => {
                 let mid = children.len() / 2;
@@ -114,9 +111,17 @@ pub struct Sums {
 /// Edit operations
 #[derive(Clone, Debug)]
 pub enum Edit {
-    Insert { pos: usize, content: Content },
-    Delete { range: Range<usize> },
-    Replace { range: Range<usize>, content: Content },
+    Insert {
+        pos: usize,
+        content: Content,
+    },
+    Delete {
+        range: Range<usize>,
+    },
+    Replace {
+        range: Range<usize>,
+        content: Content,
+    },
 }
 
 /// Content to insert
@@ -212,7 +217,7 @@ impl Tree {
                 sums: Sums::default(),
             },
             version: 0,
-            cached_flattened_text: Some(String::new()), // Empty tree = empty string
+            cached_flattened_text: Some(Arc::new(String::new())), // Empty tree = empty string
         }
     }
 
@@ -226,7 +231,7 @@ impl Tree {
                     sums: Sums::default(),
                 },
                 version: 0,
-                cached_flattened_text: Some(String::new()),
+                cached_flattened_text: Some(Arc::new(String::new())),
             };
         }
 
@@ -279,7 +284,7 @@ impl Tree {
             return Self {
                 root: all_leaves.into_iter().next().unwrap(),
                 version: 0,
-                cached_flattened_text: Some(text.to_string()),
+                cached_flattened_text: Some(Arc::new(text.to_string())),
             };
         }
 
@@ -307,7 +312,7 @@ impl Tree {
         Self {
             root: nodes.into_iter().next().unwrap(),
             version: 0,
-            cached_flattened_text: Some(text.to_string()),
+            cached_flattened_text: Some(Arc::new(text.to_string())),
         }
     }
 
@@ -322,7 +327,11 @@ impl Tree {
         let mut new_root = self.root.clone();
         for edit in edits {
             new_root = Self::apply_edit_to_node(new_root, edit);
-            debug_assert!(validate_tree_structure(&new_root), "Tree structure invalid after edit: {:?}", edit);
+            debug_assert!(
+                validate_tree_structure(&new_root),
+                "Tree structure invalid after edit: {:?}",
+                edit
+            );
         }
 
         Self {
@@ -337,7 +346,11 @@ impl Tree {
         let new_root = Self::apply_edit_to_node(self.root.clone(), edit);
 
         // Validate tree structure in debug builds
-        debug_assert!(validate_tree_structure(&new_root), "Tree structure invalid after edit: {:?}", edit);
+        debug_assert!(
+            validate_tree_structure(&new_root),
+            "Tree structure invalid after edit: {:?}",
+            edit
+        );
 
         Self {
             root: new_root,
@@ -375,7 +388,12 @@ impl Tree {
             Node::Leaf { sums, .. } => sums.bytes,
             Node::Internal { sums, .. } => sums.bytes,
         };
-        debug_assert!(pos <= total_bytes, "Insert position {} exceeds node size {}", pos, total_bytes);
+        debug_assert!(
+            pos <= total_bytes,
+            "Insert position {} exceeds node size {}",
+            pos,
+            total_bytes
+        );
 
         match node {
             Node::Leaf { mut spans, .. } => {
@@ -431,13 +449,17 @@ impl Tree {
                                 return Node::leaf(spans).split_if_needed();
                             } else if split_pos == bytes.len() {
                                 // Insert after this span - try to merge if both are text
-                                if let (Content::Text(new_text), Span::Text { .. }) = (content, &new_span) {
+                                if let (Content::Text(new_text), Span::Text { .. }) =
+                                    (content, &new_span)
+                                {
                                     // Merge with current span instead of creating a new one
-                                    let mut combined = Vec::with_capacity(bytes.len() + new_text.len());
+                                    let mut combined =
+                                        Vec::with_capacity(bytes.len() + new_text.len());
                                     combined.extend_from_slice(bytes);
                                     combined.extend_from_slice(new_text.as_bytes());
 
-                                    let new_lines = lines + bytecount::count(new_text.as_bytes(), b'\n') as u32;
+                                    let new_lines =
+                                        lines + bytecount::count(new_text.as_bytes(), b'\n') as u32;
                                     spans[i] = Span::Text {
                                         bytes: combined.into(),
                                         lines: new_lines,
@@ -507,7 +529,13 @@ impl Tree {
                     let (bytes, _) = node_metrics(&children[i]);
                     if byte_offset + bytes >= pos {
                         // Edit goes in this child
-                        let old_child = std::mem::replace(&mut children[i], Node::Leaf { spans: Vec::new(), sums: Sums::default() });
+                        let old_child = std::mem::replace(
+                            &mut children[i],
+                            Node::Leaf {
+                                spans: Vec::new(),
+                                sums: Sums::default(),
+                            },
+                        );
                         let new_child = Self::apply_edit_to_node(
                             old_child,
                             &Edit::Insert {
@@ -519,7 +547,13 @@ impl Tree {
 
                         // Check if child needs to be split
                         if children[i].needs_split() {
-                            let node_to_split = std::mem::replace(&mut children[i], Node::Leaf { spans: Vec::new(), sums: Sums::default() });
+                            let node_to_split = std::mem::replace(
+                                &mut children[i],
+                                Node::Leaf {
+                                    spans: Vec::new(),
+                                    sums: Sums::default(),
+                                },
+                            );
                             let (left, right) = Self::split_node(node_to_split);
                             children[i] = left;
                             if i + 1 < children.len() {
@@ -629,7 +663,6 @@ impl Tree {
         }
     }
 
-
     fn split_node(node: Node) -> (Node, Node) {
         match node {
             Node::Leaf { spans, .. } => {
@@ -640,7 +673,10 @@ impl Tree {
             Node::Internal { children, .. } => {
                 let mid = children.len() / 2;
                 let (left, right) = children.split_at(mid);
-                (Node::internal(left.to_vec()), Node::internal(right.to_vec()))
+                (
+                    Node::internal(left.to_vec()),
+                    Node::internal(right.to_vec()),
+                )
             }
         }
     }
@@ -663,7 +699,9 @@ impl Tree {
                 let next = &children[i + 1];
 
                 // Attempt to merge two leaves
-                if let (Node::Leaf { spans: s1, .. }, Node::Leaf { spans: s2, .. }) = (&current, next) {
+                if let (Node::Leaf { spans: s1, .. }, Node::Leaf { spans: s2, .. }) =
+                    (&current, next)
+                {
                     if s1.len() + s2.len() <= MAX_SPANS {
                         // Merge the two leaves
                         let mut merged_spans = s1.clone();
@@ -675,7 +713,9 @@ impl Tree {
                 }
 
                 // Attempt to merge two internal nodes
-                if let (Node::Internal { children: c1, .. }, Node::Internal { children: c2, .. }) = (&current, next) {
+                if let (Node::Internal { children: c1, .. }, Node::Internal { children: c2, .. }) =
+                    (&current, next)
+                {
                     if c1.len() + c2.len() <= MAX_SPANS {
                         // Merge the two internal nodes
                         let mut merged_children = c1.clone();
@@ -695,9 +735,9 @@ impl Tree {
         merged
     }
 
-    pub fn flatten_to_string(&self) -> String {
+    pub fn flatten_to_string(&self) -> Arc<String> {
         if let Some(ref cached) = self.cached_flattened_text {
-            return cached.clone();
+            return Arc::clone(cached);
         }
 
         // This shouldn't happen if we initialize the cache properly, but fallback to computing
@@ -707,7 +747,7 @@ impl Tree {
         };
         let mut result = String::with_capacity(capacity);
         collect_text(&self.root, &mut result);
-        result
+        Arc::new(result)
     }
 
     // === Navigation Methods (Iterative) ===
@@ -764,12 +804,15 @@ impl Tree {
     }
 
     pub fn find_line_end_at(&self, pos: usize) -> usize {
-        self.find_next_newline(pos).unwrap_or_else(|| self.byte_count())
+        self.find_next_newline(pos)
+            .unwrap_or_else(|| self.byte_count())
     }
 
     pub fn get_line_at(&self, pos: usize) -> String {
         let start = self.find_prev_newline(pos).map(|p| p + 1).unwrap_or(0);
-        let end = self.find_next_newline(pos).unwrap_or_else(|| self.byte_count());
+        let end = self
+            .find_next_newline(pos)
+            .unwrap_or_else(|| self.byte_count());
         self.get_text_slice(start..end)
     }
 
@@ -821,7 +864,7 @@ impl Tree {
 
 pub struct TreeCursor<'a> {
     tree: &'a Tree,
-    stack: Vec<CursorFrame<'a>>, // Stack frames for traversal
+    stack: Vec<CursorFrame<'a>>,           // Stack frames for traversal
     current_spans: Vec<(&'a Span, usize)>, // spans with byte offsets
     span_idx: usize,
     byte_pos: usize,
@@ -833,7 +876,7 @@ struct CursorFrame<'a> {
     node: &'a Node,
     byte_offset: usize,
     line_offset: u32,
-    child_index: usize, // Current child being processed
+    child_index: usize,                  // Current child being processed
     children_offsets: Vec<(usize, u32)>, // Pre-computed child offsets
 }
 
@@ -1028,8 +1071,12 @@ impl<'a> TreeCursor<'a> {
     }
 
     pub fn seek_line(&mut self, target_line: u32) -> Option<usize> {
-        if target_line == 0 { return Some(0); }
-        if target_line > self.tree.line_count() { return None; }
+        if target_line == 0 {
+            return Some(0);
+        }
+        if target_line > self.tree.line_count() {
+            return None;
+        }
 
         self.reset();
         let mut current_line = 0;
@@ -1158,8 +1205,11 @@ impl<'a> TreeCursor<'a> {
                                 if let Some(new_frame) = self.stack.pop() {
                                     self.stack.push(new_frame);
                                     if let Some(frame) = self.stack.last_mut() {
-                                        if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
-                                            let child_frame = CursorFrame::new(child, byte_off, line_off);
+                                        if let Some((child, byte_off, line_off)) =
+                                            frame.advance_to_next_child()
+                                        {
+                                            let child_frame =
+                                                CursorFrame::new(child, byte_off, line_off);
                                             self.stack.push(child_frame);
                                         } else {
                                             return false;
@@ -1192,7 +1242,8 @@ impl<'a> TreeCursor<'a> {
         let mut result = String::with_capacity(len);
         let mut remaining = len;
         let mut idx = self.span_idx;
-        let mut pos_in_span = self.byte_pos - self.current_spans.get(idx).map(|(_, o)| *o).unwrap_or(0);
+        let mut pos_in_span =
+            self.byte_pos - self.current_spans.get(idx).map(|(_, o)| *o).unwrap_or(0);
 
         while remaining > 0 && idx < self.current_spans.len() {
             if let Some((span, _)) = self.current_spans.get(idx) {
@@ -1250,7 +1301,9 @@ impl<'a> TreeCursor<'a> {
             }
 
             let leaf_start = self.current_spans.first().map(|(_, o)| *o).unwrap_or(0);
-            let leaf_end = self.current_spans.last()
+            let leaf_end = self
+                .current_spans
+                .last()
                 .map(|(span, offset)| offset + span_bytes(span))
                 .unwrap_or(leaf_start);
 
@@ -1275,7 +1328,6 @@ impl<'a> TreeCursor<'a> {
         }
     }
 }
-
 
 // === Helper Functions ===
 
@@ -1314,8 +1366,7 @@ fn find_in_span(span: &Span, target: u8, start: usize, forward: bool) -> Option<
         Span::Text { bytes, .. } => {
             if forward {
                 // Use SIMD-optimized memchr for forward search
-                memchr(target, &bytes[start..])
-                    .map(|p| start + p)
+                memchr(target, &bytes[start..]).map(|p| start + p)
             } else {
                 // Use SIMD-optimized memrchr for reverse search
                 memrchr(target, &bytes[..start])
@@ -1390,7 +1441,11 @@ fn validate_tree_structure(node: &Node) -> bool {
         Node::Leaf { spans, sums } => {
             // Check spans don't exceed MAX_SPANS
             if spans.len() > MAX_SPANS {
-                eprintln!("Leaf has {} spans, exceeds MAX_SPANS ({})", spans.len(), MAX_SPANS);
+                eprintln!(
+                    "Leaf has {} spans, exceeds MAX_SPANS ({})",
+                    spans.len(),
+                    MAX_SPANS
+                );
                 return false;
             }
 
@@ -1407,7 +1462,11 @@ fn validate_tree_structure(node: &Node) -> bool {
         Node::Internal { children, sums } => {
             // Check children don't exceed MAX_SPANS
             if children.len() > MAX_SPANS {
-                eprintln!("Internal node has {} children, exceeds MAX_SPANS ({})", children.len(), MAX_SPANS);
+                eprintln!(
+                    "Internal node has {} children, exceeds MAX_SPANS ({})",
+                    children.len(),
+                    MAX_SPANS
+                );
                 return false;
             }
 
@@ -1477,9 +1536,9 @@ mod tests {
         let tree = doc.read();
 
         // Total: "Line 1\n" (7 bytes) "Line 2\n" (7 bytes) "Line 3\n" (7 bytes)
-        assert_eq!(tree.byte_to_line(0), 0);  // Start of file
-        assert_eq!(tree.byte_to_line(5), 0);  // In "Line 1"
-        assert_eq!(tree.byte_to_line(7), 1);  // Start of "Line 2"
+        assert_eq!(tree.byte_to_line(0), 0); // Start of file
+        assert_eq!(tree.byte_to_line(5), 0); // In "Line 1"
+        assert_eq!(tree.byte_to_line(7), 1); // Start of "Line 2"
         assert_eq!(tree.byte_to_line(10), 1); // In "Line 2"
         assert_eq!(tree.byte_to_line(14), 2); // Start of "Line 3"
         assert_eq!(tree.byte_to_line(20), 2); // In "Line 3"
@@ -1572,7 +1631,7 @@ mod tests {
     #[test]
     fn test_document_operations() {
         let doc = Doc::from_str("");
-        assert_eq!(doc.read().flatten_to_string(), "");
+        assert_eq!(*doc.read().flatten_to_string(), "");
         assert_eq!(doc.read().byte_count(), 0);
 
         doc.edit(Edit::Insert {
@@ -1580,25 +1639,25 @@ mod tests {
             content: Content::Text("A".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().flatten_to_string(), "A");
+        assert_eq!(*doc.read().flatten_to_string(), "A");
 
         doc.edit(Edit::Insert {
             pos: 1,
             content: Content::Text("C".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().flatten_to_string(), "AC");
+        assert_eq!(*doc.read().flatten_to_string(), "AC");
 
         doc.edit(Edit::Insert {
             pos: 1,
             content: Content::Text("B".to_string()),
         });
         doc.flush();
-        assert_eq!(doc.read().flatten_to_string(), "ABC");
+        assert_eq!(*doc.read().flatten_to_string(), "ABC");
 
         doc.edit(Edit::Delete { range: 1..2 });
         doc.flush();
-        assert_eq!(doc.read().flatten_to_string(), "AC");
+        assert_eq!(*doc.read().flatten_to_string(), "AC");
     }
 
     #[test]
@@ -1613,7 +1672,7 @@ mod tests {
             doc.flush();
         }
 
-        assert_eq!(doc.read().flatten_to_string(), "Hello, World!");
+        assert_eq!(*doc.read().flatten_to_string(), "Hello, World!");
         assert_eq!(doc.read().byte_count(), 13);
     }
 
@@ -1624,8 +1683,8 @@ mod tests {
         let tree1 = doc.read();
         let tree2 = doc.read();
 
-        assert_eq!(tree1.flatten_to_string(), "Shared");
-        assert_eq!(tree2.flatten_to_string(), "Shared");
+        assert_eq!(*tree1.flatten_to_string(), "Shared");
+        assert_eq!(*tree2.flatten_to_string(), "Shared");
         assert_eq!(tree1.byte_count(), tree2.byte_count());
     }
 
@@ -1639,7 +1698,7 @@ mod tests {
         });
         doc.flush();
 
-        assert_eq!(doc.read().flatten_to_string(), "Text");
+        assert_eq!(*doc.read().flatten_to_string(), "Text");
     }
 
     #[test]
@@ -1647,7 +1706,10 @@ mod tests {
         // Create text that will span multiple leaves
         let mut text = String::new();
         for i in 0..100 {
-            text.push_str(&format!("This is line {} with some content to fill up space.\n", i));
+            text.push_str(&format!(
+                "This is line {} with some content to fill up space.\n",
+                i
+            ));
         }
 
         let doc = Doc::from_str(&text);
@@ -1671,7 +1733,7 @@ mod tests {
         }
 
         // Verify content is preserved
-        assert_eq!(tree.flatten_to_string(), text);
+        assert_eq!(*tree.flatten_to_string(), text);
     }
 
     #[test]
@@ -1796,7 +1858,10 @@ mod tests {
         let mut text = String::new();
         // Create 20KB of data to ensure multiple leaves
         for i in 0..500 {
-            text.push_str(&format!("This is line number {} with some padding text to make it longer\n", i));
+            text.push_str(&format!(
+                "This is line number {} with some padding text to make it longer\n",
+                i
+            ));
         }
 
         let doc = Doc::from_str(&text);
@@ -1818,7 +1883,12 @@ mod tests {
         }
 
         assert_eq!(total_bytes, tree.byte_count());
-        assert!(leaves_visited > 1, "Should have multiple leaves for large doc (visited {} leaves, {} bytes)", leaves_visited, text.len());
+        assert!(
+            leaves_visited > 1,
+            "Should have multiple leaves for large doc (visited {} leaves, {} bytes)",
+            leaves_visited,
+            text.len()
+        );
     }
 
     #[test]
@@ -1881,3 +1951,4 @@ mod tests {
         }
     }
 }
+
