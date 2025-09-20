@@ -4,8 +4,8 @@
 
 use crate::text_effects::{priority, EffectType, TextEffect, TextStyleProvider};
 use arc_swap::ArcSwap;
-use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use tree_sitter::{
     InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree as TSTree,
@@ -46,7 +46,8 @@ fn get_wgsl_language() -> Language {
     println!("Loading WGSL from WASM ({} bytes)...", WGSL_WASM.len());
 
     let store = store_guard.as_mut().unwrap();
-    let language = store.load_language("wgsl", WGSL_WASM)
+    let language = store
+        .load_language("wgsl", WGSL_WASM)
         .expect("Failed to load WGSL language");
 
     // Cache the language
@@ -99,75 +100,75 @@ impl Languages {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenType {
     // Basic tokens (0-14) - keep existing for compatibility
-    Keyword,        // 1
-    Function,       // 2
-    Type,          // 3
-    String,        // 4
-    Number,        // 5
-    Comment,       // 6
-    Constant,      // 7
-    Operator,      // 8
-    Punctuation,   // 9
-    Variable,      // 10
-    Attribute,     // 11
-    Namespace,     // 12
-    Property,      // 13
-    Parameter,     // 14
+    Keyword,     // 1
+    Function,    // 2
+    Type,        // 3
+    String,      // 4
+    Number,      // 5
+    Comment,     // 6
+    Constant,    // 7
+    Operator,    // 8
+    Punctuation, // 9
+    Variable,    // 10
+    Attribute,   // 11
+    Namespace,   // 12
+    Property,    // 13
+    Parameter,   // 14
 
     // Extended tokens for richer syntax highlighting (15+)
-    Method,           // 15
-    Field,            // 16
-    Constructor,      // 17
-    Enum,             // 18
-    EnumMember,       // 19
-    Interface,        // 20
-    Struct,           // 21
-    Class,            // 22
-    Module,           // 23
-    Macro,            // 24
-    Label,            // 25
-    KeywordControl,   // 26 - if, else, match, loop, etc.
+    Method,         // 15
+    Field,          // 16
+    Constructor,    // 17
+    Enum,           // 18
+    EnumMember,     // 19
+    Interface,      // 20
+    Struct,         // 21
+    Class,          // 22
+    Module,         // 23
+    Macro,          // 24
+    Label,          // 25
+    KeywordControl, // 26 - if, else, match, loop, etc.
 
     // String variants
-    StringEscape,     // 27
+    StringEscape,        // 27
     StringInterpolation, // 28
-    Regex,            // 29
+    Regex,               // 29
 
     // Literal variants
-    Boolean,          // 30
-    Character,        // 31
-    Float,            // 32
+    Boolean,   // 30
+    Character, // 31
+    Float,     // 32
 
     // Comment variants
-    CommentDoc,       // 33
-    CommentTodo,      // 34
+    CommentDoc,  // 33
+    CommentTodo, // 34
 
     // Operator variants
-    ComparisonOp,     // 35
-    LogicalOp,        // 36
-    ArithmeticOp,     // 37
+    ComparisonOp, // 35
+    LogicalOp,    // 36
+    ArithmeticOp, // 37
 
     // Punctuation variants
-    Bracket,          // 38 - [], <>
-    Brace,            // 39 - {}
-    Parenthesis,      // 40 - ()
-    Delimiter,        // 41 - ::, ->
-    Semicolon,        // 42
-    Comma,            // 43
+    Bracket,     // 38 - [], <>
+    Brace,       // 39 - {}
+    Parenthesis, // 40 - ()
+    Delimiter,   // 41 - ::, ->
+    Semicolon,   // 42
+    Comma,       // 43
 
     // Special highlighting
-    Error,            // 44
-    Warning,          // 45
-    Deprecated,       // 46
-    Unused,           // 47
+    Error,      // 44
+    Warning,    // 45
+    Deprecated, // 46
+    Unused,     // 47
 
     // Rust-specific semantic tokens
-    SelfKeyword,      // 48
-    Lifetime,         // 49
-    TypeParameter,    // 50
-    Generic,          // 51
-    Trait,            // 52
-    Derive,           // 53
+    SelfKeyword,   // 48
+    Lifetime,      // 49
+    TypeParameter, // 50
+    Generic,       // 51
+    Trait,         // 52
+    Derive,        // 53
 }
 
 /// Background syntax highlighter with debouncing
@@ -188,8 +189,8 @@ pub struct SyntaxHighlighter {
     /// Language for creating queries
     #[allow(dead_code)]
     language: Language,
-    /// Highlight query
-    query: Arc<Query>,
+    /// Highlight query string (compiled lazily in background thread)
+    highlights_query: &'static str,
 }
 
 /// Text edit information for tree-sitter incremental parsing
@@ -230,14 +231,6 @@ impl SyntaxHighlighter {
 
     /// Request update with edit information
     pub fn request_update_with_edit(&self, text: &str, version: u64, edit: Option<TextEdit>) {
-        if let Some(ref edit_info) = edit {
-            println!(
-                "SYNTAX: Sending request_update_with_edit WITH InputEdit: start_byte={}",
-                edit_info.start_byte
-            );
-        } else {
-            println!("SYNTAX: Sending request_update_with_edit WITHOUT InputEdit");
-        }
         let _ = self.tx.send(ParseRequest {
             text: text.to_string(),
             version,
@@ -257,22 +250,24 @@ impl SyntaxHighlighter {
             let mut store = WasmStore::new(engine).expect("Failed to create WasmStore");
 
             // Load the language into the store
-            const WGSL_WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
-            let language = store.load_language("wgsl", WGSL_WASM)
+            const WGSL_WASM: &[u8] =
+                include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
+            let language = store
+                .load_language("wgsl", WGSL_WASM)
                 .expect("Failed to load WGSL language");
 
             // Set up the parser
-            parser.set_wasm_store(store).expect("Failed to set WasmStore");
+            parser
+                .set_wasm_store(store)
+                .expect("Failed to set WasmStore");
             parser.set_language(&language)?;
         } else {
             parser.set_language(&config.language)?;
         }
 
-        let query = Arc::new(
-            Query::new(&config.language, config.highlights_query)
-                .expect("Failed to create highlight query"),
-        );
-        let query_clone = query.clone();
+        // Don't create query here - defer to background thread
+        let language_clone = config.language.clone();
+        let highlights_query_clone = config.highlights_query;
 
         let highlights = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let highlights_clone = highlights.clone();
@@ -289,18 +284,14 @@ impl SyntaxHighlighter {
 
         // Background parsing thread with debouncing - move parser into it
         thread::spawn(move || {
-            println!("SYNTAX: Background thread started for {}", language_name);
-
             let mut tree: Option<TSTree> = None;
             let mut cursor = QueryCursor::new();
             let mut last_text = String::new();
             let mut is_first_parse = true;
+            // Lazy query compilation on first use
+            let mut query: Option<Query> = None;
 
             while let Ok(request) = rx.recv() {
-                println!(
-                    "SYNTAX: Received parse request for {} bytes",
-                    request.text.len()
-                );
                 // Shorter debounce for initial parse, longer for subsequent
                 let debounce_ms = if is_first_parse { 10 } else { 100 };
                 std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
@@ -310,7 +301,6 @@ impl SyntaxHighlighter {
 
                 // Skip if text hasn't changed (avoid redundant parsing)
                 if final_request.text == last_text && final_request.edit.is_none() {
-                    println!("SYNTAX: Skipping - text unchanged and no edit");
                     continue;
                 }
                 last_text = final_request.text.clone();
@@ -334,12 +324,6 @@ impl SyntaxHighlighter {
                     }
                 }
 
-                println!(
-                    "SYNTAX [{}]: Parsing {} bytes with tree-sitter (incremental={})",
-                    language_name,
-                    final_request.text.len(),
-                    final_request.edit.is_some()
-                );
                 // Parse with tree-sitter (incremental if we have existing tree)
                 tree = parser.parse(&final_request.text, tree.as_ref());
 
@@ -348,11 +332,27 @@ impl SyntaxHighlighter {
                 }
 
                 if let Some(ref ts_tree) = tree {
+                    // Compile query on first use (lazy initialization)
+                    if query.is_none() {
+                        println!("SYNTAX [{}]: Compiling tree-sitter query on background thread...", language_name);
+                        match Query::new(&language_clone, highlights_query_clone) {
+                            Ok(compiled_query) => {
+                                println!("SYNTAX [{}]: Query compilation successful", language_name);
+                                query = Some(compiled_query);
+                            }
+                            Err(e) => {
+                                println!("SYNTAX [{}]: Failed to compile query: {:?}", language_name, e);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let query_ref = query.as_ref().unwrap();
                     let mut effects = Vec::new();
-                    let capture_names = query_clone.capture_names();
+                    let capture_names = query_ref.capture_names();
 
                     let mut matches = cursor.matches(
-                        &query_clone,
+                        query_ref,
                         ts_tree.root_node(),
                         final_request.text.as_bytes(),
                     );
@@ -363,20 +363,6 @@ impl SyntaxHighlighter {
                         for capture in match_.captures {
                             let capture_name = &capture_names[capture.index as usize];
                             capture_count += 1;
-
-                            // Debug: log first few captures to see what tree-sitter is finding
-                            if capture_count <= 10 {
-                                let node_text = &final_request.text[capture.node.start_byte()
-                                    ..capture.node.end_byte().min(final_request.text.len())];
-                                println!(
-                                    "SYNTAX: Capture #{}: name='{}', text='{}', range={}..{}",
-                                    capture_count,
-                                    capture_name,
-                                    node_text.chars().take(20).collect::<String>(),
-                                    capture.node.start_byte(),
-                                    capture.node.end_byte()
-                                );
-                            }
 
                             if let Some(token) = Self::capture_name_to_token_type(capture_name) {
                                 effects.push(TextEffect {
@@ -425,7 +411,7 @@ impl SyntaxHighlighter {
             cached_text,
             cached_version,
             language: config.language,
-            query,
+            highlights_query: config.highlights_query,
         })
     }
 
@@ -445,6 +431,20 @@ impl SyntaxHighlighter {
             "rs" => Some(Self::new_rust()),
             "wgsl" => Some(Self::new_wgsl()),
             _ => None,
+        }
+    }
+
+    /// Get the language name for a file extension without creating a highlighter
+    pub fn file_extension_to_language(path: &str) -> &'static str {
+        let extension = std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+
+        match extension.to_lowercase().as_str() {
+            "rs" => "rust",
+            "wgsl" => "wgsl",
+            _ => "rust", // Default to rust
         }
     }
 
@@ -472,18 +472,22 @@ impl SyntaxHighlighter {
             | "keyword.operator"
             | "keyword.storage"
             | "keyword.storage.type"
-            | "keyword.storage.modifier" => Some(TokenType::Keyword),
+            | "keyword.storage.modifier"
+            | "keyword.return" => Some(TokenType::Keyword),
 
             // Functions
-            "function" | "function.builtin" | "function.call"
-            | "function.method" | "method" | "method.call" => Some(TokenType::Function),
+            "function" | "function.builtin" | "function.call" | "function.method" | "method"
+            | "method.call" => Some(TokenType::Function),
 
             // Macros get special treatment
             "function.macro" => Some(TokenType::Macro),
 
+            "class" | "class.builtin" => Some(TokenType::Class),
+
             // Types
-            "type" | "type.builtin" | "type.primitive" | "type.qualifier" | "class"
-            | "storage.type" => Some(TokenType::Type),
+            "type" | "type.builtin" | "type.primitive" | "type.qualifier" | "storage.type" => {
+                Some(TokenType::Type)
+            }
 
             // Strings and escape sequences
             "string" | "string.quoted" | "string.template" | "string.regex" | "string.special"
@@ -504,20 +508,12 @@ impl SyntaxHighlighter {
             "comment.documentation" => Some(TokenType::CommentDoc),
 
             // Constants - keep separate from numbers for proper semantic highlighting
-            "constant"
-            | "constant.language"
-            | "boolean"
-            | "constant.builtin.boolean" => Some(TokenType::Constant),
+            "constant" | "constant.language" | "boolean" | "constant.builtin.boolean" => {
+                Some(TokenType::Constant)
+            }
 
             // constant.builtin in Rust is often numbers, but could be other things
             "constant.builtin" => Some(TokenType::Number),
-
-            // Operators
-            "operator"
-            | "operator.assignment"
-            | "operator.arithmetic"
-            | "operator.comparison"
-            | "operator.logical" => Some(TokenType::Operator),
 
             // Punctuation
             "punctuation"
@@ -534,7 +530,9 @@ impl SyntaxHighlighter {
             | "variable.other.member" => Some(TokenType::Variable),
 
             // Attributes - including derive in Rust
-            "attribute" | "decorator" | "annotation" | "attribute.builtin" => Some(TokenType::Attribute),
+            "attribute" | "decorator" | "annotation" | "attribute.builtin" => {
+                Some(TokenType::Attribute)
+            }
 
             // Special Rust attributes
             "derive" => Some(TokenType::Derive),
@@ -558,7 +556,6 @@ impl SyntaxHighlighter {
 
             // Structs, classes, interfaces
             "struct" => Some(TokenType::Struct),
-            "class" | "class.builtin" => Some(TokenType::Class),
             "interface" => Some(TokenType::Interface),
 
             // Traits (Rust-specific but useful)
@@ -587,6 +584,9 @@ impl SyntaxHighlighter {
             "operator.logical" => Some(TokenType::LogicalOp),
             "operator.arithmetic" => Some(TokenType::ArithmeticOp),
 
+            // Operators
+            "operator" => Some(TokenType::Operator),
+
             // Additional punctuation
             "bracket" => Some(TokenType::Bracket),
             "brace" => Some(TokenType::Brace),
@@ -613,9 +613,6 @@ impl SyntaxHighlighter {
             "structure" => Some(TokenType::Struct),
             "repeat" => Some(TokenType::Keyword),
             "conditional" => Some(TokenType::Keyword),
-            "keyword.function" => Some(TokenType::Keyword),
-            "keyword.return" => Some(TokenType::Keyword),
-            "function.call" => Some(TokenType::Function),
 
             // Catch-all for unrecognized names - return None to skip
             _ => None,
@@ -707,7 +704,7 @@ impl SyntaxHighlighter {
         let mut coalesced = Vec::with_capacity(effects.len() / 2); // Estimate
         let mut current_effect: Option<TextEffect> = None;
 
-        for mut effect in effects {
+        for effect in effects {
             if let Some(ref mut curr) = current_effect {
                 // Check if we can coalesce with current effect
                 let can_coalesce = curr.range.end == effect.range.start
@@ -744,7 +741,7 @@ impl SyntaxHighlighter {
     /// Get syntax effects for only the visible byte range - O(visible nodes)
     pub fn get_visible_effects(
         &self,
-        _text: &str,  // Ignore the passed-in text
+        _text: &str, // Ignore the passed-in text
         byte_range: std::ops::Range<usize>,
     ) -> Vec<TextEffect> {
         // Get the cached tree and text - they must match!
@@ -759,6 +756,13 @@ impl SyntaxHighlighter {
             }
         };
 
+        // Create query on demand for viewport queries
+        // This is a fallback - normally highlighting comes from the background thread
+        let query = match Query::new(&self.language, self.highlights_query) {
+            Ok(q) => q,
+            Err(_) => return Vec::new(), // Query compilation failed
+        };
+
         let mut effects = Vec::new();
         let mut cursor = QueryCursor::new();
 
@@ -766,9 +770,9 @@ impl SyntaxHighlighter {
         // tree-sitter will only visit nodes that intersect this range
         cursor.set_byte_range(byte_range.clone());
 
-        let capture_names = self.query.capture_names();
+        let capture_names = query.capture_names();
         // Use the CACHED text that corresponds to the tree!
-        let mut matches = cursor.matches(&self.query, tree.root_node(), cached_text.as_bytes());
+        let mut matches = cursor.matches(&query, tree.root_node(), cached_text.as_bytes());
 
         // Process only the visible matches
         while let Some(match_) = matches.next() {
@@ -1148,14 +1152,16 @@ fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
         println!("WASM size: {} bytes", WGSL_WASM.len());
 
         // Load language from WASM
-        let language = store.load_language("wgsl", WGSL_WASM)
+        let language = store
+            .load_language("wgsl", WGSL_WASM)
             .expect("Failed to load WGSL language");
 
         println!("Language loaded, version: {:?}", language.version());
 
         // Create parser and set the store FIRST
         let mut parser = Parser::new();
-        parser.set_wasm_store(store)
+        parser
+            .set_wasm_store(store)
             .expect("Failed to set WasmStore on parser");
 
         // Now set the language
@@ -1182,7 +1188,7 @@ fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
             "let x = 42;",
             "@vertex fn vs() {}",
             "var<private> x: f32;",
-            "",  // Empty should parse
+            "", // Empty should parse
         ];
 
         for code in test_cases {
@@ -1228,9 +1234,13 @@ fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
             for capture in match_.captures {
                 if count < 30 {
                     let capture_name = &capture_names[capture.index as usize];
-                    let node_text = &source_code[capture.node.start_byte()..capture.node.end_byte()];
+                    let node_text =
+                        &source_code[capture.node.start_byte()..capture.node.end_byte()];
                     let token_type = SyntaxHighlighter::capture_name_to_token_type(capture_name);
-                    println!("  '{}' -> '{}' -> {:?}", node_text, capture_name, token_type);
+                    println!(
+                        "  '{}' -> '{}' -> {:?}",
+                        node_text, capture_name, token_type
+                    );
                     count += 1;
                 }
             }
@@ -1259,7 +1269,9 @@ fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
         use tree_sitter::{Parser, Query, QueryCursor};
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
 
         let source_code = r#"
 fn main() {
@@ -1272,7 +1284,8 @@ fn main() {
         let query = Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
             tree_sitter_rust::HIGHLIGHTS_QUERY,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut cursor = QueryCursor::new();
         let capture_names = query.capture_names();
@@ -1289,9 +1302,13 @@ fn main() {
             for capture in match_.captures {
                 if count < 30 {
                     let capture_name = &capture_names[capture.index as usize];
-                    let node_text = &source_code[capture.node.start_byte()..capture.node.end_byte()];
+                    let node_text =
+                        &source_code[capture.node.start_byte()..capture.node.end_byte()];
                     let token_type = SyntaxHighlighter::capture_name_to_token_type(capture_name);
-                    println!("  '{}' -> '{}' -> {:?}", node_text, capture_name, token_type);
+                    println!(
+                        "  '{}' -> '{}' -> {:?}",
+                        node_text, capture_name, token_type
+                    );
                     count += 1;
                 }
             }

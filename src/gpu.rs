@@ -65,7 +65,6 @@ pub struct GpuRenderer {
     shader_base_path: PathBuf,
 
     // Cached bind group layouts (these don't change when shaders reload)
-    uniform_bind_group_layout: wgpu::BindGroupLayout, // For compatibility
     glyph_bind_group_layout: wgpu::BindGroupLayout,
     rect_uniform_bind_group_layout: wgpu::BindGroupLayout, // Rect-specific uniforms
     themed_uniform_bind_group_layout: Option<wgpu::BindGroupLayout>, // Themed shader uniforms
@@ -245,6 +244,7 @@ impl GpuRenderer {
             }
         }
     }
+
 
     /// Create rect pipeline with given shader module
     fn create_rect_pipeline(&self, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
@@ -706,20 +706,6 @@ impl GpuRenderer {
         theme1: &crate::theme::Theme,
         theme2: &crate::theme::Theme,
     ) {
-        // Load the themed shader
-        let themed_shader_src = Self::load_shader(
-            &self.shader_base_path,
-            "glyph_themed.wgsl",
-            include_str!("shaders/glyph_themed.wgsl"),
-        );
-        let themed_shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Themed Glyph Shader"),
-                source: wgpu::ShaderSource::Wgsl(themed_shader_src.into()),
-            });
-
-        // Generate merged theme texture data for interpolation
         let texture_data = crate::theme::Theme::merge_for_interpolation(theme1, theme2);
         let texture_width = 256;
         let max_colors = theme1
@@ -1042,11 +1028,11 @@ impl GpuRenderer {
 
                 // Replace the old pipeline
                 self.rect_pipeline = new_pipeline;
-                eprintln!("✅ Successfully hot-reloaded rect shader");
+                eprintln!("Successfully hot-reloaded rect shader");
                 true
             }
             Err(e) => {
-                eprintln!("❌ Rect shader compilation failed:");
+                eprintln!("Rect shader compilation failed:");
                 eprintln!("   {}", e);
                 false
             }
@@ -1068,11 +1054,11 @@ impl GpuRenderer {
                 let new_pipeline = self.create_glyph_pipeline(&shader);
 
                 self.glyph_pipeline = new_pipeline;
-                eprintln!("✅ Successfully hot-reloaded glyph shader");
+                eprintln!("Successfully hot-reloaded glyph shader");
                 true
             }
             Err(e) => {
-                eprintln!("❌ Glyph shader compilation failed:");
+                eprintln!("Glyph shader compilation failed:");
                 eprintln!("   {}", e);
                 false
             }
@@ -1093,15 +1079,15 @@ impl GpuRenderer {
 
                 if let Some(new_pipeline) = self.create_themed_pipeline(&shader) {
                     self.themed_glyph_pipeline = Some(new_pipeline);
-                    eprintln!("✅ Successfully hot-reloaded themed shader");
+                    eprintln!("Successfully hot-reloaded themed shader");
                     true
                 } else {
-                    eprintln!("⚠️  Could not create themed pipeline (missing bind group layouts)");
+                    eprintln!("Could not create themed pipeline (missing bind group layouts)");
                     false
                 }
             }
             Err(e) => {
-                eprintln!("❌ Themed shader compilation failed:");
+                eprintln!("Themed shader compilation failed:");
                 eprintln!("   {}", e);
                 false
             }
@@ -1122,7 +1108,7 @@ impl GpuRenderer {
         if self.try_reload_rect_shader(rect_src) {
             any_success = true;
         } else {
-            eprintln!("⚠️  Keeping previous rect shader");
+            eprintln!("Keeping previous rect shader");
         }
 
         // Try to reload glyph shader
@@ -1134,7 +1120,7 @@ impl GpuRenderer {
         if self.try_reload_glyph_shader(glyph_src) {
             any_success = true;
         } else {
-            eprintln!("⚠️  Keeping previous glyph shader");
+            eprintln!("Keeping previous glyph shader");
         }
 
         // Try to reload themed shader if initialized
@@ -1147,14 +1133,14 @@ impl GpuRenderer {
             if self.try_reload_themed_shader(themed_src) {
                 any_success = true;
             } else {
-                eprintln!("⚠️  Keeping previous themed shader");
+                eprintln!("Keeping previous themed shader");
             }
         }
 
         if any_success {
-            eprintln!("✨ Shader hot-reload complete!");
+            eprintln!("Shader hot-reload complete!");
         } else {
-            eprintln!("⚠️  No shaders were reloaded");
+            eprintln!("No shaders were reloaded");
         }
     }
 
@@ -1172,6 +1158,7 @@ impl GpuRenderer {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
+                // power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
@@ -1506,7 +1493,6 @@ impl GpuRenderer {
             surface,
             config,
             shader_base_path,
-            uniform_bind_group_layout,
             glyph_bind_group_layout,
             rect_uniform_bind_group_layout,
             themed_uniform_bind_group_layout: None,

@@ -16,7 +16,7 @@ use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
 #[derive(Clone, Debug)]
 pub struct GlyphInstance {
     pub glyph_id: u16,
-    pub pos: LayoutPos, // Layout space position (logical pixels)
+    pub pos: LayoutPos,       // Layout space position (logical pixels)
     pub tex_coords: [f32; 4], // [u0, v0, u1, v1] in atlas
     pub token_id: u8,         // Token type for theme lookup
     pub relative_pos: f32,    // Position within token (0.0-1.0)
@@ -194,7 +194,6 @@ impl Renderer {
             let effects = highlighter.get_visible_effects(&text, 0..text.len());
 
             let mut tokens = Vec::new();
-            let mut debug_first = true;
             for effect in effects {
                 if let crate::text_effects::EffectType::Token(token_id) = effect.effect {
                     tokens.push(crate::text_renderer::TokenRange {
@@ -316,9 +315,7 @@ impl Renderer {
                 let mut glyph_instances = Vec::new();
                 for glyph in visible_glyphs {
                     // Transform from layout to physical coordinates
-                    let physical_pos = self
-                        .viewport
-                        .layout_to_physical(glyph.layout_pos);
+                    let physical_pos = self.viewport.layout_to_physical(glyph.layout_pos);
 
                     glyph_instances.push(GlyphInstance {
                         glyph_id: 0,

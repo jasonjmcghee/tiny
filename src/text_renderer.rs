@@ -6,8 +6,8 @@
 
 use crate::coordinates::{LayoutPos, PhysicalPos};
 use crate::tree::Tree;
-use std::ops::Range;
 use ahash::HashMap;
+use std::ops::Range;
 
 /// Unified glyph with position and style data
 #[derive(Clone, Debug)]
@@ -17,8 +17,8 @@ pub struct UnifiedGlyph {
     pub physical_pos: PhysicalPos, // Physical pixels
     pub tex_coords: [f32; 4],      // Atlas coordinates
     pub char_byte_offset: usize,   // Byte position in document
-    pub token_id: u16,              // Style token ID
-    pub relative_pos: f32,          // Position within token (0.0-1.0)
+    pub token_id: u16,             // Style token ID
+    pub relative_pos: f32,         // Position within token (0.0-1.0)
 }
 
 // Legacy type alias for compatibility during migration
@@ -76,7 +76,6 @@ pub struct TextRenderer {
     pub gpu_style_buffer: Option<wgpu::Buffer>,
     /// Palette texture (256 colors, RGBA8)
     pub palette_texture: Option<wgpu::Texture>,
-
 }
 
 impl TextRenderer {
@@ -110,7 +109,8 @@ impl TextRenderer {
         }
 
         // Save old glyphs to preserve token IDs
-        let old_styles: HashMap<usize, (u16, f32)> = self.layout_cache
+        let old_styles: HashMap<usize, (u16, f32)> = self
+            .layout_cache
             .iter()
             .map(|g| (g.char_byte_offset, (g.token_id, g.relative_pos)))
             .collect();
@@ -144,10 +144,8 @@ impl TextRenderer {
                 );
 
                 // Preserve token_id from old layout if available
-                let (token_id, relative_pos) = old_styles
-                    .get(&byte_offset)
-                    .copied()
-                    .unwrap_or((0, 0.0));
+                let (token_id, relative_pos) =
+                    old_styles.get(&byte_offset).copied().unwrap_or((0, 0.0));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
@@ -176,15 +174,16 @@ impl TextRenderer {
             if line_idx < lines.len() - 1 {
                 // Newline between lines
                 // Preserve token_id for newline
-                let (token_id, relative_pos) = old_styles
-                    .get(&byte_offset)
-                    .copied()
-                    .unwrap_or((0, 0.0));
+                let (token_id, relative_pos) =
+                    old_styles.get(&byte_offset).copied().unwrap_or((0, 0.0));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(viewport.margin.x.0, y_pos),
-                    physical_pos: PhysicalPos::new(viewport.margin.x.0 * viewport.scale_factor, y_pos * viewport.scale_factor),
+                    physical_pos: PhysicalPos::new(
+                        viewport.margin.x.0 * viewport.scale_factor,
+                        y_pos * viewport.scale_factor,
+                    ),
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
                     char_byte_offset: byte_offset,
                     token_id,
@@ -195,15 +194,16 @@ impl TextRenderer {
             } else if text.ends_with('\n') {
                 // Trailing newline
                 // Preserve token_id for newline
-                let (token_id, relative_pos) = old_styles
-                    .get(&byte_offset)
-                    .copied()
-                    .unwrap_or((0, 0.0));
+                let (token_id, relative_pos) =
+                    old_styles.get(&byte_offset).copied().unwrap_or((0, 0.0));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(viewport.margin.x.0, y_pos),
-                    physical_pos: PhysicalPos::new(viewport.margin.x.0 * viewport.scale_factor, y_pos * viewport.scale_factor),
+                    physical_pos: PhysicalPos::new(
+                        viewport.margin.x.0 * viewport.scale_factor,
+                        y_pos * viewport.scale_factor,
+                    ),
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
                     char_byte_offset: byte_offset,
                     token_id,
@@ -237,38 +237,57 @@ impl TextRenderer {
         if fresh_parse {
             self.syntax_state.dirty_range = None;
             // Convert legacy tokens to new format for stable storage
-            self.syntax_state.stable_tokens = tokens.iter().map(|t| TokenRange {
-                byte_range: t.byte_range.clone(),
-                token_id: t.token_id as u8,
-            }).collect();
+            self.syntax_state.stable_tokens = tokens
+                .iter()
+                .map(|t| TokenRange {
+                    byte_range: t.byte_range.clone(),
+                    token_id: t.token_id as u8,
+                })
+                .collect();
 
-            // Apply all tokens for fresh parse
+            // Apply all tokens for fresh parse - O(n + m) single-pass merge
+            let mut glyph_idx = 0;
+            let mut token_idx = 0;
+
+            // First, clear all glyph styles
             for glyph in &mut self.layout_cache {
-                let pos = glyph.char_byte_offset;
                 glyph.token_id = 0;
                 glyph.relative_pos = 0.0;
+            }
 
-                for token in tokens {
-                    if token.byte_range.start <= pos && pos < token.byte_range.end {
-                        glyph.token_id = token.token_id as u16;
+            // Single-pass merge: both glyphs and tokens are sorted by byte position
+            while glyph_idx < self.layout_cache.len() && token_idx < tokens.len() {
+                let glyph_pos = self.layout_cache[glyph_idx].char_byte_offset;
+                let token = &tokens[token_idx];
 
-                        // Calculate relative position within token
-                        let token_byte_length = token.byte_range.end - token.byte_range.start;
-                        let byte_offset_in_token = pos - token.byte_range.start;
-                        glyph.relative_pos = if token_byte_length > 0 {
-                            (byte_offset_in_token as f32) / (token_byte_length as f32)
-                        } else {
-                            0.0
-                        };
-                        break;
-                    }
+                if glyph_pos < token.byte_range.start {
+                    // Glyph is before current token - leave as default (0)
+                    glyph_idx += 1;
+                } else if glyph_pos >= token.byte_range.end {
+                    // Glyph is after current token - advance to next token
+                    token_idx += 1;
+                } else {
+                    // Glyph is within current token - apply styling
+                    self.layout_cache[glyph_idx].token_id = token.token_id as u16;
+
+                    // Calculate relative position within token
+                    let token_byte_length = token.byte_range.end - token.byte_range.start;
+                    let byte_offset_in_token = glyph_pos - token.byte_range.start;
+                    self.layout_cache[glyph_idx].relative_pos = if token_byte_length > 0 {
+                        (byte_offset_in_token as f32) / (token_byte_length as f32)
+                    } else {
+                        0.0
+                    };
+
+                    glyph_idx += 1;
                 }
             }
         } else {
             // Incremental update - only update dirty range
             if let Some(dirty_range) = &self.syntax_state.dirty_range {
                 // Collect positions that need updating first to avoid borrow conflicts
-                let positions_to_update: Vec<usize> = self.layout_cache
+                let positions_to_update: Vec<usize> = self
+                    .layout_cache
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, glyph)| {
@@ -287,20 +306,6 @@ impl TextRenderer {
                     self.layout_cache[idx].relative_pos = 0.5; // Middle of token for dirty regions
                 }
             }
-        }
-    }
-
-    /// Infer style from surrounding context for dirty regions by position
-    fn infer_style_from_context_at_pos(&self, byte_pos: usize) -> u16 {
-        // Find the glyph at this position
-        let glyph_idx = self.layout_cache
-            .iter()
-            .position(|g| g.char_byte_offset == byte_pos);
-
-        if let Some(idx) = glyph_idx {
-            self.infer_style_from_context(idx)
-        } else {
-            0
         }
     }
 
@@ -365,39 +370,6 @@ impl TextRenderer {
             }
         };
     }
-
-    /// Expand tabs to spaces for consistent glyph mapping
-    fn expand_tabs_to_spaces(&self, line_text: &str, tab_stops: u32) -> String {
-        let mut expanded = String::new();
-        let mut column = 0;
-
-        for ch in line_text.chars() {
-            if ch == '\t' {
-                // Calculate spaces needed to reach next tab stop
-                let spaces_needed = tab_stops as usize - (column % tab_stops as usize);
-                expanded.push_str(&" ".repeat(spaces_needed));
-                column += spaces_needed;
-            } else {
-                expanded.push(ch);
-                column += 1;
-            }
-        }
-
-        expanded
-    }
-
-    /// Find token at byte position (for context inheritance)
-    fn find_token_at(&self, byte_pos: usize) -> Option<u8> {
-        // Check stable tokens
-        for token in &self.syntax_state.stable_tokens {
-            if token.byte_range.contains(&byte_pos) {
-                return Some(token.token_id);
-            }
-        }
-
-        None
-    }
-
     /// Update visible range for culling
     pub fn update_visible_range(&mut self, viewport: &crate::coordinates::Viewport, tree: &Tree) {
         let visible_byte_range = viewport.visible_byte_range_with_tree(tree);
@@ -443,24 +415,24 @@ impl TextRenderer {
     pub fn get_visible_glyphs_with_style(&self) -> Vec<UnifiedGlyph> {
         self.visible_chars
             .iter()
-            .filter_map(|&idx| {
-                self.layout_cache.get(idx).cloned()
-            })
+            .filter_map(|&idx| self.layout_cache.get(idx).cloned())
             .collect()
     }
 
     /// Upload style buffer to GPU
     pub fn upload_style_buffer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         // Extract token IDs from unified glyphs
-        let style_buffer: Vec<u16> = self.layout_cache
-            .iter()
-            .map(|g| g.token_id)
-            .collect();
+        let style_buffer: Vec<u16> = self.layout_cache.iter().map(|g| g.token_id).collect();
 
         let buffer_size = (style_buffer.len() * 2) as u64; // u16 per character
 
         // Create or recreate buffer if size changed
-        if self.gpu_style_buffer.as_ref().map(|b| b.size() != buffer_size).unwrap_or(true) {
+        if self
+            .gpu_style_buffer
+            .as_ref()
+            .map(|b| b.size() != buffer_size)
+            .unwrap_or(true)
+        {
             self.gpu_style_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Style Buffer"),
                 size: buffer_size,
@@ -531,7 +503,10 @@ impl TextRenderer {
         theme2: &crate::theme::Theme,
     ) {
         let texture_data = crate::theme::Theme::merge_for_interpolation(theme1, theme2);
-        let max_colors = theme1.max_colors_per_token.max(theme2.max_colors_per_token).max(1);
+        let max_colors = theme1
+            .max_colors_per_token
+            .max(theme2.max_colors_per_token)
+            .max(1);
         let height = (max_colors * 2) as u32; // Two themes stacked
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -578,3 +553,4 @@ pub fn token_type_to_id(token: crate::syntax::TokenType) -> u16 {
     // Use the centralized function from syntax.rs
     crate::syntax::SyntaxHighlighter::token_type_to_id(token) as u16
 }
+

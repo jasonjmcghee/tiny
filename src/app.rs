@@ -175,6 +175,12 @@ pub struct TinyApp<T: AppLogic> {
 
     // Continuous rendering for animations
     continuous_rendering: bool,
+
+    // Monitor refresh rate (cached frame time in milliseconds)
+    target_frame_time_ms: u64,
+
+    // Frame time tracking for dynamic dt
+    last_frame_time: std::time::Instant,
 }
 
 impl<T: AppLogic> TinyApp<T> {
@@ -199,6 +205,8 @@ impl<T: AppLogic> TinyApp<T> {
             just_pressed_key: false,
             animation_timer_started: Arc::new(AtomicBool::new(false)),
             continuous_rendering: false,
+            target_frame_time_ms: 16, // Default to 16ms (60fps), will be updated based on monitor
+            last_frame_time: std::time::Instant::now(),
         }
     }
 
@@ -246,6 +254,27 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     .expect("Failed to create window"),
             );
 
+            // Get monitor refresh rate for proper frame timing
+            if let Some(monitor) = window.current_monitor() {
+                if let Some(video_mode) = monitor.video_modes().next() {
+                    let refresh_rate_hz = video_mode.refresh_rate_millihertz() / 1000;
+                    if refresh_rate_hz > 0 {
+                        // Calculate target frame time in milliseconds
+                        self.target_frame_time_ms = 1000 / refresh_rate_hz as u64;
+                        println!(
+                            "Monitor refresh rate: {}Hz, target frame time: {}ms",
+                            refresh_rate_hz, self.target_frame_time_ms
+                        );
+                    } else {
+                        println!("Invalid refresh rate detected, using default 16ms (60Hz)");
+                    }
+                } else {
+                    println!("No video modes available, using default 16ms (60Hz)");
+                }
+            } else {
+                println!("No current monitor detected, using default 16ms (60Hz)");
+            }
+
             // Setup GPU renderer
             let mut gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
 
@@ -268,7 +297,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             // Option 3: Interpolate between two themes (animated!)
             let _theme1 = crate::theme::Themes::monokai();
-            let theme2 = crate::theme::Themes::one_dark();
+            let _theme2 = crate::theme::Themes::one_dark();
             // gpu_renderer.init_themed_interpolation(&theme1, &theme2);
 
             // Register any custom shaders from the app logic
@@ -556,7 +585,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
 impl<T: AppLogic> TinyApp<T> {
     fn setup_shader_watcher(&mut self) {
-        use notify::{RecommendedWatcher, Watcher, RecursiveMode, Event};
+        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
         use std::sync::mpsc::channel;
         use std::time::{Duration, Instant};
 
@@ -567,8 +596,12 @@ impl<T: AppLogic> TinyApp<T> {
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     // Only care about modifications to .wgsl files
-                    if event.kind.is_modify() &&
-                       event.paths.iter().any(|p| p.extension().map_or(false, |ext| ext == "wgsl")) {
+                    if event.kind.is_modify()
+                        && event
+                            .paths
+                            .iter()
+                            .any(|p| p.extension().map_or(false, |ext| ext == "wgsl"))
+                    {
                         let _ = tx.send(());
                     }
                 }
@@ -577,7 +610,10 @@ impl<T: AppLogic> TinyApp<T> {
         ) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("Failed to create file watcher: {}. Shader hot-reload disabled.", e);
+                eprintln!(
+                    "Failed to create file watcher: {}. Shader hot-reload disabled.",
+                    e
+                );
                 return;
             }
         };
@@ -588,11 +624,14 @@ impl<T: AppLogic> TinyApp<T> {
             .join("src/shaders");
 
         if let Err(e) = watcher.watch(&shader_path, RecursiveMode::NonRecursive) {
-            eprintln!("Failed to watch shader directory {:?}: {}. Shader hot-reload disabled.", shader_path, e);
+            eprintln!(
+                "Failed to watch shader directory {:?}: {}. Shader hot-reload disabled.",
+                shader_path, e
+            );
             return;
         }
 
-        eprintln!("✨ Shader hot-reload enabled! Watching: {:?}", shader_path);
+        eprintln!("Shader hot-reload enabled! Watching: {:?}", shader_path);
 
         // Simple debounce thread
         let reload_flag = self.shader_reload_pending.clone();
@@ -624,29 +663,34 @@ impl<T: AppLogic> TinyApp<T> {
         if let (Some(window), Some(gpu_renderer), Some(cpu_renderer)) =
             (&self.window, &mut self.gpu_renderer, &mut self.cpu_renderer)
         {
+            // Measure actual frame time for dynamic dt calculation
+            let current_time = std::time::Instant::now();
+            let frame_duration = current_time.duration_since(self.last_frame_time);
+            self.last_frame_time = current_time;
+
             // Update logic
             self.logic.on_update();
 
+            // Calculate dt - use actual frame time in continuous mode, theoretical time otherwise
+            let dt = if self.continuous_rendering {
+                // Use actual measured frame time for smooth animations
+                frame_duration.as_secs_f32().min(0.05) // Cap at 50ms to prevent huge jumps
+            } else {
+                // Use theoretical monitor refresh rate for consistent timing
+                self.target_frame_time_ms as f32 / 1000.0
+            };
+
             // Update widgets (for animations like cursor blinking)
-            let dt = 0.016; // ~60fps frame time
             cpu_renderer.update_widgets(dt);
 
             // Update GPU time for theme animations
             gpu_renderer.update_time(dt);
 
-            // Start animation timer if continuous rendering is enabled
-            if self.continuous_rendering && !self.animation_timer_started.load(Ordering::Relaxed) {
-                self.animation_timer_started.store(true, Ordering::Relaxed);
-                let window_clone = window.clone();
-                std::thread::spawn(move || {
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
-                        window_clone.request_redraw();
-                    }
-                });
-            } else if !self.continuous_rendering
-                && !self.animation_timer_started.load(Ordering::Relaxed)
-            {
+            // Handle continuous rendering with proper winit control flow
+            if self.continuous_rendering {
+                // For continuous rendering, just request next redraw immediately
+                window.request_redraw();
+            } else if !self.animation_timer_started.load(Ordering::Relaxed) {
                 // For non-continuous mode, still update occasionally for cursor blink
                 self.animation_timer_started.store(true, Ordering::Relaxed);
                 let window_clone = window.clone();
@@ -751,35 +795,79 @@ impl EditorLogic {
     pub fn with_file(mut self, path: PathBuf) -> Self {
         // Update syntax highlighter based on file extension
         if let Some(path_str) = path.to_str() {
-            println!("EditorLogic: Checking file extension for {}", path_str);
-            if let Some(new_highlighter) = crate::syntax::SyntaxHighlighter::from_file_path(path_str) {
-                println!("EditorLogic: Selected {} syntax highlighter for {}", new_highlighter.name(), path_str);
-                let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
+            // Determine what language this file needs
+            let desired_language =
+                crate::syntax::SyntaxHighlighter::file_extension_to_language(path_str);
 
-                // Update the syntax highlighter
-                self.syntax_highlighter = Some(syntax_highlighter);
-
-                // Now get a reference to the newly set highlighter and connect it properly
-                if let Some(ref syntax_highlighter) = self.syntax_highlighter {
-                    // Request initial highlight with the correct language
-                    let text = self.doc.read().flatten_to_string();
-
-                    if let Some(syntax_hl) = syntax_highlighter
+            // Check if current syntax highlighter already matches
+            let needs_new_highlighter =
+                if let Some(ref current_highlighter) = self.syntax_highlighter {
+                    if let Some(syntax_hl) = current_highlighter
                         .as_any()
                         .downcast_ref::<crate::syntax::SyntaxHighlighter>()
                     {
-                        println!("EditorLogic: Connecting {} highlighter to InputHandler", syntax_hl.name());
-
-                        // Update input handler with new syntax highlighter - this is CRITICAL!
-                        let shared_highlighter = Arc::new(syntax_hl.clone());
-                        self.input.set_syntax_highlighter(shared_highlighter);
-
-                        // Now request the initial parse
-                        syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
+                        // Check if the language name matches what we need
+                        syntax_hl.name() != desired_language
+                    } else {
+                        true // Current provider is not a SyntaxHighlighter
                     }
+                } else {
+                    true // No highlighter at all
+                };
+
+            if needs_new_highlighter {
+                if let Some(new_highlighter) =
+                    crate::syntax::SyntaxHighlighter::from_file_path(path_str)
+                {
+                    println!(
+                        "EditorLogic: Switching to {} syntax highlighter for {}",
+                        new_highlighter.name(),
+                        path_str
+                    );
+                    let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
+
+                    // Update the syntax highlighter
+                    self.syntax_highlighter = Some(syntax_highlighter);
+
+                    // Connect new highlighter to input handler
+                    if let Some(ref syntax_highlighter) = self.syntax_highlighter {
+                        if let Some(syntax_hl) = syntax_highlighter
+                            .as_any()
+                            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                        {
+                            let shared_highlighter = Arc::new(syntax_hl.clone());
+                            self.input.set_syntax_highlighter(shared_highlighter);
+                        }
+                    }
+                } else {
+                    println!(
+                        "EditorLogic: No syntax highlighter available for {}, keeping existing",
+                        path_str
+                    );
                 }
             } else {
-                println!("EditorLogic: No syntax highlighter available for {}, using default Rust", path_str);
+                println!(
+                    "EditorLogic: Keeping existing {} syntax highlighter for {}",
+                    self.syntax_highlighter
+                        .as_ref()
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                        .unwrap()
+                        .name(),
+                    path_str
+                );
+            }
+
+            // Always request update for the new file content (whether highlighter changed or not)
+            if let Some(ref syntax_highlighter) = self.syntax_highlighter {
+                let text = self.doc.read().flatten_to_string();
+                if let Some(syntax_hl) = syntax_highlighter
+                    .as_any()
+                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                {
+                    syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
+                }
             }
         }
 
@@ -835,8 +923,7 @@ impl EditorLogic {
             syntax_highlighter.request_update(&text, doc.version());
         }
 
-        // Give the background thread a moment to parse (reduced debounce is 10ms)
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Background thread will parse asynchronously - no need to block startup
 
         // Create input handler with syntax highlighter reference
         let mut input = InputHandler::new();
@@ -847,7 +934,6 @@ impl EditorLogic {
             // Clone the SyntaxHighlighter and wrap in Arc for sharing
             let shared_highlighter = Arc::new(syntax_hl.clone());
             input.set_syntax_highlighter(shared_highlighter);
-            println!("EditorLogic: Connected syntax highlighter to InputHandler");
         }
 
         Self {
