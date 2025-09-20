@@ -62,12 +62,11 @@ impl Selection {
     }
 
     /// Generate rectangles for this selection (1-3 rectangles for multi-line)
-    pub fn to_rectangles(&self, doc: &Doc, viewport: &Viewport) -> Vec<LayoutRect> {
+    pub fn to_rectangles(&self, _doc: &Doc, viewport: &Viewport) -> Vec<LayoutRect> {
         if self.is_cursor() {
             return Vec::new();
         }
 
-        let _tree = doc.read();
         let (start, end) = if self.min_pos() == self.cursor {
             (self.cursor, self.anchor)
         } else {
@@ -169,25 +168,6 @@ impl InputHandler {
         }
     }
 
-    /// Helper: get line text for a line
-    fn get_line_text(tree: &crate::tree::Tree, line: u32) -> String {
-        tree.line_to_byte(line).map_or(String::new(), |start| {
-            let end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
-            tree.get_text_slice(start..end)
-        })
-    }
-
-    /// Helper: get line text without newline
-    fn get_line_text_trimmed(tree: &crate::tree::Tree, line: u32) -> String {
-        Self::get_line_text(tree, line)
-            .trim_end_matches('\n')
-            .to_string()
-    }
-
-    /// Helper: get line character count
-    fn get_line_char_count(tree: &crate::tree::Tree, line: u32) -> u32 {
-        Self::get_line_text_trimmed(tree, line).chars().count() as u32
-    }
 
     /// Handle character typing with optional renderer
     fn handle_character_input(
@@ -229,65 +209,58 @@ impl InputHandler {
         InputAction::Redraw
     }
 
-    /// Move cursor vertically (up/down)
-    fn move_cursor_vertical(&mut self, doc: &Doc, direction: i32, shift_held: bool) -> InputAction {
-        if self.goal_column.is_none() && !self.selections.is_empty() {
-            self.goal_column = Some(self.selections[0].cursor.column);
-        }
+    /// Unified cursor movement
+    fn move_cursor(&mut self, doc: &Doc, dx: i32, dy: i32, shift_held: bool) -> InputAction {
+        let tree = doc.read();
 
-        for sel in &mut self.selections {
-            let tree = doc.read();
-            if direction < 0 && sel.cursor.line > 0 {
-                sel.cursor.line -= 1;
-            } else if direction > 0 && tree.line_to_byte(sel.cursor.line + 1).is_some() {
-                sel.cursor.line += 1;
-            } else {
-                continue;
+        // Handle vertical movement
+        if dy != 0 {
+            if self.goal_column.is_none() && !self.selections.is_empty() {
+                self.goal_column = Some(self.selections[0].cursor.column);
             }
 
-            let line_length = Self::get_line_char_count(&tree, sel.cursor.line);
-            sel.cursor.column = self
-                .goal_column
-                .unwrap_or(sel.cursor.column)
-                .min(line_length);
-            if !shift_held {
-                sel.anchor = sel.cursor;
-            }
-        }
-        InputAction::Redraw
-    }
-
-    /// Move cursor horizontally (left/right)
-    fn move_cursor_horizontal(
-        &mut self,
-        doc: &Doc,
-        direction: i32,
-        shift_held: bool,
-    ) -> InputAction {
-        self.goal_column = None;
-
-        for sel in &mut self.selections {
-            let tree = doc.read();
-            if direction < 0 {
-                if sel.cursor.column > 0 {
-                    sel.cursor.column -= 1;
-                } else if sel.cursor.line > 0 {
+            for sel in &mut self.selections {
+                if dy < 0 && sel.cursor.line > 0 {
                     sel.cursor.line -= 1;
-                    sel.cursor.column = Self::get_line_char_count(&tree, sel.cursor.line);
-                }
-            } else {
-                let line_length = Self::get_line_char_count(&tree, sel.cursor.line);
-                if sel.cursor.column < line_length {
-                    sel.cursor.column += 1;
-                } else if tree.line_to_byte(sel.cursor.line + 1).is_some() {
+                } else if dy > 0 && tree.line_to_byte(sel.cursor.line + 1).is_some() {
                     sel.cursor.line += 1;
-                    sel.cursor.column = 0;
                 }
-            }
-            if !shift_held {
-                sel.anchor = sel.cursor;
+
+                let line_length = tree.line_char_count(sel.cursor.line) as u32;
+                sel.cursor.column = self.goal_column.unwrap_or(sel.cursor.column).min(line_length);
+                if !shift_held {
+                    sel.anchor = sel.cursor;
+                }
             }
         }
+
+        // Handle horizontal movement
+        if dx != 0 {
+            self.goal_column = None;
+
+            for sel in &mut self.selections {
+                if dx < 0 {
+                    if sel.cursor.column > 0 {
+                        sel.cursor.column -= 1;
+                    } else if sel.cursor.line > 0 {
+                        sel.cursor.line -= 1;
+                        sel.cursor.column = tree.line_char_count(sel.cursor.line) as u32;
+                    }
+                } else {
+                    let line_length = tree.line_char_count(sel.cursor.line) as u32;
+                    if sel.cursor.column < line_length {
+                        sel.cursor.column += 1;
+                    } else if tree.line_to_byte(sel.cursor.line + 1).is_some() {
+                        sel.cursor.line += 1;
+                        sel.cursor.column = 0;
+                    }
+                }
+                if !shift_held {
+                    sel.anchor = sel.cursor;
+                }
+            }
+        }
+
         InputAction::Redraw
     }
 
@@ -353,7 +326,7 @@ impl InputHandler {
                 } else if sel.cursor.line > 0 {
                     sel.cursor.line -= 1;
                     sel.cursor.column = if deleted.as_deref() == Some("\n") {
-                        Self::get_line_length(doc, sel.cursor.line)
+                        doc.read().line_char_count(sel.cursor.line) as u32
                     } else {
                         0
                     };
@@ -403,18 +376,13 @@ impl InputHandler {
         InputAction::Redraw
     }
 
-    /// Get line length for a given line number
-    fn get_line_length(doc: &Doc, line: u32) -> u32 {
-        let tree = doc.read();
-        Self::get_line_char_count(&tree, line)
-    }
 
     /// Move cursor to start or end of line
     fn move_to_line_edge(&mut self, doc: &Doc, to_end: bool, shift_held: bool) -> InputAction {
         self.goal_column = None;
         for sel in &mut self.selections {
             sel.cursor.column = if to_end {
-                Self::get_line_length(doc, sel.cursor.line)
+                doc.read().line_char_count(sel.cursor.line) as u32
             } else {
                 0
             };
@@ -442,7 +410,7 @@ impl InputHandler {
             } else {
                 sel.cursor.line = (sel.cursor.line + PAGE_SIZE).min(total_lines.saturating_sub(1));
             }
-            let line_length = Self::get_line_length(doc, sel.cursor.line);
+            let line_length = doc.read().line_char_count(sel.cursor.line) as u32;
             sel.cursor.column = self
                 .goal_column
                 .unwrap_or(sel.cursor.column)
@@ -771,10 +739,10 @@ impl InputHandler {
             Key::Named(NamedKey::Enter) => self.insert_text(doc, "\n"),
             Key::Named(NamedKey::Tab) => self.insert_text(doc, "\t"),
             Key::Named(NamedKey::Space) => self.insert_text(doc, " "),
-            Key::Named(NamedKey::ArrowLeft) => self.move_cursor_horizontal(doc, -1, shift_held),
-            Key::Named(NamedKey::ArrowRight) => self.move_cursor_horizontal(doc, 1, shift_held),
-            Key::Named(NamedKey::ArrowUp) => self.move_cursor_vertical(doc, -1, shift_held),
-            Key::Named(NamedKey::ArrowDown) => self.move_cursor_vertical(doc, 1, shift_held),
+            Key::Named(NamedKey::ArrowLeft) => self.move_cursor(doc, -1, 0, shift_held),
+            Key::Named(NamedKey::ArrowRight) => self.move_cursor(doc, 1, 0, shift_held),
+            Key::Named(NamedKey::ArrowUp) => self.move_cursor(doc, 0, -1, shift_held),
+            Key::Named(NamedKey::ArrowDown) => self.move_cursor(doc, 0, 1, shift_held),
             Key::Named(NamedKey::Home) => self.move_to_line_edge(doc, false, shift_held),
             Key::Named(NamedKey::End) => self.move_to_line_edge(doc, true, shift_held),
             Key::Named(NamedKey::PageUp) => self.page_jump(doc, true, shift_held),
@@ -943,7 +911,7 @@ impl InputHandler {
             cursor: DocPos {
                 byte_offset: tree.byte_count(),
                 line: last_line,
-                column: Self::get_line_char_count(&tree, last_line),
+                column: tree.line_char_count(last_line) as u32,
             },
             anchor: DocPos::default(),
             id: self.next_id,
@@ -988,7 +956,7 @@ impl InputHandler {
 
         let cursor_widget = self.selections.first().map(|sel| {
             let tree = doc.read();
-            let line_text = Self::get_line_text(&tree, sel.cursor.line);
+            let line_text = tree.line_text(sel.cursor.line);
             widget::cursor(viewport.doc_to_layout_with_text(sel.cursor, &line_text))
         });
 

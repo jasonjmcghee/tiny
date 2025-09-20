@@ -1558,12 +1558,11 @@ impl CircleApp {
                     });
 
             // Update viewport uniforms
-            let uniforms = tiny_editor::gpu::ShaderUniforms {
+            let uniforms = tiny_editor::gpu::BasicUniforms {
                 viewport_size: [
                     viewport.physical_size.width as f32,
                     viewport.physical_size.height as f32,
                 ],
-                _padding: [0.0, 0.0],
             };
             gpu_renderer.queue().write_buffer(
                 gpu_renderer.uniform_buffer(),

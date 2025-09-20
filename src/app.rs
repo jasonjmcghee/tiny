@@ -184,6 +184,31 @@ pub struct TinyApp<T: AppLogic> {
 }
 
 impl<T: AppLogic> TinyApp<T> {
+    fn physical_to_logical_point(&self, position: winit::dpi::PhysicalPosition<f64>) -> Option<Point> {
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor() as f32;
+        let logical_x = position.x as f32 / scale;
+        let logical_y = position.y as f32 / scale;
+        Some(Point {
+            x: LogicalPixels(logical_x),
+            y: LogicalPixels(logical_y),
+        })
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn update_window_title(&self) {
+        if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+            if let Some(window) = &self.window {
+                window.set_title(&editor.title());
+            }
+        }
+    }
+
     pub fn new(logic: T) -> Self {
         Self {
             window: None,
@@ -391,17 +416,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             Some(cpu_renderer),
                         );
                         if should_redraw {
-                            // Update window title if using EditorLogic
-                            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>()
-                            {
-                                if let Some(window) = &self.window {
-                                    window.set_title(&editor.title());
-                                }
-                            }
-
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
+                            self.update_window_title();
+                            self.request_redraw();
                         }
                     }
                 }
@@ -414,55 +430,20 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some(position);
 
-                // Call on_mouse_move for tracking
-                if let (Some(window), Some(cpu_renderer)) = (&self.window, &self.cpu_renderer) {
-                    let scale = window.scale_factor() as f32;
-                    let logical_x = position.x as f32 / scale;
-                    let logical_y = position.y as f32 / scale;
+                if let Some(point) = self.physical_to_logical_point(position) {
+                    if let Some(cpu_renderer) = &self.cpu_renderer {
+                        // Mouse move
+                        if self.logic.on_mouse_move(point, &cpu_renderer.viewport) {
+                            self.request_redraw();
+                        }
 
-                    let point = Point {
-                        x: LogicalPixels(logical_x),
-                        y: LogicalPixels(logical_y),
-                    };
-
-                    if self.logic.on_mouse_move(point, &cpu_renderer.viewport) {
-                        window.request_redraw();
-                    }
-                }
-
-                // Check for drag if mouse is pressed
-                if self.mouse_pressed {
-                    if let (Some(window), Some(cpu_renderer), Some(start_pos), Some(end_pos)) = (
-                        &self.window,
-                        &self.cpu_renderer,
-                        self.drag_start,
-                        Some(position),
-                    ) {
-                        let scale = window.scale_factor() as f32;
-
-                        let start_logical_x = start_pos.x as f32 / scale;
-                        let start_logical_y = start_pos.y as f32 / scale;
-                        let end_logical_x = end_pos.x as f32 / scale;
-                        let end_logical_y = end_pos.y as f32 / scale;
-
-                        let from_point = Point {
-                            x: LogicalPixels(start_logical_x),
-                            y: LogicalPixels(start_logical_y),
-                        };
-
-                        let to_point = Point {
-                            x: LogicalPixels(end_logical_x),
-                            y: LogicalPixels(end_logical_y),
-                        };
-
-                        let should_redraw = self.logic.on_drag(
-                            from_point,
-                            to_point,
-                            &cpu_renderer.viewport,
-                            &self.modifiers,
-                        );
-                        if should_redraw {
-                            window.request_redraw();
+                        // Mouse drag
+                        if self.mouse_pressed {
+                            if let Some(from) = self.drag_start.and_then(|p| self.physical_to_logical_point(p)) {
+                                if self.logic.on_drag(from, point, &cpu_renderer.viewport, &self.modifiers) {
+                                    self.request_redraw();
+                                }
+                            }
                         }
                     }
                 }
@@ -472,37 +453,24 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 state,
                 button: winit::event::MouseButton::Left,
                 ..
-            } => {
-                match state {
-                    ElementState::Pressed => {
-                        if let (Some(window), Some(cpu_renderer), Some(position)) =
-                            (&self.window, &self.cpu_renderer, self.cursor_position)
-                        {
-                            self.mouse_pressed = true;
-                            self.drag_start = self.cursor_position;
+            } => match state {
+                ElementState::Pressed => {
+                    if let Some(position) = self.cursor_position {
+                        self.mouse_pressed = true;
+                        self.drag_start = Some(position);
 
-                            let scale = window.scale_factor() as f32;
-                            let logical_x = position.x as f32 / scale;
-                            let logical_y = position.y as f32 / scale;
-
-                            // Convert to document coordinates
-                            let point = Point {
-                                x: LogicalPixels(logical_x),
-                                y: LogicalPixels(logical_y),
-                            };
-
-                            let should_redraw =
-                                self.logic
-                                    .on_click(point, &cpu_renderer.viewport, &self.modifiers);
-                            if should_redraw {
-                                window.request_redraw();
+                        if let Some(point) = self.physical_to_logical_point(position) {
+                            if let Some(cpu_renderer) = &self.cpu_renderer {
+                                if self.logic.on_click(point, &cpu_renderer.viewport, &self.modifiers) {
+                                    self.request_redraw();
+                                }
                             }
                         }
                     }
-                    ElementState::Released => {
-                        self.mouse_pressed = false;
-                        self.drag_start = None;
-                    }
+                }
+                ElementState::Released => {
+                    self.mouse_pressed = false;
+                    self.drag_start = None;
                 }
             }
 
@@ -651,6 +619,19 @@ impl<T: AppLogic> TinyApp<T> {
         self._shader_watcher = Some(watcher);
     }
 
+    fn update_frame_timing(&mut self) -> f32 {
+        let current_time = std::time::Instant::now();
+        let frame_duration = current_time.duration_since(self.last_frame_time);
+        self.last_frame_time = current_time;
+
+        if self.continuous_rendering {
+            frame_duration.as_secs_f32().min(0.05) // Cap at 50ms to prevent huge jumps
+        } else {
+            self.target_frame_time_ms as f32 / 1000.0
+        }
+    }
+
+
     fn render_frame(&mut self) {
         // Check for pending shader reload
         if self.shader_reload_pending.load(Ordering::Relaxed) {
@@ -660,38 +641,14 @@ impl<T: AppLogic> TinyApp<T> {
             }
         }
 
-        if let (Some(window), Some(gpu_renderer), Some(cpu_renderer)) =
-            (&self.window, &mut self.gpu_renderer, &mut self.cpu_renderer)
-        {
-            // Measure actual frame time for dynamic dt calculation
-            let current_time = std::time::Instant::now();
-            let frame_duration = current_time.duration_since(self.last_frame_time);
-            self.last_frame_time = current_time;
+        let dt = self.update_frame_timing();
+        self.logic.on_update();
 
-            // Update logic
-            self.logic.on_update();
-
-            // Calculate dt - use actual frame time in continuous mode, theoretical time otherwise
-            let dt = if self.continuous_rendering {
-                // Use actual measured frame time for smooth animations
-                frame_duration.as_secs_f32().min(0.05) // Cap at 50ms to prevent huge jumps
-            } else {
-                // Use theoretical monitor refresh rate for consistent timing
-                self.target_frame_time_ms as f32 / 1000.0
-            };
-
-            // Update widgets (for animations like cursor blinking)
-            cpu_renderer.update_widgets(dt);
-
-            // Update GPU time for theme animations
-            gpu_renderer.update_time(dt);
-
-            // Handle continuous rendering with proper winit control flow
+        // Setup continuous rendering
+        if let Some(window) = &self.window {
             if self.continuous_rendering {
-                // For continuous rendering, just request next redraw immediately
                 window.request_redraw();
             } else if !self.animation_timer_started.load(Ordering::Relaxed) {
-                // For non-continuous mode, still update occasionally for cursor blink
                 self.animation_timer_started.store(true, Ordering::Relaxed);
                 let window_clone = window.clone();
                 std::thread::spawn(move || loop {
@@ -699,43 +656,41 @@ impl<T: AppLogic> TinyApp<T> {
                     window_clone.request_redraw();
                 });
             }
+        }
 
-            if self.just_pressed_key {
-                self.just_pressed_key = false;
-                // Only scroll to cursor if it moved via keyboard, not every frame
-                // This prevents fighting with manual mouse wheel scrolling
-                if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
+        // Handle cursor scroll
+        if self.just_pressed_key {
+            self.just_pressed_key = false;
+            if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
+                if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
                     cpu_renderer.viewport.ensure_visible(layout_pos);
                 }
             }
+        }
 
-            // Calculate viewport dimensions
+        if let (Some(window), Some(gpu_renderer), Some(cpu_renderer)) =
+            (&self.window, &mut self.gpu_renderer, &mut self.cpu_renderer)
+        {
+            cpu_renderer.update_widgets(dt);
+            gpu_renderer.update_time(dt);
+
+            // Update viewport
             let size = window.inner_size();
             let scale_factor = window.scale_factor() as f32;
             let logical_width = size.width as f32 / scale_factor;
             let logical_height = size.height as f32 / scale_factor;
-
-            // Update CPU renderer viewport - this is where scale factor should be handled
             cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
 
-            // Set up text styles/syntax highlighter
+            // Setup text styles
             if let Some(text_styles) = self.logic.text_styles() {
-                // If it's a SyntaxHighlighter, clone it and set both fields
-                if let Some(syntax_hl) = text_styles
-                    .as_any()
-                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                {
+                if let Some(syntax_hl) = text_styles.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
                     let highlighter = Arc::new(syntax_hl.clone());
-                    cpu_renderer.set_syntax_highlighter(highlighter.clone());
-                    // SyntaxHighlighter implements TextStyleProvider
+                    cpu_renderer.set_syntax_highlighter(highlighter);
                     cpu_renderer.text_styles = Some(Box::new(syntax_hl.clone()));
                 }
-                // For other TextStyleProvider types, we can't clone them (trait objects)
-                // so we'll rely on the syntax_highlighter field if it was set
             }
 
-            // Define viewport for rendering
             let viewport = Rect {
                 x: LogicalPixels(0.0),
                 y: LogicalPixels(0.0),
@@ -743,25 +698,20 @@ impl<T: AppLogic> TinyApp<T> {
                 height: LogicalPixels(logical_height),
             };
 
-            // Generate render commands using direct GPU rendering path
-            let doc = self.logic.doc();
-            let selections = self.logic.selections();
-
-            // Update widget manager with current selections if EditorLogic is being used
-            // This ensures cursor and selection widgets are updated
+            // Update widgets if EditorLogic
             if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
-                // For now, always update widgets (widgets_dirty = true)
                 cpu_renderer.set_selection_widgets(&editor.input, &editor.doc);
             }
 
-            // Upload atlas (in case new glyphs were rasterized)
+            // Upload font atlas
             if let Some(font_system) = &self.font_system {
                 let atlas_data = font_system.atlas_data();
                 let (atlas_width, atlas_height) = font_system.atlas_size();
                 gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
             }
 
-            // Render directly with GPU - this will paint widgets
+            let doc = self.logic.doc();
+            let selections = self.logic.selections();
             unsafe {
                 gpu_renderer.render_with_widgets(&doc.read(), viewport, selections, cpu_renderer);
             }
@@ -787,64 +737,55 @@ pub struct EditorLogic {
 }
 
 impl EditorLogic {
+    fn needs_syntax_highlighter_update(&self, path: &str) -> bool {
+        let desired_language = crate::syntax::SyntaxHighlighter::file_extension_to_language(path);
+
+        if let Some(ref current_highlighter) = self.syntax_highlighter {
+            if let Some(syntax_hl) = current_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+                syntax_hl.name() != desired_language
+            } else {
+                true
+            }
+        } else {
+            true
+        }
+    }
+
+    fn setup_syntax_highlighter(&mut self, path: &str) {
+        if let Some(new_highlighter) = crate::syntax::SyntaxHighlighter::from_file_path(path) {
+            println!("EditorLogic: Switching to {} syntax highlighter for {}", new_highlighter.name(), path);
+            let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
+            self.syntax_highlighter = Some(syntax_highlighter);
+
+            if let Some(ref syntax_highlighter) = self.syntax_highlighter {
+                if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+                    let shared_highlighter = Arc::new(syntax_hl.clone());
+                    self.input.set_syntax_highlighter(shared_highlighter);
+                }
+            }
+        } else {
+            println!("EditorLogic: No syntax highlighter available for {}, keeping existing", path);
+        }
+    }
+
+    fn request_syntax_update(&self) {
+        if let Some(ref syntax_highlighter) = self.syntax_highlighter {
+            let text = self.doc.read().flatten_to_string();
+            if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+                syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
+            }
+        }
+    }
+
     pub fn with_text_style(mut self, style: Box<dyn TextStyleProvider>) -> Self {
         self.extra_text_styles.push(style);
         self
     }
 
     pub fn with_file(mut self, path: PathBuf) -> Self {
-        // Update syntax highlighter based on file extension
         if let Some(path_str) = path.to_str() {
-            // Determine what language this file needs
-            let desired_language =
-                crate::syntax::SyntaxHighlighter::file_extension_to_language(path_str);
-
-            // Check if current syntax highlighter already matches
-            let needs_new_highlighter =
-                if let Some(ref current_highlighter) = self.syntax_highlighter {
-                    if let Some(syntax_hl) = current_highlighter
-                        .as_any()
-                        .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                    {
-                        // Check if the language name matches what we need
-                        syntax_hl.name() != desired_language
-                    } else {
-                        true // Current provider is not a SyntaxHighlighter
-                    }
-                } else {
-                    true // No highlighter at all
-                };
-
-            if needs_new_highlighter {
-                if let Some(new_highlighter) =
-                    crate::syntax::SyntaxHighlighter::from_file_path(path_str)
-                {
-                    println!(
-                        "EditorLogic: Switching to {} syntax highlighter for {}",
-                        new_highlighter.name(),
-                        path_str
-                    );
-                    let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
-
-                    // Update the syntax highlighter
-                    self.syntax_highlighter = Some(syntax_highlighter);
-
-                    // Connect new highlighter to input handler
-                    if let Some(ref syntax_highlighter) = self.syntax_highlighter {
-                        if let Some(syntax_hl) = syntax_highlighter
-                            .as_any()
-                            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                        {
-                            let shared_highlighter = Arc::new(syntax_hl.clone());
-                            self.input.set_syntax_highlighter(shared_highlighter);
-                        }
-                    }
-                } else {
-                    println!(
-                        "EditorLogic: No syntax highlighter available for {}, keeping existing",
-                        path_str
-                    );
-                }
+            if self.needs_syntax_highlighter_update(path_str) {
+                self.setup_syntax_highlighter(path_str);
             } else {
                 println!(
                     "EditorLogic: Keeping existing {} syntax highlighter for {}",
@@ -858,17 +799,7 @@ impl EditorLogic {
                     path_str
                 );
             }
-
-            // Always request update for the new file content (whether highlighter changed or not)
-            if let Some(ref syntax_highlighter) = self.syntax_highlighter {
-                let text = self.doc.read().flatten_to_string();
-                if let Some(syntax_hl) = syntax_highlighter
-                    .as_any()
-                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                {
-                    syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
-                }
-            }
+            self.request_syntax_update();
         }
 
         self.file_path = Some(path);
@@ -903,35 +834,19 @@ impl EditorLogic {
     }
 
     pub fn new(doc: Doc) -> Self {
-        // Default to Rust syntax highlighting (can be overridden by with_file)
-        let syntax_highlighter: Box<dyn TextStyleProvider> =
-            Box::new(SyntaxHighlighter::new_rust());
+        let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(SyntaxHighlighter::new_rust());
 
-        // Request initial highlight using the new API
         let text = doc.read().flatten_to_string();
-        println!(
-            "EditorLogic: Requesting initial syntax highlighting for {} bytes of text",
-            text.len()
-        );
-        // Use the new API for consistency (no edit info for initial parse)
-        if let Some(syntax_hl) = syntax_highlighter
-            .as_any()
-            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-        {
+        println!("EditorLogic: Requesting initial syntax highlighting for {} bytes of text", text.len());
+
+        if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
             syntax_hl.request_update_with_edit(&text, doc.version(), None);
         } else {
             syntax_highlighter.request_update(&text, doc.version());
         }
 
-        // Background thread will parse asynchronously - no need to block startup
-
-        // Create input handler with syntax highlighter reference
         let mut input = InputHandler::new();
-        if let Some(syntax_hl) = syntax_highlighter
-            .as_any()
-            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-        {
-            // Clone the SyntaxHighlighter and wrap in Arc for sharing
+        if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
             let shared_highlighter = Arc::new(syntax_hl.clone());
             input.set_syntax_highlighter(shared_highlighter);
         }
@@ -944,7 +859,44 @@ impl EditorLogic {
             extra_text_styles: Vec::new(),
             file_path: None,
             is_modified: false,
-            show_line_numbers: true, // Enable by default
+            show_line_numbers: true,
+        }
+    }
+}
+
+impl EditorLogic {
+    fn handle_input_action(&mut self, action: InputAction) -> bool {
+        match action {
+            InputAction::Save => {
+                if let Err(e) = self.save() {
+                    eprintln!("Failed to save: {}", e);
+                }
+                true
+            }
+            InputAction::Undo => {
+                if self.input.undo(&self.doc) {
+                    self.widgets_dirty = true;
+                    self.is_modified = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            InputAction::Redo => {
+                if self.input.redo(&self.doc) {
+                    self.widgets_dirty = true;
+                    self.is_modified = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            InputAction::Redraw => {
+                self.widgets_dirty = true;
+                self.is_modified = true;
+                true
+            }
+            InputAction::None => false,
         }
     }
 }
@@ -961,42 +913,8 @@ impl AppLogic for EditorLogic {
         modifiers: &winit::event::Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> bool {
-        let action = self
-            .input
-            .on_key_with_renderer(&self.doc, viewport, event, modifiers, renderer);
-
-        match action {
-            InputAction::Save => {
-                if let Err(e) = self.save() {
-                    eprintln!("Failed to save: {}", e);
-                }
-                true // Redraw to update title
-            }
-            InputAction::Undo => {
-                if self.input.undo(&self.doc) {
-                    self.widgets_dirty = true;
-                    self.is_modified = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            InputAction::Redo => {
-                if self.input.redo(&self.doc) {
-                    self.widgets_dirty = true;
-                    self.is_modified = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            InputAction::Redraw => {
-                self.widgets_dirty = true;
-                self.is_modified = true;
-                true
-            }
-            InputAction::None => false,
-        }
+        let action = self.input.on_key_with_renderer(&self.doc, viewport, event, modifiers, renderer);
+        self.handle_input_action(action)
     }
 
     fn on_key(
@@ -1006,39 +924,7 @@ impl AppLogic for EditorLogic {
         modifiers: &winit::event::Modifiers,
     ) -> bool {
         let action = self.input.on_key(&self.doc, viewport, event, modifiers);
-
-        match action {
-            InputAction::Save => {
-                if let Err(e) = self.save() {
-                    eprintln!("Failed to save: {}", e);
-                }
-                true // Redraw to update title
-            }
-            InputAction::Undo => {
-                if self.input.undo(&self.doc) {
-                    self.widgets_dirty = true;
-                    self.is_modified = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            InputAction::Redo => {
-                if self.input.redo(&self.doc) {
-                    self.widgets_dirty = true;
-                    self.is_modified = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            InputAction::Redraw => {
-                self.widgets_dirty = true;
-                self.is_modified = true;
-                true
-            }
-            InputAction::None => false,
-        }
+        self.handle_input_action(action)
     }
 
     fn on_click(

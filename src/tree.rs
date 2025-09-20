@@ -735,6 +735,26 @@ impl Tree {
         }
     }
 
+    /// Get the text of a line (including newline if present)
+    pub fn line_text(&self, line: u32) -> String {
+        if let Some(start) = self.line_to_byte(line) {
+            let end = self.line_to_byte(line + 1).unwrap_or(self.byte_count());
+            self.get_text_slice(start..end)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Get the text of a line without trailing newline
+    pub fn line_text_trimmed(&self, line: u32) -> String {
+        self.line_text(line).trim_end_matches('\n').to_string()
+    }
+
+    /// Get the character count of a line (excluding newline)
+    pub fn line_char_count(&self, line: u32) -> usize {
+        self.line_text_trimmed(line).chars().count()
+    }
+
     pub fn walk_visible_range<F>(&self, byte_range: Range<usize>, callback: F)
     where
         F: FnMut(&[Span], usize, usize),

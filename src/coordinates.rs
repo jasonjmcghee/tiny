@@ -490,17 +490,17 @@ impl Viewport {
         PhysicalPos::new(pos.x.0 * self.scale_factor, pos.y.0 * self.scale_factor)
     }
 
-    /// Combined: Document to view position
+    /// Document to view position
     pub fn doc_to_view(&self, pos: DocPos) -> ViewPos {
         self.layout_to_view(self.doc_to_layout(pos))
     }
 
-    /// Combined: Document to physical position
+    /// Document to physical position
     pub fn doc_to_physical(&self, pos: DocPos) -> PhysicalPos {
-        self.view_to_physical(self.doc_to_view(pos))
+        self.view_to_physical(self.layout_to_view(self.doc_to_layout(pos)))
     }
 
-    /// Combined: Layout to physical position
+    /// Layout to physical position
     pub fn layout_to_physical(&self, pos: LayoutPos) -> PhysicalPos {
         self.view_to_physical(self.layout_to_view(pos))
     }
@@ -568,14 +568,14 @@ impl Viewport {
         }
     }
 
-    /// Combined: Physical to layout position
+    /// Physical to layout position
     pub fn physical_to_layout(&self, pos: PhysicalPos) -> LayoutPos {
         self.view_to_layout(self.physical_to_view(pos))
     }
 
-    /// Combined: Physical to document position
+    /// Physical to document position
     pub fn physical_to_doc(&self, pos: PhysicalPos) -> DocPos {
-        self.layout_to_doc(self.physical_to_layout(pos))
+        self.layout_to_doc(self.view_to_layout(self.physical_to_view(pos)))
     }
 
     // === Rectangle Transformations ===
@@ -984,8 +984,6 @@ impl Viewport {
         byte_pos
     }
 }
-
-// === Convenience Implementations ===
 
 impl ViewRect {
     pub fn contains(&self, pos: ViewPos) -> bool {

@@ -167,22 +167,6 @@ pub struct LineNumberWidget {
     pub style: StyleId,
 }
 
-/// Diagnostic widget - error/warning underline
-#[derive(Clone)]
-pub struct DiagnosticWidget {
-    pub severity: Severity,
-    pub message: Arc<str>,
-    pub range: std::ops::Range<usize>,
-}
-
-/// Style widget - changes text appearance
-#[derive(Clone)]
-pub struct StyleWidget {
-    /// Where style ends
-    pub end_byte: usize,
-    /// New style to apply
-    pub style: StyleId,
-}
 
 // === Supporting Types ===
 
@@ -194,13 +178,6 @@ pub struct CursorStyle {
     pub width: f32,
 }
 
-#[derive(Clone, Copy)]
-pub enum Severity {
-    Error,
-    Warning,
-    Info,
-    Hint,
-}
 
 // === Core Widget Trait ===
 
@@ -531,14 +508,6 @@ impl Widget for SelectionWidget {
         2 // Fixed ID for selection
     }
 
-    fn update(&mut self, _dt: f32) -> bool {
-        false // No animations
-    }
-
-    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
-        EventResponse::Ignored
-    }
-
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         // Calculate bounding size from rectangles
         if self.rectangles.is_empty() {
@@ -647,14 +616,6 @@ impl Widget for LineNumberWidget {
         1000 + self.line as u64 // Unique ID per line number
     }
 
-    fn update(&mut self, _dt: f32) -> bool {
-        false // No animations
-    }
-
-    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
-        EventResponse::Ignored
-    }
-
     fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
         let text = format!("{}", self.line);
         let width = text.len() as f32 * 8.4;
@@ -696,92 +657,7 @@ impl Widget for LineNumberWidget {
     }
 }
 
-impl Widget for DiagnosticWidget {
-    fn widget_id(&self) -> WidgetId {
-        3 // Fixed ID for diagnostics
-    }
 
-    fn update(&mut self, _dt: f32) -> bool {
-        false // No animations
-    }
-
-    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
-        EventResponse::Ignored
-    }
-
-    fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
-        LayoutResult {
-            size: LogicalSize::new(0.0, 2.0),
-        }
-    }
-
-    fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(0.0, 0.0, 0.0, 2.0)
-    }
-
-    fn priority(&self) -> i32 {
-        10 // Above text
-    }
-
-    fn paint(&self, _ctx: &PaintContext<'_>, _render_pass: &mut wgpu::RenderPass) {
-        let color = match self.severity {
-            Severity::Error => 0xFF00FFu32,   // Red
-            Severity::Warning => 0xFF88FFu32, // Orange
-            Severity::Info => 0x0088FFFFu32,  // Blue
-            Severity::Hint => 0x888888FFu32,  // Gray
-        };
-
-        // TODO: Draw wavy underline - needs absolute positioning
-        // For now, skip wavy underline rendering - would need line drawing capability in GPU renderer
-        // TODO: Implement line rendering for diagnostics
-        let _ = color; // Silence unused warnings
-    }
-
-    fn clone_box(&self) -> Arc<dyn Widget> {
-        Arc::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-impl Widget for StyleWidget {
-    fn widget_id(&self) -> WidgetId {
-        4 // Fixed ID for style
-    }
-
-    fn update(&mut self, _dt: f32) -> bool {
-        false // No animations
-    }
-
-    fn handle_event(&mut self, _event: &WidgetEvent) -> EventResponse {
-        EventResponse::Ignored
-    }
-
-    fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
-        LayoutResult {
-            size: LogicalSize::new(0.0, 0.0),
-        }
-    }
-
-    fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(0.0, 0.0, 0.0, 0.0)
-    }
-
-    fn paint(&self, _ctx: &PaintContext<'_>, _render_pass: &mut wgpu::RenderPass) {
-        // StyleWidget doesn't render anything - it's just metadata
-        // The TextWidget will look for these when rendering text
-    }
-
-    fn clone_box(&self) -> Arc<dyn Widget> {
-        Arc::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
 
 // === Public API ===
 
@@ -822,18 +698,6 @@ pub fn line_number(line: u32) -> Arc<dyn Widget> {
     Arc::new(LineNumberWidget { line, style: 0 })
 }
 
-/// Create diagnostic widget
-pub fn diagnostic(
-    severity: Severity,
-    message: &str,
-    range: std::ops::Range<usize>,
-) -> Arc<dyn Widget> {
-    Arc::new(DiagnosticWidget {
-        severity,
-        message: Arc::from(message),
-        range,
-    })
-}
 
 /// Widget manager - tracks overlay widgets like cursor and selections
 pub struct WidgetManager {
