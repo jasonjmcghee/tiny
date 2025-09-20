@@ -29,7 +29,7 @@ crossbeam = "0.8"  # Lock-free data structures
 ahash = "0.8.12"
 
 # Syntax highlighting
-tree-sitter = "0.25"
+tree-sitter = { version = "0.25", features = ["wasm"] }
 tree-sitter-rust = "0.24"
 
 # LSP support
@@ -39,6 +39,7 @@ lsp-types = "0.97"
 # System integration
 arboard = "3.4"  # Clipboard support
 pollster = "0.3"  # Async executor for main
+notify = "6"  # File watching for shader hot-reload
 
 # Async runtime for LSP
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
