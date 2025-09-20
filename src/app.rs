@@ -184,7 +184,10 @@ pub struct TinyApp<T: AppLogic> {
 }
 
 impl<T: AppLogic> TinyApp<T> {
-    fn physical_to_logical_point(&self, position: winit::dpi::PhysicalPosition<f64>) -> Option<Point> {
+    fn physical_to_logical_point(
+        &self,
+        position: winit::dpi::PhysicalPosition<f64>,
+    ) -> Option<Point> {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor() as f32;
         let logical_x = position.x as f32 / scale;
@@ -439,8 +442,16 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                         // Mouse drag
                         if self.mouse_pressed {
-                            if let Some(from) = self.drag_start.and_then(|p| self.physical_to_logical_point(p)) {
-                                if self.logic.on_drag(from, point, &cpu_renderer.viewport, &self.modifiers) {
+                            if let Some(from) = self
+                                .drag_start
+                                .and_then(|p| self.physical_to_logical_point(p))
+                            {
+                                if self.logic.on_drag(
+                                    from,
+                                    point,
+                                    &cpu_renderer.viewport,
+                                    &self.modifiers,
+                                ) {
                                     self.request_redraw();
                                 }
                             }
@@ -461,7 +472,11 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                         if let Some(point) = self.physical_to_logical_point(position) {
                             if let Some(cpu_renderer) = &self.cpu_renderer {
-                                if self.logic.on_click(point, &cpu_renderer.viewport, &self.modifiers) {
+                                if self.logic.on_click(
+                                    point,
+                                    &cpu_renderer.viewport,
+                                    &self.modifiers,
+                                ) {
                                     self.request_redraw();
                                 }
                             }
@@ -472,7 +487,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     self.mouse_pressed = false;
                     self.drag_start = None;
                 }
-            }
+            },
 
             WindowEvent::RedrawRequested => {
                 self.render_frame();
@@ -631,7 +646,6 @@ impl<T: AppLogic> TinyApp<T> {
         }
     }
 
-
     fn render_frame(&mut self) {
         // Check for pending shader reload
         if self.shader_reload_pending.load(Ordering::Relaxed) {
@@ -684,7 +698,10 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Setup text styles
             if let Some(text_styles) = self.logic.text_styles() {
-                if let Some(syntax_hl) = text_styles.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+                if let Some(syntax_hl) = text_styles
+                    .as_any()
+                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                {
                     let highlighter = Arc::new(syntax_hl.clone());
                     cpu_renderer.set_syntax_highlighter(highlighter);
                     cpu_renderer.text_styles = Some(Box::new(syntax_hl.clone()));
@@ -741,7 +758,10 @@ impl EditorLogic {
         let desired_language = crate::syntax::SyntaxHighlighter::file_extension_to_language(path);
 
         if let Some(ref current_highlighter) = self.syntax_highlighter {
-            if let Some(syntax_hl) = current_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+            if let Some(syntax_hl) = current_highlighter
+                .as_any()
+                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+            {
                 syntax_hl.name() != desired_language
             } else {
                 true
@@ -753,25 +773,38 @@ impl EditorLogic {
 
     fn setup_syntax_highlighter(&mut self, path: &str) {
         if let Some(new_highlighter) = crate::syntax::SyntaxHighlighter::from_file_path(path) {
-            println!("EditorLogic: Switching to {} syntax highlighter for {}", new_highlighter.name(), path);
+            println!(
+                "EditorLogic: Switching to {} syntax highlighter for {}",
+                new_highlighter.name(),
+                path
+            );
             let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
             self.syntax_highlighter = Some(syntax_highlighter);
 
             if let Some(ref syntax_highlighter) = self.syntax_highlighter {
-                if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+                if let Some(syntax_hl) = syntax_highlighter
+                    .as_any()
+                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                {
                     let shared_highlighter = Arc::new(syntax_hl.clone());
                     self.input.set_syntax_highlighter(shared_highlighter);
                 }
             }
         } else {
-            println!("EditorLogic: No syntax highlighter available for {}, keeping existing", path);
+            println!(
+                "EditorLogic: No syntax highlighter available for {}, keeping existing",
+                path
+            );
         }
     }
 
     fn request_syntax_update(&self) {
         if let Some(ref syntax_highlighter) = self.syntax_highlighter {
             let text = self.doc.read().flatten_to_string();
-            if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+            if let Some(syntax_hl) = syntax_highlighter
+                .as_any()
+                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+            {
                 syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
             }
         }
@@ -834,19 +867,29 @@ impl EditorLogic {
     }
 
     pub fn new(doc: Doc) -> Self {
-        let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(SyntaxHighlighter::new_rust());
+        let syntax_highlighter: Box<dyn TextStyleProvider> =
+            Box::new(SyntaxHighlighter::new_rust());
 
         let text = doc.read().flatten_to_string();
-        println!("EditorLogic: Requesting initial syntax highlighting for {} bytes of text", text.len());
+        println!(
+            "EditorLogic: Requesting initial syntax highlighting for {} bytes of text",
+            text.len()
+        );
 
-        if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+        if let Some(syntax_hl) = syntax_highlighter
+            .as_any()
+            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+        {
             syntax_hl.request_update_with_edit(&text, doc.version(), None);
         } else {
             syntax_highlighter.request_update(&text, doc.version());
         }
 
         let mut input = InputHandler::new();
-        if let Some(syntax_hl) = syntax_highlighter.as_any().downcast_ref::<crate::syntax::SyntaxHighlighter>() {
+        if let Some(syntax_hl) = syntax_highlighter
+            .as_any()
+            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+        {
             let shared_highlighter = Arc::new(syntax_hl.clone());
             input.set_syntax_highlighter(shared_highlighter);
         }
@@ -913,7 +956,9 @@ impl AppLogic for EditorLogic {
         modifiers: &winit::event::Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> bool {
-        let action = self.input.on_key_with_renderer(&self.doc, viewport, event, modifiers, renderer);
+        let action = self
+            .input
+            .on_key_with_renderer(&self.doc, viewport, event, modifiers, renderer);
         self.handle_input_action(action)
     }
 

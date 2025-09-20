@@ -327,14 +327,22 @@ fn test_delete_causing_many_span_splits() {
         match node {
             Node::Leaf { spans, .. } => {
                 if spans.len() > MAX_SPANS {
-                    eprintln!("Leaf has {} spans, exceeds MAX_SPANS ({})", spans.len(), MAX_SPANS);
+                    eprintln!(
+                        "Leaf has {} spans, exceeds MAX_SPANS ({})",
+                        spans.len(),
+                        MAX_SPANS
+                    );
                     return false;
                 }
                 true
             }
             Node::Internal { children, .. } => {
                 if children.len() > MAX_SPANS {
-                    eprintln!("Internal has {} children, exceeds MAX_SPANS ({})", children.len(), MAX_SPANS);
+                    eprintln!(
+                        "Internal has {} children, exceeds MAX_SPANS ({})",
+                        children.len(),
+                        MAX_SPANS
+                    );
                     return false;
                 }
                 children.iter().all(verify_node)
@@ -342,7 +350,10 @@ fn test_delete_causing_many_span_splits() {
         }
     }
 
-    assert!(verify_node(&tree.root), "Tree structure invalid after delete");
+    assert!(
+        verify_node(&tree.root),
+        "Tree structure invalid after delete"
+    );
 }
 
 #[test]

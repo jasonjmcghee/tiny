@@ -168,7 +168,6 @@ impl InputHandler {
         }
     }
 
-
     /// Handle character typing with optional renderer
     fn handle_character_input(
         &mut self,
@@ -227,7 +226,10 @@ impl InputHandler {
                 }
 
                 let line_length = tree.line_char_count(sel.cursor.line) as u32;
-                sel.cursor.column = self.goal_column.unwrap_or(sel.cursor.column).min(line_length);
+                sel.cursor.column = self
+                    .goal_column
+                    .unwrap_or(sel.cursor.column)
+                    .min(line_length);
                 if !shift_held {
                     sel.anchor = sel.cursor;
                 }
@@ -375,7 +377,6 @@ impl InputHandler {
         }
         InputAction::Redraw
     }
-
 
     /// Move cursor to start or end of line
     fn move_to_line_edge(&mut self, doc: &Doc, to_end: bool, shift_held: bool) -> InputAction {

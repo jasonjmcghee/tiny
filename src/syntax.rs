@@ -4,58 +4,75 @@
 
 use crate::text_effects::{priority, EffectType, TextEffect, TextStyleProvider};
 use arc_swap::ArcSwap;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use tree_sitter::{
     InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree as TSTree,
     WasmStore,
 };
 
-// Global WasmStore that lives forever
-lazy_static::lazy_static! {
-    static ref WASM_STORE: Mutex<Option<Box<WasmStore>>> = Mutex::new(None);
-    static ref WGSL_LANGUAGE: Mutex<Option<Language>> = Mutex::new(None);
+// Generic WASM language loader with lazy initialization
+// Uses parking_lot::RwLock for better read concurrency when many files open at once
+struct WasmLanguageLoader {
+    store: Mutex<Option<Box<WasmStore>>>,
+    languages: RwLock<ahash::HashMap<&'static str, Language>>,
 }
 
-fn get_wgsl_language() -> Language {
-    // Check if already loaded
-    {
-        let lang_guard = WGSL_LANGUAGE.lock().unwrap();
-        if let Some(lang) = lang_guard.as_ref() {
+impl WasmLanguageLoader {
+    fn new() -> Self {
+        Self {
+            store: Mutex::new(None),
+            languages: RwLock::new(ahash::HashMap::default()),
+        }
+    }
+
+    fn load(&self, name: &'static str, wasm_bytes: &[u8]) -> Language {
+        // Fast path: check cache with read lock (allows concurrent reads)
+        {
+            let langs = self.languages.read();
+            if let Some(lang) = langs.get(name) {
+                return lang.clone();
+            }
+        }
+
+        // Slow path: need to load the language
+        // Take write lock to prevent duplicate loading
+        let mut langs = self.languages.write();
+
+        // Double-check pattern: another thread might have loaded it
+        if let Some(lang) = langs.get(name) {
             return lang.clone();
         }
-    }
 
-    // Need to load it
-    let mut store_guard = WASM_STORE.lock().unwrap();
-
-    // Initialize store if needed
-    if store_guard.is_none() {
-        let engine = tree_sitter::wasmtime::Engine::default();
-        let store = Box::new(WasmStore::new(&engine).expect("Failed to create WasmStore"));
-        // Leak the box to make it live forever - this ensures the WasmStore outlives any Language references
-        let store_ptr: &'static mut WasmStore = Box::leak(store);
-        unsafe {
-            *store_guard = Some(Box::from_raw(store_ptr));
+        // Initialize store if needed (only during first language load)
+        let mut store_guard = self.store.lock();
+        if store_guard.is_none() {
+            let engine = tree_sitter::wasmtime::Engine::default();
+            let store = Box::new(WasmStore::new(&engine).expect("Failed to create WasmStore"));
+            let store_ptr: &'static mut WasmStore = Box::leak(store);
+            unsafe {
+                *store_guard = Some(Box::from_raw(store_ptr));
+            }
         }
+
+        // Load the language
+        let store = store_guard.as_mut().unwrap();
+        let language = store
+            .load_language(name, wasm_bytes)
+            .expect(&format!("Failed to load {} language", name));
+
+        // Cache it (we already have write lock)
+        langs.insert(name, language.clone());
+        drop(store_guard); // Release store lock early
+
+        language
     }
+}
 
-    // Load language
-    const WGSL_WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
-    println!("Loading WGSL from WASM ({} bytes)...", WGSL_WASM.len());
-
-    let store = store_guard.as_mut().unwrap();
-    let language = store
-        .load_language("wgsl", WGSL_WASM)
-        .expect("Failed to load WGSL language");
-
-    // Cache the language
-    let mut lang_guard = WGSL_LANGUAGE.lock().unwrap();
-    *lang_guard = Some(language.clone());
-
-    println!("WGSL language loaded and cached");
-    language
+lazy_static::lazy_static! {
+    static ref WASM_LOADER: WasmLanguageLoader = WasmLanguageLoader::new();
 }
 
 /// Language configuration for syntax highlighting
@@ -69,7 +86,7 @@ pub struct LanguageConfig {
 pub struct Languages;
 
 impl Languages {
-    /// Rust language configuration
+    /// Rust language configuration (native)
     pub fn rust() -> LanguageConfig {
         LanguageConfig {
             language: tree_sitter_rust::LANGUAGE.into(),
@@ -78,22 +95,28 @@ impl Languages {
         }
     }
 
-    /// WGSL language configuration (loads from WASM)
+    /// WGSL language configuration (WASM)
     pub fn wgsl() -> LanguageConfig {
-        const WGSL_HIGHLIGHTS: &str = include_str!("../assets/grammars/wgsl/highlights.scm");
-
-        let language = get_wgsl_language();
+        const WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
+        const HIGHLIGHTS: &str = include_str!("../assets/grammars/wgsl/highlights.scm");
 
         LanguageConfig {
-            language,
-            highlights_query: WGSL_HIGHLIGHTS,
+            language: WASM_LOADER.load("wgsl", WASM),
+            highlights_query: HIGHLIGHTS,
             name: "wgsl",
         }
     }
 
-    // Future languages can be added here:
-    // pub fn javascript() -> LanguageConfig { ... }
-    // pub fn python() -> LanguageConfig { ... }
+    // Adding new WASM languages is now trivial:
+    // pub fn javascript() -> LanguageConfig {
+    //     const WASM: &[u8] = include_bytes!("../assets/grammars/js/tree-sitter-javascript.wasm");
+    //     const HIGHLIGHTS: &str = include_str!("../assets/grammars/js/highlights.scm");
+    //     LanguageConfig {
+    //         language: WASM_LOADER.load("javascript", WASM),
+    //         highlights_query: HIGHLIGHTS,
+    //         name: "javascript",
+    //     }
+    // }
 }
 
 /// Token types (universal across languages)
@@ -468,163 +491,83 @@ impl SyntaxHighlighter {
     /// Map tree-sitter capture names to token types
     /// These are standard capture names used across tree-sitter grammars
     pub fn capture_name_to_token_type(name: &str) -> Option<TokenType> {
+        // Handle special cases first
         match name {
-            // Keywords
-            "keyword"
-            | "keyword.control"
-            | "keyword.control.conditional"
-            | "keyword.control.repeat"
-            | "keyword.control.import"
-            | "keyword.control.return"
-            | "keyword.control.exception"
-            | "keyword.function"
-            | "keyword.operator"
-            | "keyword.storage"
-            | "keyword.storage.type"
-            | "keyword.storage.modifier"
-            | "keyword.return" => Some(TokenType::Keyword),
+            "function.macro" => return Some(TokenType::Macro),
+            "comment.documentation" | "string.documentation" => return Some(TokenType::CommentDoc),
+            "derive" => return Some(TokenType::Derive),
+            "escape" => return Some(TokenType::StringEscape),
+            "constant.builtin" => return Some(TokenType::Number),
+            _ => {}
+        }
 
-            // Functions
-            "function" | "function.builtin" | "function.call" | "function.method" | "method"
-            | "method.call" => Some(TokenType::Function),
-
-            // Macros get special treatment
-            "function.macro" => Some(TokenType::Macro),
-
-            "class" | "class.builtin" => Some(TokenType::Class),
-
-            // Types
-            "type" | "type.builtin" | "type.primitive" | "type.qualifier" | "storage.type" => {
-                Some(TokenType::Type)
+        // Check prefixes for common patterns
+        if name.starts_with("keyword")
+            || name == "storageclass"
+            || name == "repeat"
+            || name == "conditional"
+        {
+            Some(TokenType::Keyword)
+        } else if name.starts_with("function") || name.starts_with("method") {
+            Some(TokenType::Function)
+        } else if name.starts_with("type") || name == "storage.type" {
+            Some(TokenType::Type)
+        } else if name.starts_with("string") || name == "char" || name == "character" {
+            Some(TokenType::String)
+        } else if name.starts_with("constant.numeric") || name == "number" || name == "float" {
+            Some(TokenType::Number)
+        } else if name.starts_with("comment") {
+            Some(TokenType::Comment)
+        } else if name.starts_with("constant") || name == "boolean" {
+            Some(TokenType::Constant)
+        } else if name.starts_with("punctuation") {
+            Some(TokenType::Punctuation)
+        } else if name.starts_with("variable") {
+            Some(TokenType::Variable)
+        } else if name.starts_with("attribute")
+            || name == "decorator"
+            || name == "annotation"
+            || name == "tag.attribute"
+        {
+            Some(TokenType::Attribute)
+        } else if name.starts_with("operator") {
+            match name {
+                "operator.comparison" => Some(TokenType::ComparisonOp),
+                "operator.logical" => Some(TokenType::LogicalOp),
+                "operator.arithmetic" => Some(TokenType::ArithmeticOp),
+                _ => Some(TokenType::Operator),
             }
-
-            // Strings and escape sequences
-            "string" | "string.quoted" | "string.template" | "string.regex" | "string.special"
-            | "string.escape" | "char" | "character" => Some(TokenType::String),
-
-            // Escape sequences get special treatment
-            "escape" => Some(TokenType::StringEscape),
-
-            // Numbers
-            "number"
-            | "constant.numeric"
-            | "constant.numeric.integer"
-            | "constant.numeric.float"
-            | "float" => Some(TokenType::Number),
-
-            // Comments
-            "comment" | "comment.line" | "comment.block" => Some(TokenType::Comment),
-            "comment.documentation" => Some(TokenType::CommentDoc),
-
-            // Constants - keep separate from numbers for proper semantic highlighting
-            "constant" | "constant.language" | "boolean" | "constant.builtin.boolean" => {
-                Some(TokenType::Constant)
+        } else {
+            // Handle remaining specific cases
+            match name {
+                "class" | "class.builtin" => Some(TokenType::Class),
+                "namespace" | "module" => Some(TokenType::Namespace),
+                "property" | "field" | "key" => Some(TokenType::Property),
+                "parameter" => Some(TokenType::Parameter),
+                "label" => Some(TokenType::Label),
+                "constructor" => Some(TokenType::Constructor),
+                "enum" => Some(TokenType::Enum),
+                "enum.member" | "enummember" => Some(TokenType::EnumMember),
+                "struct" | "structure" => Some(TokenType::Struct),
+                "interface" => Some(TokenType::Interface),
+                "trait" => Some(TokenType::Trait),
+                "lifetime" => Some(TokenType::Lifetime),
+                "type.parameter" | "typeparameter" | "generic" => Some(TokenType::TypeParameter),
+                "self" | "keyword.self" => Some(TokenType::SelfKeyword),
+                "error" => Some(TokenType::Error),
+                "warning" => Some(TokenType::Warning),
+                "regex" | "regexp" => Some(TokenType::Regex),
+                "char.literal" | "character.literal" => Some(TokenType::Character),
+                "bracket" => Some(TokenType::Bracket),
+                "brace" => Some(TokenType::Brace),
+                "parenthesis" | "paren" => Some(TokenType::Parenthesis),
+                "delimiter" => Some(TokenType::Delimiter),
+                "semicolon" => Some(TokenType::Semicolon),
+                "comma" => Some(TokenType::Comma),
+                "tag" | "tag.builtin" => Some(TokenType::Type),
+                "heading" | "title" => Some(TokenType::Keyword),
+                _ => None,
             }
-
-            // constant.builtin in Rust is often numbers, but could be other things
-            "constant.builtin" => Some(TokenType::Number),
-
-            // Punctuation
-            "punctuation"
-            | "punctuation.bracket"
-            | "punctuation.delimiter"
-            | "punctuation.separator"
-            | "punctuation.special" => Some(TokenType::Punctuation),
-
-            // Variables
-            "variable"
-            | "variable.builtin"
-            | "variable.parameter"
-            | "variable.other"
-            | "variable.other.member" => Some(TokenType::Variable),
-
-            // Attributes - including derive in Rust
-            "attribute" | "decorator" | "annotation" | "attribute.builtin" => {
-                Some(TokenType::Attribute)
-            }
-
-            // Special Rust attributes
-            "derive" => Some(TokenType::Derive),
-
-            // Namespaces and modules
-            "namespace" | "module" => Some(TokenType::Namespace),
-
-            // Properties and fields
-            "property" | "field" => Some(TokenType::Property),
-
-            // Parameters and labels
-            "parameter" => Some(TokenType::Parameter),
-            "label" => Some(TokenType::Label),
-
-            // Constructor
-            "constructor" => Some(TokenType::Constructor),
-
-            // Enums and enum members
-            "enum" => Some(TokenType::Enum),
-            "enum.member" | "enummember" => Some(TokenType::EnumMember),
-
-            // Structs, classes, interfaces
-            "struct" => Some(TokenType::Struct),
-            "interface" => Some(TokenType::Interface),
-
-            // Traits (Rust-specific but useful)
-            "trait" => Some(TokenType::Trait),
-
-            // Lifetimes (Rust-specific)
-            "lifetime" => Some(TokenType::Lifetime),
-
-            // Type parameters and generics
-            "type.parameter" | "typeparameter" | "generic" => Some(TokenType::TypeParameter),
-
-            // Self keyword (Rust/Python)
-            "self" | "keyword.self" => Some(TokenType::SelfKeyword),
-
-            // Error and warning markers
-            "error" => Some(TokenType::Error),
-            "warning" => Some(TokenType::Warning),
-
-            // Additional string types
-            "string.documentation" => Some(TokenType::CommentDoc),
-            "regex" | "regexp" => Some(TokenType::Regex),
-            "char.literal" | "character.literal" => Some(TokenType::Character),
-
-            // Additional operators
-            "operator.comparison" => Some(TokenType::ComparisonOp),
-            "operator.logical" => Some(TokenType::LogicalOp),
-            "operator.arithmetic" => Some(TokenType::ArithmeticOp),
-
-            // Operators
-            "operator" => Some(TokenType::Operator),
-
-            // Additional punctuation
-            "bracket" => Some(TokenType::Bracket),
-            "brace" => Some(TokenType::Brace),
-            "parenthesis" | "paren" => Some(TokenType::Parenthesis),
-            "delimiter" => Some(TokenType::Delimiter),
-            "semicolon" => Some(TokenType::Semicolon),
-            "comma" => Some(TokenType::Comma),
-
-            // Tag names (for HTML/XML/JSX)
-            "tag" | "tag.builtin" => Some(TokenType::Type),
-            "tag.attribute" => Some(TokenType::Attribute),
-
-            // JSON/YAML/TOML keys
-            "key" => Some(TokenType::Property),
-
-            // SQL keywords
-            "keyword.sql" => Some(TokenType::Keyword),
-
-            // Markdown headers
-            "heading" | "title" => Some(TokenType::Keyword),
-
-            // WGSL-specific captures
-            "storageclass" => Some(TokenType::Keyword),
-            "structure" => Some(TokenType::Struct),
-            "repeat" => Some(TokenType::Keyword),
-            "conditional" => Some(TokenType::Keyword),
-
-            // Catch-all for unrecognized names - return None to skip
-            _ => None,
         }
     }
 
@@ -812,79 +755,6 @@ impl SyntaxHighlighter {
         Self::coalesce_effects(cleaned)
     }
 
-    /// Walk visible nodes in tree (alternative approach using tree walking)
-    pub fn walk_visible_nodes(
-        &self,
-        text: &str,
-        byte_range: std::ops::Range<usize>,
-    ) -> Vec<TextEffect> {
-        let tree_guard = self.cached_tree.load();
-        let tree = match tree_guard.as_ref() {
-            Some(tree) => tree,
-            None => return Vec::new(),
-        };
-
-        let mut effects = Vec::new();
-        let mut cursor = tree.root_node().walk();
-        self.collect_visible_effects(&mut cursor, text, &byte_range, &mut effects);
-
-        effects.sort_by_key(|e| (e.range.start, e.range.end));
-        Self::remove_overlaps(effects)
-    }
-
-    fn collect_visible_effects(
-        &self,
-        cursor: &mut tree_sitter::TreeCursor,
-        text: &str,
-        visible_range: &std::ops::Range<usize>,
-        effects: &mut Vec<TextEffect>,
-    ) {
-        let node = cursor.node();
-        let node_start = node.start_byte();
-        let node_end = node.end_byte();
-
-        // Early exit if this entire subtree is outside visible range
-        if node_end < visible_range.start || node_start > visible_range.end {
-            return;
-        }
-
-        // Check if this node has a syntax capture
-        let node_kind = node.kind();
-        if let Some(token) = self.node_kind_to_token_type(node_kind) {
-            effects.push(TextEffect {
-                range: node_start..node_end,
-                effect: EffectType::Token(Self::token_type_to_id(token)),
-                priority: priority::SYNTAX,
-            });
-        }
-
-        // Only recurse into children if this node intersects visible range
-        if cursor.goto_first_child() {
-            loop {
-                self.collect_visible_effects(cursor, text, visible_range, effects);
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-            cursor.goto_parent();
-        }
-    }
-
-    /// Map node kind directly to token type (simpler than capture names)
-    fn node_kind_to_token_type(&self, kind: &str) -> Option<TokenType> {
-        // This is a simplified version - would need language-specific mapping
-        match kind {
-            "string" | "string_literal" | "string_content" => Some(TokenType::String),
-            "number" | "integer" | "float" => Some(TokenType::Number),
-            "comment" | "line_comment" | "block_comment" => Some(TokenType::Comment),
-            "function" | "function_declaration" | "method_declaration" => Some(TokenType::Function),
-            "type" | "type_identifier" | "primitive_type" => Some(TokenType::Type),
-            _ if kind.contains("keyword") => Some(TokenType::Keyword),
-            _ if kind.contains("operator") => Some(TokenType::Operator),
-            _ => None,
-        }
-    }
-
     /// Remove overlapping effects (keeps the more specific one)
     pub fn remove_overlaps(effects: Vec<TextEffect>) -> Vec<TextEffect> {
         if effects.is_empty() {
@@ -946,8 +816,6 @@ impl TextStyleProvider for SyntaxHighlighter {
 /// Convert byte position to tree-sitter Point using efficient tree navigation
 fn byte_to_point(tree: &crate::tree::Tree, byte_pos: usize) -> Point {
     let line = tree.byte_to_line(byte_pos);
-
-    // Get column by finding start of line and calculating offset
     let line_start = tree.line_to_byte(line).unwrap_or(0);
     let byte_in_line = byte_pos - line_start;
 
@@ -957,16 +825,11 @@ fn byte_to_point(tree: &crate::tree::Tree, byte_pos: usize) -> Point {
 
     let mut column = 0;
     let mut byte_offset = 0;
-
     for ch in line_text.chars() {
         if byte_offset >= byte_in_line {
             break;
         }
-        if ch == '\t' {
-            column = ((column / 4) + 1) * 4; // 4-space tabs
-        } else {
-            column += 1;
-        }
+        column += if ch == '\t' { 4 - (column % 4) } else { 1 };
         byte_offset += ch.len_utf8();
     }
 
@@ -976,113 +839,64 @@ fn byte_to_point(tree: &crate::tree::Tree, byte_pos: usize) -> Point {
     }
 }
 
-/// Create TextEdit from document edit information using tree navigation
-pub fn create_text_edit(tree: &crate::tree::Tree, edit: &crate::tree::Edit) -> TextEdit {
-    use crate::tree::Edit;
-
-    match edit {
-        Edit::Insert { pos, content } => {
-            let content_text = match content {
-                crate::tree::Content::Text(s) => s.clone(),
-                crate::tree::Content::Widget(_) => String::new(), // Widgets don't affect text parsing
-            };
-
-            let start_point = byte_to_point(tree, *pos);
-            let end_point = start_point; // Insert doesn't change end position initially
-
-            // Calculate new end position after insert
-            let new_end_point = {
-                let mut line = start_point.row;
-                let mut column = start_point.column;
-                for ch in content_text.chars() {
-                    if ch == '\n' {
-                        line += 1;
-                        column = 0;
-                    } else {
-                        column += 1;
-                    }
-                }
-                Point {
-                    row: line as usize,
-                    column,
-                }
-            };
-
-            TextEdit {
-                start_byte: *pos,
-                old_end_byte: *pos,
-                new_end_byte: *pos + content_text.len(),
-                start_position: start_point,
-                old_end_position: end_point,
-                new_end_position: new_end_point,
-            }
+/// Calculate new point position after inserting text
+fn calc_new_point(start: Point, text: &str) -> Point {
+    let mut line = start.row;
+    let mut column = start.column;
+    for ch in text.chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 0;
+        } else {
+            column += 1;
         }
-        Edit::Delete { range } => {
-            let start_point = byte_to_point(tree, range.start);
-            let old_end_point = byte_to_point(tree, range.end);
-
-            TextEdit {
-                start_byte: range.start,
-                old_end_byte: range.end,
-                new_end_byte: range.start, // Delete shrinks to start position
-                start_position: start_point,
-                old_end_position: old_end_point,
-                new_end_position: start_point, // New end is at start after deletion
-            }
-        }
-        Edit::Replace { range, content } => {
-            let content_text = match content {
-                crate::tree::Content::Text(s) => s.clone(),
-                crate::tree::Content::Widget(_) => String::new(),
-            };
-
-            let start_point = byte_to_point(tree, range.start);
-            let old_end_point = byte_to_point(tree, range.end);
-
-            // Calculate new end position after replacement
-            let new_end_point = {
-                let mut line = start_point.row;
-                let mut column = start_point.column;
-                for ch in content_text.chars() {
-                    if ch == '\n' {
-                        line += 1;
-                        column = 0;
-                    } else {
-                        column += 1;
-                    }
-                }
-                Point {
-                    row: line as usize,
-                    column,
-                }
-            };
-
-            TextEdit {
-                start_byte: range.start,
-                old_end_byte: range.end,
-                new_end_byte: range.start + content_text.len(),
-                start_position: start_point,
-                old_end_position: old_end_point,
-                new_end_position: new_end_point,
-            }
-        }
+    }
+    Point {
+        row: line as usize,
+        column,
     }
 }
 
-/// Helper to create Rust syntax highlighter
-pub fn create_rust_highlighter() -> Box<dyn TextStyleProvider> {
-    Box::new(SyntaxHighlighter::new_rust())
-}
+/// Create TextEdit from document edit information using tree navigation
+pub fn create_text_edit(tree: &crate::tree::Tree, edit: &crate::tree::Edit) -> TextEdit {
+    use crate::tree::{Content, Edit};
 
-/// Helper to create WGSL syntax highlighter
-pub fn create_wgsl_highlighter() -> Box<dyn TextStyleProvider> {
-    Box::new(SyntaxHighlighter::new_wgsl())
-}
+    let (start_byte, old_end_byte, new_end_byte, content_text) = match edit {
+        Edit::Insert { pos, content } => {
+            let text = match content {
+                Content::Text(s) => s.as_str(),
+                Content::Widget(_) => "",
+            };
+            (*pos, *pos, *pos + text.len(), text)
+        }
+        Edit::Delete { range } => (range.start, range.end, range.start, ""),
+        Edit::Replace { range, content } => {
+            let text = match content {
+                Content::Text(s) => s.as_str(),
+                Content::Widget(_) => "",
+            };
+            (range.start, range.end, range.start + text.len(), text)
+        }
+    };
 
-/// Helper to create syntax highlighter based on file extension
-/// Falls back to Rust if extension is not recognized
-pub fn create_highlighter_for_file(path: &str) -> Box<dyn TextStyleProvider> {
-    SyntaxHighlighter::from_file_path(path)
-        .map(|h| Box::new(h) as Box<dyn TextStyleProvider>)
-        .unwrap_or_else(|| create_rust_highlighter())
+    let start_position = byte_to_point(tree, start_byte);
+    let old_end_position = if old_end_byte == start_byte {
+        start_position
+    } else {
+        byte_to_point(tree, old_end_byte)
+    };
+    let new_end_position = if content_text.is_empty() {
+        start_position
+    } else {
+        calc_new_point(start_position, content_text)
+    };
+
+    TextEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte,
+        start_position,
+        old_end_position,
+        new_end_position,
+    }
 }

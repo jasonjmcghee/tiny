@@ -167,7 +167,6 @@ pub struct LineNumberWidget {
     pub style: StyleId,
 }
 
-
 // === Supporting Types ===
 
 pub type StyleId = u32;
@@ -177,7 +176,6 @@ pub struct CursorStyle {
     pub color: u32,
     pub width: f32,
 }
-
 
 // === Core Widget Trait ===
 
@@ -657,8 +655,6 @@ impl Widget for LineNumberWidget {
     }
 }
 
-
-
 // === Public API ===
 
 /// Create text widget from string
@@ -697,7 +693,6 @@ pub fn selection(rectangles: Vec<LayoutRect>) -> Arc<dyn Widget> {
 pub fn line_number(line: u32) -> Arc<dyn Widget> {
     Arc::new(LineNumberWidget { line, style: 0 })
 }
-
 
 /// Widget manager - tracks overlay widgets like cursor and selections
 pub struct WidgetManager {

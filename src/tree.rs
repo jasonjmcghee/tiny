@@ -48,11 +48,17 @@ pub enum Node {
 
 impl Node {
     fn leaf(spans: Vec<Span>) -> Self {
-        Node::Leaf { sums: compute_sums(&spans), spans }
+        Node::Leaf {
+            sums: compute_sums(&spans),
+            spans,
+        }
     }
 
     fn internal(children: Vec<Node>) -> Self {
-        Node::Internal { sums: compute_node_sums(&children), children }
+        Node::Internal {
+            sums: compute_node_sums(&children),
+            children,
+        }
     }
 
     fn len(&self) -> usize {
@@ -67,7 +73,9 @@ impl Node {
     }
 
     fn split_if_needed(self) -> Self {
-        if self.len() <= MAX_SPANS { return self; }
+        if self.len() <= MAX_SPANS {
+            return self;
+        }
         let mid = self.len() / 2;
         match self {
             Node::Leaf { spans, .. } => {
@@ -364,7 +372,6 @@ impl Tree {
         result.split_if_needed()
     }
 
-
     fn create_span(content: &Content) -> Span {
         match content {
             Content::Text(s) => {
@@ -397,7 +404,12 @@ impl Tree {
 
     fn insert_at_node(node: Node, pos: usize, content: &Content) -> Node {
         let total_bytes = node_metrics(&node).0;
-        debug_assert!(pos <= total_bytes, "Insert position {} exceeds node size {}", pos, total_bytes);
+        debug_assert!(
+            pos <= total_bytes,
+            "Insert position {} exceeds node size {}",
+            pos,
+            total_bytes
+        );
 
         match node {
             Node::Leaf { mut spans, .. } => {
@@ -405,7 +417,8 @@ impl Tree {
 
                 // Try to merge at end for text
                 if let (Content::Text(text), Some(Span::Text { bytes, lines })) =
-                    (content, spans.last()) {
+                    (content, spans.last())
+                {
                     if pos == spans.iter().map(span_bytes).sum::<usize>() {
                         let last = spans.len() - 1;
                         spans[last] = Self::merge_text_spans(bytes, *lines, text);
@@ -439,9 +452,13 @@ impl Tree {
 
                                 let prefix = &bytes[..split_pos];
                                 let suffix = &bytes[split_pos..];
-                                if !prefix.is_empty() { new_spans.push(Self::text_span(prefix)); }
+                                if !prefix.is_empty() {
+                                    new_spans.push(Self::text_span(prefix));
+                                }
                                 new_spans.push(new_span);
-                                if !suffix.is_empty() { new_spans.push(Self::text_span(suffix)); }
+                                if !suffix.is_empty() {
+                                    new_spans.push(Self::text_span(suffix));
+                                }
                                 new_spans.extend_from_slice(&spans[i + 1..]);
                                 return Node::leaf(new_spans).split_if_needed();
                             }
@@ -508,7 +525,9 @@ impl Tree {
     }
 
     fn delete_from_node(node: Node, range: &Range<usize>) -> Node {
-        if range.is_empty() { return node; }
+        if range.is_empty() {
+            return node;
+        }
 
         match node {
             Node::Leaf { spans, .. } => {
@@ -582,7 +601,9 @@ impl Tree {
     }
 
     fn merge_children(children: Vec<Node>) -> Vec<Node> {
-        if children.len() >= MAX_SPANS / 2 { return children; }
+        if children.len() >= MAX_SPANS / 2 {
+            return children;
+        }
 
         let mut merged = Vec::new();
         let mut i = 0;
@@ -590,10 +611,12 @@ impl Tree {
         while i < children.len() {
             if i + 1 < children.len() {
                 let can_merge = match (&children[i], &children[i + 1]) {
-                    (Node::Leaf { spans: s1, .. }, Node::Leaf { spans: s2, .. }) =>
-                        s1.len() + s2.len() <= MAX_SPANS,
-                    (Node::Internal { children: c1, .. }, Node::Internal { children: c2, .. }) =>
-                        c1.len() + c2.len() <= MAX_SPANS,
+                    (Node::Leaf { spans: s1, .. }, Node::Leaf { spans: s2, .. }) => {
+                        s1.len() + s2.len() <= MAX_SPANS
+                    }
+                    (Node::Internal { children: c1, .. }, Node::Internal { children: c2, .. }) => {
+                        c1.len() + c2.len() <= MAX_SPANS
+                    }
                     _ => false,
                 };
 
@@ -603,7 +626,12 @@ impl Tree {
                             s1.extend(s2);
                             merged.push(Node::leaf(s1));
                         }
-                        (Node::Internal { children: mut c1, .. }, Node::Internal { children: c2, .. }) => {
+                        (
+                            Node::Internal {
+                                children: mut c1, ..
+                            },
+                            Node::Internal { children: c2, .. },
+                        ) => {
                             c1.extend(c2);
                             merged.push(Node::internal(c1));
                         }
@@ -801,7 +829,13 @@ impl<'a> CursorFrame<'a> {
             Vec::new()
         };
 
-        Self { node, byte_offset, line_offset, child_index: 0, children_offsets }
+        Self {
+            node,
+            byte_offset,
+            line_offset,
+            child_index: 0,
+            children_offsets,
+        }
     }
 
     fn advance_to_next_child(&mut self) -> Option<(&'a Node, usize, u32)> {
@@ -923,7 +957,8 @@ impl<'a> TreeCursor<'a> {
                 Node::Internal { children, .. } => {
                     for (i, &(byte_off, line_off)) in frame.children_offsets.iter().enumerate() {
                         if byte_off + node_metrics(&children[i]).0 > target {
-                            self.stack.push(CursorFrame::new(&children[i], byte_off, line_off));
+                            self.stack
+                                .push(CursorFrame::new(&children[i], byte_off, line_off));
                             break;
                         }
                     }
@@ -934,8 +969,12 @@ impl<'a> TreeCursor<'a> {
     }
 
     pub fn seek_line(&mut self, target_line: u32) -> Option<usize> {
-        if target_line == 0 { return Some(0); }
-        if target_line > self.tree.line_count() { return None; }
+        if target_line == 0 {
+            return Some(0);
+        }
+        if target_line > self.tree.line_count() {
+            return None;
+        }
 
         self.reset();
         let mut current_line = 0;
@@ -943,20 +982,26 @@ impl<'a> TreeCursor<'a> {
         loop {
             if self.current_spans.is_empty() {
                 self.descend_to_leaf();
-                if self.current_spans.is_empty() { break; }
+                if self.current_spans.is_empty() {
+                    break;
+                }
             }
 
             for (span, offset) in self.current_spans.iter() {
                 if let Span::Text { bytes, lines } = span {
                     if current_line + lines >= target_line {
                         let skip = target_line - current_line;
-                        if skip == 0 { return Some(*offset); }
+                        if skip == 0 {
+                            return Some(*offset);
+                        }
 
                         let mut n = 0;
                         for (i, &b) in bytes.iter().enumerate() {
                             if b == b'\n' {
                                 n += 1;
-                                if n == skip { return Some(*offset + i + 1); }
+                                if n == skip {
+                                    return Some(*offset + i + 1);
+                                }
                             }
                         }
                     }
@@ -964,7 +1009,9 @@ impl<'a> TreeCursor<'a> {
                 }
             }
 
-            if !self.advance_leaf() { break; }
+            if !self.advance_leaf() {
+                break;
+            }
         }
         None
     }
@@ -1024,7 +1071,9 @@ impl<'a> TreeCursor<'a> {
         }
 
         loop {
-            let Some(frame) = self.stack.last_mut() else { return false; };
+            let Some(frame) = self.stack.last_mut() else {
+                return false;
+            };
 
             if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
                 self.stack.push(CursorFrame::new(child, byte_off, line_off));
@@ -1035,7 +1084,9 @@ impl<'a> TreeCursor<'a> {
                         return true;
                     }
 
-                    let Some(mut frame) = self.stack.pop() else { return false; };
+                    let Some(mut frame) = self.stack.pop() else {
+                        return false;
+                    };
                     if let Some((child, byte_off, line_off)) = frame.advance_to_next_child() {
                         self.stack.push(frame);
                         self.stack.push(CursorFrame::new(child, byte_off, line_off));
@@ -1045,7 +1096,9 @@ impl<'a> TreeCursor<'a> {
                 }
             } else {
                 self.stack.pop();
-                if self.stack.is_empty() { return false; }
+                if self.stack.is_empty() {
+                    return false;
+                }
             }
         }
     }
@@ -1086,41 +1139,60 @@ impl<'a> TreeCursor<'a> {
         loop {
             if self.current_spans.is_empty() {
                 self.descend_to_leaf();
-                if self.current_spans.is_empty() { break; }
+                if self.current_spans.is_empty() {
+                    break;
+                }
             }
 
             for (span, _) in &self.current_spans {
                 if let Span::Text { bytes, .. } = span {
-                    count += unsafe { from_utf8(bytes).unwrap_unchecked() }.chars().count();
+                    count += unsafe { from_utf8(bytes).unwrap_unchecked() }
+                        .chars()
+                        .count();
                 }
             }
 
-            if !self.advance_leaf() { break; }
+            if !self.advance_leaf() {
+                break;
+            }
         }
         count
     }
 
     pub fn walk_range<F>(&mut self, byte_range: Range<usize>, mut callback: F)
-    where F: FnMut(&[Span], usize, usize)
+    where
+        F: FnMut(&[Span], usize, usize),
     {
         self.seek_byte(byte_range.start);
 
         loop {
-            if self.current_spans.is_empty() { break; }
+            if self.current_spans.is_empty() {
+                break;
+            }
 
             let start = self.current_spans.first().map(|(_, o)| *o).unwrap_or(0);
-            let end = self.current_spans.last()
-                .map(|(s, o)| o + span_bytes(s)).unwrap_or(start);
+            let end = self
+                .current_spans
+                .last()
+                .map(|(s, o)| o + span_bytes(s))
+                .unwrap_or(start);
 
-            if start >= byte_range.end { break; }
+            if start >= byte_range.end {
+                break;
+            }
 
             if end > byte_range.start {
-                let spans: Vec<_> = self.current_spans.iter()
-                    .map(|(s, _)| (*s).clone()).collect();
+                let spans: Vec<_> = self
+                    .current_spans
+                    .iter()
+                    .map(|(s, _)| (*s).clone())
+                    .collect();
                 callback(&spans, start.max(byte_range.start), end.min(byte_range.end));
             }
 
-            if !self.advance_leaf() { break; }
+            if !self.advance_leaf() {
+                break;
+            }
         }
     }
 }
