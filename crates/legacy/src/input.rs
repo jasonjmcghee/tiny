@@ -2,15 +2,16 @@
 //!
 //! Handles keyboard, mouse, and multi-cursor selections
 
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, Viewport};
+use crate::coordinates::Viewport;
 use crate::history::{DocumentHistory, DocumentSnapshot, SelectionHistory};
+use crate::input_types::{ElementState, Key, KeyEvent, Modifiers, MouseButton, NamedKey};
 use crate::syntax::SyntaxHighlighter;
-use crate::tree::{Content, Doc, Edit, Point};
+use arboard::Clipboard;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
-use winit::event::{ElementState, KeyEvent, MouseButton};
-use winit::keyboard::{Key, NamedKey};
+use tiny_core::tree::{Content, Doc, Edit, Point};
+use tiny_sdk::{DocPos, LayoutPos, LayoutRect};
 
 /// Actions that can be triggered by input
 pub enum InputAction {
@@ -617,10 +618,8 @@ impl InputHandler {
         doc: &Doc,
         _viewport: &Viewport,
         event: &KeyEvent,
-        _modifiers: &winit::event::Modifiers,
-    ) -> Vec<crate::tree::Edit> {
-        use crate::tree::{Content, Edit};
-
+        _modifiers: &Modifiers,
+    ) -> Vec<tiny_core::tree::Edit> {
         if event.state != ElementState::Pressed {
             return Vec::new();
         }
@@ -691,7 +690,7 @@ impl InputHandler {
         doc: &Doc,
         viewport: &Viewport,
         event: &KeyEvent,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> InputAction {
         self.on_key_internal(doc, viewport, event, modifiers, renderer)
@@ -703,7 +702,7 @@ impl InputHandler {
         doc: &Doc,
         viewport: &Viewport,
         event: &KeyEvent,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &Modifiers,
     ) -> InputAction {
         self.on_key_internal(doc, viewport, event, modifiers, None)
     }
@@ -714,7 +713,7 @@ impl InputHandler {
         doc: &Doc,
         _viewport: &Viewport,
         event: &KeyEvent,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> InputAction {
         if event.state != ElementState::Pressed {
@@ -844,7 +843,7 @@ impl InputHandler {
             if range.end <= text.len() {
                 let selected = &text[range];
                 self.clipboard = Some(selected.to_string());
-                let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(selected));
+                let _ = Clipboard::new().and_then(|mut c| c.set_text(selected));
             }
         }
     }
@@ -872,7 +871,7 @@ impl InputHandler {
 
     /// Paste from clipboard
     pub fn paste(&mut self, doc: &Doc) {
-        let text = arboard::Clipboard::new()
+        let text = Clipboard::new()
             .ok()
             .and_then(|mut c| c.get_text().ok())
             .or_else(|| self.clipboard.clone());
@@ -933,7 +932,7 @@ impl InputHandler {
     }
 
     /// Get primary cursor position in document space
-    pub fn primary_cursor_doc_pos(&self, doc: &Doc) -> crate::coordinates::DocPos {
+    pub fn primary_cursor_doc_pos(&self, doc: &Doc) -> DocPos {
         self.selections.first().map_or(DocPos::default(), |sel| {
             let tree = doc.read();
             DocPos {

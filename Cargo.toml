@@ -1,58 +1,25 @@
-[package]
-name = "tiny-editor"
+[workspace]
+members = [
+    "crates/tree",
+    "crates/legacy",
+    "crates/sdk",
+    "crates/core",
+    "crates/plugins/cursor",
+    # "crates/std_plugins/*", # Will add when we create plugins
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["Tiny Editor Contributors"]
 
-[workspace]
-
-[[bin]]
-name = "tiny-editor"
-path = "src/main.rs"
-
-[dependencies]
-# Graphics and windowing
-# wgpu = { path = "/Users/jason/tools/wgpu/wgpu", features = ["metal"] }
+[workspace.dependencies]
+# Shared dependencies across all crates
 wgpu = { version = "26.0.1", features = ["metal"] }
 bytemuck = { version = "1", features = ["derive"] }
-winit = "0.30"
-
-# Text rendering
-fontdue = "0.9"
-swash = "0.2.5"
-
-# Core data structures
-parking_lot = "0.12"
-memchr = "2.7"  # SIMD-optimized byte searching (uses NEON on ARM)
-lazy_static = "1.4"  # For global statics
-arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
-crossbeam = "0.8"  # Lock-free data structures
 ahash = "0.8.12"
-
-# Syntax highlighting
-tree-sitter = { version = "0.25", features = ["wasm"] }
-tree-sitter-rust = "0.24"
-
-# LSP support
-tower-lsp = "0.20"  # LSP server framework
-lsp-types = "0.97"
-
-# System integration
-arboard = "3.4"  # Clipboard support
-pollster = "0.3"  # Async executor for main
-notify = "6"  # File watching for shader hot-reload
-
-# Async runtime for LSP
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-simdutf8 = "0.1.5"
-bytecount = "0.6.9"
-mimalloc = "0.1.48"
-
-[features]
-test-support = []
-
-[dev-dependencies]
-criterion = "0.7"  # Benchmarking
-pollster = "0.3"   # Async executor for examples
+winit = "0.30"
 
 [profile.release]
 # lto = true
@@ -62,32 +29,3 @@ debug = true
 
 [profile.dev]
 opt-level = 1  # Faster compilation, still decent perf
-
-
-[[bench]]
-name = "tree_bench"
-harness = false
-
-[[example]]
-name = "minimal_typing"
-path = "examples/minimal_typing.rs"
-
-[[example]]
-name = "debug_font"
-path = "examples/debug_font.rs"
-
-[[example]]
-name = "debug_gpu"
-path = "examples/debug_gpu.rs"
-
-[[example]]
-name = "debug_coordinates"
-path = "examples/debug_coordinates.rs"
-
-[[example]]
-name = "single_char"
-path = "examples/single_char.rs"
-
-[[example]]
-name = "rect_test"
-path = "examples/rect_test.rs"

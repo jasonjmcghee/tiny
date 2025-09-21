@@ -2,47 +2,37 @@
 //!
 //! Converts document tree to widgets and coordinates their GPU rendering
 
-use crate::coordinates::{LayoutPos, LayoutRect, LogicalSize, Viewport};
-use crate::text_renderer::TextRenderer;
-use crate::tree::{Rect, Tree};
-use crate::widget::WidgetManager;
 use std::sync::Arc;
 #[allow(unused)]
-use wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
+use tiny_core::wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
+use tiny_core::{
+    tree::{self, Rect, Tree},
+    GpuRenderer,
+};
+use tiny_sdk::{GlyphInstance, LayoutPos, LayoutRect, LogicalSize, PaintContext};
 
-// === Glyph Instances ===
-
-/// Single glyph instance (in layout space, logical pixels)
-#[derive(Clone, Debug)]
-pub struct GlyphInstance {
-    pub glyph_id: u16,
-    pub pos: LayoutPos,       // Layout space position (logical pixels)
-    pub tex_coords: [f32; 4], // [u0, v0, u1, v1] in atlas
-    pub token_id: u8,         // Token type for theme lookup
-    pub relative_pos: f32,    // Position within token (0.0-1.0)
-}
-
-// RectInstance still used directly by widgets for rendering
-#[derive(Clone, Copy)]
-pub struct RectInstance {
-    pub rect: Rect,
-    pub color: u32,
-}
+use crate::coordinates::Viewport;
+use crate::font;
+use crate::input;
+use crate::syntax;
+use crate::text_effects;
+use crate::text_renderer::{self, TextRenderer};
+use crate::widget::{self, WidgetManager};
 
 // === Renderer ===
 
 /// Converts tree to widgets and manages rendering
 pub struct Renderer {
     /// Text style provider for syntax highlighting
-    pub text_styles: Option<Box<dyn crate::text_effects::TextStyleProvider>>,
+    pub text_styles: Option<Box<dyn text_effects::TextStyleProvider>>,
     /// Syntax highlighter for viewport queries (optional)
-    pub syntax_highlighter: Option<Arc<crate::syntax::SyntaxHighlighter>>,
+    pub syntax_highlighter: Option<Arc<syntax::SyntaxHighlighter>>,
     /// Font system for text rendering (shared reference)
-    pub font_system: Option<std::sync::Arc<crate::font::SharedFontSystem>>,
+    pub font_system: Option<std::sync::Arc<font::SharedFontSystem>>,
     /// Viewport for coordinate transformation
     pub viewport: Viewport,
     /// GPU renderer reference for widget painting
-    gpu_renderer: Option<*const crate::gpu::GpuRenderer>,
+    gpu_renderer: Option<*const GpuRenderer>,
     /// Cached document text for syntax queries
     pub cached_doc_text: Option<Arc<String>>,
     /// Cached document version
@@ -88,24 +78,24 @@ impl Renderer {
     }
 
     /// Set GPU renderer reference for widget painting and initialize theme
-    pub fn set_gpu_renderer(&mut self, gpu_renderer: &crate::gpu::GpuRenderer) {
+    pub fn set_gpu_renderer(&mut self, gpu_renderer: &GpuRenderer) {
         self.gpu_renderer = Some(gpu_renderer as *const _);
         // Theme initialization is now handled in app.rs
     }
 
     /// Set text style provider (takes ownership)
-    pub fn set_text_styles(&mut self, provider: Box<dyn crate::text_effects::TextStyleProvider>) {
+    pub fn set_text_styles(&mut self, provider: Box<dyn text_effects::TextStyleProvider>) {
         self.text_styles = Some(provider);
     }
 
     /// Set syntax highlighter for viewport queries
-    pub fn set_syntax_highlighter(&mut self, highlighter: Arc<crate::syntax::SyntaxHighlighter>) {
+    pub fn set_syntax_highlighter(&mut self, highlighter: Arc<syntax::SyntaxHighlighter>) {
         self.syntax_highlighter = Some(highlighter);
         self.syntax_dirty = true; // Syntax needs updating when highlighter changes
     }
 
     /// Set font system (takes shared reference)
-    pub fn set_font_system(&mut self, font_system: std::sync::Arc<crate::font::SharedFontSystem>) {
+    pub fn set_font_system(&mut self, font_system: std::sync::Arc<font::SharedFontSystem>) {
         // Set font system on viewport for accurate measurements
         self.viewport.set_font_system(font_system.clone());
         self.font_system = Some(font_system);
@@ -113,7 +103,7 @@ impl Renderer {
     }
 
     /// Handle incremental edit for stable typing experience
-    pub fn apply_incremental_edit(&mut self, edit: &crate::tree::Edit) {
+    pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
         self.text_renderer.apply_incremental_edit(edit);
     }
 
@@ -124,11 +114,7 @@ impl Renderer {
     }
 
     /// Set selections and cursor widgets
-    pub fn set_selection_widgets(
-        &mut self,
-        input_handler: &crate::input::InputHandler,
-        doc: &crate::tree::Doc,
-    ) {
+    pub fn set_selection_widgets(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
         // Create widgets from current selections
         let (selection_widgets, cursor_widget) = input_handler.create_widgets(doc, &self.viewport);
 
@@ -144,7 +130,7 @@ impl Renderer {
         &mut self,
         tree: &Tree,
         viewport: Rect,
-        selections: &[crate::input::Selection],
+        selections: &[input::Selection],
         render_pass: &mut wgpu::RenderPass,
     ) {
         // Simply delegate to render_with_pass which will handle everything
@@ -156,7 +142,7 @@ impl Renderer {
         &mut self,
         tree: &Tree,
         viewport: Rect,
-        selections: &[crate::input::Selection],
+        selections: &[input::Selection],
         render_pass: Option<&mut wgpu::RenderPass>,
     ) {
         self.render_with_pass_and_context(tree, viewport, selections, render_pass, None);
@@ -167,9 +153,9 @@ impl Renderer {
         &mut self,
         tree: &Tree,
         _viewport: Rect,
-        _selections: &[crate::input::Selection],
+        _selections: &[input::Selection],
         mut render_pass: Option<&mut wgpu::RenderPass>,
-        widget_paint_context: Option<&crate::widget::PaintContext>,
+        widget_paint_context: Option<&PaintContext>,
     ) {
         // Early exit if nothing has changed - skip all expensive operations
         if tree.version == self.last_rendered_version && !self.layout_dirty && !self.syntax_dirty {
@@ -195,8 +181,8 @@ impl Renderer {
 
             let mut tokens = Vec::new();
             for effect in effects {
-                if let crate::text_effects::EffectType::Token(token_id) = effect.effect {
-                    tokens.push(crate::text_renderer::TokenRange {
+                if let text_effects::EffectType::Token(token_id) = effect.effect {
+                    tokens.push(text_renderer::TokenRange {
                         byte_range: effect.range.clone(),
                         token_id,
                     });
@@ -228,7 +214,7 @@ impl Renderer {
                 }
             } else if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu };
-                let ctx = crate::widget::PaintContext::new(
+                let ctx = PaintContext::new(
                     &self.viewport,
                     gpu_renderer.device_arc(),
                     gpu_renderer.queue_arc(),
@@ -260,7 +246,7 @@ impl Renderer {
                 }
             } else if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu };
-                let ctx = crate::widget::PaintContext::new(
+                let ctx = PaintContext::new(
                     &self.viewport,
                     gpu_renderer.device_arc(),
                     gpu_renderer.queue_arc(),
@@ -306,8 +292,7 @@ impl Renderer {
 
                 // Upload the visible-only style buffer to GPU
                 if gpu_renderer.has_styled_pipeline() {
-                    let gpu_renderer_mut =
-                        unsafe { &mut *(gpu_renderer_ptr as *mut crate::gpu::GpuRenderer) };
+                    let gpu_renderer_mut = unsafe { &mut *(gpu_renderer_ptr as *mut GpuRenderer) };
                     gpu_renderer_mut.upload_style_buffer_u32(&visible_style_buffer);
                 }
 
@@ -318,11 +303,11 @@ impl Renderer {
                     let physical_pos = self.viewport.layout_to_physical(glyph.layout_pos);
 
                     glyph_instances.push(GlyphInstance {
-                        glyph_id: 0,
                         pos: LayoutPos::new(physical_pos.x.0, physical_pos.y.0),
                         tex_coords: glyph.tex_coords,
                         token_id: glyph.token_id as u8,
                         relative_pos: glyph.relative_pos,
+                        shader_id: None,
                     });
                 }
 
@@ -336,8 +321,8 @@ impl Renderer {
                 // Still handle widgets separately
                 tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
                     for span in spans {
-                        if let crate::tree::Span::Widget(widget) = span {
-                            let ctx = crate::widget::PaintContext::new(
+                        if let tree::Span::Spatial(widget) = span {
+                            let ctx = PaintContext::new(
                                 &self.viewport,
                                 gpu_renderer.device_arc(),
                                 gpu_renderer.queue_arc(),
@@ -361,14 +346,14 @@ impl Renderer {
         byte_range: std::ops::Range<usize>,
         mut render_pass: Option<&mut wgpu::RenderPass>,
     ) {
-        use crate::widget::Widget;
+        use widget::Widget;
 
         // Collect all visible text WITHOUT culling
         let mut all_visible_bytes = Vec::new();
         tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
             for span in spans {
                 match span {
-                    crate::tree::Span::Widget(widget) => {
+                    tree::Span::Widget(widget) => {
                         // If we have a render pass and supporting resources, paint directly
                         if let Some(pass) = render_pass.as_mut() {
                             if let Some(font_system) = &self.font_system {
@@ -379,7 +364,7 @@ impl Renderer {
                                     let uniform_bind_group = gpu_renderer.uniform_bind_group();
 
                                     // Create paint context for the widget
-                                    let ctx = crate::widget::PaintContext::new(
+                                    let ctx = PaintContext::new(
                                         &self.viewport,
                                         device_arc,
                                         queue_arc,
@@ -395,7 +380,7 @@ impl Renderer {
                             }
                         }
                     }
-                    crate::tree::Span::Text { bytes, .. } => {
+                    tree::Span::Text { bytes, .. } => {
                         all_visible_bytes.extend_from_slice(bytes);
                     }
                 }
@@ -426,8 +411,8 @@ impl Renderer {
         // Render ALL visible text as a single TextWidget WITHOUT culling
         // This preserves the 1:1 byte mapping for syntax highlighting
         if !all_visible_bytes.is_empty() && render_pass.is_some() {
-            use crate::widget::{ContentType, TextWidget};
             use std::sync::Arc;
+            use widget::{ContentType, TextWidget};
 
             // Create a TextWidget for ALL visible text (no culling)
             let text_widget = TextWidget {
@@ -458,21 +443,20 @@ impl Renderer {
                         };
 
                         // Use the InputEdit-aware syntax highlighter for text styles
-                        let text_styles_for_widget = if let Some(ref syntax_hl) =
-                            self.syntax_highlighter
-                        {
-                            // Use the syntax highlighter directly (it implements TextStyleProvider)
-                            // This ensures widgets get InputEdit-aware effects
-                            Some(syntax_hl.as_ref() as &dyn crate::text_effects::TextStyleProvider)
-                        } else if let Some(ref viewport_provider) = viewport_style_provider {
-                            // Use viewport-specific effects if available
-                            Some(viewport_provider as &dyn crate::text_effects::TextStyleProvider)
-                        } else {
-                            // Fallback to static text styles
-                            self.text_styles.as_deref()
-                        };
+                        let text_styles_for_widget =
+                            if let Some(ref syntax_hl) = self.syntax_highlighter {
+                                // Use the syntax highlighter directly (it implements TextStyleProvider)
+                                // This ensures widgets get InputEdit-aware effects
+                                Some(syntax_hl.as_ref() as &dyn text_effects::TextStyleProvider)
+                            } else if let Some(ref viewport_provider) = viewport_style_provider {
+                                // Use viewport-specific effects if available
+                                Some(viewport_provider as &dyn text_effects::TextStyleProvider)
+                            } else {
+                                // Fallback to static text styles
+                                self.text_styles.as_deref()
+                            };
 
-                        let ctx = crate::widget::PaintContext::new(
+                        let ctx = PaintContext::new(
                             &self.viewport,
                             device_arc,
                             queue_arc,
@@ -505,7 +489,7 @@ impl Renderer {
     }
 
     /// Update widgets from current selections
-    pub fn update_widgets_from_selections(&mut self, selections: &[crate::input::Selection]) {
+    pub fn update_widgets_from_selections(&mut self, selections: &[input::Selection]) {
         // Clear existing widgets
         self.widget_manager.clear();
 
@@ -517,7 +501,7 @@ impl Renderer {
             if selection.is_cursor() {
                 // Create cursor widget
                 let layout_pos = self.viewport.doc_to_layout(selection.cursor);
-                cursor_widget = Some(crate::widget::cursor(layout_pos));
+                cursor_widget = Some(widget::cursor(layout_pos));
             } else {
                 // Create selection widget
                 let start_layout = self.viewport.doc_to_layout(selection.anchor);
@@ -542,7 +526,7 @@ impl Renderer {
                 };
 
                 let rect = LayoutRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
-                selection_widgets.push(crate::widget::selection(vec![rect]));
+                selection_widgets.push(widget::selection(vec![rect]));
             }
         }
 
@@ -556,20 +540,17 @@ impl Renderer {
 
 // === Viewport Effects Provider (simplified) ===
 struct ViewportEffectsProvider {
-    effects: Vec<crate::text_effects::TextEffect>,
+    effects: Vec<text_effects::TextEffect>,
     byte_offset: usize,
 }
 
-impl crate::text_effects::TextStyleProvider for ViewportEffectsProvider {
-    fn get_effects_in_range(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> Vec<crate::text_effects::TextEffect> {
+impl text_effects::TextStyleProvider for ViewportEffectsProvider {
+    fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<text_effects::TextEffect> {
         let doc_range = (range.start + self.byte_offset)..(range.end + self.byte_offset);
         self.effects
             .iter()
             .filter(|e| e.range.start < doc_range.end && e.range.end > doc_range.start)
-            .map(|e| crate::text_effects::TextEffect {
+            .map(|e| text_effects::TextEffect {
                 range: e.range.start.saturating_sub(self.byte_offset)
                     ..e.range.end.saturating_sub(self.byte_offset),
                 effect: e.effect.clone(),

@@ -2,16 +2,14 @@
 //!
 //! Eliminates boilerplate across examples - focus on rendering logic
 
-use crate::coordinates::{DocPos, LogicalPixels};
 use crate::{
     font::SharedFontSystem,
-    gpu::GpuRenderer,
     input::{InputAction, InputHandler},
+    input_types,
     io,
     render::Renderer,
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
-    tree::{Doc, Point, Rect},
 };
 #[allow(unused)]
 use std::io::BufRead;
@@ -26,6 +24,13 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
+
+// Plugin orchestration support
+use tiny_core::{
+    tree::{Doc, Point, Rect},
+    GpuRenderer, Uniforms,
+};
+use tiny_sdk::{types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {
@@ -44,9 +49,9 @@ pub trait AppLogic: 'static {
     /// Handle keyboard input with optional renderer for incremental updates
     fn on_key_with_renderer(
         &mut self,
-        _key: &winit::event::KeyEvent,
+        _key: &input_types::KeyEvent,
         _viewport: &crate::coordinates::Viewport,
-        _modifiers: &winit::event::Modifiers,
+        _modifiers: &input_types::Modifiers,
         _renderer: Option<&mut crate::render::Renderer>,
     ) -> bool {
         // Default fallback to regular on_key
@@ -56,9 +61,9 @@ pub trait AppLogic: 'static {
     /// Handle keyboard input
     fn on_key(
         &mut self,
-        _key: &winit::event::KeyEvent,
+        _key: &input_types::KeyEvent,
         _viewport: &crate::coordinates::Viewport,
-        _modifiers: &winit::event::Modifiers,
+        _modifiers: &input_types::Modifiers,
     ) -> bool {
         // Default implementation with basic editor functionality
         false
@@ -69,7 +74,7 @@ pub trait AppLogic: 'static {
         &mut self,
         _pos: Point,
         _viewport: &crate::coordinates::Viewport,
-        _modifiers: &winit::event::Modifiers,
+        _modifiers: &input_types::Modifiers,
     ) -> bool {
         false
     }
@@ -80,7 +85,7 @@ pub trait AppLogic: 'static {
         _from: Point,
         _to: Point,
         _viewport: &crate::coordinates::Viewport,
-        _modifiers: &winit::event::Modifiers,
+        _modifiers: &input_types::Modifiers,
     ) -> bool {
         false
     }
@@ -135,6 +140,64 @@ pub trait AppLogic: 'static {
     }
 }
 
+/// Simple plugin orchestrator - manages plugin lifecycle
+/// This will eventually move to core crate
+pub struct PluginOrchestrator {
+    /// Widgets that need update calls
+    update_widgets: Vec<Box<dyn SdkUpdate>>,
+    /// Widgets that need paint calls
+    paint_widgets: Vec<Box<dyn SdkPaint>>,
+    /// Hooks for transforming glyph instances
+    glyph_hooks: Vec<Box<dyn Hook<tiny_sdk::GlyphInstances, Output = tiny_sdk::GlyphInstances>>>,
+}
+
+impl PluginOrchestrator {
+    pub fn new() -> Self {
+        Self {
+            update_widgets: Vec::new(),
+            paint_widgets: Vec::new(),
+            glyph_hooks: Vec::new(),
+        }
+    }
+
+    pub fn register_update(&mut self, widget: Box<dyn SdkUpdate>) {
+        self.update_widgets.push(widget);
+    }
+
+    pub fn register_paint(&mut self, widget: Box<dyn SdkPaint>) {
+        self.paint_widgets.push(widget);
+    }
+
+    pub fn register_glyph_hook(
+        &mut self,
+        hook: Box<dyn Hook<tiny_sdk::GlyphInstances, Output = tiny_sdk::GlyphInstances>>,
+    ) {
+        self.glyph_hooks.push(hook);
+    }
+
+    pub fn update_all(&mut self, dt: f32) -> Result<(), tiny_sdk::PluginError> {
+        // For now, create a simple update context
+        let mut ctx = tiny_sdk::UpdateContext {
+            registry: tiny_sdk::PluginRegistry { _private: () },
+            frame: 0,
+            elapsed: 0.0,
+        };
+
+        for widget in &mut self.update_widgets {
+            widget.update(dt, &mut ctx)?;
+        }
+        Ok(())
+    }
+
+    pub fn process_glyphs(&self, glyphs: tiny_sdk::GlyphInstances) -> tiny_sdk::GlyphInstances {
+        let mut result = glyphs;
+        for hook in &self.glyph_hooks {
+            result = hook.process(result);
+        }
+        result
+    }
+}
+
 /// Shared winit application that handles all GPU/font boilerplate
 pub struct TinyApp<T: AppLogic> {
     // Winit/GPU infrastructure
@@ -147,6 +210,9 @@ pub struct TinyApp<T: AppLogic> {
 
     // Application-specific logic
     logic: T,
+
+    // Plugin orchestrator (will eventually move to core)
+    orchestrator: PluginOrchestrator,
 
     // Settings
     window_title: String,
@@ -161,7 +227,7 @@ pub struct TinyApp<T: AppLogic> {
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
 
     // Track modifier keys
-    modifiers: winit::event::Modifiers,
+    modifiers: input_types::Modifiers,
 
     // Track mouse drag
     mouse_pressed: bool,
@@ -221,13 +287,14 @@ impl<T: AppLogic> TinyApp<T> {
             _shader_watcher: None,
             shader_reload_pending: Arc::new(AtomicBool::new(false)),
             logic,
+            orchestrator: PluginOrchestrator::new(),
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             font_size: 14.0,
             scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
             cursor_position: None,
-            modifiers: winit::event::Modifiers::default(),
+            modifiers: input_types::Modifiers::default(),
             mouse_pressed: false,
             drag_start: None,
             just_pressed_key: false,
@@ -304,16 +371,27 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             }
 
             // Setup GPU renderer
-            let mut gpu_renderer = unsafe { pollster::block_on(GpuRenderer::new(window.clone())) };
+            let mut gpu_renderer = {
+                let window_clone = window.clone();
+                let inner_size = window_clone.inner_size();
+                let size = tiny_sdk::PhysicalSize {
+                    width: inner_size.width,
+                    height: inner_size.height,
+                };
+                unsafe { pollster::block_on(GpuRenderer::new(window_clone, size)) }
+            };
 
             // Initialize theme for syntax highlighting
             // Option 1: Single theme
             // let theme = crate::theme::Themes::one_dark();
-            // gpu_renderer.init_themed_pipeline(&theme);
+            // gpu_renderer.init_themed_pipeline(&theme.generate_texture_data(), theme.max_colors_per_token.max(1) as u32);
 
             // Option 2: Rainbow theme with multi-color tokens
             let theme = crate::theme::Themes::one_dark(); // Load One Dark for shine effect
-            gpu_renderer.init_themed_pipeline(&theme);
+            gpu_renderer.init_themed_pipeline(
+                &theme.generate_texture_data(),
+                theme.max_colors_per_token.max(1) as u32,
+            );
 
             // Set theme mode:
             // 0 = Pastel Rainbow
@@ -326,7 +404,12 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             // Option 3: Interpolate between two themes (animated!)
             let _theme1 = crate::theme::Themes::monokai();
             let _theme2 = crate::theme::Themes::one_dark();
-            // gpu_renderer.init_themed_interpolation(&theme1, &theme2);
+            // let texture_data = crate::theme::Theme::merge_for_interpolation(theme1, theme2);
+            // let max_colors = theme1
+            //     .max_colors_per_token
+            //     .max(theme2.max_colors_per_token)
+            //     .max(1) as u32;
+            // gpu_renderer.init_themed_interpolation(texture_data, max_colors);
 
             // Register any custom shaders from the app logic
             for (shader_id, shader_source, uniform_size) in self.logic.register_shaders() {
@@ -350,7 +433,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             let mut cpu_renderer = Renderer::new(self.window_size, scale_factor);
             cpu_renderer.set_font_size(self.font_size);
             cpu_renderer.set_font_system(font_system.clone());
-            // Font size is now managed by viewport metrics (defaults to 14.0)
 
             // Store everything
             self.window = Some(window);
@@ -412,8 +494,10 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     if let Some(cpu_renderer) = &mut self.cpu_renderer {
                         // Extract viewport to avoid borrow conflicts
                         let viewport = cpu_renderer.viewport.clone();
+                        // Convert winit event to our types
+                        let key_event: input_types::KeyEvent = (&event).into();
                         let should_redraw = self.logic.on_key_with_renderer(
-                            &event,
+                            &key_event,
                             &viewport,
                             &self.modifiers,
                             Some(cpu_renderer),
@@ -427,7 +511,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
-                self.modifiers = new_modifiers;
+                // Convert winit modifiers to our types
+                self.modifiers = (&new_modifiers).into();
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -462,9 +547,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             WindowEvent::MouseInput {
                 state,
-                button: winit::event::MouseButton::Left,
+                button,
                 ..
-            } => match state {
+            } if button == winit::event::MouseButton::Left => match state {
                 ElementState::Pressed => {
                     if let Some(position) = self.cursor_position {
                         self.mouse_pressed = true;
@@ -555,7 +640,10 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             WindowEvent::Resized(new_size) => {
                 if let Some(gpu_renderer) = &mut self.gpu_renderer {
-                    gpu_renderer.resize(new_size);
+                    gpu_renderer.resize(tiny_sdk::PhysicalSize {
+                        width: new_size.width,
+                        height: new_size.height,
+                    });
                 }
                 // Render immediately to prevent stretching during resize
                 self.render_frame();
@@ -658,6 +746,11 @@ impl<T: AppLogic> TinyApp<T> {
         let dt = self.update_frame_timing();
         self.logic.on_update();
 
+        // Update plugins through orchestrator
+        if let Err(e) = self.orchestrator.update_all(dt) {
+            eprintln!("Plugin update error: {}", e);
+        }
+
         // Setup continuous rendering
         if let Some(window) = &self.window {
             if self.continuous_rendering {
@@ -729,8 +822,35 @@ impl<T: AppLogic> TinyApp<T> {
 
             let doc = self.logic.doc();
             let selections = self.logic.selections();
+
+            // Prepare uniforms for GPU rendering
+            let uniforms = Uniforms {
+                viewport_size: [
+                    cpu_renderer.viewport.physical_size.width as f32,
+                    cpu_renderer.viewport.physical_size.height as f32,
+                ],
+                scale_factor: cpu_renderer.viewport.scale_factor,
+                time: gpu_renderer.current_time,
+                theme_mode: gpu_renderer.current_theme_mode,
+                _padding: [0.0, 0.0, 0.0],
+            };
+
+            // Set up CPU renderer state
+            cpu_renderer.set_gpu_renderer(gpu_renderer);
+            let doc_read = doc.read();
+            cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
+            cpu_renderer.cached_doc_version = doc_read.version;
+
+            // Render using the callback API
             unsafe {
-                gpu_renderer.render_with_widgets(&doc.read(), viewport, selections, cpu_renderer);
+                gpu_renderer.render_with_callback(uniforms, |render_pass| {
+                    cpu_renderer.render_with_pass(
+                        &doc_read,
+                        viewport,
+                        selections,
+                        Some(render_pass),
+                    );
+                });
             }
         }
     }
@@ -882,7 +1002,7 @@ impl EditorLogic {
         {
             syntax_hl.request_update_with_edit(&text, doc.version(), None);
         } else {
-            syntax_highlighter.request_update(&text, doc.version());
+            panic!("Syntax highlighter could not be used to update")
         }
 
         let mut input = InputHandler::new();
@@ -951,9 +1071,9 @@ impl AppLogic for EditorLogic {
 
     fn on_key_with_renderer(
         &mut self,
-        event: &winit::event::KeyEvent,
+        event: &input_types::KeyEvent,
         viewport: &crate::coordinates::Viewport,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &input_types::Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> bool {
         let action = self
@@ -964,9 +1084,9 @@ impl AppLogic for EditorLogic {
 
     fn on_key(
         &mut self,
-        event: &winit::event::KeyEvent,
+        event: &input_types::KeyEvent,
         viewport: &crate::coordinates::Viewport,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &input_types::Modifiers,
     ) -> bool {
         let action = self.input.on_key(&self.doc, viewport, event, modifiers);
         self.handle_input_action(action)
@@ -976,7 +1096,7 @@ impl AppLogic for EditorLogic {
         &mut self,
         pos: Point,
         viewport: &crate::coordinates::Viewport,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &input_types::Modifiers,
     ) -> bool {
         // Convert to mouse click for InputHandler
         let alt_held = modifiers.state().alt_key();
@@ -984,7 +1104,7 @@ impl AppLogic for EditorLogic {
             &self.doc,
             viewport,
             pos,
-            winit::event::MouseButton::Left,
+            input_types::MouseButton::Left,
             alt_held,
         );
         self.widgets_dirty = true; // Mark widgets for update
@@ -996,7 +1116,7 @@ impl AppLogic for EditorLogic {
         from: Point,
         to: Point,
         viewport: &crate::coordinates::Viewport,
-        modifiers: &winit::event::Modifiers,
+        modifiers: &input_types::Modifiers,
     ) -> bool {
         // Convert to mouse drag for InputHandler
         let alt_held = modifiers.state().alt_key();
@@ -1023,13 +1143,6 @@ impl AppLogic for EditorLogic {
             .unwrap_or(0)
     }
 
-    fn set_cursor_pos(&mut self, _pos: usize) {
-        // InputHandler doesn't expose a way to set cursor position directly
-        // This would need to be added to InputHandler if needed
-        // For now, just clear extra selections
-        self.input.clear_selections();
-    }
-
     fn get_cursor_doc_pos(&self) -> Option<DocPos> {
         Some(self.input.primary_cursor_doc_pos(&self.doc))
     }
@@ -1049,37 +1162,4 @@ impl AppLogic for EditorLogic {
             self.input.flush_syntax_updates(&self.doc);
         }
     }
-}
-
-#[allow(dead_code)]
-fn print_editor_info(doc: &Doc) {
-    println!("\n=== Editor Info ===");
-    let tree = doc.read();
-    println!("Document tree version: {}", tree.version);
-    println!("Document size: {} bytes", tree.flatten_to_string().len());
-    println!("Line count: {}", tree.flatten_to_string().lines().count());
-}
-
-/// Helper to run a simple app with just document rendering
-pub fn run_simple_app(title: &str, doc: Doc) -> Result<(), Box<dyn std::error::Error>> {
-    struct SimpleApp {
-        doc: Doc,
-    }
-
-    impl AppLogic for SimpleApp {
-        fn on_key(
-            &mut self,
-            _event: &winit::event::KeyEvent,
-            _viewport: &crate::coordinates::Viewport,
-            _modifiers: &winit::event::Modifiers,
-        ) -> bool {
-            false // No key handling
-        }
-
-        fn doc(&self) -> &Doc {
-            &self.doc
-        }
-    }
-
-    TinyApp::new(SimpleApp { doc }).with_title(title).run()
 }

@@ -1,0 +1,34 @@
+# Cursor Plugin Configuration
+
+[metadata]
+name = "cursor"
+version = "0.1.0"
+author = "Tiny Editor Team"
+description = "Blinking text cursor with customizable appearance"
+
+[capabilities]
+# This plugin needs frame updates for blinking animation
+update = true
+# This plugin renders visual content
+paint = true
+
+[dependencies]
+# No dependencies on other plugins for now
+
+[config]
+# Blinking configuration
+blink_enabled = true
+blink_rate = 2.0  # Blinks per second
+solid_duration_ms = 500  # How long cursor stays solid after activity
+
+# Appearance
+width = 2.0
+color = 0xFFFFFFFF  # White cursor by default
+height_scale = 1.0  # Multiplier for line height
+
+# Position adjustment
+x_offset = -2.0  # Pixels to shift left for better alignment
+
+[exports]
+# Entry point function name in the compiled library
+entry_point = "cursor_plugin_create"

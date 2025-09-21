@@ -11,6 +11,11 @@
 
 use std::sync::Arc;
 
+use tiny_core::DocTree;
+use tiny_sdk::{
+    DocPos, LayoutPos, LayoutRect, LogicalSize, PhysicalPos, PhysicalSize, ViewPos, ViewRect,
+};
+
 // === Scrolloff Configuration (Neovim-style) ===
 /// Number of lines to keep visible above/below cursor when scrolling vertically
 const VERTICAL_SCROLLOFF_LINES: f32 = 4.0;
@@ -58,235 +63,6 @@ pub enum VisibleLineContent {
         /// The visual lines after wrapping
         visual_lines: Vec<String>,
     },
-}
-
-// === Document Space ===
-
-/// Position in document (text/editing operations)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct DocPos {
-    /// Byte offset in the document
-    pub byte_offset: usize,
-    /// Line number (0-indexed)
-    pub line: u32,
-    /// Visual column (0-indexed, accounts for tabs)
-    pub column: u32,
-}
-
-// === Logical Pixels (used by Layout and View spaces) ===
-
-/// Logical pixels - DPI-independent unit
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
-pub struct LogicalPixels(pub f32);
-
-impl LogicalPixels {
-    pub fn to_physical(self, scale_factor: f32) -> PhysicalPixels {
-        PhysicalPixels(self.0 * scale_factor)
-    }
-}
-
-impl std::ops::Add for LogicalPixels {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        LogicalPixels(self.0 + rhs.0)
-    }
-}
-
-impl std::ops::Add<f32> for LogicalPixels {
-    type Output = Self;
-    fn add(self, rhs: f32) -> Self {
-        LogicalPixels(self.0 + rhs)
-    }
-}
-
-impl std::ops::Sub for LogicalPixels {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        LogicalPixels(self.0 - rhs.0)
-    }
-}
-
-impl std::ops::Sub<f32> for LogicalPixels {
-    type Output = Self;
-    fn sub(self, rhs: f32) -> Self {
-        LogicalPixels(self.0 - rhs)
-    }
-}
-
-impl std::ops::Mul<f32> for LogicalPixels {
-    type Output = Self;
-    fn mul(self, rhs: f32) -> Self {
-        LogicalPixels(self.0 * rhs)
-    }
-}
-
-impl std::ops::Div<f32> for LogicalPixels {
-    type Output = f32;
-    fn div(self, rhs: f32) -> f32 {
-        self.0 / rhs
-    }
-}
-
-impl std::fmt::Display for LogicalPixels {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// Logical size in DPI-independent pixels
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct LogicalSize {
-    pub width: LogicalPixels,
-    pub height: LogicalPixels,
-}
-
-impl LogicalSize {
-    pub fn new(width: f32, height: f32) -> Self {
-        Self {
-            width: LogicalPixels(width),
-            height: LogicalPixels(height),
-        }
-    }
-}
-
-// === Layout Space (pre-scroll) ===
-
-/// Position in layout space - where things are before scrolling
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct LayoutPos {
-    pub x: LogicalPixels,
-    pub y: LogicalPixels,
-}
-
-impl LayoutPos {
-    pub fn new(x: f32, y: f32) -> Self {
-        Self {
-            x: LogicalPixels(x),
-            y: LogicalPixels(y),
-        }
-    }
-}
-
-/// Size in layout space
-pub type LayoutSize = LogicalSize;
-
-/// Rectangle in layout space
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct LayoutRect {
-    pub x: LogicalPixels,
-    pub y: LogicalPixels,
-    pub width: LogicalPixels,
-    pub height: LogicalPixels,
-}
-
-impl LayoutRect {
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self {
-            x: LogicalPixels(x),
-            y: LogicalPixels(y),
-            width: LogicalPixels(width),
-            height: LogicalPixels(height),
-        }
-    }
-
-    pub fn contains(&self, pt: LayoutPos) -> bool {
-        pt.x.0 >= self.x.0
-            && pt.x.0 <= self.x.0 + self.width.0
-            && pt.y.0 >= self.y.0
-            && pt.y.0 <= self.y.0 + self.height.0
-    }
-}
-
-// === View Space (post-scroll) ===
-
-/// Position in view space - layout minus scroll offset
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ViewPos {
-    pub x: LogicalPixels,
-    pub y: LogicalPixels,
-}
-
-impl ViewPos {
-    pub fn new(x: f32, y: f32) -> Self {
-        Self {
-            x: LogicalPixels(x),
-            y: LogicalPixels(y),
-        }
-    }
-}
-
-/// Size in view space (same as layout size)
-pub type ViewSize = LogicalSize;
-
-/// Rectangle in view space
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ViewRect {
-    pub x: LogicalPixels,
-    pub y: LogicalPixels,
-    pub width: LogicalPixels,
-    pub height: LogicalPixels,
-}
-
-impl ViewRect {
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self {
-            x: LogicalPixels(x),
-            y: LogicalPixels(y),
-            width: LogicalPixels(width),
-            height: LogicalPixels(height),
-        }
-    }
-}
-
-// === Physical Space (device pixels) ===
-
-/// Physical pixels - actual device pixels
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct PhysicalPixels(pub f32);
-
-impl PhysicalPixels {
-    pub fn to_logical(self, scale_factor: f32) -> LogicalPixels {
-        LogicalPixels(self.0 / scale_factor)
-    }
-}
-
-/// Position in physical pixels
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct PhysicalPos {
-    pub x: PhysicalPixels,
-    pub y: PhysicalPixels,
-}
-
-impl PhysicalPos {
-    pub fn new(x: f32, y: f32) -> Self {
-        Self {
-            x: PhysicalPixels(x),
-            y: PhysicalPixels(y),
-        }
-    }
-}
-
-/// Size in physical pixels (keeping u32 for GPU compatibility)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PhysicalSize {
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Size in physical pixels (float version for calculations)
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct PhysicalSizeF {
-    pub width: PhysicalPixels,
-    pub height: PhysicalPixels,
-}
-
-impl PhysicalSizeF {
-    pub fn new(width: f32, height: f32) -> Self {
-        Self {
-            width: PhysicalPixels(width),
-            height: PhysicalPixels(height),
-        }
-    }
 }
 
 // === Text Metrics (single source of truth) ===
@@ -534,7 +310,7 @@ impl Viewport {
     }
 
     /// Layout position to document position using font system's binary search hit testing
-    pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &crate::tree::Tree) -> DocPos {
+    pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &DocTree) -> DocPos {
         // Subtract margin to get document position
         let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
         let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
@@ -664,7 +440,7 @@ impl Viewport {
     }
 
     /// Get visible byte range using tree navigation (to be called with tree reference)
-    pub fn visible_byte_range_with_tree(&self, tree: &crate::tree::Tree) -> std::ops::Range<usize> {
+    pub fn visible_byte_range_with_tree(&self, tree: &DocTree) -> std::ops::Range<usize> {
         let total_lines = tree.line_count();
         let lines = self.visible_lines_with_margin(2); // 2 lines margin
 
@@ -694,7 +470,7 @@ impl Viewport {
     }
 
     /// Get document bounds with caching
-    pub fn get_document_bounds(&mut self, tree: &crate::tree::Tree) -> (f32, f32) {
+    pub fn get_document_bounds(&mut self, tree: &DocTree) -> (f32, f32) {
         // First, find the line with the most characters (just counting)
         let mut longest_line_chars = 0;
         let mut longest_line_text = "".to_string();
@@ -755,7 +531,7 @@ impl Viewport {
     }
 
     /// Clamp scroll position to document bounds
-    pub fn clamp_scroll_to_bounds(&mut self, tree: &crate::tree::Tree) {
+    pub fn clamp_scroll_to_bounds(&mut self, tree: &DocTree) {
         // Invalidate cache if it might be stale (temporary fix)
         self.cached_doc_bounds = None;
 
@@ -982,14 +758,5 @@ impl Viewport {
             }
         }
         byte_pos
-    }
-}
-
-impl ViewRect {
-    pub fn contains(&self, pos: ViewPos) -> bool {
-        pos.x >= self.x
-            && pos.x <= self.x + self.width
-            && pos.y >= self.y
-            && pos.y <= self.y + self.height
     }
 }

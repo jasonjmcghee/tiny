@@ -2,10 +2,10 @@
 //!
 //! Load and save documents
 
-use crate::tree::Doc;
 use std::fs;
 use std::io;
 use std::path::Path;
+use tiny_core::tree::Doc;
 
 /// Load document from file
 pub fn load(path: &Path) -> io::Result<Doc> {

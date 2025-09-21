@@ -2,9 +2,17 @@
 //!
 //! Text rendering uses the consolidated FontSystem from font.rs
 
-use crate::coordinates::{LayoutPos, LayoutRect, LogicalPixels, LogicalSize, Viewport};
+use crate::coordinates::Viewport;
+use crate::input_types::{KeyEvent, Modifiers, MouseButton};
 use ahash::HashMap;
 use std::sync::Arc;
+use tiny_core::{
+    gpu::{create_rect_vertices, RectVertex},
+    GpuRenderer,
+};
+use tiny_sdk::types::{
+    LayoutPos, LayoutRect, LogicalPixels, LogicalSize, RectInstance, ViewPos, ViewRect,
+};
 
 /// Widget identifier for texture access
 pub type WidgetId = u64;
@@ -15,8 +23,8 @@ pub enum WidgetEvent {
     MouseMove(LayoutPos),
     MouseEnter,
     MouseLeave,
-    MouseClick(LayoutPos, winit::event::MouseButton),
-    KeyboardInput(winit::event::KeyEvent, winit::event::Modifiers),
+    MouseClick(LayoutPos, MouseButton),
+    KeyboardInput(KeyEvent, Modifiers),
 }
 
 /// Event response from widgets
@@ -51,7 +59,7 @@ pub struct PaintContext<'a> {
     /// Uniform bind group for viewport uniforms
     pub uniform_bind_group: &'a wgpu::BindGroup,
     /// GPU renderer for access to pipelines and resources (raw pointer for flexibility)
-    gpu_renderer: *mut crate::gpu::GpuRenderer,
+    gpu_renderer: *mut GpuRenderer,
     /// Font system for text layout and rasterization
     pub font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
     /// Text style provider for syntax highlighting (optional)
@@ -65,7 +73,7 @@ impl<'a> PaintContext<'a> {
         device: std::sync::Arc<wgpu::Device>,
         queue: std::sync::Arc<wgpu::Queue>,
         uniform_bind_group: &'a wgpu::BindGroup,
-        gpu_renderer: *mut crate::gpu::GpuRenderer,
+        gpu_renderer: *mut GpuRenderer,
         font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
         text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
     ) -> Self {
@@ -81,12 +89,12 @@ impl<'a> PaintContext<'a> {
     }
 
     /// Get immutable reference to GPU renderer (safe wrapper around raw pointer)
-    pub fn gpu(&self) -> &crate::gpu::GpuRenderer {
+    pub fn gpu(&self) -> &GpuRenderer {
         unsafe { &*self.gpu_renderer }
     }
 
     /// Get mutable reference to GPU renderer (safe wrapper around raw pointer)
-    pub fn gpu_mut(&self) -> &mut crate::gpu::GpuRenderer {
+    pub fn gpu_mut(&self) -> &mut GpuRenderer {
         unsafe { &mut *self.gpu_renderer }
     }
 }
@@ -275,7 +283,7 @@ impl Widget for TextWidget {
 
         // Text should include margin positioning to match cursor/selection
         // Add margin to align with cursor/selection coordinate system
-        let layout_pos = crate::coordinates::LayoutPos::new(
+        let layout_pos = LayoutPos::new(
             ctx.viewport.margin.x.0 + x_base_offset,
             ctx.viewport.margin.y.0,
         );
@@ -307,7 +315,7 @@ impl Widget for TextWidget {
         // Transform all glyphs from layout to physical coordinates for GPU
         for glyph in &mut all_glyph_instances {
             let physical_pos = ctx.viewport.layout_to_physical(glyph.pos);
-            glyph.pos = crate::coordinates::LayoutPos::new(physical_pos.x.0, physical_pos.y.0);
+            glyph.pos = LayoutPos::new(physical_pos.x.0, physical_pos.y.0);
         }
 
         // Check for shader effects in text styles and render with appropriate pipeline
@@ -445,10 +453,10 @@ impl Widget for CursorWidget {
         let view_pos = ctx.viewport.layout_to_view(self.position);
 
         // Apply 2px left shift for better alignment
-        let adjusted_view_pos = crate::coordinates::ViewPos::new(view_pos.x.0 - 2.0, view_pos.y.0);
+        let adjusted_view_pos = ViewPos::new(view_pos.x.0 - 2.0, view_pos.y.0);
 
         // Create view-space rectangle for GPU rendering
-        let view_rect = crate::coordinates::ViewRect::new(
+        let view_rect = ViewRect::new(
             adjusted_view_pos.x.0,
             adjusted_view_pos.y.0,
             self.style.width,
@@ -456,8 +464,8 @@ impl Widget for CursorWidget {
         );
 
         // Convert to render rect format
-        let rect_instance = crate::render::RectInstance {
-            rect: crate::coordinates::LayoutRect::new(
+        let rect_instance = RectInstance {
+            rect: LayoutRect::new(
                 view_rect.x.0,
                 view_rect.y.0,
                 view_rect.width.0,
@@ -468,7 +476,7 @@ impl Widget for CursorWidget {
 
         // Create our own vertex buffer to avoid conflicts with shared buffer
         let scale = ctx.viewport.scale_factor;
-        let vertices = crate::gpu::create_rect_vertices(
+        let vertices = create_rect_vertices(
             rect_instance.rect.x.0 * scale,
             rect_instance.rect.y.0 * scale,
             rect_instance.rect.width.0 * scale,
@@ -479,7 +487,7 @@ impl Widget for CursorWidget {
         // Create temporary buffer for this cursor
         let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Cursor Vertex Buffer"),
-            size: vertices.len() as u64 * std::mem::size_of::<crate::gpu::RectVertex>() as u64,
+            size: vertices.len() as u64 * std::mem::size_of::<RectVertex>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -547,7 +555,7 @@ impl Widget for SelectionWidget {
 
     fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
         // Transform all selection rectangles from layout space to view space
-        let rect_instances: Vec<crate::render::RectInstance> = self
+        let rect_instances: Vec<RectInstance> = self
             .rectangles
             .iter()
             .map(|rect| {
@@ -555,8 +563,8 @@ impl Widget for SelectionWidget {
                 let view_rect = ctx.viewport.layout_rect_to_view(*rect);
 
                 // Convert ViewRect back to LayoutRect format for RectInstance
-                crate::render::RectInstance {
-                    rect: crate::coordinates::LayoutRect::new(
+                RectInstance {
+                    rect: LayoutRect::new(
                         view_rect.x.0,
                         view_rect.y.0,
                         view_rect.width.0,
@@ -573,7 +581,7 @@ impl Widget for SelectionWidget {
             let mut vertices = Vec::with_capacity(rect_instances.len() * 6);
 
             for rect in &rect_instances {
-                let rect_verts = crate::gpu::create_rect_vertices(
+                let rect_verts = create_rect_vertices(
                     rect.rect.x.0 * scale,
                     rect.rect.y.0 * scale,
                     rect.rect.width.0 * scale,
@@ -586,7 +594,7 @@ impl Widget for SelectionWidget {
             // Create temporary buffer
             let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Selection Vertex Buffer"),
-                size: vertices.len() as u64 * std::mem::size_of::<crate::gpu::RectVertex>() as u64,
+                size: vertices.len() as u64 * std::mem::size_of::<RectVertex>() as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });

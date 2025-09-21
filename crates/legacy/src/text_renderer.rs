@@ -4,10 +4,10 @@
 //! Style buffer: token IDs (changes on syntax updates)
 //! Palette: token → color mapping (instant theme switching)
 
-use crate::coordinates::{LayoutPos, PhysicalPos};
-use crate::tree::Tree;
 use ahash::HashMap;
 use std::ops::Range;
+use tiny_core::{tree, DocTree as Tree};
+use tiny_sdk::{LayoutPos, PhysicalPos};
 
 /// Unified glyph with position and style data
 #[derive(Clone, Debug)]
@@ -338,24 +338,24 @@ impl TextRenderer {
     }
 
     /// Handle incremental syntax update (while tree-sitter is parsing)
-    pub fn apply_incremental_edit(&mut self, edit: &crate::tree::Edit) {
+    pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
         // Calculate the affected range for this edit
         let edit_range = match edit {
-            crate::tree::Edit::Insert { pos, content } => {
+            tree::Edit::Insert { pos, content } => {
                 let len = match content {
-                    crate::tree::Content::Text(text) => text.len(),
-                    crate::tree::Content::Widget(_) => 0,
+                    tree::Content::Text(text) => text.len(),
+                    tree::Content::Spatial(_) => 0,
                 };
                 *pos..*pos + len
             }
-            crate::tree::Edit::Delete { range } => {
+            tree::Edit::Delete { range } => {
                 // After deletion, the range collapses to the start position
                 range.start..range.start
             }
-            crate::tree::Edit::Replace { range, content } => {
+            tree::Edit::Replace { range, content } => {
                 let len = match content {
-                    crate::tree::Content::Text(text) => text.len(),
-                    crate::tree::Content::Widget(_) => 0,
+                    tree::Content::Text(text) => text.len(),
+                    tree::Content::Spatial(_) => 0,
                 };
                 range.start..range.start + len
             }

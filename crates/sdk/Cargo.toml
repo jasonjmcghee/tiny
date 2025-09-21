@@ -1,0 +1,11 @@
+[package]
+name = "tiny-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Minimal dependencies - SDK should be lightweight
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+ahash = { workspace = true }

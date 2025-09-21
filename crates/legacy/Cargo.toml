@@ -1,0 +1,85 @@
+[package]
+name = "tiny-editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tiny-editor"
+path = "src/main.rs"
+
+[dependencies]
+# Minimal dependencies - SDK should be lightweight
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+ahash = { workspace = true }
+
+# Plugin SDK
+tiny-sdk = { path = "../sdk" }
+tiny-core = { path = "../core" }
+tiny-tree = { path = "../tree" }
+
+winit = { version = "0.30", optional = true }
+
+# Text rendering
+fontdue = "0.9"
+swash = "0.2.5"
+
+# Core data structures
+parking_lot = "0.12"
+lazy_static = "1.4"  # For global statics
+arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
+
+# Syntax highlighting
+tree-sitter = { version = "0.25", features = ["wasm"] }
+tree-sitter-rust = "0.24"
+
+# LSP support
+tower-lsp = "0.20"  # LSP server framework
+lsp-types = "0.97"
+
+# System integration
+arboard = "3.4"  # Clipboard support
+pollster = "0.3"  # Async executor for main
+notify = "6"  # File watching for shader hot-reload
+
+# Async runtime for LSP
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mimalloc = "0.1.48"
+
+[features]
+default = ["winit"]
+test-support = []
+winit = ["dep:winit"]
+
+[dev-dependencies]
+criterion = "0.7"  # Benchmarking
+pollster = "0.3"   # Async executor for examples
+
+[[bench]]
+name = "tree_bench"
+harness = false
+
+[[example]]
+name = "minimal_typing"
+path = "examples/minimal_typing.rs"
+
+[[example]]
+name = "debug_font"
+path = "examples/debug_font.rs"
+
+[[example]]
+name = "debug_gpu"
+path = "examples/debug_gpu.rs"
+
+[[example]]
+name = "debug_coordinates"
+path = "examples/debug_coordinates.rs"
+
+[[example]]
+name = "single_char"
+path = "examples/single_char.rs"
+
+[[example]]
+name = "rect_test"
+path = "examples/rect_test.rs"

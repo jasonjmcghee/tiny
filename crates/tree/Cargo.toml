@@ -1,0 +1,16 @@
+[package]
+name = "tiny-tree"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+# SDK for plugin traits
+tiny-sdk = { path = "../sdk" }
+
+# Core dependencies
+arc-swap = "1.7"    # Lock-free Arc swapping for RCU pattern
+crossbeam = "0.8"   # Lock-free data structures (SeqQueue)
+memchr = "2.7"      # SIMD-optimized byte searching (uses NEON on ARM)
+simdutf8 = "0.1.5"  # SIMD-UTF8
+bytecount = "0.6.9" # SIMD byte counting (Faster than others)

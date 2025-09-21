@@ -28,25 +28,6 @@ impl TextStyleProvider for MockProvider {
 }
 
 #[test]
-fn test_registry_collects_effects() {
-    let mut registry = StyleRegistry::new();
-
-    let provider = MockProvider {
-        effects: vec![TextEffect {
-            range: 0..10,
-            effect: EffectType::Token(1), // Token ID 1
-            priority: priority::SYNTAX,
-        }],
-    };
-
-    registry.add_provider(Box::new(provider));
-    let effects = registry.get_effects_in_range(5..15);
-
-    assert_eq!(effects.len(), 1);
-    assert_eq!(effects[0].range, 0..10);
-}
-
-#[test]
 fn test_range_filtering() {
     let provider = MockProvider {
         effects: vec![

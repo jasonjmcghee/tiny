@@ -814,7 +814,7 @@ impl TextStyleProvider for SyntaxHighlighter {
 }
 
 /// Convert byte position to tree-sitter Point using efficient tree navigation
-fn byte_to_point(tree: &crate::tree::Tree, byte_pos: usize) -> Point {
+fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
     let line = tree.byte_to_line(byte_pos);
     let line_start = tree.line_to_byte(line).unwrap_or(0);
     let byte_in_line = byte_pos - line_start;
@@ -858,14 +858,14 @@ fn calc_new_point(start: Point, text: &str) -> Point {
 }
 
 /// Create TextEdit from document edit information using tree navigation
-pub fn create_text_edit(tree: &crate::tree::Tree, edit: &crate::tree::Edit) -> TextEdit {
-    use crate::tree::{Content, Edit};
+pub fn create_text_edit(tree: &tiny_core::tree::Tree, edit: &tiny_core::tree::Edit) -> TextEdit {
+    use tiny_core::tree::{Content, Edit};
 
     let (start_byte, old_end_byte, new_end_byte, content_text) = match edit {
         Edit::Insert { pos, content } => {
             let text = match content {
                 Content::Text(s) => s.as_str(),
-                Content::Widget(_) => "",
+                Content::Spatial(_) => "",
             };
             (*pos, *pos, *pos + text.len(), text)
         }
@@ -873,7 +873,7 @@ pub fn create_text_edit(tree: &crate::tree::Tree, edit: &crate::tree::Edit) -> T
         Edit::Replace { range, content } => {
             let text = match content {
                 Content::Text(s) => s.as_str(),
-                Content::Widget(_) => "",
+                Content::Spatial(_) => "",
             };
             (range.start, range.end, range.start + text.len(), text)
         }

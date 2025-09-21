@@ -2,7 +2,9 @@
 //!
 //! Provides a reusable history stack for any cloneable type
 
-use crate::coordinates::DocPos;
+use tiny_core::DocTree;
+use tiny_sdk::DocPos;
+
 use crate::input::Selection;
 use std::sync::Arc;
 
@@ -91,7 +93,7 @@ impl<T> History<T> {
 #[derive(Clone)]
 pub struct DocumentSnapshot {
     /// Document tree at this point in time
-    pub tree: Arc<crate::tree::Tree>,
+    pub tree: Arc<DocTree>,
     /// All selections/cursors at this point in time
     pub selections: Vec<Selection>,
 }
@@ -100,7 +102,7 @@ pub struct DocumentSnapshot {
 pub type DocumentHistory = History<DocumentSnapshot>;
 
 /// Type alias for tree history (document content only)
-pub type TreeHistory = History<Arc<crate::tree::Tree>>;
+pub type TreeHistory = History<Arc<DocTree>>;
 
 /// Type alias for cursor navigation history (Cmd+[/])
 pub type SelectionHistory = History<DocPos>;

@@ -86,59 +86,6 @@ pub enum UnderlineStyle {
     Double,
 }
 
-// === Style Registry ===
-
-/// Manages multiple text style providers and resolves conflicts
-pub struct StyleRegistry {
-    providers: Vec<Box<dyn TextStyleProvider>>,
-}
-
-impl StyleRegistry {
-    /// Create empty registry
-    pub fn new() -> Self {
-        Self {
-            providers: Vec::new(),
-        }
-    }
-
-    /// Add a style provider
-    pub fn add_provider(&mut self, provider: Box<dyn TextStyleProvider>) {
-        self.providers.push(provider);
-    }
-
-    /// Get all effects for a range, with conflict resolution
-    pub fn get_effects_in_range(&self, range: Range<usize>) -> Vec<TextEffect> {
-        let mut all_effects = Vec::new();
-
-        // Collect effects from all providers
-        for provider in &self.providers {
-            all_effects.extend(provider.get_effects_in_range(range.clone()));
-        }
-
-        // Sort by priority (higher priority wins conflicts)
-        all_effects.sort_by_key(|e| e.priority);
-
-        // TODO: Resolve overlapping effects based on priority
-        // For now, just return all effects
-        all_effects
-    }
-
-    /// Request update from all providers
-    pub fn request_update(&self, text: &str, version: u64) {
-        for provider in &self.providers {
-            provider.request_update(text, version);
-        }
-    }
-
-    /// Get provider by name (for debugging)
-    pub fn get_provider(&self, name: &str) -> Option<&dyn TextStyleProvider> {
-        self.providers
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.as_ref())
-    }
-}
-
 // === Built-in Priority Constants ===
 
 pub mod priority {
@@ -165,11 +112,5 @@ impl Default for TextTransform {
             offset_x: 0.0,
             offset_y: 0.0,
         }
-    }
-}
-
-impl Default for StyleRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }

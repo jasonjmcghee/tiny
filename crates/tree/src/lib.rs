@@ -1,14 +1,14 @@
 //! Unified document tree with iterative operations and lock-free reads
 
-use crate::coordinates::{DocPos, LayoutPos, LayoutRect, LogicalPixels};
-use crate::widget::Widget;
 use arc_swap::ArcSwap;
+use bytecount::count as bytecount_count;
 use crossbeam::queue::SegQueue;
 use memchr::{memchr, memrchr};
 use simdutf8::basic::from_utf8;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tiny_sdk::{DocPos, LayoutPos, LayoutRect, LogicalPixels, Spatial};
 
 /// Maximum spans per leaf node (tuned for cache line)
 const MAX_SPANS: usize = 16;
@@ -90,13 +90,13 @@ impl Node {
     }
 }
 
-/// Content spans - text or widgets
+/// Content spans - text or Spatials
 #[derive(Clone)]
 pub enum Span {
     /// Raw UTF-8 text bytes with cached line count
     Text { bytes: Arc<[u8]>, lines: u32 },
-    /// Any visual widget
-    Widget(Arc<dyn Widget>),
+    /// Any visual Spatial
+    Spatial(Arc<dyn Spatial>),
 }
 
 /// Aggregated metadata for O(log n) queries
@@ -128,14 +128,14 @@ pub enum Edit {
 #[derive(Clone)]
 pub enum Content {
     Text(String),
-    Widget(Arc<dyn Widget>),
+    Spatial(Arc<dyn Spatial>),
 }
 
 impl std::fmt::Debug for Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Content::Text(s) => write!(f, "Text({:?})", s),
-            Content::Widget(_) => write!(f, "Widget(...)"),
+            Content::Spatial(_) => write!(f, "Spatial(...)"),
         }
     }
 }
@@ -259,7 +259,7 @@ impl Tree {
             }
 
             let chunk = &bytes[pos..e];
-            let lines = bytecount::count(chunk, b'\n') as u32;
+            let lines = bytecount_count(chunk, b'\n') as u32;
             current_leaf_spans.push(Span::Text {
                 bytes: Arc::from(chunk),
                 lines,
@@ -381,7 +381,7 @@ impl Tree {
                     lines: bytecount::count(bytes, b'\n') as u32,
                 }
             }
-            Content::Widget(w) => Span::Widget(w.clone()),
+            Content::Spatial(w) => Span::Spatial(w.clone()),
         }
     }
 
@@ -1202,14 +1202,14 @@ impl<'a> TreeCursor<'a> {
 fn span_bytes(span: &Span) -> usize {
     match span {
         Span::Text { bytes, .. } => bytes.len(),
-        Span::Widget(_) => 0,
+        Span::Spatial(_) => 0,
     }
 }
 
 fn span_lines(span: &Span) -> u32 {
     match span {
         Span::Text { lines, .. } => *lines,
-        Span::Widget(_) => 0,
+        Span::Spatial(_) => 0,
     }
 }
 
@@ -1223,9 +1223,9 @@ fn node_metrics(node: &Node) -> (usize, u32) {
 fn count_lines_to(span: &Span, byte_offset: usize) -> u32 {
     match span {
         Span::Text { bytes, .. } => {
-            bytecount::count(&bytes[..byte_offset.min(bytes.len())], b'\n') as u32
+            bytecount_count(&bytes[..byte_offset.min(bytes.len())], b'\n') as u32
         }
-        Span::Widget(_) => 0,
+        Span::Spatial(_) => 0,
     }
 }
 
@@ -1240,7 +1240,7 @@ fn find_in_span(span: &Span, target: u8, start: usize, forward: bool) -> Option<
                 memrchr(target, &bytes[..start])
             }
         }
-        Span::Widget(_) => None,
+        Span::Spatial(_) => None,
     }
 }
 
@@ -1253,7 +1253,7 @@ fn compute_sums(spans: &[Span]) -> Sums {
                 sums.bytes += bytes.len();
                 sums.lines += lines;
             }
-            Span::Widget(w) => {
+            Span::Spatial(w) => {
                 let size = w.measure();
                 sums.bounds.width = LogicalPixels(sums.bounds.width.0.max(size.width.0));
                 sums.bounds.height = LogicalPixels(sums.bounds.height.0 + size.height.0);

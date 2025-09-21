@@ -1,0 +1,23 @@
+[package]
+name = "tiny-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+# SDK for plugin traits
+tiny-sdk = { path = "../sdk" }
+tiny-tree = { path = "../tree" }
+
+# Core dependencies
+wgpu = { workspace = true }
+winit = { workspace = true }
+bytemuck = { workspace = true }
+ahash = "0.8"
+parking_lot = "0.12"
+pollster = "0.3"
+notify = "6"  # File watching for shader hot-reload
+
+# Plugin system
+libloading = "0.8"  # Dynamic library loading
+toml = "0.8"  # Plugin configuration parsing

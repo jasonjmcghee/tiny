@@ -2,12 +2,11 @@
 //!
 //! Combines font loading, text shaping, glyph rasterization, and atlas management
 
-use crate::coordinates::{PhysicalPos, PhysicalSizeF};
-use crate::render::GlyphInstance;
 use ahash::HashMap;
 use fontdue::layout::{CoordinateSystem, Layout, TextStyle};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tiny_sdk::{types::PhysicalSizeF, GlyphInstance, LayoutPos, PhysicalPos};
 
 /// Helper to expand tabs to spaces
 fn expand_tabs(text: &str) -> String {
@@ -489,15 +488,13 @@ impl FontSystem {
 pub fn create_glyph_instances(
     font_system: &SharedFontSystem,
     text: &str,
-    pos: crate::coordinates::LayoutPos,
+    pos: LayoutPos,
     font_size: f32,
     scale_factor: f32,
     line_height: f32,
     effects: Option<&[crate::text_effects::TextEffect]>,
     original_byte_offset: usize,
 ) -> Vec<GlyphInstance> {
-    use crate::coordinates::LayoutPos;
-
     let lines: Vec<&str> = text.lines().collect();
     let mut all_glyph_instances = Vec::new();
     let mut y_offset = 0.0;
@@ -532,7 +529,6 @@ pub fn create_glyph_instances(
             let glyph_logical_y = glyph.pos.y.0 / scale_factor;
 
             all_glyph_instances.push(GlyphInstance {
-                glyph_id: 0,
                 pos: LayoutPos::new(
                     pos.x.0 + glyph_logical_x,
                     pos.y.0 + y_offset + glyph_logical_y,
@@ -540,6 +536,7 @@ pub fn create_glyph_instances(
                 tex_coords: glyph.tex_coords,
                 token_id: found_token_id.unwrap_or(0),
                 relative_pos: 0.0,
+                shader_id: None,
             });
         }
 
