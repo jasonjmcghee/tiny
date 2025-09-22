@@ -3,7 +3,6 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
-    font::SharedFontSystem,
     input::{InputAction, InputHandler},
     input_types,
     io,
@@ -11,6 +10,7 @@ use crate::{
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
 };
+use tiny_font::SharedFontSystem;
 #[allow(unused)]
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -692,7 +692,7 @@ impl<T: AppLogic> TinyApp<T> {
         // Watch the shaders directory
         let shader_path = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join("src/shaders");
+            .join("crates/core/src/shaders");
 
         if let Err(e) = watcher.watch(&shader_path, RecursiveMode::NonRecursive) {
             eprintln!(

@@ -8,12 +8,28 @@ use crate::LogicalSize;
 pub trait Initializable {
     /// Called once when the plugin is first loaded
     fn setup(&mut self, ctx: &mut SetupContext) -> Result<(), PluginError>;
+
+    /// Called before plugin is unloaded (optional)
+    fn cleanup(&mut self) -> Result<(), PluginError> {
+        Ok(())
+    }
 }
 
 /// Per-frame logic updates (animations, state changes, etc.)
 pub trait Updatable {
     /// Called every frame with time delta
     fn update(&mut self, dt: f32, ctx: &mut UpdateContext) -> Result<(), PluginError>;
+}
+
+/// Configuration management for plugins
+pub trait Configurable {
+    /// Called when configuration file changes
+    fn config_updated(&mut self, config_data: &str) -> Result<(), PluginError>;
+
+    /// Get current configuration as TOML string (optional)
+    fn get_config(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Per-frame rendering
@@ -28,11 +44,11 @@ pub trait Paintable {
 
 /// Expose functionality to other plugins
 pub trait Library {
-    /// The type-safe API this plugin exposes
-    type API;
+    /// Library name
+    fn name(&self) -> &str;
 
-    /// Get reference to this plugin's API
-    fn api(&self) -> &Self::API;
+    /// Call a method with arguments (mutable for state changes)
+    fn call(&mut self, method: &str, args: &[u8]) -> Result<Vec<u8>, PluginError>;
 }
 
 /// Transform data flowing through the system (type-safe event bus)
@@ -69,6 +85,14 @@ pub struct UpdateContext {
     pub elapsed: f32,
 }
 
+/// FFI-safe function pointer for drawing rect vertices
+pub type DrawRectVerticesFn = unsafe extern "C" fn(
+    pass: *mut wgpu::RenderPass,
+    vertices: *const u8,
+    vertices_len: usize,
+    count: u32,
+);
+
 /// Context provided during paint - with full GPU access
 pub struct PaintContext {
     /// GPU device
@@ -80,20 +104,64 @@ pub struct PaintContext {
     /// Raw GPU renderer pointer for pipeline/buffer access
     /// This gives plugins full GPU power - they can create pipelines, upload buffers, etc.
     pub gpu_renderer: *mut std::ffi::c_void,
+    /// Function pointer to draw rect vertices (FFI-safe)
+    pub draw_rect_vertices_fn: Option<DrawRectVerticesFn>,
     /// Any additional context data plugins might need
     /// This is opaque to the SDK but the runtime knows what it is
     pub context_data: *const std::ffi::c_void,
+
+    pub gpu_context: Option<crate::ffi::PluginGpuContext>,
+}
+
+impl PaintContext {
+    /// Create a new PaintContext with a service registry
+    /// Note: The registry must outlive the PaintContext
+    pub fn new(
+        viewport: crate::types::ViewportInfo,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+        gpu_renderer: *mut std::ffi::c_void,
+        registry: &crate::services::ServiceRegistry,
+    ) -> Self {
+        // eprintln!("Creating PaintContext with device: {:p}, registry pointer: {:p}", &device, registry);
+        Self {
+            viewport,
+            device,
+            queue,
+            gpu_renderer,
+            draw_rect_vertices_fn: None, // Will be set by caller if needed
+            context_data: registry as *const _ as *const std::ffi::c_void,
+            gpu_context: None,
+        }
+    }
+
+    /// Get the service registry from context data
+    ///
+    /// # Safety
+    /// Caller must ensure the context_data pointer is valid and points to a ServiceRegistry
+    pub unsafe fn services(&self) -> &crate::services::ServiceRegistry {
+        eprintln!("PaintContext::services() called, context_data: {:p}", self.context_data);
+        let registry = &*(self.context_data as *const crate::services::ServiceRegistry);
+        eprintln!("Registry pointer: {:p}", registry);
+        registry
+    }
 }
 
 // === Plugin Registry ===
 
 /// Registry for plugin discovery and type-safe API access
+#[derive(Clone)]
 pub struct PluginRegistry {
     // Implementation will be in core, this is just the interface
     pub _private: (),
 }
 
 impl PluginRegistry {
+    /// Create empty registry (for now)
+    pub fn empty() -> Self {
+        Self { _private: () }
+    }
+
     /// Get a plugin's Library API by type
     pub fn get<T: 'static>(&self) -> Option<&T> {
         // Core will implement actual lookup
@@ -183,6 +251,16 @@ pub trait Plugin: Send + Sync {
     fn as_glyph_hook(
         &self,
     ) -> Option<&dyn Hook<crate::GlyphInstances, Output = crate::GlyphInstances>> {
+        None
+    }
+
+    /// Get mutable Library trait if implemented
+    fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
+        None
+    }
+
+    /// Get Configurable trait if implemented
+    fn as_configurable(&mut self) -> Option<&mut dyn Configurable> {
         None
     }
 }

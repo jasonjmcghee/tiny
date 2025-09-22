@@ -40,6 +40,12 @@ pub struct PluginLoader {
     plugin_dir: PathBuf,
     /// Loaded plugins by name
     plugins: HashMap<String, LoadedPlugin>,
+    /// Shared registry for all plugins
+    registry: tiny_sdk::PluginRegistry,
+    /// GPU device for plugin initialization (set after first init)
+    device: Option<std::sync::Arc<wgpu::Device>>,
+    /// GPU queue for plugin initialization (set after first init)
+    queue: Option<std::sync::Arc<wgpu::Queue>>,
 }
 
 impl PluginLoader {
@@ -48,6 +54,9 @@ impl PluginLoader {
         Self {
             plugin_dir,
             plugins: HashMap::new(),
+            registry: tiny_sdk::PluginRegistry::empty(),
+            device: None,
+            queue: None,
         }
     }
 
@@ -97,25 +106,46 @@ impl PluginLoader {
         Ok(loaded)
     }
 
-    /// Load a specific plugin by name
-    pub fn load_plugin(&mut self, name: &str) -> Result<(), PluginError> {
-        // Load configuration
-        let config_path = self.plugin_dir.join(format!("{}.toml", name));
-        let config = self.load_config(&config_path)?;
+    /// Load a plugin from explicit paths
+    pub fn load_plugin_from_path(
+        &mut self,
+        name: &str,
+        lib_path: &str,
+        config_path: &str,
+    ) -> Result<(), PluginError> {
+        // Load configuration from explicit path
+        let config_path_buf = std::path::PathBuf::from(config_path);
+        let config = self.load_config(&config_path_buf)?;
 
-        // Determine library file extension based on platform
-        let lib_extension = if cfg!(target_os = "macos") {
-            "dylib"
-        } else if cfg!(target_os = "windows") {
-            "dll"
+        // Read the config file content for the plugin
+        let config_content = if config_path_buf.exists() {
+            std::fs::read_to_string(&config_path_buf).ok()
         } else {
-            "so"
+            None
         };
 
-        // Load dynamic library
-        let lib_path = self.plugin_dir.join(format!("{}.{}", name, lib_extension));
+        // Load dynamic library from explicit path
+        let lib_path_buf = std::path::PathBuf::from(lib_path);
+
+        // IMPORTANT: Load the plugin with RTLD_GLOBAL so it can access host symbols
         let lib = unsafe {
-            libloading::Library::new(&lib_path).map_err(|e| PluginError::Other(Box::new(e)))?
+            #[cfg(unix)]
+            {
+                use libloading::os::unix::Library as UnixLibrary;
+
+                const RTLD_LAZY: std::os::raw::c_int = 0x1;
+                const RTLD_GLOBAL: std::os::raw::c_int = 0x100;
+
+                let unix_lib = UnixLibrary::open(Some(&lib_path_buf), RTLD_LAZY | RTLD_GLOBAL)
+                    .map_err(|e| PluginError::Other(Box::new(e)))?;
+                libloading::Library::from(unix_lib)
+            }
+
+            #[cfg(not(unix))]
+            {
+                libloading::Library::new(&lib_path_buf)
+                    .map_err(|e| PluginError::Other(Box::new(e)))?
+            }
         };
 
         // Get entry point function
@@ -126,7 +156,21 @@ impl PluginLoader {
         };
 
         // Create plugin instance
-        let instance = create_fn();
+        let mut instance = create_fn();
+
+        // Send initial config to the plugin if it supports it
+        if let Some(ref config_str) = config_content {
+            if let Some(configurable) = instance.as_configurable() {
+                if let Err(e) = configurable.config_updated(config_str) {
+                    eprintln!(
+                        "Warning: Failed to apply initial config to plugin {}: {}",
+                        name, e
+                    );
+                } else {
+                    eprintln!("Applied initial config to plugin {}", name);
+                }
+            }
+        }
 
         // Store the loaded plugin
         self.plugins.insert(
@@ -138,6 +182,105 @@ impl PluginLoader {
             },
         );
 
+        eprintln!("Plugin loaded from explicit path: {}", name);
+        Ok(())
+    }
+
+    /// Load a specific plugin by name using default paths
+    /// Note: You must call initialize_plugin separately with GPU resources
+    pub fn load_plugin(&mut self, name: &str) -> Result<(), PluginError> {
+        // Determine library file extension based on platform
+        let lib_extension = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(target_os = "windows") {
+            "dll"
+        } else {
+            "so"
+        };
+
+        // Build default paths
+        let lib_path = self.plugin_dir.join(format!(
+            "lib{}_plugin.{}",
+            name.replace("-", "_"),
+            lib_extension
+        ));
+        let config_path = self.plugin_dir.join(format!("{}.toml", name));
+
+        // Use the explicit path loader
+        self.load_plugin_from_path(
+            name,
+            lib_path.to_str().unwrap(),
+            config_path.to_str().unwrap(),
+        )
+    }
+
+    /// Initialize a plugin with GPU resources after loading
+    pub fn initialize_plugin(
+        &mut self,
+        name: &str,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> Result<(), PluginError> {
+        // Store device and queue for future use (e.g., reloading)
+        if self.device.is_none() {
+            self.device = Some(device.clone());
+            self.queue = Some(queue.clone());
+        }
+
+        let plugin = self
+            .plugins
+            .get_mut(name)
+            .ok_or_else(|| PluginError::Other(format!("Plugin {} not found", name).into()))?;
+
+        if let Some(initializable) = plugin.instance.as_initializable() {
+            eprintln!("Initializing plugin: {}", name);
+            let mut ctx = tiny_sdk::SetupContext {
+                device,
+                queue,
+                registry: self.registry.clone(), // Use shared registry
+            };
+            initializable.setup(&mut ctx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Unload a plugin, calling cleanup if needed
+    pub fn unload_plugin(&mut self, name: &str) -> Result<(), PluginError> {
+        if let Some(mut plugin) = self.plugins.remove(name) {
+            // Call cleanup if the plugin implements it
+            if let Some(initializable) = plugin.instance.as_initializable() {
+                eprintln!("Cleaning up plugin: {}", name);
+                initializable.cleanup()?;
+            }
+            eprintln!("Unloaded plugin: {}", name);
+        }
+        Ok(())
+    }
+
+    /// Reload a plugin (unload, then load and initialize)
+    /// Requires GPU resources to have been previously set via initialize_plugin
+    pub fn reload_plugin(&mut self, name: &str) -> Result<(), PluginError> {
+        eprintln!("Reloading plugin: {}", name);
+
+        // Get stored device and queue
+        let device = self.device.clone().ok_or_else(|| {
+            PluginError::Other("No GPU device available - initialize a plugin first".into())
+        })?;
+        let queue = self.queue.clone().ok_or_else(|| {
+            PluginError::Other("No GPU queue available - initialize a plugin first".into())
+        })?;
+
+        // First unload the existing plugin
+        self.unload_plugin(name)?;
+
+        // Then load it again
+        self.load_plugin(name)?;
+
+        // And initialize with GPU resources
+        self.initialize_plugin(name, device, queue)?;
+
+        eprintln!("Successfully reloaded plugin: {}", name);
         Ok(())
     }
 
@@ -243,20 +386,6 @@ impl PluginLoader {
         hooks
     }
 
-    /// Hot-reload a plugin
-    pub fn reload_plugin(&mut self, name: &str) -> Result<(), PluginError> {
-        // Remove old plugin
-        self.plugins.remove(name);
-
-        // Load new version
-        self.load_plugin(name)
-    }
-
-    /// Unload a plugin
-    pub fn unload_plugin(&mut self, name: &str) -> Option<LoadedPlugin> {
-        self.plugins.remove(name)
-    }
-
     /// Get plugin by name
     pub fn get_plugin(&self, name: &str) -> Option<&LoadedPlugin> {
         self.plugins.get(name)
@@ -277,9 +406,78 @@ impl PluginLoader {
 pub struct PluginWatcher {
     loader: Arc<std::sync::Mutex<PluginLoader>>,
     _watcher: notify::RecommendedWatcher,
+    _source_watcher: Option<notify::RecommendedWatcher>,
+    auto_rebuild: bool,
+    build_command: Option<String>,
 }
 
 impl PluginWatcher {
+    /// Enable source file watching with automatic rebuild
+    pub fn enable_source_watching(
+        &mut self,
+        watch_dirs: Vec<PathBuf>,
+        build_command: String,
+    ) -> Result<(), PluginError> {
+        use notify::{Event, RecursiveMode, Watcher};
+        use std::process::Command;
+
+        self.auto_rebuild = true;
+        self.build_command = Some(build_command.clone());
+
+        let _loader = self.loader.clone();
+        let build_cmd = build_command;
+
+        let mut source_watcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    // Watch for source file changes
+                    if event.kind.is_modify() || event.kind.is_create() {
+                        for path in &event.paths {
+                            if let Some(ext) = path.extension() {
+                                // Watch Rust source files and TOML configs
+                                if ext == "rs" || ext == "toml" {
+                                    eprintln!("Source file changed: {:?}", path);
+
+                                    // Trigger rebuild
+                                    eprintln!("Rebuilding plugins: {}", build_cmd);
+                                    let output =
+                                        Command::new("sh").arg("-c").arg(&build_cmd).output();
+
+                                    match output {
+                                        Ok(output) => {
+                                            if output.status.success() {
+                                                eprintln!("Build successful!");
+                                                // The dylib watcher will pick up the change and reload
+                                            } else {
+                                                eprintln!(
+                                                    "Build failed: {}",
+                                                    String::from_utf8_lossy(&output.stderr)
+                                                );
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Failed to run build command: {}", e),
+                                    }
+                                    break; // Only build once per event
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| PluginError::Other(Box::new(e)))?;
+
+        // Watch all specified directories
+        for dir in watch_dirs {
+            eprintln!("Watching source directory: {:?}", dir);
+            source_watcher
+                .watch(&dir, RecursiveMode::Recursive)
+                .map_err(|e| PluginError::Other(Box::new(e)))?;
+        }
+
+        self._source_watcher = Some(source_watcher);
+        Ok(())
+    }
+
     /// Create a new plugin watcher
     pub fn new(loader: Arc<std::sync::Mutex<PluginLoader>>) -> Result<Self, PluginError> {
         use notify::{Event, RecursiveMode, Watcher};
@@ -297,6 +495,7 @@ impl PluginWatcher {
                                     // Trigger reload
                                     if let Ok(mut loader) = loader_clone.lock() {
                                         println!("Reloading plugin: {}", name);
+                                        // Reload using stored GPU resources
                                         if let Err(e) = loader.reload_plugin(name) {
                                             eprintln!("Failed to reload plugin {}: {}", name, e);
                                         }
@@ -320,6 +519,9 @@ impl PluginWatcher {
         Ok(Self {
             loader,
             _watcher: watcher,
+            _source_watcher: None,
+            auto_rebuild: false,
+            build_command: None,
         })
     }
 }

@@ -45,6 +45,11 @@ pub enum NamedKey {
     F11,
     F12,
     Escape,
+    // Modifier keys
+    Shift,
+    Control,
+    Alt,
+    Super,
 }
 
 /// Logical key representation
@@ -164,7 +169,16 @@ pub mod winit_conversions {
                 winit::keyboard::NamedKey::F11 => NamedKey::F11,
                 winit::keyboard::NamedKey::F12 => NamedKey::F12,
                 winit::keyboard::NamedKey::Escape => NamedKey::Escape,
-                _ => NamedKey::Space, // Default fallback for unhandled keys
+                // Modifier keys
+                winit::keyboard::NamedKey::Shift => NamedKey::Shift,
+                winit::keyboard::NamedKey::Control => NamedKey::Control,
+                winit::keyboard::NamedKey::Alt => NamedKey::Alt,
+                winit::keyboard::NamedKey::Super => NamedKey::Super,
+                _ => {
+                    // Log unhandled keys for debugging
+                    eprintln!("Unhandled named key: {:?}", key);
+                    return NamedKey::Escape; // Safe fallback that won't type anything
+                }
             }
         }
     }

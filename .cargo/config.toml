@@ -1,7 +1,6 @@
-#[build]
-#rustflags = ["-Z", "threads=8", "-Cforce-frame-pointers=yes"]
+[build]
 rustflags = ["-Z", "threads=8"]
-codegen-backend = "cranelift"
+# codegen-backend = "cranelift"  # Disabled for now to use default LLVM
 
 #[build]
 #rustflags = ["-C", "target-cpu=native"]

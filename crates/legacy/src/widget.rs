@@ -11,7 +11,7 @@ use tiny_core::{
     GpuRenderer,
 };
 use tiny_sdk::types::{
-    LayoutPos, LayoutRect, LogicalPixels, LogicalSize, RectInstance, ViewPos, ViewRect,
+    LayoutPos, LayoutRect, LogicalPixels, LogicalSize, RectInstance,
 };
 
 /// Widget identifier for texture access
@@ -48,54 +48,28 @@ pub struct LayoutResult {
     pub size: LogicalSize,
 }
 
-/// Context passed to widgets during painting - with FULL GPU access
-pub struct PaintContext<'a> {
-    /// Viewport for all coordinate transformations and metrics
-    pub viewport: &'a Viewport,
-    /// GPU device for creating resources
-    pub device: std::sync::Arc<wgpu::Device>,
-    /// GPU queue for uploading data
-    pub queue: std::sync::Arc<wgpu::Queue>,
-    /// Uniform bind group for viewport uniforms
-    pub uniform_bind_group: &'a wgpu::BindGroup,
-    /// GPU renderer for access to pipelines and resources (raw pointer for flexibility)
-    gpu_renderer: *mut GpuRenderer,
-    /// Font system for text layout and rasterization
-    pub font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
-    /// Text style provider for syntax highlighting (optional)
-    pub text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
+// Re-export SDK PaintContext for use in widgets
+pub use tiny_sdk::PaintContext;
+
+// Helper extension trait for easier GPU renderer access
+pub trait PaintContextExt {
+    fn gpu(&self) -> &GpuRenderer;
+    fn gpu_mut(&self) -> &mut GpuRenderer;
+    fn uniform_bind_group(&self) -> &wgpu::BindGroup;
 }
 
-impl<'a> PaintContext<'a> {
-    /// Create a new PaintContext with raw GPU renderer pointer
-    pub fn new(
-        viewport: &'a Viewport,
-        device: std::sync::Arc<wgpu::Device>,
-        queue: std::sync::Arc<wgpu::Queue>,
-        uniform_bind_group: &'a wgpu::BindGroup,
-        gpu_renderer: *mut GpuRenderer,
-        font_system: &'a std::sync::Arc<crate::font::SharedFontSystem>,
-        text_styles: Option<&'a dyn crate::text_effects::TextStyleProvider>,
-    ) -> Self {
-        Self {
-            viewport,
-            device,
-            queue,
-            uniform_bind_group,
-            gpu_renderer,
-            font_system,
-            text_styles,
-        }
+impl PaintContextExt for PaintContext {
+    fn gpu(&self) -> &GpuRenderer {
+        unsafe { &*(self.gpu_renderer as *mut GpuRenderer) }
     }
 
-    /// Get immutable reference to GPU renderer (safe wrapper around raw pointer)
-    pub fn gpu(&self) -> &GpuRenderer {
-        unsafe { &*self.gpu_renderer }
+    fn gpu_mut(&self) -> &mut GpuRenderer {
+        unsafe { &mut *(self.gpu_renderer as *mut GpuRenderer) }
     }
 
-    /// Get mutable reference to GPU renderer (safe wrapper around raw pointer)
-    pub fn gpu_mut(&self) -> &mut GpuRenderer {
-        unsafe { &mut *self.gpu_renderer }
+    fn uniform_bind_group(&self) -> &wgpu::BindGroup {
+        // Get from GPU renderer
+        self.gpu().uniform_bind_group()
     }
 }
 
@@ -148,16 +122,6 @@ impl Clone for TextWidget {
     }
 }
 
-/// Cursor widget - blinking text cursor
-#[derive(Clone)]
-pub struct CursorWidget {
-    /// Absolute position in layout space
-    pub position: LayoutPos,
-    /// Style for cursor (color, width)
-    pub style: CursorStyle,
-    /// Animation state
-    pub blink_phase: f32,
-}
 
 /// Selection widget - highlight for selected text
 #[derive(Clone)]
@@ -178,12 +142,6 @@ pub struct LineNumberWidget {
 // === Supporting Types ===
 
 pub type StyleId = u32;
-
-#[derive(Clone)]
-pub struct CursorStyle {
-    pub color: u32,
-    pub width: f32,
-}
 
 // === Core Widget Trait ===
 
@@ -206,7 +164,7 @@ pub trait Widget: Send + Sync {
     fn layout(&mut self, constraints: LayoutConstraints) -> LayoutResult;
 
     /// Paint widget - generate render commands or render directly to GPU
-    fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass);
+    fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass);
 
     /// Widget's bounds for hit testing
     fn bounds(&self) -> LayoutRect;
@@ -264,13 +222,26 @@ impl Widget for TextWidget {
         LayoutRect::new(0.0, 0.0, self.size.width.0, self.size.height.0)
     }
 
-    fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        use crate::font::create_glyph_instances;
+    fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
+        use tiny_font::create_glyph_instances;
 
         let text = std::str::from_utf8(&self.text).unwrap_or("");
         if text.is_empty() {
             return;
         }
+
+        use PaintContextExt;
+        use tiny_sdk::TextStyleService;
+
+        // Get services from registry
+        let services = unsafe { ctx.services() };
+
+        // Get font service (concrete type SharedFontSystem)
+        let font_service = services.get::<tiny_font::SharedFontSystem>()
+            .expect("Font service not found in registry");
+
+        // Get text style service
+        let text_style_service = services.get::<crate::text_style_box_adapter::BoxedTextStyleAdapter>();
 
         // Handle different content types
         let x_base_offset = match &self.content_type {
@@ -289,7 +260,7 @@ impl Widget for TextWidget {
         );
 
         // Get effects for this text if available
-        let effects = if let Some(text_styles) = ctx.text_styles {
+        let effects = if let Some(ref text_styles) = text_style_service {
             let text_range = self.original_byte_offset..(self.original_byte_offset + text.len());
             text_styles.get_effects_in_range(text_range)
         } else {
@@ -298,17 +269,13 @@ impl Widget for TextWidget {
 
         // Create glyph instances using the helper
         let mut all_glyph_instances = create_glyph_instances(
-            ctx.font_system,
+            &font_service,
             text,
             layout_pos,
-            ctx.viewport.metrics.font_size,
+            14.0,  // TODO: Get font size from viewport
             ctx.viewport.scale_factor,
-            ctx.viewport.metrics.line_height,
-            if effects.is_empty() {
-                None
-            } else {
-                Some(&effects)
-            },
+            ctx.viewport.line_height,
+            if effects.is_empty() { None } else { Some(&effects) },
             self.original_byte_offset,
         );
 
@@ -322,39 +289,36 @@ impl Widget for TextWidget {
         if !all_glyph_instances.is_empty() {
             let mut shader_id = None;
 
-            // Scan text styles for shader effects AND apply color effects to glyphs
-            if let Some(text_styles) = ctx.text_styles {
+            // Scan text styles for shader effects from service
+            if let Some(ref text_styles) = text_style_service {
                 // Use the same range as before - document-relative positions
                 let text_range = self.original_byte_offset
                     ..(self.original_byte_offset
                         + std::str::from_utf8(&self.text).unwrap_or("").len());
                 let effects = text_styles.get_effects_in_range(text_range);
 
-                // Apply color effects to glyphs by updating their colors
+                // Apply shader effects
                 for effect in &effects {
-                    match &effect.effect {
-                        crate::text_effects::EffectType::Shader { id, params } => {
-                            shader_id = Some(*id);
-                            println!("TextWidget: Found shader effect with ID: {}", id);
-                            // Pass params to shader via uniform buffer
-                            if let Some(params) = params {
-                                println!("TextWidget: Writing shader params: {:?}", params);
-                                if let Some(effect_buffer) = ctx.gpu().effect_uniform_buffer(*id) {
-                                    ctx.queue.write_buffer(
-                                        effect_buffer,
-                                        0,
-                                        bytemuck::cast_slice(params.as_ref()),
-                                    );
-                                } else {
-                                    println!(
-                                        "TextWidget: No effect buffer found for shader ID {}",
-                                        id
-                                    );
-                                }
+                    if let tiny_sdk::services::TextEffectType::Shader { id, params } = &effect.effect {
+                        shader_id = Some(*id);
+                        println!("TextWidget: Found shader effect with ID: {}", id);
+                        // Pass params to shader via uniform buffer
+                        if let Some(params) = params {
+                            println!("TextWidget: Writing shader params: {:?}", params);
+                            if let Some(effect_buffer) = ctx.gpu().effect_uniform_buffer(*id) {
+                                ctx.queue.write_buffer(
+                                    effect_buffer,
+                                    0,
+                                    bytemuck::cast_slice(params.as_slice()),
+                                );
+                            } else {
+                                println!(
+                                    "TextWidget: No effect buffer found for shader ID {}",
+                                    id
+                                );
                             }
                         }
-                        // Ignore other effect types for now (weight, italic, etc.)
-                        _ => {}
+                        break; // Use first shader effect found
                     }
                 }
             }
@@ -380,134 +344,6 @@ impl Widget for TextWidget {
     }
 }
 
-impl Widget for CursorWidget {
-    fn widget_id(&self) -> WidgetId {
-        1 // Fixed ID for cursor
-    }
-
-    fn update(&mut self, dt: f32) -> bool {
-        // Update blink animation - faster and sharper
-        self.blink_phase += dt * 4.0; // 2x faster
-        if self.blink_phase > std::f32::consts::TAU {
-            self.blink_phase -= std::f32::consts::TAU;
-        }
-        true // Always redraw for animation
-    }
-
-    fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
-        LayoutResult {
-            size: LogicalSize::new(self.style.width, 19.6),
-        }
-    }
-
-    fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(self.position.x.0, self.position.y.0, self.style.width, 19.6)
-    }
-
-    fn priority(&self) -> i32 {
-        100 // Cursor on top
-    }
-
-    fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        // Track cursor position and last activity time (in milliseconds since program start)
-        static LAST_POS: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
-        static CURSOR_LAST_ACTIVE: AtomicU64 = AtomicU64::new(0);
-        static PROGRAM_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-        let start = PROGRAM_START.get_or_init(std::time::Instant::now);
-        let now_ms = start.elapsed().as_millis() as u64;
-
-        // Check if cursor moved
-        let current_pos = (self.position.x.0, self.position.y.0);
-        if let Ok(mut last) = LAST_POS.lock() {
-            if last.map_or(true, |p| p != current_pos) {
-                *last = Some(current_pos);
-                // Update last activity time
-                CURSOR_LAST_ACTIVE.store(now_ms, Ordering::Relaxed);
-            }
-        }
-
-        // Simple blink logic
-        let last_active = CURSOR_LAST_ACTIVE.load(Ordering::Relaxed);
-        let ms_since_activity = now_ms.saturating_sub(last_active);
-
-        let color = if ms_since_activity < 500 {
-            // Solid cursor for 500ms after activity
-            self.style.color
-        } else {
-            // Blink: 500ms on, 500ms off
-            let blink_phase = (now_ms / 500) % 2;
-            if blink_phase == 0 {
-                self.style.color
-            } else {
-                0x00000000
-            }
-        };
-
-        // Use line height from viewport metrics
-        let line_height = ctx.viewport.metrics.line_height;
-
-        // Transform cursor position from layout space to view space (apply scroll offset)
-        let view_pos = ctx.viewport.layout_to_view(self.position);
-
-        // Apply 2px left shift for better alignment
-        let adjusted_view_pos = ViewPos::new(view_pos.x.0 - 2.0, view_pos.y.0);
-
-        // Create view-space rectangle for GPU rendering
-        let view_rect = ViewRect::new(
-            adjusted_view_pos.x.0,
-            adjusted_view_pos.y.0,
-            self.style.width,
-            line_height,
-        );
-
-        // Convert to render rect format
-        let rect_instance = RectInstance {
-            rect: LayoutRect::new(
-                view_rect.x.0,
-                view_rect.y.0,
-                view_rect.width.0,
-                view_rect.height.0,
-            ),
-            color,
-        };
-
-        // Create our own vertex buffer to avoid conflicts with shared buffer
-        let scale = ctx.viewport.scale_factor;
-        let vertices = create_rect_vertices(
-            rect_instance.rect.x.0 * scale,
-            rect_instance.rect.y.0 * scale,
-            rect_instance.rect.width.0 * scale,
-            rect_instance.rect.height.0 * scale,
-            rect_instance.color,
-        );
-
-        // Create temporary buffer for this cursor
-        let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Cursor Vertex Buffer"),
-            size: vertices.len() as u64 * std::mem::size_of::<RectVertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        ctx.queue
-            .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        render_pass.set_pipeline(ctx.gpu().rect_pipeline());
-        render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-        render_pass.draw(0..vertices.len() as u32, 0..1);
-    }
-
-    fn clone_box(&self) -> Arc<dyn Widget> {
-        Arc::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
 
 impl Widget for SelectionWidget {
     fn widget_id(&self) -> WidgetId {
@@ -553,7 +389,7 @@ impl Widget for SelectionWidget {
         -10 // Selection well behind text
     }
 
-    fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
         // Transform all selection rectangles from layout space to view space
         let rect_instances: Vec<RectInstance> = self
             .rectangles
@@ -602,7 +438,7 @@ impl Widget for SelectionWidget {
             ctx.queue
                 .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
             render_pass.set_pipeline(ctx.gpu().rect_pipeline());
-            render_pass.set_bind_group(0, ctx.uniform_bind_group, &[]);
+            render_pass.set_bind_group(0, ctx.uniform_bind_group(), &[]);
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.draw(0..vertices.len() as u32, 0..1);
         }
@@ -638,7 +474,7 @@ impl Widget for LineNumberWidget {
         LayoutRect::new(0.0, 0.0, width, height)
     }
 
-    fn paint(&self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
         // Create text widget for the line number and paint it
         let text = format!("{}", self.line);
         // For line numbers, we can use approximate size since they're simple
@@ -677,17 +513,6 @@ pub fn text(s: &str) -> Arc<dyn Widget> {
     })
 }
 
-/// Create cursor widget at position
-pub fn cursor(position: LayoutPos) -> Arc<dyn Widget> {
-    Arc::new(CursorWidget {
-        position,
-        style: CursorStyle {
-            color: 0xFFFFFFFF, // White cursor
-            width: 2.0,        // Normal width
-        },
-        blink_phase: 0.0,
-    })
-}
 
 /// Create selection widget from rectangles
 pub fn selection(rectangles: Vec<LayoutRect>) -> Arc<dyn Widget> {
@@ -782,7 +607,7 @@ impl WidgetManager {
     }
 
     /// Paint all widgets in order
-    pub fn paint_all(&mut self, ctx: &PaintContext<'_>, render_pass: &mut wgpu::RenderPass) {
+    pub fn paint_all(&mut self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
         let widgets = self.widgets_in_order();
         if !widgets.is_empty() {
             println!("PAINTING {} widgets", widgets.len());
@@ -831,24 +656,4 @@ impl WidgetManager {
         }
     }
 
-    /// Set cursor widget (replaces existing)
-    pub fn set_cursor_widget(&mut self, cursor: Arc<dyn Widget>) {
-        // Remove all existing cursor widgets by widget type
-        self.sorted_ids.retain(|&id| {
-            if let Some(widget) = self.widgets.get(&id) {
-                if widget.widget_id() == 1 {
-                    // CursorWidget returns id 1
-                    self.widgets.remove(&id);
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false // Remove invalid IDs
-            }
-        });
-
-        // Add new cursor widget
-        self.add_widget(cursor);
-    }
 }

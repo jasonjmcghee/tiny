@@ -12,16 +12,21 @@
 
 // Re-export all traits
 pub use crate::traits::{
-    Capability, Hook, Initializable, Library, PaintContext, Paintable, Plugin, PluginError,
-    PluginRegistry, SetupContext, Spatial, Updatable, UpdateContext,
+    Capability, Configurable, Hook, Initializable, Library, PaintContext, Paintable, Plugin,
+    PluginError, PluginRegistry, SetupContext, Spatial, Updatable, UpdateContext,
 };
 
 // Re-export all types
 pub use crate::types::{
     ByteRange, Color, DocPos, GlyphInstance, GlyphInstances, InputEvent, KeyEvent, LayoutPos,
     LayoutRect, LogicalPixels, LogicalPos, LogicalRect, LogicalSize, Modifiers, MouseButton,
-    MouseEvent, PhysicalPixels, PhysicalPos, PhysicalSize, ScrollEvent, TokenType, ViewPos,
+    MouseEvent, PhysicalPixels, PhysicalPos, PhysicalSize, PhysicalSizeF, ScrollEvent, TokenType, ViewPos,
     ViewRect, ViewportInfo,
+};
+
+// Re-export services
+pub use crate::services::{
+    ContextData, FontService, PositionedGlyph, ServiceRegistry, TextEffect, TextLayout, TextStyleService,
 };
 
 pub use bytemuck;
@@ -30,6 +35,8 @@ pub use wgpu;
 
 mod traits;
 pub mod types;
+pub mod services;
+pub mod ffi;
 
 /// Macro to simplify plugin declaration
 ///

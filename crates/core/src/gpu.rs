@@ -2,6 +2,7 @@
 //!
 //! Provides GPU resources and methods for widget rendering
 
+use crate::gpu_ffi;
 use ahash::HashMap;
 use bytemuck::{Pod, Zeroable};
 use std::fs;
@@ -122,6 +123,10 @@ pub struct GpuRenderer {
     // Vertex buffers
     rect_vertex_buffer: Buffer,
     glyph_vertex_buffer: Buffer,
+
+    // Store registered IDs for plugin context
+    rect_pipeline_id: gpu_ffi::PipelineId,
+    uniform_bind_group_id: gpu_ffi::BindGroupId,
 }
 
 /// Create 6 vertices (2 triangles) for a quad
@@ -323,7 +328,7 @@ impl GpuRenderer {
 
     /// Load shader with fallback to embedded source
     fn load_shader(base_path: &Path, shader_name: &str, fallback: &str) -> String {
-        let shader_path = base_path.join(format!("src/shaders/{}", shader_name));
+        let shader_path = base_path.join(format!("crates/core/src/shaders/{}", shader_name));
         match Self::load_shader_from_file(&shader_path) {
             Ok(source) => {
                 eprintln!("Loaded shader from file: {:?}", shader_path);
@@ -398,6 +403,7 @@ impl GpuRenderer {
 
     /// Get device Arc for custom widget rendering
     pub fn device_arc(&self) -> std::sync::Arc<Device> {
+        // eprintln!("GPU renderer returning device Arc: {:p}, Device: {:p}", &self.device, self.device.as_ref());
         std::sync::Arc::clone(&self.device)
     }
 
@@ -428,7 +434,67 @@ impl GpuRenderer {
 
     /// Get rect vertex buffer for widget backgrounds
     pub fn rect_vertex_buffer(&self) -> &Buffer {
+        // eprintln!("GPU renderer returning rect_vertex_buffer at {:p}", &self.rect_vertex_buffer);
         &self.rect_vertex_buffer
+    }
+
+    /// Get FFI context for plugins (with IDs for rect pipeline and bind group)
+    pub fn get_plugin_context(&self) -> gpu_ffi::PluginGpuContext {
+        gpu_ffi::PluginGpuContext {
+            rect_pipeline_id: self.rect_pipeline_id,
+            uniform_bind_group_id: self.uniform_bind_group_id,
+            render_pass: std::ptr::null_mut(),
+        }
+    }
+
+    /// Test method to write to rect buffer directly
+    pub fn test_write_rect_buffer(&self, data: &[u8]) {
+        // eprintln!("GPU renderer writing {} bytes to rect buffer", data.len());
+        self.queue.write_buffer(&self.rect_vertex_buffer, 0, data);
+        // eprintln!("GPU renderer successfully wrote to rect buffer");
+    }
+
+    /// Draw vertices directly for plugins (avoids passing Buffer objects)
+    pub fn draw_plugin_vertices(
+        &self,
+        render_pass: &mut RenderPass,
+        vertex_data: &[u8],
+        vertex_count: u32,
+    ) {
+        // eprintln!("GPU renderer drawing {} vertices for plugin", vertex_count);
+        // eprintln!("rect_vertex_buffer at {:p}", &self.rect_vertex_buffer);
+        // eprintln!("vertex_data size: {} bytes", vertex_data.len());
+
+        // CRITICAL: Update uniforms with current viewport size!
+        self.update_uniforms(self.config.width as f32, self.config.height as f32);
+
+        // Write data to our rect buffer (reusing it)
+        self.queue
+            .write_buffer(&self.rect_vertex_buffer, 0, vertex_data);
+
+        // Set up pipeline
+        render_pass.set_pipeline(&self.rect_pipeline);
+        render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.rect_vertex_buffer.slice(..));
+        render_pass.draw(0..vertex_count, 0..1);
+
+        eprintln!("Drew plugin vertices");
+    }
+
+    /// FFI-safe extern function for drawing vertices
+    pub extern "C" fn draw_rect_vertices_extern(
+        gpu_renderer: &GpuRenderer,
+        pass: *mut RenderPass,
+        vertices: *const u8,
+        vertices_len: usize,
+        count: u32,
+    ) {
+        eprintln!("FFI draw_rect_vertices called with {} vertices", count);
+        unsafe {
+            let pass = &mut *pass;
+            let vertex_data = std::slice::from_raw_parts(vertices, vertices_len);
+            gpu_renderer.draw_plugin_vertices(pass, vertex_data, count);
+        }
     }
 
     /// Get effect uniform buffer for updating shader parameters
@@ -1028,6 +1094,23 @@ impl GpuRenderer {
             std::mem::size_of::<GlyphVertex>() as BufferAddress,
         );
 
+        // Initialize the FFI registry for plugins
+        let ffi_registry =
+            unsafe { Some(gpu_ffi::init_gpu_registry(device.clone(), queue.clone())) };
+
+        // Register existing resources so plugins can use them and store IDs
+        let (rect_pipeline_id, uniform_bind_group_id) = if let Some(ref registry) = ffi_registry {
+            let pipeline_id = registry.register_pipeline(rect_pipeline.clone());
+            let bind_group_id = registry.register_bind_group(rect_uniform_bind_group.clone());
+            eprintln!(
+                "Registered rect pipeline with ID: {:?}, bind group with ID: {:?}",
+                pipeline_id, bind_group_id
+            );
+            (pipeline_id, bind_group_id)
+        } else {
+            (gpu_ffi::PipelineId(0), gpu_ffi::BindGroupId(0))
+        };
+
         Self {
             device,
             queue,
@@ -1064,6 +1147,8 @@ impl GpuRenderer {
             theme_bind_group: None,
             current_time: 0.0,
             current_theme_mode: 0,
+            rect_pipeline_id,
+            uniform_bind_group_id,
         }
     }
 
@@ -1228,8 +1313,13 @@ impl GpuRenderer {
             .collect()
     }
 
+    /// Get current viewport size
+    pub fn viewport_size(&self) -> (f32, f32) {
+        (self.config.width as f32, self.config.height as f32)
+    }
+
     /// Update uniforms helper
-    fn update_uniforms(&self, viewport_width: f32, viewport_height: f32) {
+    pub fn update_uniforms(&self, viewport_width: f32, viewport_height: f32) {
         let uniforms = BasicUniforms {
             viewport_size: [viewport_width, viewport_height],
         };

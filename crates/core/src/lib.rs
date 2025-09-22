@@ -1,6 +1,8 @@
 //! Tiny Core - The plugin runtime
 
 pub mod gpu;
+// pub mod gpu_core;
+pub mod gpu_ffi;
 pub mod plugin_loader;
 // pub mod orchestrator;
 

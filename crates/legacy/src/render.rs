@@ -8,16 +8,18 @@ use tiny_core::wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
 use tiny_core::{
     tree::{self, Rect, Tree},
     GpuRenderer,
+    plugin_loader::PluginLoader,
 };
-use tiny_sdk::{GlyphInstance, LayoutPos, LayoutRect, LogicalSize, PaintContext};
+use tiny_sdk::{GlyphInstance, LayoutPos, LayoutRect, LogicalSize};
 
 use crate::coordinates::Viewport;
-use crate::font;
+use tiny_font;
 use crate::input;
 use crate::syntax;
 use crate::text_effects;
 use crate::text_renderer::{self, TextRenderer};
-use crate::widget::{self, WidgetManager};
+use crate::widget::{self, PaintContext, WidgetManager};
+use tiny_sdk::ServiceRegistry;
 
 // === Renderer ===
 
@@ -28,7 +30,7 @@ pub struct Renderer {
     /// Syntax highlighter for viewport queries (optional)
     pub syntax_highlighter: Option<Arc<syntax::SyntaxHighlighter>>,
     /// Font system for text rendering (shared reference)
-    pub font_system: Option<std::sync::Arc<font::SharedFontSystem>>,
+    pub font_system: Option<std::sync::Arc<tiny_font::SharedFontSystem>>,
     /// Viewport for coordinate transformation
     pub viewport: Viewport,
     /// GPU renderer reference for widget painting
@@ -47,6 +49,16 @@ pub struct Renderer {
     layout_dirty: bool,
     /// Whether syntax needs updating due to highlighter changes
     syntax_dirty: bool,
+    /// Plugin loader for dynamic plugins
+    plugin_loader: Option<std::sync::Arc<std::sync::Mutex<PluginLoader>>>,
+    /// Library file watchers for hot reloading (one per plugin)
+    lib_watchers: Vec<notify::RecommendedWatcher>,
+    /// Config file watchers for hot reloading (one per plugin)
+    config_watchers: Vec<notify::RecommendedWatcher>,
+    /// Current cursor position for plugins
+    cursor_position: Option<LayoutPos>,
+    /// Service registry for plugins (persistent)
+    service_registry: ServiceRegistry,
 }
 
 // SAFETY: Renderer is Send + Sync because the GPU renderer pointer
@@ -56,6 +68,12 @@ unsafe impl Sync for Renderer {}
 
 impl Renderer {
     pub fn new(size: (f32, f32), scale_factor: f32) -> Self {
+        // Create service registry
+        let service_registry = ServiceRegistry::new();
+
+        // Plugin loader will be initialized later when we have GPU resources
+        let plugin_loader = None;
+
         Self {
             text_styles: None,
             syntax_highlighter: None,
@@ -69,6 +87,11 @@ impl Renderer {
             last_rendered_version: 0,
             layout_dirty: true, // Start dirty to ensure first render happens
             syntax_dirty: false,
+            plugin_loader,
+            lib_watchers: Vec::new(),
+            config_watchers: Vec::new(),
+            cursor_position: None,
+            service_registry,
         }
     }
 
@@ -79,12 +102,250 @@ impl Renderer {
 
     /// Set GPU renderer reference for widget painting and initialize theme
     pub fn set_gpu_renderer(&mut self, gpu_renderer: &GpuRenderer) {
-        self.gpu_renderer = Some(gpu_renderer as *const _);
-        // Theme initialization is now handled in app.rs
+        // Only set if not already set to avoid reinitializing
+        if self.gpu_renderer.is_none() {
+            self.gpu_renderer = Some(gpu_renderer as *const _);
+            // Theme initialization is now handled in app.rs
+
+            // Now that we have GPU, initialize plugins if not already done
+            if self.plugin_loader.is_none() {
+                self.initialize_plugins(gpu_renderer);
+            }
+        }
+    }
+
+    /// Initialize plugins with GPU resources
+    fn initialize_plugins(&mut self, gpu_renderer: &GpuRenderer) {
+        // Load configuration from init.toml
+        let app_config = match crate::config::AppConfig::load() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Failed to load init.toml: {}, using defaults", e);
+                crate::config::AppConfig::default()
+            }
+        };
+
+        let plugin_dir = std::path::PathBuf::from(&app_config.plugins.plugin_dir);
+        if !plugin_dir.exists() {
+            // eprintln!("Plugin directory not found: {}", app_config.plugins.plugin_dir);
+            return;
+        }
+
+        let mut loader = PluginLoader::new(plugin_dir.clone());
+
+        // Load all enabled plugins using explicit paths from config
+        for plugin_name in &app_config.plugins.enabled {
+            // eprintln!("Loading plugin: {}", plugin_name);
+
+            // Check if we have explicit config for this plugin
+            if let Some(plugin_config) = app_config.plugins.plugins.get(plugin_name) {
+                let lib_path = plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
+                let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
+
+                println!("Using explicit paths - lib: {}, config: {}", lib_path, config_path);
+
+                match loader.load_plugin_from_path(plugin_name, &lib_path, &config_path) {
+                    Ok(_) => {
+                        // eprintln!("Loaded {} plugin from explicit path", plugin_name);
+
+                        // Initialize with GPU resources
+                        let device = gpu_renderer.device_arc();
+                        let queue = gpu_renderer.queue_arc();
+
+                        match loader.initialize_plugin(plugin_name, device, queue) {
+                            Ok(_) => eprintln!("Initialized {} plugin with GPU resources", plugin_name),
+                            Err(e) => eprintln!("Failed to initialize {} plugin: {}", plugin_name, e),
+                        }
+
+                    }
+                    Err(e) => eprintln!("Failed to load {} plugin from explicit path: {}", plugin_name, e),
+                }
+            } else {
+                // Use default paths
+                match loader.load_plugin(plugin_name) {
+                    Ok(_) => {
+                        eprintln!("Loaded {} plugin with default paths", plugin_name);
+
+                        // Initialize with GPU resources
+                        let device = gpu_renderer.device_arc();
+                        let queue = gpu_renderer.queue_arc();
+
+                        match loader.initialize_plugin(plugin_name, device, queue) {
+                            Ok(_) => eprintln!("Initialized {} plugin with GPU resources", plugin_name),
+                            Err(e) => eprintln!("Failed to initialize {} plugin: {}", plugin_name, e),
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to load {} plugin: {}", plugin_name, e),
+                }
+            }
+        }
+
+        // Store loader in Arc for sharing with watchers
+        let loader_arc = std::sync::Arc::new(std::sync::Mutex::new(loader));
+
+        // Set up hot-reload watching for enabled plugins' library files
+        // eprintln!("Enabled plugins: {:?}", app_config.plugins.enabled);
+        // eprintln!("Plugin configs: {:?}", app_config.plugins.plugins.keys().collect::<Vec<_>>());
+        for plugin_name in &app_config.plugins.enabled {
+            // eprintln!("Checking plugin {} for hot-reload", plugin_name);
+            if let Some(plugin_config) = app_config.plugins.plugins.get(plugin_name) {
+                // eprintln!("Found config for {}, auto_reload = {}", plugin_name, plugin_config.auto_reload);
+                if plugin_config.auto_reload {
+                    let lib_path = plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
+                    let lib_path_buf = std::path::PathBuf::from(&lib_path);
+
+                    eprintln!("Setting up hot-reload for {} watching specific file: {:?}", plugin_name, lib_path);
+                    eprintln!("Library file exists: {}", lib_path_buf.exists());
+                    if lib_path_buf.exists() {
+                        eprintln!("Library file metadata: {:?}", std::fs::metadata(&lib_path_buf).ok());
+                    }
+
+                    // Create watcher for the specific library file
+                    use notify::{Watcher, RecursiveMode, Event};
+                    let loader_for_lib = loader_arc.clone();
+                    let plugin_name_for_lib = plugin_name.clone();
+                    let device = gpu_renderer.device_arc();
+                    let queue = gpu_renderer.queue_arc();
+                    let lib_path_for_reload = lib_path.clone();
+                    let config_path_for_reload = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
+
+                    let lib_watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                        if let Ok(event) = res {
+                            eprintln!("Watcher event for {}: kind={:?}, paths={:?}", plugin_name_for_lib, event.kind, event.paths);
+
+                            // Only reload on Create or Modify, not Remove (file is being replaced during build)
+                            if event.kind.is_create() || event.kind.is_modify() {
+                                eprintln!("Library file changed for {}: {:?}", plugin_name_for_lib, event.paths);
+
+                                // Quick check if file exists and is not empty (cargo watch might still be writing)
+                                let mut retries = 0;
+                                while retries < 10 {
+                                    if let Ok(metadata) = std::fs::metadata(&lib_path_for_reload) {
+                                        if metadata.len() > 0 {
+                                            // File exists and has content, safe to reload
+                                            break;
+                                        }
+                                    }
+                                    retries += 1;
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+
+                                if retries == 10 {
+                                    eprintln!("File not ready after 100ms, skipping reload");
+                                    return;
+                                }
+
+                                if let Ok(mut loader) = loader_for_lib.lock() {
+                                    // First unload the plugin
+                                    if let Err(e) = loader.unload_plugin(&plugin_name_for_lib) {
+                                        eprintln!("Failed to unload plugin {}: {}", plugin_name_for_lib, e);
+                                        return;
+                                    }
+
+                                    // Use the original configured paths for reload
+                                    eprintln!("Reloading plugin {} from lib={}, config={}", plugin_name_for_lib, lib_path_for_reload, config_path_for_reload);
+
+                                    if let Err(e) = loader.load_plugin_from_path(&plugin_name_for_lib, &lib_path_for_reload, &config_path_for_reload) {
+                                        eprintln!("Failed to reload plugin {}: {}", plugin_name_for_lib, e);
+                                        return;
+                                    }
+
+                                    // Re-initialize with GPU resources
+                                    if let Err(e) = loader.initialize_plugin(&plugin_name_for_lib, device.clone(), queue.clone()) {
+                                        eprintln!("Failed to reinitialize plugin {}: {}", plugin_name_for_lib, e);
+                                    } else {
+                                        eprintln!("Successfully hot-reloaded plugin: {}", plugin_name_for_lib);
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    if let Ok(mut watcher) = lib_watcher {
+                        // First try to watch the specific library file
+                        let watch_result = watcher.watch(&lib_path_buf, RecursiveMode::NonRecursive);
+
+                        if let Err(e) = watch_result {
+                            eprintln!("Failed to watch lib file directly {}: {}, trying parent directory", lib_path, e);
+
+                            // Fallback: watch parent directory (required on some macOS versions)
+                            if let Some(parent_dir) = lib_path_buf.parent() {
+                                if let Err(e2) = watcher.watch(parent_dir, RecursiveMode::NonRecursive) {
+                                    eprintln!("Failed to watch parent directory {:?}: {}", parent_dir, e2);
+                                } else {
+                                    eprintln!("Watching parent directory for library: {:?}", parent_dir);
+                                    self.lib_watchers.push(watcher);
+                                }
+                            }
+                        } else {
+                            eprintln!("Watching library file: {}", lib_path);
+                            self.lib_watchers.push(watcher);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Set up TOML config watching for specific plugin config files
+        for plugin_name in &app_config.plugins.enabled {
+            if let Some(plugin_config) = app_config.plugins.plugins.get(plugin_name) {
+                let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
+                let config_path_buf = std::path::PathBuf::from(&config_path);
+
+                // Only watch if the config file exists
+                if config_path_buf.exists() {
+                    // eprintln!("Setting up config watching for {} at: {:?}", plugin_name, config_path);
+
+                    use notify::{Watcher, RecursiveMode, Event};
+                    let loader_for_config = loader_arc.clone();
+                    let plugin_name_for_config = plugin_name.clone();
+
+                    let config_watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                        if let Ok(event) = res {
+                            if event.kind.is_modify() {
+                                // eprintln!("Config file changed for {}: {:?}", plugin_name_for_config, event.paths);
+
+                                // Read the new config
+                                if let Ok(config_data) = std::fs::read_to_string(&event.paths[0]) {
+                                    // Send to plugin
+                                    if let Ok(mut loader) = loader_for_config.lock() {
+                                        if let Some(plugin) = loader.get_plugin_mut(&plugin_name_for_config) {
+                                            if let Some(configurable) = plugin.instance.as_configurable() {
+                                                if let Err(e) = configurable.config_updated(&config_data) {
+                                                    eprintln!("Failed to update config for {}: {}", plugin_name_for_config, e);
+                                                } else {
+                                                    eprintln!("Updated config for plugin: {}", plugin_name_for_config);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    if let Ok(mut watcher) = config_watcher {
+                        // Watch the specific config file only
+                        if let Err(e) = watcher.watch(&config_path_buf, RecursiveMode::NonRecursive) {
+                            eprintln!("Failed to watch config file {}: {}", config_path, e);
+                        } else {
+                            eprintln!("Watching config file: {}", config_path);
+                            self.config_watchers.push(watcher);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Store the loader Arc
+        self.plugin_loader = Some(loader_arc);
     }
 
     /// Set text style provider (takes ownership)
     pub fn set_text_styles(&mut self, provider: Box<dyn text_effects::TextStyleProvider>) {
+        // Register text styles adapter in service registry
+        let adapter = crate::text_style_box_adapter::BoxedTextStyleAdapter::from_ref(&provider);
+        self.service_registry.register(adapter);
         self.text_styles = Some(provider);
     }
 
@@ -95,9 +356,11 @@ impl Renderer {
     }
 
     /// Set font system (takes shared reference)
-    pub fn set_font_system(&mut self, font_system: std::sync::Arc<font::SharedFontSystem>) {
+    pub fn set_font_system(&mut self, font_system: std::sync::Arc<tiny_font::SharedFontSystem>) {
         // Set font system on viewport for accurate measurements
         self.viewport.set_font_system(font_system.clone());
+        // Register font in service registry
+        self.service_registry.register(font_system.clone());
         self.font_system = Some(font_system);
         self.layout_dirty = true; // Layout needs updating when font system changes
     }
@@ -116,12 +379,39 @@ impl Renderer {
     /// Set selections and cursor widgets
     pub fn set_selection_widgets(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
         // Create widgets from current selections
-        let (selection_widgets, cursor_widget) = input_handler.create_widgets(doc, &self.viewport);
+        let (selection_widgets, cursor_pos) = input_handler.create_widgets(doc, &self.viewport);
 
-        // Update widget manager
+        // Update widget manager with selection widgets
         self.widget_manager.set_selection_widgets(selection_widgets);
-        if let Some(cursor) = cursor_widget {
-            self.widget_manager.set_cursor_widget(cursor);
+
+        // Update cursor position via plugin library
+        if let Some(pos) = cursor_pos {
+            // Convert layout position to view position (accounting for scroll)
+            let view_pos = self.viewport.layout_to_view(pos);
+            self.cursor_position = Some(pos);
+
+            // Update cursor plugin via library API
+            if let Some(ref loader_arc) = self.plugin_loader {
+                if let Ok(mut loader) = loader_arc.lock() {
+                    if let Some(cursor_plugin) = loader.get_plugin_mut("cursor") {
+                    if let Some(library) = cursor_plugin.instance.as_library_mut() {
+                        // Call set_position method with binary-encoded VIEW position
+                        let x_bytes = view_pos.x.0.to_le_bytes();
+                        let y_bytes = view_pos.y.0.to_le_bytes();
+                        let mut args = Vec::new();
+                        args.extend_from_slice(&x_bytes);
+                        args.extend_from_slice(&y_bytes);
+
+                        match library.call("set_position", &args) {
+                            Ok(_) => {},
+                            Err(e) => eprintln!("Failed to update cursor position: {}", e),
+                        }
+                    }
+                    }
+                }
+            }
+        } else {
+            // eprintln!("No cursor position from input handler");
         }
     }
 
@@ -214,15 +504,19 @@ impl Renderer {
                 }
             } else if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu };
-                let ctx = PaintContext::new(
-                    &self.viewport,
+
+                let mut ctx = PaintContext::new(
+                    self.viewport.to_viewport_info(),
                     gpu_renderer.device_arc(),
                     gpu_renderer.queue_arc(),
-                    gpu_renderer.uniform_bind_group(),
                     gpu as *mut _,
-                    font,
-                    self.text_styles.as_deref(),
+                    &self.service_registry,
                 );
+
+                // Set the GPU context for plugins
+                ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                // Don't need draw function for regular widgets
                 for widget in widgets {
                     if widget.priority() < 0 {
                         widget.paint(&ctx, pass);
@@ -244,21 +538,91 @@ impl Renderer {
                         widget.paint(ctx, pass);
                     }
                 }
+
+                // Paint cursor plugin from loader
+                if let Some(ref loader_arc) = self.plugin_loader {
+                    // eprintln!("Have plugin loader");
+                    if let Ok(loader) = loader_arc.lock() {
+                        if let Some(cursor_plugin) = loader.get_plugin("cursor") {
+                        // eprintln!("Found cursor plugin");
+                        if let Some(paintable) = cursor_plugin.instance.as_paintable() {
+                            // eprintln!("Calling cursor plugin paint");
+                            paintable.paint(ctx, pass);
+                        } else {
+                            // eprintln!("Cursor plugin doesn't implement Paintable");
+                        }
+                    } else {
+                        // eprintln!("Cursor plugin not found in loader");
+                    }
+                    }
+                } else {
+                    // eprintln!("No plugin loader!");
+                }
             } else if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu };
-                let ctx = PaintContext::new(
-                    &self.viewport,
+
+                let mut ctx = PaintContext::new(
+                    self.viewport.to_viewport_info(),
                     gpu_renderer.device_arc(),
                     gpu_renderer.queue_arc(),
-                    gpu_renderer.uniform_bind_group(),
                     gpu as *mut _,
-                    font,
-                    self.text_styles.as_deref(),
+                    &self.service_registry,
                 );
+
+                // Set the GPU context for plugins
+                ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                // Set draw function that uses host's GPU resources
+                unsafe extern "C" fn draw_vertices(
+                    pass: *mut wgpu::RenderPass,
+                    vertices: *const u8,
+                    vertices_len: usize,
+                    count: u32,
+                ) {
+                    let pass = &mut *pass;
+                    let vertex_data = std::slice::from_raw_parts(vertices, vertices_len);
+
+                    // Get GPU renderer from somewhere... this is the issue
+                    // We need access to gpu_renderer here
+                    // eprintln!("Draw function called but can't access GPU renderer!");
+                }
+
+                // Actually, let's use a closure that captures gpu_renderer
+                let draw_fn = |pass: &mut wgpu::RenderPass, vertex_data: &[u8], count: u32| {
+                    gpu_renderer.draw_plugin_vertices(pass, vertex_data, count);
+                };
+
+                // But we can't use a closure with extern "C"...
+                // This is why we need a different approach
+
                 for widget in widgets {
                     if widget.priority() >= 0 {
                         widget.paint(&ctx, pass);
                     }
+                }
+
+                // Ensure render state is properly set up for plugins
+                let (width, height) = gpu_renderer.viewport_size();
+                gpu_renderer.update_uniforms(width, height);
+
+                // Paint cursor plugin from loader
+                if let Some(ref loader_arc) = self.plugin_loader {
+                    // eprintln!("Have plugin loader (2nd location)");
+                    if let Ok(loader) = loader_arc.lock() {
+                        if let Some(cursor_plugin) = loader.get_plugin("cursor") {
+                        // eprintln!("Found cursor plugin (2nd location)");
+                        if let Some(paintable) = cursor_plugin.instance.as_paintable() {
+                            // eprintln!("Calling cursor plugin paint (2nd location)");
+                            paintable.paint(&ctx, pass);
+                        } else {
+                            // eprintln!("Cursor plugin doesn't implement Paintable (2nd location)");
+                        }
+                    } else {
+                        // eprintln!("Cursor plugin not found in loader (2nd location)");
+                    }
+                    }
+                } else {
+                    // eprintln!("No plugin loader! (2nd location)");
                 }
             }
         }
@@ -322,14 +686,13 @@ impl Renderer {
                 tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
                     for span in spans {
                         if let tree::Span::Spatial(widget) = span {
+                            // Use persistent service registry
                             let ctx = PaintContext::new(
-                                &self.viewport,
+                                self.viewport.to_viewport_info(),
                                 gpu_renderer.device_arc(),
                                 gpu_renderer.queue_arc(),
-                                gpu_renderer.uniform_bind_group(),
                                 gpu_renderer_ptr as *mut _,
-                                font_system,
-                                self.text_styles.as_deref(),
+                                &self.service_registry,
                             );
                             widget.paint(&ctx, pass);
                         }
@@ -353,7 +716,7 @@ impl Renderer {
         tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
             for span in spans {
                 match span {
-                    tree::Span::Widget(widget) => {
+                    tree::Span::Spatial(widget) => {
                         // If we have a render pass and supporting resources, paint directly
                         if let Some(pass) = render_pass.as_mut() {
                             if let Some(font_system) = &self.font_system {
@@ -361,17 +724,15 @@ impl Renderer {
                                     let gpu_renderer = unsafe { &*gpu_renderer_ptr };
                                     let device_arc = gpu_renderer.device_arc();
                                     let queue_arc = gpu_renderer.queue_arc();
-                                    let uniform_bind_group = gpu_renderer.uniform_bind_group();
+                                    let _uniform_bind_group = gpu_renderer.uniform_bind_group();
 
-                                    // Create paint context for the widget
+                                    // Create paint context for the widget using persistent registry
                                     let ctx = PaintContext::new(
-                                        &self.viewport,
+                                        self.viewport.to_viewport_info(),
                                         device_arc,
                                         queue_arc,
-                                        uniform_bind_group,
                                         gpu_renderer_ptr as *mut _,
-                                        font_system,
-                                        self.text_styles.as_deref(),
+                                        &self.service_registry,
                                     );
 
                                     // Let widget paint directly to GPU
@@ -430,7 +791,7 @@ impl Renderer {
                         let gpu_renderer = unsafe { &*gpu_renderer_ptr };
                         let device_arc = gpu_renderer.device_arc();
                         let queue_arc = gpu_renderer.queue_arc();
-                        let uniform_bind_group = gpu_renderer.uniform_bind_group();
+                        let _uniform_bind_group = gpu_renderer.uniform_bind_group();
 
                         // Create a custom text style provider that returns our viewport-specific effects
                         let viewport_style_provider = if let Some(effects) = visible_effects {
@@ -456,14 +817,17 @@ impl Renderer {
                                 self.text_styles.as_deref()
                             };
 
+                        // TODO: Handle viewport-specific text styles
+                        if let Some(_text_styles) = text_styles_for_widget {
+                            // For now, just use the main registry which has the global text styles
+                        }
+
                         let ctx = PaintContext::new(
-                            &self.viewport,
+                            self.viewport.to_viewport_info(),
                             device_arc,
                             queue_arc,
-                            uniform_bind_group,
                             gpu_renderer_ptr as *mut _,
-                            font_system,
-                            text_styles_for_widget,
+                            &self.service_registry,
                         );
 
                         text_widget.paint(&ctx, pass);
@@ -494,14 +858,32 @@ impl Renderer {
         self.widget_manager.clear();
 
         // Create widgets from selections
-        let mut cursor_widget = None;
         let mut selection_widgets = Vec::new();
 
         for selection in selections {
             if selection.is_cursor() {
-                // Create cursor widget
+                // Update cursor position via plugin library
                 let layout_pos = self.viewport.doc_to_layout(selection.cursor);
-                cursor_widget = Some(widget::cursor(layout_pos));
+                let view_pos = self.viewport.layout_to_view(layout_pos);
+                self.cursor_position = Some(layout_pos);
+
+                // Call cursor plugin library API
+                if let Some(ref loader_arc) = self.plugin_loader {
+                    if let Ok(mut loader) = loader_arc.lock() {
+                        if let Some(cursor_plugin) = loader.get_plugin_mut("cursor") {
+                        if let Some(library) = cursor_plugin.instance.as_library_mut() {
+                            // Send VIEW position (accounts for scroll)
+                            let x_bytes = view_pos.x.0.to_le_bytes();
+                            let y_bytes = view_pos.y.0.to_le_bytes();
+                            let mut args = Vec::new();
+                            args.extend_from_slice(&x_bytes);
+                            args.extend_from_slice(&y_bytes);
+
+                            let _ = library.call("set_position", &args);
+                        }
+                    }
+                    }
+                }
             } else {
                 // Create selection widget
                 let start_layout = self.viewport.doc_to_layout(selection.anchor);
@@ -530,11 +912,8 @@ impl Renderer {
             }
         }
 
-        // Add widgets to manager
+        // Add selection widgets to manager
         self.widget_manager.set_selection_widgets(selection_widgets);
-        if let Some(cursor) = cursor_widget {
-            self.widget_manager.set_cursor_widget(cursor);
-        }
     }
 }
 

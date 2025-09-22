@@ -1,0 +1,21 @@
+[build]
+jobs = 16
+#rustflags = ["-Z", "threads=8"]
+codegen-backend = "cranelift"
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+#[build]
+#rustflags = ["-C", "target-cpu=native"]
+#
+#[profile.release]
+#opt-level = 3
+#lto = "fat"
+#codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+debug = 1              # Line tables only
+incremental = true     # Enable incremental compilation
+codegen-units = 256    # Parallel code generation

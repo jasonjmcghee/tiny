@@ -730,24 +730,32 @@ impl InputHandler {
             if let Key::Character(ch) = &event.logical_key {
                 return self.handle_command_key(doc, ch.to_lowercase().as_str(), shift_held);
             }
-        }
-
-        match &event.logical_key {
-            Key::Character(ch) if !cmd_held => self.handle_character_input(doc, ch, renderer),
-            Key::Named(NamedKey::Backspace) => self.delete_at_cursor(doc, false),
-            Key::Named(NamedKey::Delete) => self.delete_at_cursor(doc, true),
-            Key::Named(NamedKey::Enter) => self.insert_text(doc, "\n"),
-            Key::Named(NamedKey::Tab) => self.insert_text(doc, "\t"),
-            Key::Named(NamedKey::Space) => self.insert_text(doc, " "),
-            Key::Named(NamedKey::ArrowLeft) => self.move_cursor(doc, -1, 0, shift_held),
-            Key::Named(NamedKey::ArrowRight) => self.move_cursor(doc, 1, 0, shift_held),
-            Key::Named(NamedKey::ArrowUp) => self.move_cursor(doc, 0, -1, shift_held),
-            Key::Named(NamedKey::ArrowDown) => self.move_cursor(doc, 0, 1, shift_held),
-            Key::Named(NamedKey::Home) => self.move_to_line_edge(doc, false, shift_held),
-            Key::Named(NamedKey::End) => self.move_to_line_edge(doc, true, shift_held),
-            Key::Named(NamedKey::PageUp) => self.page_jump(doc, true, shift_held),
-            Key::Named(NamedKey::PageDown) => self.page_jump(doc, false, shift_held),
-            _ => InputAction::None,
+            InputAction::None
+        } else {
+            match &event.logical_key {
+                // Ignore modifier keys pressed alone
+                Key::Named(NamedKey::Shift) |
+                Key::Named(NamedKey::Control) |
+                Key::Named(NamedKey::Alt) |
+                Key::Named(NamedKey::Super) => InputAction::None,
+                Key::Character(ch) if ch.chars().all(|c| !c.is_control()) => {
+                    self.handle_character_input(doc, ch, renderer)
+                },
+                Key::Named(NamedKey::Backspace) => self.delete_at_cursor(doc, false),
+                Key::Named(NamedKey::Delete) => self.delete_at_cursor(doc, true),
+                Key::Named(NamedKey::Enter) => self.insert_text(doc, "\n"),
+                Key::Named(NamedKey::Tab) => self.insert_text(doc, "\t"),
+                Key::Named(NamedKey::Space) => self.insert_text(doc, " "),
+                Key::Named(NamedKey::ArrowLeft) => self.move_cursor(doc, -1, 0, shift_held),
+                Key::Named(NamedKey::ArrowRight) => self.move_cursor(doc, 1, 0, shift_held),
+                Key::Named(NamedKey::ArrowUp) => self.move_cursor(doc, 0, -1, shift_held),
+                Key::Named(NamedKey::ArrowDown) => self.move_cursor(doc, 0, 1, shift_held),
+                Key::Named(NamedKey::Home) => self.move_to_line_edge(doc, false, shift_held),
+                Key::Named(NamedKey::End) => self.move_to_line_edge(doc, true, shift_held),
+                Key::Named(NamedKey::PageUp) => self.page_jump(doc, true, shift_held),
+                Key::Named(NamedKey::PageDown) => self.page_jump(doc, false, shift_held),
+                _ => InputAction::None,
+            }
         }
     }
 
@@ -943,21 +951,21 @@ impl InputHandler {
         })
     }
 
-    /// Create widget instances for current selections and cursor
+    /// Create widget instances for current selections and return cursor position
     pub fn create_widgets(
         &self,
         doc: &Doc,
         viewport: &Viewport,
     ) -> (
         Vec<Arc<dyn crate::widget::Widget>>,
-        Option<Arc<dyn crate::widget::Widget>>,
+        Option<tiny_sdk::LayoutPos>,
     ) {
         use crate::widget;
 
-        let cursor_widget = self.selections.first().map(|sel| {
+        let cursor_pos = self.selections.first().map(|sel| {
             let tree = doc.read();
             let line_text = tree.line_text(sel.cursor.line);
-            widget::cursor(viewport.doc_to_layout_with_text(sel.cursor, &line_text))
+            viewport.doc_to_layout_with_text(sel.cursor, &line_text)
         });
 
         let selection_widgets: Vec<_> = self
@@ -970,7 +978,7 @@ impl InputHandler {
             })
             .collect();
 
-        (selection_widgets, cursor_widget)
+        (selection_widgets, cursor_pos)
     }
 
     /// Save current document state to history before making an edit

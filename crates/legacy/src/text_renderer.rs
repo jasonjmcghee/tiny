@@ -100,7 +100,7 @@ impl TextRenderer {
     pub fn update_layout(
         &mut self,
         tree: &Tree,
-        font_system: &crate::font::SharedFontSystem,
+        font_system: &tiny_font::SharedFontSystem,
         viewport: &crate::coordinates::Viewport,
     ) {
         // Only rebuild if text actually changed

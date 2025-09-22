@@ -1,0 +1,26 @@
+# Tiny Editor Configuration
+
+[editor]
+# Default font size
+font_size = 14.0
+# Theme: "dark" or "light"
+theme = "dark"
+
+[plugins]
+# Default plugin directory
+plugin_dir = "plugins"
+# Enabled plugins
+enabled = ["cursor"]
+
+# Cursor plugin configuration
+[plugins.cursor]
+lib = "crates/plugins/cursor/target/debug/libcursor_plugin.dylib"
+config = "crates/plugins/cursor/plugin.toml"
+# Watch lib and swap it in if it changes
+auto_reload = true
+
+[development]
+# Enable debug output
+debug = true
+# Show frame times
+show_fps = false

@@ -2,14 +2,36 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tiny_core::GpuRenderer;
+use serde::Deserialize;
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
-use tiny_sdk::wgpu::{BindGroup, BindGroupLayout, Buffer, RenderPipeline};
+use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
-    Capability, LayoutPos, PaintContext, Paintable, Plugin, PluginError, Updatable, UpdateContext,
+    Capability, Configurable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
+    Updatable, UpdateContext, Library, Initializable, SetupContext,
 };
+
+/// API exposed by cursor plugin
+pub struct CursorAPI {
+    position: LayoutPos,
+}
+
+impl CursorAPI {
+    pub fn new() -> Self {
+        Self {
+            position: LayoutPos::new(0.0, 0.0),
+        }
+    }
+
+    pub fn set_position(&mut self, pos: LayoutPos) {
+        self.position = pos;
+    }
+
+    pub fn get_position(&self) -> LayoutPos {
+        self.position
+    }
+}
 
 /// Cursor appearance configuration
 #[derive(Debug, Clone)]
@@ -50,8 +72,10 @@ pub struct CursorPlugin {
     // Configuration
     config: CursorConfig,
 
+    // API for external access
+    api: CursorAPI,
+
     // Current state
-    position: LayoutPos,
     blink_phase: f32,
 
     // Activity tracking for smart blinking
@@ -59,11 +83,11 @@ pub struct CursorPlugin {
     last_active_ms: AtomicU64,
     program_start: Instant,
 
-    // GPU resources (created during setup if needed)
+    // GPU resources (created during setup)
     vertex_buffer: Option<Buffer>,
-    pipeline: Option<RenderPipeline>,
-    bind_group_layout: Option<BindGroupLayout>,
-    bind_group: Option<BindGroup>,
+    vertex_buffer_id: Option<tiny_sdk::ffi::BufferId>,
+    device: Option<std::sync::Arc<wgpu::Device>>,
+    queue: Option<std::sync::Arc<wgpu::Queue>>,
 }
 
 impl CursorPlugin {
@@ -71,15 +95,15 @@ impl CursorPlugin {
     pub fn new() -> Self {
         Self {
             config: CursorConfig::default(),
-            position: LayoutPos::new(0.0, 0.0),
+            api: CursorAPI::new(),
             blink_phase: 0.0,
             last_position: None,
             last_active_ms: AtomicU64::new(0),
             program_start: Instant::now(),
             vertex_buffer: None,
-            pipeline: None,
-            bind_group_layout: None,
-            bind_group: None,
+            vertex_buffer_id: None,
+            device: None,
+            queue: None,
         }
     }
 
@@ -98,7 +122,7 @@ impl CursorPlugin {
             self.last_active_ms.store(now_ms, Ordering::Relaxed);
         }
 
-        self.position = new_pos;
+        self.api.set_position(new_pos);
     }
 
     /// Calculate current cursor visibility based on blink state
@@ -122,8 +146,8 @@ impl CursorPlugin {
         }
     }
 
-    /// Create vertex data for cursor rectangle
-    fn create_vertices(&self, viewport: &tiny_sdk::ViewportInfo) -> Vec<CursorVertex> {
+    /// Create vertex data for cursor rectangle at a specific position
+    fn create_vertices_at_position(&self, viewport: &tiny_sdk::ViewportInfo, position: tiny_sdk::LayoutPos) -> Vec<CursorVertex> {
         let visible = self.calculate_visibility();
         let color = if visible {
             self.config.style.color
@@ -131,14 +155,17 @@ impl CursorPlugin {
             0x00000000
         };
 
-        // Use viewport's line height
+        // Use viewport's line height (in logical pixels)
         let line_height = viewport.line_height * self.config.style.height_scale;
 
-        // Apply position offset
-        let x = self.position.x.0 + self.config.style.x_offset;
-        let y = self.position.y.0;
-        let w = self.config.style.width;
-        let h = line_height;
+        // Position from host is in logical VIEW pixels (already accounts for scroll)
+        // Shader expects physical pixels, so we need to scale
+        let scale = viewport.scale_factor;
+
+        let x = (position.x.0 + self.config.style.x_offset) * scale;
+        let y = position.y.0 * scale;
+        let w = self.config.style.width * scale;
+        let h = line_height * scale;
 
         // Create two triangles for a quad
         vec![
@@ -192,9 +219,65 @@ impl Plugin for CursorPlugin {
 
     fn capabilities(&self) -> Vec<Capability> {
         vec![
+            Capability::Initializable,
             Capability::Updatable,
             Capability::Paintable("cursor".to_string()),
         ]
+    }
+
+    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
+        Some(self)
+    }
+
+    fn as_updatable(&mut self) -> Option<&mut dyn Updatable> {
+        Some(self)
+    }
+
+    fn as_paintable(&self) -> Option<&dyn Paintable> {
+        Some(self)
+    }
+
+    fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
+        Some(self)
+    }
+
+    fn as_configurable(&mut self) -> Option<&mut dyn Configurable> {
+        Some(self)
+    }
+}
+
+// === Initializable Trait Implementation ===
+
+impl Initializable for CursorPlugin {
+    fn setup(&mut self, ctx: &mut SetupContext) -> Result<(), PluginError> {
+        // eprintln!("CursorPlugin::setup called");
+
+        // Store device and queue for later use
+        self.device = Some(ctx.device.clone());
+        self.queue = Some(ctx.queue.clone());
+
+        // Create vertex buffer with reasonable initial size (6 vertices for a quad)
+        let vertex_size = std::mem::size_of::<CursorVertex>();
+        let buffer_size = (vertex_size * 6) as u64;
+
+        let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cursor Plugin Vertex Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        self.vertex_buffer = Some(vertex_buffer);
+
+        // Also create an FFI buffer ID for reuse
+        use tiny_sdk::ffi::BufferId;
+        let buffer_id = BufferId::create(
+            buffer_size,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
+        );
+        self.vertex_buffer_id = Some(buffer_id);
+
+        Ok(())
     }
 }
 
@@ -214,38 +297,141 @@ impl Updatable for CursorPlugin {
     }
 }
 
+// === Library Trait Implementation ===
+
+impl Library for CursorPlugin {
+    fn name(&self) -> &str {
+        "cursor_api"
+    }
+
+    fn call(&mut self, method: &str, args: &[u8]) -> Result<Vec<u8>, PluginError> {
+        match method {
+            "set_position" => {
+                if args.len() == 8 {
+                    let x = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+                    let y = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
+                    // Call the plugin's set_position method to update activity
+                    self.set_position(x, y);
+                    Ok(Vec::new())
+                } else {
+                    Err(PluginError::Other("Invalid args for set_position".into()))
+                }
+            }
+            _ => Err(PluginError::Other("Unknown method".into()))
+        }
+    }
+}
+
 // === Paint Trait Implementation ===
 
 impl Paintable for CursorPlugin {
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Create vertices for current frame
-        let vertices = self.create_vertices(&ctx.viewport);
+        // Get cursor position from our API
+        let pos = self.api.get_position();
 
-        // Skip rendering if cursor is invisible
-        if vertices.is_empty() || vertices[0].color == 0x00000000 {
+        // Create vertices for current frame
+        let vertices = self.create_vertices_at_position(&ctx.viewport, pos);
+        if vertices.is_empty() {
             return;
         }
 
-        // Cast gpu_renderer pointer to access the rect pipeline
-        let gpu_renderer = ctx.gpu_renderer as *mut GpuRenderer;
+        // eprintln!("Rendering {} vertices with color {:#010x}", vertices.len(), vertices[0].color);
 
-        // Create vertex buffer for this frame
         let vertex_data = bytemuck::cast_slice(&vertices);
-        let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Cursor Vertex Buffer"),
-            size: vertex_data.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        ctx.queue.write_buffer(&vertex_buffer, 0, vertex_data);
+        let vertex_count = vertices.len() as u32;
 
-        // Use the GPU's rect pipeline for rendering
-        unsafe {
-            render_pass.set_pipeline((*gpu_renderer).rect_pipeline());
-            render_pass.set_bind_group(0, (*gpu_renderer).uniform_bind_group(), &[]);
+        // Reuse the existing FFI buffer created during setup
+        if let Some(buffer_id) = self.vertex_buffer_id {
+            // Write updated vertex data to the existing buffer
+            buffer_id.write(0, vertex_data);
+            // eprintln!("Updated reusable buffer via FFI");
+
+            // Draw using the host's rect pipeline via FFI
+            if let Some(ref gpu_ctx) = ctx.gpu_context {
+                gpu_ctx.draw_vertices(render_pass, buffer_id, vertex_count);
+                // eprintln!("Drew vertices via FFI");
+            } else {
+                eprintln!("No GPU context - cannot use FFI draw");
+            }
+        } else {
+            eprintln!("No FFI buffer ID available - cursor not properly initialized");
         }
-        render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-        render_pass.draw(0..vertices.len() as u32, 0..1);
+    }
+}
+
+// === Configurable Trait Implementation ===
+
+impl Configurable for CursorPlugin {
+    fn config_updated(&mut self, config_data: &str) -> Result<(), PluginError> {
+        // Parse the full plugin.toml structure
+        #[derive(Deserialize)]
+        struct PluginToml {
+            config: PluginConfig,
+        }
+
+        #[derive(Deserialize)]
+        struct PluginConfig {
+            #[serde(default = "default_blink_enabled")]
+            blink_enabled: bool,
+            #[serde(default = "default_blink_rate")]
+            blink_rate: f32,
+            #[serde(default = "default_solid_duration_ms")]
+            solid_duration_ms: u64,
+            #[serde(default = "default_width")]
+            width: f32,
+            #[serde(default = "default_color")]
+            color: u32,
+            #[serde(default = "default_height_scale")]
+            height_scale: f32,
+            #[serde(default = "default_x_offset")]
+            x_offset: f32,
+        }
+
+        fn default_blink_enabled() -> bool { true }
+        fn default_blink_rate() -> f32 { 2.0 }
+        fn default_solid_duration_ms() -> u64 { 500 }
+        fn default_width() -> f32 { 2.0 }
+        fn default_color() -> u32 { 0xFFFFFFFF }
+        fn default_height_scale() -> f32 { 1.0 }
+        fn default_x_offset() -> f32 { -2.0 }
+
+        match toml::from_str::<PluginToml>(config_data) {
+            Ok(plugin_toml) => {
+                // Update our config from the parsed values
+                self.config.blink_enabled = plugin_toml.config.blink_enabled;
+                self.config.blink_rate = plugin_toml.config.blink_rate;
+                self.config.solid_duration_ms = plugin_toml.config.solid_duration_ms;
+                self.config.style.width = plugin_toml.config.width;
+                self.config.style.color = plugin_toml.config.color;
+                self.config.style.height_scale = plugin_toml.config.height_scale;
+                self.config.style.x_offset = plugin_toml.config.x_offset;
+
+                eprintln!("Cursor plugin config updated: width={}, color={:#010x}, blink_rate={}",
+                         self.config.style.width, self.config.style.color, self.config.blink_rate);
+
+                // Reset blink phase when config changes
+                self.blink_phase = 0.0;
+                self.last_active_ms.store(0, Ordering::Relaxed);
+
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Failed to parse cursor config: {}", e);
+                Err(PluginError::Other(format!("Config parse error: {}", e).into()))
+            }
+        }
+    }
+
+    fn get_config(&self) -> Option<String> {
+        // Convert current config back to TOML
+        format!("[config]\nblink_enabled = {}\nblink_rate = {}\nsolid_duration_ms = {}\nwidth = {}\ncolor = {:#010x}\nheight_scale = {}\nx_offset = {}",
+                self.config.blink_enabled,
+                self.config.blink_rate,
+                self.config.solid_duration_ms,
+                self.config.style.width,
+                self.config.style.color,
+                self.config.style.height_scale,
+                self.config.style.x_offset).into()
     }
 }
 
@@ -269,7 +455,7 @@ impl CursorPlugin {
 
     /// Get current cursor position
     pub fn position(&self) -> LayoutPos {
-        self.position
+        self.api.get_position()
     }
 
     /// Check if cursor is currently visible

@@ -426,4 +426,19 @@ impl ViewportInfo {
             y: PhysicalPixels(view.y.0 * self.scale_factor),
         }
     }
+
+    /// Transform layout rectangle to view rectangle
+    pub fn layout_rect_to_view(&self, rect: LayoutRect) -> ViewRect {
+        ViewRect::new(
+            rect.x.0 - self.scroll.x.0,
+            rect.y.0 - self.scroll.y.0,
+            rect.width.0,
+            rect.height.0,
+        )
+    }
+
+    /// Get font size from line height (approximate)
+    pub fn font_size(&self) -> f32 {
+        self.line_height / 1.4  // Standard line height multiplier
+    }
 }

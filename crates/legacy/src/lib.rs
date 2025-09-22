@@ -1,12 +1,15 @@
 extern crate lazy_static;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Host-only GPU FFI implementations
+pub mod gpu_ffi_host;
 
 #[cfg(feature = "winit")]
 pub mod app;
+pub mod config;
 pub mod coordinates; // Coordinate system abstraction
-pub mod font;
 pub mod history;
 pub mod input;
 pub mod input_types;
@@ -15,6 +18,7 @@ pub mod render;
 pub mod syntax;
 pub mod text_effects;
 pub mod text_renderer;
+pub mod text_style_box_adapter;
 pub mod theme;
 pub mod widget;
 
@@ -24,5 +28,5 @@ pub use input::{InputHandler, Selection};
 pub use render::Renderer;
 pub use syntax::SyntaxHighlighter;
 pub use tiny_tree::{Content, Doc, Edit, Point, Rect, Span, Tree as DocTree};
-pub use widget::{CursorWidget, SelectionWidget, StyleId, TextWidget};
+pub use widget::{SelectionWidget, StyleId, TextWidget};
 pub use widget::{EventResponse, LayoutConstraints, LayoutResult, Widget, WidgetEvent, WidgetId};

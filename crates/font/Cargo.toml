@@ -1,0 +1,10 @@
+[package]
+name = "tiny-font"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tiny-sdk = { path = "../sdk" }
+fontdue = "0.9"
+parking_lot = "0.12"
+ahash = "0.8"

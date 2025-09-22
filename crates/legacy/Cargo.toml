@@ -18,11 +18,11 @@ ahash = { workspace = true }
 tiny-sdk = { path = "../sdk" }
 tiny-core = { path = "../core" }
 tiny-tree = { path = "../tree" }
+tiny-font = { path = "../font" }
 
 winit = { version = "0.30", optional = true }
 
-# Text rendering
-fontdue = "0.9"
+# Text rendering (swash for advanced text features)
 swash = "0.2.5"
 
 # Core data structures
@@ -46,6 +46,10 @@ notify = "6"  # File watching for shader hot-reload
 # Async runtime for LSP
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 mimalloc = "0.1.48"
+
+# Configuration parsing
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
 
 [features]
 default = ["winit"]

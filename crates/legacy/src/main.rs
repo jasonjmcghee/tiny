@@ -1,9 +1,13 @@
 use std::env;
 use std::path::PathBuf;
 use tiny_editor::app::{EditorLogic, TinyApp};
-use tiny_editor::{io, tree::Doc};
+use tiny_editor::{io, Doc};
+use tiny_editor::gpu_ffi_host;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize GPU FFI for plugins
+    gpu_ffi_host::init_ffi();
+
     let args: Vec<String> = env::args().collect();
 
     let editor_logic = if args.len() > 1 {

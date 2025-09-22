@@ -158,7 +158,7 @@ pub struct Viewport {
     cached_longest_line_chars: usize,
 
     // === Optional font system for accurate measurement ===
-    font_system: Option<Arc<crate::font::SharedFontSystem>>,
+    font_system: Option<Arc<tiny_font::SharedFontSystem>>,
 }
 
 impl Viewport {
@@ -189,7 +189,7 @@ impl Viewport {
     }
 
     /// Set font system for accurate text measurement
-    pub fn set_font_system(&mut self, font_system: Arc<crate::font::SharedFontSystem>) {
+    pub fn set_font_system(&mut self, font_system: Arc<tiny_font::SharedFontSystem>) {
         // Cache the actual metrics from the font system once
         let line_layout =
             font_system.layout_text_scaled("A\nB", self.metrics.font_size, self.scale_factor);
@@ -557,6 +557,18 @@ impl Viewport {
     }
 
     // === Horizontal Virtualization ===
+
+    /// Convert to SDK ViewportInfo for plugins
+    pub fn to_viewport_info(&self) -> tiny_sdk::ViewportInfo {
+        tiny_sdk::ViewportInfo {
+            scroll: self.scroll.clone(),
+            logical_size: self.logical_size.clone(),
+            physical_size: self.physical_size.clone(),
+            scale_factor: self.scale_factor,
+            line_height: self.metrics.line_height,
+            margin: self.margin.clone(),
+        }
+    }
 
     /// Calculate what part of a line is actually visible
     pub fn visible_line_content_semantic(
