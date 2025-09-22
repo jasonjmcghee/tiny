@@ -1,15 +1,16 @@
 //! Cursor Plugin - Blinking text cursor with customizable appearance
 
+use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use serde::Deserialize;
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
-    Capability, Configurable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
-    Updatable, UpdateContext, Library, Initializable, SetupContext,
+    ffi::{PipelineId, ShaderModuleId},
+    Capability, Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
+    PluginError, SetupContext, Updatable, UpdateContext,
 };
 
 /// API exposed by cursor plugin
@@ -86,6 +87,7 @@ pub struct CursorPlugin {
     // GPU resources (created during setup)
     vertex_buffer: Option<Buffer>,
     vertex_buffer_id: Option<tiny_sdk::ffi::BufferId>,
+    custom_pipeline_id: Option<PipelineId>,
     device: Option<std::sync::Arc<wgpu::Device>>,
     queue: Option<std::sync::Arc<wgpu::Queue>>,
 }
@@ -102,6 +104,7 @@ impl CursorPlugin {
             program_start: Instant::now(),
             vertex_buffer: None,
             vertex_buffer_id: None,
+            custom_pipeline_id: None,
             device: None,
             queue: None,
         }
@@ -147,7 +150,11 @@ impl CursorPlugin {
     }
 
     /// Create vertex data for cursor rectangle at a specific position
-    fn create_vertices_at_position(&self, viewport: &tiny_sdk::ViewportInfo, position: tiny_sdk::LayoutPos) -> Vec<CursorVertex> {
+    fn create_vertices_at_position(
+        &self,
+        viewport: &tiny_sdk::ViewportInfo,
+        position: tiny_sdk::LayoutPos,
+    ) -> Vec<CursorVertex> {
         let visible = self.calculate_visibility();
         let color = if visible {
             self.config.style.color
@@ -273,9 +280,73 @@ impl Initializable for CursorPlugin {
         use tiny_sdk::ffi::BufferId;
         let buffer_id = BufferId::create(
             buffer_size,
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
         self.vertex_buffer_id = Some(buffer_id);
+
+        // Create custom shader for cursor rendering
+        let shader_source = r#"
+// Vertex shader
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) color: u32,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+
+struct Uniforms {
+    viewport_size: vec2<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+
+    // Convert from pixel coordinates to normalized device coordinates
+    let x = (input.position.x / uniforms.viewport_size.x) * 2.0 - 1.0;
+    let y = 1.0 - (input.position.y / uniforms.viewport_size.y) * 2.0;
+
+    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+
+    // Unpack color from u32 to vec4
+    let r = f32((input.color >> 24u) & 0xFFu) / 255.0;
+    let g = f32((input.color >> 16u) & 0xFFu) / 255.0;
+    let b = f32((input.color >> 8u) & 0xFFu) / 255.0;
+    let a = f32(input.color & 0xFFu) / 255.0;
+    out.color = vec4<f32>(r, g, b, a);
+
+    return out;
+}
+
+// Fragment shader with rounded corners effect
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Apply a subtle gradient or pulsing effect
+    var color = input.color;
+
+    // Add a subtle pulse based on the alpha channel
+    // This could be animated with time uniform in the future
+    color.a = color.a * 0.5;
+    color.r = 1.0;
+
+    return color;
+}
+"#;
+
+        // Create shader modules
+        let shader_id = ShaderModuleId::create_from_wgsl(shader_source);
+
+        // Create pipeline with the same shader for vertex and fragment
+        let pipeline_id = PipelineId::create_simple(shader_id, shader_id);
+        self.custom_pipeline_id = Some(pipeline_id);
+
+        eprintln!("Cursor plugin created custom pipeline");
 
         Ok(())
     }
@@ -317,7 +388,7 @@ impl Library for CursorPlugin {
                     Err(PluginError::Other("Invalid args for set_position".into()))
                 }
             }
-            _ => Err(PluginError::Other("Unknown method".into()))
+            _ => Err(PluginError::Other("Unknown method".into())),
         }
     }
 }
@@ -346,10 +417,23 @@ impl Paintable for CursorPlugin {
             buffer_id.write(0, vertex_data);
             // eprintln!("Updated reusable buffer via FFI");
 
-            // Draw using the host's rect pipeline via FFI
+            // Use atomic render operations with our custom pipeline
             if let Some(ref gpu_ctx) = ctx.gpu_context {
-                gpu_ctx.draw_vertices(render_pass, buffer_id, vertex_count);
-                // eprintln!("Drew vertices via FFI");
+                if let Some(pipeline_id) = self.custom_pipeline_id {
+                    // Use our custom pipeline
+                    gpu_ctx.set_pipeline(render_pass, pipeline_id);
+                    // Use the host's uniform bind group for viewport transforms
+                    gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
+                    // Set our vertex buffer
+                    gpu_ctx.set_vertex_buffer(render_pass, 0, buffer_id);
+                    // Draw!
+                    gpu_ctx.draw(render_pass, vertex_count, 1);
+                    // eprintln!("Drew cursor with custom pipeline");
+                } else {
+                    // Fallback to old method if custom pipeline not available
+                    gpu_ctx.draw_vertices(render_pass, buffer_id, vertex_count);
+                    // eprintln!("Drew vertices via FFI (fallback)");
+                }
             } else {
                 eprintln!("No GPU context - cannot use FFI draw");
             }
@@ -387,13 +471,27 @@ impl Configurable for CursorPlugin {
             x_offset: f32,
         }
 
-        fn default_blink_enabled() -> bool { true }
-        fn default_blink_rate() -> f32 { 2.0 }
-        fn default_solid_duration_ms() -> u64 { 500 }
-        fn default_width() -> f32 { 2.0 }
-        fn default_color() -> u32 { 0xFFFFFFFF }
-        fn default_height_scale() -> f32 { 1.0 }
-        fn default_x_offset() -> f32 { -2.0 }
+        fn default_blink_enabled() -> bool {
+            true
+        }
+        fn default_blink_rate() -> f32 {
+            2.0
+        }
+        fn default_solid_duration_ms() -> u64 {
+            500
+        }
+        fn default_width() -> f32 {
+            2.0
+        }
+        fn default_color() -> u32 {
+            0xFFFFFFFF
+        }
+        fn default_height_scale() -> f32 {
+            1.0
+        }
+        fn default_x_offset() -> f32 {
+            -2.0
+        }
 
         match toml::from_str::<PluginToml>(config_data) {
             Ok(plugin_toml) => {
@@ -406,8 +504,10 @@ impl Configurable for CursorPlugin {
                 self.config.style.height_scale = plugin_toml.config.height_scale;
                 self.config.style.x_offset = plugin_toml.config.x_offset;
 
-                eprintln!("Cursor plugin config updated: width={}, color={:#010x}, blink_rate={}",
-                         self.config.style.width, self.config.style.color, self.config.blink_rate);
+                eprintln!(
+                    "Cursor plugin config updated: width={}, color={:#010x}, blink_rate={}",
+                    self.config.style.width, self.config.style.color, self.config.blink_rate
+                );
 
                 // Reset blink phase when config changes
                 self.blink_phase = 0.0;
@@ -417,7 +517,9 @@ impl Configurable for CursorPlugin {
             }
             Err(e) => {
                 eprintln!("Failed to parse cursor config: {}", e);
-                Err(PluginError::Other(format!("Config parse error: {}", e).into()))
+                Err(PluginError::Other(
+                    format!("Config parse error: {}", e).into(),
+                ))
             }
         }
     }

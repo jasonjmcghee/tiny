@@ -17,6 +17,16 @@ pub struct PipelineId(pub u64);
 #[derive(Debug, Clone, Copy)]
 pub struct BindGroupId(pub u64);
 
+/// FFI-safe shader module ID
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ShaderModuleId(pub u64);
+
+/// FFI-safe bind group layout ID
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BindGroupLayoutId(pub u64);
+
 /// Plugin GPU context with FFI-safe IDs
 #[repr(C)]
 pub struct PluginGpuContext {
@@ -37,6 +47,33 @@ extern "C" {
         buffer_id: BufferId,
         vertex_count: u32,
     );
+
+    // Shader and pipeline creation
+    pub fn gpu_create_shader_module(source: *const u8, len: usize) -> ShaderModuleId;
+    pub fn gpu_create_render_pipeline_simple(
+        vertex_shader: ShaderModuleId,
+        fragment_shader: ShaderModuleId,
+        vertex_buffer_layout: *const u8,
+        layout_len: usize,
+    ) -> PipelineId;
+
+    // Atomic render operations
+    pub fn gpu_render_set_pipeline(render_pass: *mut c_void, pipeline_id: PipelineId);
+    pub fn gpu_render_set_bind_group(
+        render_pass: *mut c_void,
+        index: u32,
+        bind_group_id: BindGroupId,
+    );
+    pub fn gpu_render_set_vertex_buffer(
+        render_pass: *mut c_void,
+        slot: u32,
+        buffer_id: BufferId,
+    );
+    pub fn gpu_render_draw(
+        render_pass: *mut c_void,
+        vertices: u32,
+        instances: u32,
+    );
 }
 
 // Safe wrappers for plugins to use
@@ -50,6 +87,19 @@ impl BufferId {
     }
 }
 
+impl ShaderModuleId {
+    pub fn create_from_wgsl(source: &str) -> Self {
+        unsafe { gpu_create_shader_module(source.as_ptr(), source.len()) }
+    }
+}
+
+impl PipelineId {
+    pub fn create_simple(vertex_shader: ShaderModuleId, fragment_shader: ShaderModuleId) -> Self {
+        // For now, pass empty layout data - the host will use defaults
+        unsafe { gpu_create_render_pipeline_simple(vertex_shader, fragment_shader, std::ptr::null(), 0) }
+    }
+}
+
 impl PluginGpuContext {
     pub fn draw_vertices(&self, render_pass: &mut wgpu::RenderPass, buffer_id: BufferId, vertex_count: u32) {
         unsafe {
@@ -60,6 +110,31 @@ impl PluginGpuContext {
                 buffer_id,
                 vertex_count,
             );
+        }
+    }
+
+    // Atomic render operations
+    pub fn set_pipeline(&self, render_pass: &mut wgpu::RenderPass, pipeline_id: PipelineId) {
+        unsafe {
+            gpu_render_set_pipeline(render_pass as *mut _ as *mut c_void, pipeline_id);
+        }
+    }
+
+    pub fn set_bind_group(&self, render_pass: &mut wgpu::RenderPass, index: u32, bind_group_id: BindGroupId) {
+        unsafe {
+            gpu_render_set_bind_group(render_pass as *mut _ as *mut c_void, index, bind_group_id);
+        }
+    }
+
+    pub fn set_vertex_buffer(&self, render_pass: &mut wgpu::RenderPass, slot: u32, buffer_id: BufferId) {
+        unsafe {
+            gpu_render_set_vertex_buffer(render_pass as *mut _ as *mut c_void, slot, buffer_id);
+        }
+    }
+
+    pub fn draw(&self, render_pass: &mut wgpu::RenderPass, vertices: u32, instances: u32) {
+        unsafe {
+            gpu_render_draw(render_pass as *mut _ as *mut c_void, vertices, instances);
         }
     }
 }

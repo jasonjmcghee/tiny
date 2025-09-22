@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use wgpu::*;
 
-pub use tiny_sdk::ffi::{BufferId, PipelineId, BindGroupId, PluginGpuContext};
+pub use tiny_sdk::ffi::{BufferId, PipelineId, BindGroupId, PluginGpuContext, ShaderModuleId, BindGroupLayoutId};
 
 /// GPU resource registry - maintains the actual wgpu objects
 pub struct GpuRegistry {
@@ -18,6 +18,8 @@ pub struct GpuRegistry {
     buffers: RwLock<HashMap<u64, Buffer>>,
     pipelines: RwLock<HashMap<u64, RenderPipeline>>,
     bind_groups: RwLock<HashMap<u64, BindGroup>>,
+    bind_group_layouts: RwLock<HashMap<u64, BindGroupLayout>>,
+    shader_modules: RwLock<HashMap<u64, ShaderModule>>,
     textures: RwLock<HashMap<u64, Texture>>,
     samplers: RwLock<HashMap<u64, Sampler>>,
 
@@ -33,6 +35,8 @@ impl GpuRegistry {
             buffers: RwLock::new(HashMap::new()),
             pipelines: RwLock::new(HashMap::new()),
             bind_groups: RwLock::new(HashMap::new()),
+            bind_group_layouts: RwLock::new(HashMap::new()),
+            shader_modules: RwLock::new(HashMap::new()),
             textures: RwLock::new(HashMap::new()),
             samplers: RwLock::new(HashMap::new()),
             device,
@@ -93,6 +97,32 @@ impl GpuRegistry {
 
     pub fn get_bind_group(&self, id: BindGroupId) -> Option<BindGroup> {
         self.bind_groups.read().unwrap().get(&id.0).cloned()
+    }
+
+    // Shader module management
+    pub fn create_shader_module(&self, source: &str) -> ShaderModuleId {
+        let shader = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Plugin Shader"),
+            source: ShaderSource::Wgsl(source.into()),
+        });
+        let id = self.next_id();
+        self.shader_modules.write().unwrap().insert(id, shader);
+        ShaderModuleId(id)
+    }
+
+    pub fn get_shader_module(&self, id: ShaderModuleId) -> Option<ShaderModule> {
+        self.shader_modules.read().unwrap().get(&id.0).cloned()
+    }
+
+    // Bind group layout management
+    pub fn register_bind_group_layout(&self, layout: BindGroupLayout) -> BindGroupLayoutId {
+        let id = self.next_id();
+        self.bind_group_layouts.write().unwrap().insert(id, layout);
+        BindGroupLayoutId(id)
+    }
+
+    pub fn get_bind_group_layout(&self, id: BindGroupLayoutId) -> Option<BindGroupLayout> {
+        self.bind_group_layouts.read().unwrap().get(&id.0).cloned()
     }
 }
 
