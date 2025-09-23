@@ -18,7 +18,7 @@ paint = true
 [config]
 # Selection color (RGBA in hex, format: 0xRRGGBBAA)
 # Default is semi-transparent blue
-color = 0x4080FF30
+color = 0x4080FF40
 
 [exports]
 # Entry point function name in the compiled library

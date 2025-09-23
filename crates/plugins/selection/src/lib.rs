@@ -7,7 +7,7 @@ use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
-    ffi::{BufferId, PipelineId, ShaderModuleId, BindGroupLayoutId},
+    ffi::{BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId},
     Capability, Configurable, Initializable, LayoutRect, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext,
 };
@@ -81,13 +81,13 @@ impl SelectionPlugin {
         Self {
             config: SelectionConfig::default(),
             selections: Vec::new(),
-            line_height: 19.6, // Default
+            line_height: 19.6,     // Default
             viewport_width: 800.0, // Default
-            margin_x: 60.0, // Default
-            margin_y: 10.0, // Default
-            scale_factor: 1.0, // Default
-            scroll_x: 0.0, // Default
-            scroll_y: 0.0, // Default
+            margin_x: 60.0,        // Default
+            margin_y: 10.0,        // Default
+            scale_factor: 1.0,     // Default
+            scroll_x: 0.0,         // Default
+            scroll_y: 0.0,         // Default
             vertex_buffer: None,
             vertex_buffer_id: None,
             custom_pipeline_id: None,
@@ -100,14 +100,23 @@ impl SelectionPlugin {
     pub fn set_selections(&mut self, selections: Vec<(DocPos, DocPos)>) {
         self.selections = selections
             .into_iter()
-            .map(|(start, end)| {
-                Selection { start, end }
-            })
+            .map(|(start, end)| Selection { start, end })
             .collect();
     }
 
     /// Update viewport information (including scroll offset)
-    pub fn set_viewport_info(&mut self, line_height: f32, viewport_width: f32, margin_x: f32, margin_y: f32, scale_factor: f32, scroll_x: f32, scroll_y: f32, global_margin_x: f32, global_margin_y: f32) {
+    pub fn set_viewport_info(
+        &mut self,
+        line_height: f32,
+        viewport_width: f32,
+        margin_x: f32,
+        margin_y: f32,
+        scale_factor: f32,
+        scroll_x: f32,
+        scroll_y: f32,
+        global_margin_x: f32,
+        global_margin_y: f32,
+    ) {
         // Check if scale factor seems wrong (e.g., 1.0 on a retina display)
         if scale_factor == 1.0 {
             eprintln!("WARNING: Scale factor is 1.0, might be incorrect for high-DPI display!");
@@ -135,7 +144,9 @@ impl SelectionPlugin {
         let mut rects = Vec::new();
 
         // Skip if it's just a cursor (no selection)
-        if selection.start.line == selection.end.line && selection.start.column == selection.end.column {
+        if selection.start.line == selection.end.line
+            && selection.start.column == selection.end.column
+        {
             return rects;
         }
 
@@ -148,7 +159,7 @@ impl SelectionPlugin {
             let (end_x, _) = self.doc_to_view(selection.end);
 
             rects.push(LayoutRect::new(
-                start_x - 2.0,
+                start_x - 16.0,
                 start_y,
                 end_x - start_x,
                 self.line_height,
@@ -161,16 +172,16 @@ impl SelectionPlugin {
 
             // First line - extends to right edge
             rects.push(LayoutRect::new(
-                start_x - 2.0,
+                start_x - 16.0,
                 start_y,
-                (viewport_right - start_x).max(0.0) + 2.0,
+                (viewport_right - start_x).max(0.0),
                 self.line_height,
             ));
 
             // Middle lines - full width
             if selection.end.line > selection.start.line + 1 {
                 rects.push(LayoutRect::new(
-                    self.margin_x - self.scroll_x,  // Account for horizontal scroll
+                    self.margin_x - self.scroll_x, // Account for horizontal scroll
                     start_y + self.line_height,
                     self.viewport_width - (self.margin_x * 2.0),
                     (selection.end.line - selection.start.line - 1) as f32 * self.line_height,
@@ -179,9 +190,9 @@ impl SelectionPlugin {
 
             // Last line - from left margin to end position
             rects.push(LayoutRect::new(
-                self.margin_x - self.scroll_x,  // Account for horizontal scroll
+                self.margin_x - self.scroll_x, // Account for horizontal scroll
                 end_y,
-                (end_x - self.margin_x + self.scroll_x).max(0.0) - 2.0,
+                (end_x - self.margin_x + self.scroll_x).max(0.0) - 16.0,
                 self.line_height,
             ));
         }
@@ -415,7 +426,10 @@ impl Library for SelectionPlugin {
 
                 let mut offset = 0;
                 let selection_count = u32::from_le_bytes([
-                    args[offset], args[offset + 1], args[offset + 2], args[offset + 3]
+                    args[offset],
+                    args[offset + 1],
+                    args[offset + 2],
+                    args[offset + 3],
                 ]) as usize;
                 offset += 4;
 
@@ -423,27 +437,47 @@ impl Library for SelectionPlugin {
 
                 for i in 0..selection_count {
                     if offset + 16 > args.len() {
-                        return Err(PluginError::Other("Invalid args: incomplete selection data".into()));
+                        return Err(PluginError::Other(
+                            "Invalid args: incomplete selection data".into(),
+                        ));
                     }
 
                     let start_line = u32::from_le_bytes([
-                        args[offset], args[offset + 1], args[offset + 2], args[offset + 3]
+                        args[offset],
+                        args[offset + 1],
+                        args[offset + 2],
+                        args[offset + 3],
                     ]);
                     let start_column = u32::from_le_bytes([
-                        args[offset + 4], args[offset + 5], args[offset + 6], args[offset + 7]
+                        args[offset + 4],
+                        args[offset + 5],
+                        args[offset + 6],
+                        args[offset + 7],
                     ]);
                     let end_line = u32::from_le_bytes([
-                        args[offset + 8], args[offset + 9], args[offset + 10], args[offset + 11]
+                        args[offset + 8],
+                        args[offset + 9],
+                        args[offset + 10],
+                        args[offset + 11],
                     ]);
                     let end_column = u32::from_le_bytes([
-                        args[offset + 12], args[offset + 13], args[offset + 14], args[offset + 15]
+                        args[offset + 12],
+                        args[offset + 13],
+                        args[offset + 14],
+                        args[offset + 15],
                     ]);
 
                     offset += 16;
 
                     selections.push((
-                        DocPos { line: start_line, column: start_column },
-                        DocPos { line: end_line, column: end_column }
+                        DocPos {
+                            line: start_line,
+                            column: start_column,
+                        },
+                        DocPos {
+                            line: end_line,
+                            column: end_column,
+                        },
                     ));
                 }
 
@@ -467,7 +501,17 @@ impl Library for SelectionPlugin {
                     let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
                     let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
 
-                    self.set_viewport_info(line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y, 0.0, 0.0);
+                    self.set_viewport_info(
+                        line_height,
+                        viewport_width,
+                        margin_x,
+                        margin_y,
+                        scale_factor,
+                        scroll_x,
+                        scroll_y,
+                        0.0,
+                        0.0,
+                    );
                 } else {
                     // New format - with global margin
                     let line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
@@ -477,10 +521,22 @@ impl Library for SelectionPlugin {
                     let scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
                     let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
                     let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
-                    let global_margin_x = f32::from_le_bytes([args[28], args[29], args[30], args[31]]);
-                    let global_margin_y = f32::from_le_bytes([args[32], args[33], args[34], args[35]]);
+                    let global_margin_x =
+                        f32::from_le_bytes([args[28], args[29], args[30], args[31]]);
+                    let global_margin_y =
+                        f32::from_le_bytes([args[32], args[33], args[34], args[35]]);
 
-                    self.set_viewport_info(line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y, global_margin_x, global_margin_y);
+                    self.set_viewport_info(
+                        line_height,
+                        viewport_width,
+                        margin_x,
+                        margin_y,
+                        scale_factor,
+                        scroll_x,
+                        scroll_y,
+                        global_margin_x,
+                        global_margin_y,
+                    );
                 }
                 Ok(Vec::new())
             }
