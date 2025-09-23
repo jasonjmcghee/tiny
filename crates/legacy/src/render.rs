@@ -496,13 +496,7 @@ impl Renderer {
         // Paint selections BEFORE text
         if let Some(pass) = render_pass.as_deref_mut() {
             let widgets = self.widget_manager.widgets_in_order();
-            if let Some(ctx) = widget_paint_context {
-                for widget in widgets {
-                    if widget.priority() < 0 {
-                        widget.paint(ctx, pass);
-                    }
-                }
-            } else if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
+            if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu };
 
                 let mut ctx = PaintContext::new(
@@ -522,6 +516,22 @@ impl Renderer {
                         widget.paint(&ctx, pass);
                     }
                 }
+
+                // Paint plugins
+                if let Some(ref loader_arc) = self.plugin_loader {
+                    // eprintln!("Have plugin loader (2nd location)");
+                    if let Ok(loader) = loader_arc.lock() {
+                        for plugin_key in loader.list_plugins() {
+                            if let Some(plugin) = loader.get_plugin(&plugin_key) {
+                                if let Some(paintable) = plugin.instance.as_paintable() {
+                                    if paintable.z_index() < 0 {
+                                        paintable.paint(&ctx, pass);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -531,34 +541,7 @@ impl Renderer {
 
         // Paint cursor and overlays AFTER text
         if let Some(pass) = render_pass.as_deref_mut() {
-            let widgets = self.widget_manager.widgets_in_order();
-            if let Some(ctx) = widget_paint_context {
-                for widget in widgets {
-                    if widget.priority() >= 0 {
-                        widget.paint(ctx, pass);
-                    }
-                }
-
-                // Paint cursor plugin from loader
-                if let Some(ref loader_arc) = self.plugin_loader {
-                    // eprintln!("Have plugin loader");
-                    if let Ok(loader) = loader_arc.lock() {
-                        if let Some(cursor_plugin) = loader.get_plugin("cursor") {
-                        // eprintln!("Found cursor plugin");
-                        if let Some(paintable) = cursor_plugin.instance.as_paintable() {
-                            // eprintln!("Calling cursor plugin paint");
-                            paintable.paint(ctx, pass);
-                        } else {
-                            // eprintln!("Cursor plugin doesn't implement Paintable");
-                        }
-                    } else {
-                        // eprintln!("Cursor plugin not found in loader");
-                    }
-                    }
-                } else {
-                    // eprintln!("No plugin loader!");
-                }
-            } else if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
+            if let (Some(gpu), Some(font)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu };
 
                 let mut ctx = PaintContext::new(
@@ -572,29 +555,8 @@ impl Renderer {
                 // Set the GPU context for plugins
                 ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
 
-                // Set draw function that uses host's GPU resources
-                unsafe extern "C" fn draw_vertices(
-                    pass: *mut wgpu::RenderPass,
-                    vertices: *const u8,
-                    vertices_len: usize,
-                    count: u32,
-                ) {
-                    let pass = &mut *pass;
-                    let vertex_data = std::slice::from_raw_parts(vertices, vertices_len);
-
-                    // Get GPU renderer from somewhere... this is the issue
-                    // We need access to gpu_renderer here
-                    // eprintln!("Draw function called but can't access GPU renderer!");
-                }
-
-                // Actually, let's use a closure that captures gpu_renderer
-                let draw_fn = |pass: &mut wgpu::RenderPass, vertex_data: &[u8], count: u32| {
-                    gpu_renderer.draw_plugin_vertices(pass, vertex_data, count);
-                };
-
-                // But we can't use a closure with extern "C"...
-                // This is why we need a different approach
-
+                // TODO: Move all this to plugins
+                let widgets = self.widget_manager.widgets_in_order();
                 for widget in widgets {
                     if widget.priority() >= 0 {
                         widget.paint(&ctx, pass);
@@ -605,24 +567,20 @@ impl Renderer {
                 let (width, height) = gpu_renderer.viewport_size();
                 gpu_renderer.update_uniforms(width, height);
 
-                // Paint cursor plugin from loader
+                // Paint plugins
                 if let Some(ref loader_arc) = self.plugin_loader {
                     // eprintln!("Have plugin loader (2nd location)");
                     if let Ok(loader) = loader_arc.lock() {
-                        if let Some(cursor_plugin) = loader.get_plugin("cursor") {
-                        // eprintln!("Found cursor plugin (2nd location)");
-                        if let Some(paintable) = cursor_plugin.instance.as_paintable() {
-                            // eprintln!("Calling cursor plugin paint (2nd location)");
-                            paintable.paint(&ctx, pass);
-                        } else {
-                            // eprintln!("Cursor plugin doesn't implement Paintable (2nd location)");
+                        for plugin_key in loader.list_plugins() {
+                            if let Some(plugin) = loader.get_plugin(&plugin_key) {
+                                if let Some(paintable) = plugin.instance.as_paintable() {
+                                    if paintable.z_index() >= 0 {
+                                        paintable.paint(&ctx, pass);
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        // eprintln!("Cursor plugin not found in loader (2nd location)");
                     }
-                    }
-                } else {
-                    // eprintln!("No plugin loader! (2nd location)");
                 }
             }
         }
@@ -702,141 +660,6 @@ impl Renderer {
         }
     }
 
-    #[allow(dead_code)]
-    fn walk_visible_range_old(
-        &mut self,
-        tree: &Tree,
-        byte_range: std::ops::Range<usize>,
-        mut render_pass: Option<&mut wgpu::RenderPass>,
-    ) {
-        use widget::Widget;
-
-        // Collect all visible text WITHOUT culling
-        let mut all_visible_bytes = Vec::new();
-        tree.walk_visible_range(byte_range.clone(), |spans, _, _| {
-            for span in spans {
-                match span {
-                    tree::Span::Spatial(widget) => {
-                        // If we have a render pass and supporting resources, paint directly
-                        if let Some(pass) = render_pass.as_mut() {
-                            if let Some(font_system) = &self.font_system {
-                                if let Some(gpu_renderer_ptr) = self.gpu_renderer {
-                                    let gpu_renderer = unsafe { &*gpu_renderer_ptr };
-                                    let device_arc = gpu_renderer.device_arc();
-                                    let queue_arc = gpu_renderer.queue_arc();
-                                    let _uniform_bind_group = gpu_renderer.uniform_bind_group();
-
-                                    // Create paint context for the widget using persistent registry
-                                    let ctx = PaintContext::new(
-                                        self.viewport.to_viewport_info(),
-                                        device_arc,
-                                        queue_arc,
-                                        gpu_renderer_ptr as *mut _,
-                                        &self.service_registry,
-                                    );
-
-                                    // Let widget paint directly to GPU
-                                    widget.paint(&ctx, pass);
-                                }
-                            }
-                        }
-                    }
-                    tree::Span::Text { bytes, .. } => {
-                        all_visible_bytes.extend_from_slice(bytes);
-                    }
-                }
-            }
-        });
-
-        // Get viewport-specific syntax effects if we have a highlighter
-        let visible_effects = if let Some(ref highlighter) = self.syntax_highlighter {
-            // Always use the latest cached text which was updated in render()
-            let doc_text = self
-                .cached_doc_text
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or("");
-
-            // Only query effects if we have actual text and the range is valid
-            if !doc_text.is_empty() && byte_range.end <= doc_text.len() {
-                // Query ONLY the visible AST nodes - O(visible) instead of O(document)!
-                let effects = highlighter.get_visible_effects(doc_text, byte_range.clone());
-                Some(effects)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Render ALL visible text as a single TextWidget WITHOUT culling
-        // This preserves the 1:1 byte mapping for syntax highlighting
-        if !all_visible_bytes.is_empty() && render_pass.is_some() {
-            use std::sync::Arc;
-            use widget::{ContentType, TextWidget};
-
-            // Create a TextWidget for ALL visible text (no culling)
-            let text_widget = TextWidget {
-                text: Arc::from(all_visible_bytes.as_slice()),
-                style: 0,
-                size: LogicalSize::new(10000.0, 1000.0), // Large enough for any content
-                content_type: ContentType::Full,
-                original_byte_offset: byte_range.start,
-            };
-
-            // Paint the widget directly
-            if let Some(pass) = render_pass.as_mut() {
-                if let Some(font_system) = &self.font_system {
-                    if let Some(gpu_renderer_ptr) = self.gpu_renderer {
-                        let gpu_renderer = unsafe { &*gpu_renderer_ptr };
-                        let device_arc = gpu_renderer.device_arc();
-                        let queue_arc = gpu_renderer.queue_arc();
-                        let _uniform_bind_group = gpu_renderer.uniform_bind_group();
-
-                        // Create a custom text style provider that returns our viewport-specific effects
-                        let viewport_style_provider = if let Some(effects) = visible_effects {
-                            Some(ViewportEffectsProvider {
-                                effects,
-                                byte_offset: byte_range.start,
-                            })
-                        } else {
-                            None
-                        };
-
-                        // Use the InputEdit-aware syntax highlighter for text styles
-                        let text_styles_for_widget =
-                            if let Some(ref syntax_hl) = self.syntax_highlighter {
-                                // Use the syntax highlighter directly (it implements TextStyleProvider)
-                                // This ensures widgets get InputEdit-aware effects
-                                Some(syntax_hl.as_ref() as &dyn text_effects::TextStyleProvider)
-                            } else if let Some(ref viewport_provider) = viewport_style_provider {
-                                // Use viewport-specific effects if available
-                                Some(viewport_provider as &dyn text_effects::TextStyleProvider)
-                            } else {
-                                // Fallback to static text styles
-                                self.text_styles.as_deref()
-                            };
-
-                        // TODO: Handle viewport-specific text styles
-                        if let Some(_text_styles) = text_styles_for_widget {
-                            // For now, just use the main registry which has the global text styles
-                        }
-
-                        let ctx = PaintContext::new(
-                            self.viewport.to_viewport_info(),
-                            device_arc,
-                            queue_arc,
-                            gpu_renderer_ptr as *mut _,
-                            &self.service_registry,
-                        );
-
-                        text_widget.paint(&ctx, pass);
-                    }
-                }
-            }
-        }
-    }
-
     /// Update animation for overlay widgets
     pub fn update_widgets(&mut self, dt: f32) -> bool {
         self.widget_manager.update_all(dt)
@@ -850,70 +673,6 @@ impl Renderer {
     /// Get mutable widget manager for manual widget painting
     pub fn widget_manager_mut(&mut self) -> &mut WidgetManager {
         &mut self.widget_manager
-    }
-
-    /// Update widgets from current selections
-    pub fn update_widgets_from_selections(&mut self, selections: &[input::Selection]) {
-        // Clear existing widgets
-        self.widget_manager.clear();
-
-        // Create widgets from selections
-        let mut selection_widgets = Vec::new();
-
-        for selection in selections {
-            if selection.is_cursor() {
-                // Update cursor position via plugin library
-                let layout_pos = self.viewport.doc_to_layout(selection.cursor);
-                let view_pos = self.viewport.layout_to_view(layout_pos);
-                self.cursor_position = Some(layout_pos);
-
-                // Call cursor plugin library API
-                if let Some(ref loader_arc) = self.plugin_loader {
-                    if let Ok(mut loader) = loader_arc.lock() {
-                        if let Some(cursor_plugin) = loader.get_plugin_mut("cursor") {
-                        if let Some(library) = cursor_plugin.instance.as_library_mut() {
-                            // Send VIEW position (accounts for scroll)
-                            let x_bytes = view_pos.x.0.to_le_bytes();
-                            let y_bytes = view_pos.y.0.to_le_bytes();
-                            let mut args = Vec::new();
-                            args.extend_from_slice(&x_bytes);
-                            args.extend_from_slice(&y_bytes);
-
-                            let _ = library.call("set_position", &args);
-                        }
-                    }
-                    }
-                }
-            } else {
-                // Create selection widget
-                let start_layout = self.viewport.doc_to_layout(selection.anchor);
-                let end_layout = self.viewport.doc_to_layout(selection.cursor);
-
-                // Simple single rectangle for now
-                let (min_x, max_x) = if start_layout.x.0 < end_layout.x.0 {
-                    (start_layout.x.0, end_layout.x.0)
-                } else {
-                    (end_layout.x.0, start_layout.x.0)
-                };
-                let (min_y, max_y) = if start_layout.y.0 < end_layout.y.0 {
-                    (
-                        start_layout.y.0,
-                        end_layout.y.0 + self.viewport.metrics.line_height,
-                    )
-                } else {
-                    (
-                        end_layout.y.0,
-                        start_layout.y.0 + self.viewport.metrics.line_height,
-                    )
-                };
-
-                let rect = LayoutRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
-                selection_widgets.push(widget::selection(vec![rect]));
-            }
-        }
-
-        // Add selection widgets to manager
-        self.widget_manager.set_selection_widgets(selection_widgets);
     }
 }
 

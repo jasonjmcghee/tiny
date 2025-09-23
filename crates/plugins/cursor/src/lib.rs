@@ -332,7 +332,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Add a subtle pulse based on the alpha channel
     // This could be animated with time uniform in the future
-    color.a = color.a * 0.5;
+    // color.a = color.a * 0.5;
     color.r = 1.0;
 
     return color;
@@ -396,6 +396,10 @@ impl Library for CursorPlugin {
 // === Paint Trait Implementation ===
 
 impl Paintable for CursorPlugin {
+    fn z_index(&self) -> i32 {
+        -10
+    }
+
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
         // Get cursor position from our API
         let pos = self.api.get_position();

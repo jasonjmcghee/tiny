@@ -23,7 +23,8 @@ solid_duration_ms = 250  # How long cursor stays solid after activity
 
 # Appearance
 width = 20.0
-color = 0xFF88DDFF  # White cursor by default
+# color = 0xFF88DDFF  # White cursor by default
+color = 0xFFFFFFFF  # White cursor by default
 height_scale = 1.0  # Multiplier for line height
 
 # Position adjustment
