@@ -397,7 +397,7 @@ impl Library for CursorPlugin {
 
 impl Paintable for CursorPlugin {
     fn z_index(&self) -> i32 {
-       -10
+       10
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {

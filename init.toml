@@ -10,12 +10,19 @@ theme = "dark"
 # Default plugin directory
 plugin_dir = "plugins"
 # Enabled plugins
-enabled = ["cursor"]
+enabled = ["cursor", "selection"]
 
 # Cursor plugin configuration
 [plugins.cursor]
 lib = "crates/plugins/cursor/target/debug/libcursor_plugin.dylib"
 config = "crates/plugins/cursor/plugin.toml"
+# Watch lib and swap it in if it changes
+auto_reload = true
+
+# Selection plugin configuration
+[plugins.selection]
+lib = "crates/plugins/selection/target/debug/libselection_plugin.dylib"
+config = "crates/plugins/selection/plugin.toml"
 # Watch lib and swap it in if it changes
 auto_reload = true
 

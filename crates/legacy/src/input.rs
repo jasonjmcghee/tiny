@@ -949,34 +949,38 @@ impl InputHandler {
         })
     }
 
-    /// Create widget instances for current selections and return cursor position
-    pub fn create_widgets(
+    /// Get selection data for plugins: cursor position and selection positions
+    pub fn get_selection_data(
         &self,
         doc: &Doc,
         viewport: &Viewport,
     ) -> (
-        Vec<Arc<dyn crate::widget::Widget>>,
         Option<tiny_sdk::LayoutPos>,
+        Vec<(DocPos, DocPos)>,  // Selection start/end positions
     ) {
-        use crate::widget;
-
         let cursor_pos = self.selections.first().map(|sel| {
             let tree = doc.read();
             let line_text = tree.line_text(sel.cursor.line);
             viewport.doc_to_layout_with_text(sel.cursor, &line_text)
         });
 
-        let selection_widgets: Vec<_> = self
+        // Collect selection positions (not rectangles - plugin will calculate those)
+        let selection_positions: Vec<(DocPos, DocPos)> = self
             .selections
             .iter()
             .filter(|sel| !sel.is_cursor())
-            .filter_map(|sel| {
-                let rects = sel.to_rectangles(doc, viewport);
-                (!rects.is_empty()).then(|| widget::selection(rects))
+            .map(|sel| {
+                // Return normalized start/end positions
+                let (start, end) = if sel.min_pos() == sel.cursor {
+                    (sel.cursor, sel.anchor)
+                } else {
+                    (sel.anchor, sel.cursor)
+                };
+                (start, end)
             })
             .collect();
 
-        (selection_widgets, cursor_pos)
+        (cursor_pos, selection_positions)
     }
 
     /// Save current document state to history before making an edit

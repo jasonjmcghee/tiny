@@ -57,6 +57,10 @@ pub struct Renderer {
     config_watchers: Vec<notify::RecommendedWatcher>,
     /// Current cursor position for plugins
     cursor_position: Option<LayoutPos>,
+    /// Last selection positions sent to plugin (to avoid redundant updates)
+    last_selection_positions: Vec<(tiny_sdk::DocPos, tiny_sdk::DocPos)>,
+    /// Last viewport scroll sent to plugin
+    last_viewport_scroll: (f32, f32),
     /// Service registry for plugins (persistent)
     service_registry: ServiceRegistry,
 }
@@ -91,6 +95,8 @@ impl Renderer {
             lib_watchers: Vec::new(),
             config_watchers: Vec::new(),
             cursor_position: None,
+            last_selection_positions: Vec::new(),
+            last_viewport_scroll: (0.0, 0.0),
             service_registry,
         }
     }
@@ -158,7 +164,28 @@ impl Renderer {
 
                         match loader.initialize_plugin(plugin_name, device, queue) {
                             Ok(_) => {
-                                eprintln!("Initialized {} plugin with GPU resources", plugin_name)
+                                eprintln!("Initialized {} plugin with GPU resources", plugin_name);
+
+                                // Send initial viewport info to selection plugin
+                                if plugin_name == "selection" {
+                                    if let Some(selection_plugin) = loader.get_plugin_mut("selection") {
+                                        if let Some(library) = selection_plugin.instance.as_library_mut() {
+                                            let mut viewport_args = Vec::new();
+                                            viewport_args.extend_from_slice(&self.viewport.metrics.line_height.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.logical_size.width.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.margin.x.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.margin.y.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.scale_factor.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.scroll.x.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.scroll.y.0.to_le_bytes());
+
+                                            match library.call("set_viewport_info", &viewport_args) {
+                                                Ok(_) => eprintln!("Sent initial viewport info to selection plugin"),
+                                                Err(e) => eprintln!("Failed to send initial viewport info: {}", e),
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!("Failed to initialize {} plugin: {}", plugin_name, e)
@@ -182,7 +209,28 @@ impl Renderer {
 
                         match loader.initialize_plugin(plugin_name, device, queue) {
                             Ok(_) => {
-                                eprintln!("Initialized {} plugin with GPU resources", plugin_name)
+                                eprintln!("Initialized {} plugin with GPU resources", plugin_name);
+
+                                // Send initial viewport info to selection plugin
+                                if plugin_name == "selection" {
+                                    if let Some(selection_plugin) = loader.get_plugin_mut("selection") {
+                                        if let Some(library) = selection_plugin.instance.as_library_mut() {
+                                            let mut viewport_args = Vec::new();
+                                            viewport_args.extend_from_slice(&self.viewport.metrics.line_height.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.logical_size.width.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.margin.x.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.margin.y.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.scale_factor.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.scroll.x.0.to_le_bytes());
+                                            viewport_args.extend_from_slice(&self.viewport.scroll.y.0.to_le_bytes());
+
+                                            match library.call("set_viewport_info", &viewport_args) {
+                                                Ok(_) => eprintln!("Sent initial viewport info to selection plugin"),
+                                                Err(e) => eprintln!("Failed to send initial viewport info: {}", e),
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!("Failed to initialize {} plugin: {}", plugin_name, e)
@@ -461,23 +509,81 @@ impl Renderer {
         self.layout_dirty = true; // Layout needs updating when viewport changes
     }
 
-    /// Set selections and cursor widgets
+    /// Set selections and cursor plugins data
     pub fn set_selection_widgets(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
-        // Create widgets from current selections
-        let (selection_widgets, cursor_pos) = input_handler.create_widgets(doc, &self.viewport);
+        // Get selection data from input handler
+        let (cursor_pos, selection_positions) = input_handler.get_selection_data(doc, &self.viewport);
 
-        // Update widget manager with selection widgets
-        self.widget_manager.set_selection_widgets(selection_widgets);
+        // Check if viewport scroll has changed
+        let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
+        let viewport_changed = current_scroll != self.last_viewport_scroll;
 
-        // Update cursor position via plugin library
-        if let Some(pos) = cursor_pos {
-            // Convert layout position to view position (accounting for scroll)
-            let view_pos = self.viewport.layout_to_view(pos);
-            self.cursor_position = Some(pos);
+        // Check if selections have changed
+        let selections_changed = selection_positions != self.last_selection_positions;
 
-            // Update cursor plugin via library API
-            if let Some(ref loader_arc) = self.plugin_loader {
-                if let Ok(mut loader) = loader_arc.lock() {
+        if !viewport_changed && !selections_changed {
+            // Nothing changed, skip update
+            return;
+        }
+
+        // Update selection plugin via library API
+        if let Some(ref loader_arc) = self.plugin_loader {
+            if let Ok(mut loader) = loader_arc.lock() {
+                // Update viewport info if it changed OR if this is the first selection
+                if viewport_changed {
+                    if let Some(selection_plugin) = loader.get_plugin_mut("selection") {
+                        if let Some(library) = selection_plugin.instance.as_library_mut() {
+                            // Send viewport info (including scroll offsets)
+                            let mut viewport_args = Vec::new();
+                            viewport_args.extend_from_slice(&self.viewport.metrics.line_height.to_le_bytes());
+                            viewport_args.extend_from_slice(&self.viewport.logical_size.width.0.to_le_bytes());
+                            viewport_args.extend_from_slice(&self.viewport.margin.x.0.to_le_bytes());
+                            viewport_args.extend_from_slice(&self.viewport.margin.y.0.to_le_bytes());
+                            viewport_args.extend_from_slice(&self.viewport.scale_factor.to_le_bytes());
+                            viewport_args.extend_from_slice(&self.viewport.scroll.x.0.to_le_bytes());
+                            viewport_args.extend_from_slice(&self.viewport.scroll.y.0.to_le_bytes());
+
+                            match library.call("set_viewport_info", &viewport_args) {
+                                Ok(_) => eprintln!("Updated selection plugin viewport info"),
+                                Err(e) => eprintln!("Failed to update selection viewport: {}", e),
+                            }
+                        }
+                    }
+                    self.last_viewport_scroll = current_scroll;
+                }
+
+                // Update selections if they changed
+                if selections_changed {
+                    if let Some(selection_plugin) = loader.get_plugin_mut("selection") {
+                        if let Some(library) = selection_plugin.instance.as_library_mut() {
+                            // Format: count (u32), then for each selection:
+                            //   start_line, start_column, end_line, end_column (u32 each)
+
+                            let mut args = Vec::new();
+                            args.extend_from_slice(&(selection_positions.len() as u32).to_le_bytes());
+
+                            for (start, end) in &selection_positions {
+                                args.extend_from_slice(&start.line.to_le_bytes());
+                                args.extend_from_slice(&start.column.to_le_bytes());
+                                args.extend_from_slice(&end.line.to_le_bytes());
+                                args.extend_from_slice(&end.column.to_le_bytes());
+                            }
+
+                            match library.call("set_selections", &args) {
+                                Ok(_) => {},
+                                Err(e) => eprintln!("Failed to update selection plugin: {}", e),
+                            }
+                        }
+                    }
+                    self.last_selection_positions = selection_positions;
+                }
+
+                // Update cursor plugin position
+                if let Some(pos) = cursor_pos {
+                    // Convert layout position to view position (accounting for scroll)
+                    let view_pos = self.viewport.layout_to_view(pos);
+                    self.cursor_position = Some(pos);
+
                     if let Some(cursor_plugin) = loader.get_plugin_mut("cursor") {
                         if let Some(library) = cursor_plugin.instance.as_library_mut() {
                             // Call set_position method with binary-encoded VIEW position
@@ -493,10 +599,10 @@ impl Renderer {
                             }
                         }
                     }
+                } else {
+                    // eprintln!("No cursor position from input handler");
                 }
             }
-        } else {
-            // eprintln!("No cursor position from input handler");
         }
     }
 
@@ -580,10 +686,12 @@ impl Renderer {
                 if let Some(ref loader_arc) = self.plugin_loader {
                     // eprintln!("Have plugin loader (2nd location)");
                     if let Ok(loader) = loader_arc.lock() {
-                        for plugin_key in loader.list_plugins() {
+                        let plugins = loader.list_plugins();
+                        for plugin_key in plugins {
                             if let Some(plugin) = loader.get_plugin(&plugin_key) {
                                 if let Some(paintable) = plugin.instance.as_paintable() {
-                                    if paintable.z_index() < 0 {
+                                    let z = paintable.z_index();
+                                    if z < 0 {
                                         paintable.paint(&ctx, pass);
                                     }
                                 }

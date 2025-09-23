@@ -123,15 +123,6 @@ impl Clone for TextWidget {
 }
 
 
-/// Selection widget - highlight for selected text
-#[derive(Clone)]
-pub struct SelectionWidget {
-    /// Rectangles that make up this selection (1-3 for multi-line)
-    pub rectangles: Vec<LayoutRect>,
-    /// Selection color
-    pub color: u32,
-}
-
 /// Line number widget
 #[derive(Clone)]
 pub struct LineNumberWidget {
@@ -344,115 +335,6 @@ impl Widget for TextWidget {
     }
 }
 
-
-impl Widget for SelectionWidget {
-    fn widget_id(&self) -> WidgetId {
-        2 // Fixed ID for selection
-    }
-
-    fn layout(&mut self, _constraints: LayoutConstraints) -> LayoutResult {
-        // Calculate bounding size from rectangles
-        if self.rectangles.is_empty() {
-            return LayoutResult {
-                size: LogicalSize::new(0.0, 0.0),
-            };
-        }
-
-        let bounds = self.bounds();
-        LayoutResult {
-            size: LogicalSize::new(bounds.width.0, bounds.height.0),
-        }
-    }
-
-    fn bounds(&self) -> LayoutRect {
-        // Return bounding box that encompasses all selection rectangles
-        if self.rectangles.is_empty() {
-            return LayoutRect::new(0.0, 0.0, 0.0, 0.0);
-        }
-
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-
-        for rect in &self.rectangles {
-            min_x = min_x.min(rect.x.0);
-            min_y = min_y.min(rect.y.0);
-            max_x = max_x.max(rect.x.0 + rect.width.0);
-            max_y = max_y.max(rect.y.0 + rect.height.0);
-        }
-
-        LayoutRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
-    }
-
-    fn priority(&self) -> i32 {
-        -10 // Selection well behind text
-    }
-
-    fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Transform all selection rectangles from layout space to view space
-        let rect_instances: Vec<RectInstance> = self
-            .rectangles
-            .iter()
-            .map(|rect| {
-                // Transform each rectangle from layout to view space (apply scroll offset)
-                let view_rect = ctx.viewport.layout_rect_to_view(*rect);
-
-                // Convert ViewRect back to LayoutRect format for RectInstance
-                RectInstance {
-                    rect: LayoutRect::new(
-                        view_rect.x.0,
-                        view_rect.y.0,
-                        view_rect.width.0,
-                        view_rect.height.0,
-                    ),
-                    color: self.color,
-                }
-            })
-            .collect();
-
-        if !rect_instances.is_empty() {
-            // Create our own vertex buffer to avoid conflicts
-            let scale = ctx.viewport.scale_factor;
-            let mut vertices = Vec::with_capacity(rect_instances.len() * 6);
-
-            for rect in &rect_instances {
-                let rect_verts = create_rect_vertices(
-                    rect.rect.x.0 * scale,
-                    rect.rect.y.0 * scale,
-                    rect.rect.width.0 * scale,
-                    rect.rect.height.0 * scale,
-                    rect.color,
-                );
-                vertices.extend_from_slice(&rect_verts);
-            }
-
-            // Create temporary buffer
-            let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Selection Vertex Buffer"),
-                size: vertices.len() as u64 * std::mem::size_of::<RectVertex>() as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            ctx.queue
-                .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-            render_pass.set_pipeline(ctx.gpu().rect_pipeline());
-            render_pass.set_bind_group(0, ctx.uniform_bind_group(), &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.draw(0..vertices.len() as u32, 0..1);
-        }
-    }
-
-    fn clone_box(&self) -> Arc<dyn Widget> {
-        Arc::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 impl Widget for LineNumberWidget {
     fn widget_id(&self) -> WidgetId {
         1000 + self.line as u64 // Unique ID per line number
@@ -510,15 +392,6 @@ pub fn text(s: &str) -> Arc<dyn Widget> {
         size: LogicalSize::new(0.0, 0.0), // Will be calculated properly in render_text
         content_type: ContentType::default(),
         original_byte_offset: 0, // Default offset
-    })
-}
-
-
-/// Create selection widget from rectangles
-pub fn selection(rectangles: Vec<LayoutRect>) -> Arc<dyn Widget> {
-    Arc::new(SelectionWidget {
-        rectangles,
-        color: 0x4080FF40, // Semi-transparent blue
     })
 }
 
@@ -630,29 +503,6 @@ impl WidgetManager {
                 );
                 widget.paint(ctx, render_pass);
             }
-        }
-    }
-
-    /// Replace selection widgets with new ones
-    pub fn set_selection_widgets(&mut self, selections: Vec<Arc<dyn Widget>>) {
-        // Remove all existing selection widgets by widget type
-        self.sorted_ids.retain(|&id| {
-            if let Some(widget) = self.widgets.get(&id) {
-                if widget.widget_id() == 2 {
-                    // SelectionWidget returns id 2
-                    self.widgets.remove(&id);
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false // Remove invalid IDs
-            }
-        });
-
-        // Add new selection widgets
-        for widget in selections {
-            self.add_widget(widget);
         }
     }
 

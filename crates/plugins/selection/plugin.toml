@@ -1,0 +1,25 @@
+# Selection Plugin Configuration
+
+[metadata]
+name = "selection"
+version = "0.1.0"
+author = "Tiny Editor Team"
+description = "Visual highlight for selected text"
+
+[capabilities]
+# This plugin doesn't need frame updates (only updates when selections change)
+update = false
+# This plugin renders visual content
+paint = true
+
+[dependencies]
+# No dependencies on other plugins
+
+[config]
+# Selection color (RGBA in hex, format: 0xRRGGBBAA)
+# Default is semi-transparent blue
+color = 0x4080FF40
+
+[exports]
+# Entry point function name in the compiled library
+entry_point = "selection_plugin_create"

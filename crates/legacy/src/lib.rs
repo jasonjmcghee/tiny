@@ -28,5 +28,5 @@ pub use input::{InputHandler, Selection};
 pub use render::Renderer;
 pub use syntax::SyntaxHighlighter;
 pub use tiny_tree::{Content, Doc, Edit, Point, Rect, Span, Tree as DocTree};
-pub use widget::{SelectionWidget, StyleId, TextWidget};
+pub use widget::{StyleId, TextWidget};
 pub use widget::{EventResponse, LayoutConstraints, LayoutResult, Widget, WidgetEvent, WidgetId};
