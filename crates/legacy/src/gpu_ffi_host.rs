@@ -116,6 +116,7 @@ pub extern "C" fn gpu_create_shader_module(source: *const u8, len: usize) -> Sha
 }
 
 /// Simple render pipeline creation with vertex buffer layout
+/// Kept for backward compatibility - plugins should use gpu_create_render_pipeline_with_layout
 #[no_mangle]
 #[export_name = "gpu_create_render_pipeline_simple"]
 pub extern "C" fn gpu_create_render_pipeline_simple(
@@ -225,6 +226,160 @@ pub extern "C" fn gpu_create_render_pipeline_simple(
     }
 }
 
+/// Create a bind group layout
+#[no_mangle]
+#[export_name = "gpu_create_bind_group_layout"]
+pub extern "C" fn gpu_create_bind_group_layout(
+    entries: *const u8,
+    entries_len: usize,
+) -> BindGroupLayoutId {
+    unsafe {
+        if let Some(registry) = get_gpu_registry() {
+            use wgpu::*;
+
+            // For now, create standard uniform layout
+            // TODO: Parse entries for custom layouts
+            let layout = registry
+                .device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: Some("Plugin Bind Group Layout"),
+                    entries: &[BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+
+            registry.register_bind_group_layout(layout)
+        } else {
+            BindGroupLayoutId(0)
+        }
+    }
+}
+
+/// Create a render pipeline with custom vertex layout
+#[no_mangle]
+#[export_name = "gpu_create_render_pipeline_with_layout"]
+pub extern "C" fn gpu_create_render_pipeline_with_layout(
+    vertex_shader: ShaderModuleId,
+    fragment_shader: ShaderModuleId,
+    bind_group_layout: BindGroupLayoutId,
+    vertex_stride: u32,
+    vertex_attributes: *const u8,
+    attributes_len: usize,
+) -> PipelineId {
+    unsafe {
+        if let Some(registry) = get_gpu_registry() {
+            let vertex_shader_module = registry.get_shader_module(vertex_shader);
+            let fragment_shader_module = registry.get_shader_module(fragment_shader);
+            let bind_layout = registry.get_bind_group_layout(bind_group_layout);
+
+            if let (Some(vs), Some(fs), Some(layout)) = (vertex_shader_module, fragment_shader_module, bind_layout) {
+                use wgpu::*;
+
+                // Parse vertex attributes from buffer
+                // Format: [offset: u32, location: u32, format: u32] repeated
+                let attr_slice = std::slice::from_raw_parts(vertex_attributes, attributes_len);
+                let mut attributes = Vec::new();
+                let mut i = 0;
+                while i + 12 <= attributes_len {
+                    let offset = u32::from_le_bytes([
+                        attr_slice[i], attr_slice[i+1],
+                        attr_slice[i+2], attr_slice[i+3]
+                    ]);
+                    let location = u32::from_le_bytes([
+                        attr_slice[i+4], attr_slice[i+5],
+                        attr_slice[i+6], attr_slice[i+7]
+                    ]);
+                    let format_id = u32::from_le_bytes([
+                        attr_slice[i+8], attr_slice[i+9],
+                        attr_slice[i+10], attr_slice[i+11]
+                    ]);
+
+                    // Map format ID to VertexFormat
+                    let format = match format_id {
+                        0 => VertexFormat::Float32x2,
+                        1 => VertexFormat::Float32x3,
+                        2 => VertexFormat::Float32x4,
+                        3 => VertexFormat::Uint32,
+                        4 => VertexFormat::Uint32x2,
+                        5 => VertexFormat::Uint32x3,
+                        6 => VertexFormat::Uint32x4,
+                        _ => VertexFormat::Float32x2, // Default
+                    };
+
+                    attributes.push(VertexAttribute {
+                        offset: offset as u64,
+                        shader_location: location,
+                        format,
+                    });
+
+                    i += 12;
+                }
+
+                let pipeline_layout = registry
+                    .device
+                    .create_pipeline_layout(&PipelineLayoutDescriptor {
+                        label: Some("Plugin Custom Pipeline Layout"),
+                        bind_group_layouts: &[&layout],
+                        push_constant_ranges: &[],
+                    });
+
+                let pipeline = registry
+                    .device
+                    .create_render_pipeline(&RenderPipelineDescriptor {
+                        label: Some("Plugin Custom Render Pipeline"),
+                        layout: Some(&pipeline_layout),
+                        vertex: VertexState {
+                            module: &vs,
+                            entry_point: Some("vs_main"),
+                            buffers: &[VertexBufferLayout {
+                                array_stride: vertex_stride as u64,
+                                step_mode: VertexStepMode::Vertex,
+                                attributes: &attributes,
+                            }],
+                            compilation_options: PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(FragmentState {
+                            module: &fs,
+                            entry_point: Some("fs_main"),
+                            targets: &[Some(ColorTargetState {
+                                format: TextureFormat::Bgra8Unorm,
+                                blend: Some(BlendState::ALPHA_BLENDING),
+                                write_mask: ColorWrites::ALL,
+                            })],
+                            compilation_options: PipelineCompilationOptions::default(),
+                        }),
+                        primitive: PrimitiveState {
+                            topology: PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        depth_stencil: None,
+                        multisample: MultisampleState::default(),
+                        multiview: None,
+                        cache: None,
+                    });
+
+                registry.register_pipeline(pipeline)
+            } else {
+                PipelineId(0)
+            }
+        } else {
+            PipelineId(0)
+        }
+    }
+}
+
 /// Set pipeline for rendering
 #[no_mangle]
 #[export_name = "gpu_render_set_pipeline"]
@@ -296,17 +451,21 @@ pub fn init_ffi() {
         let _ = gpu_draw_vertices as *const ();
         let _ = gpu_create_shader_module as *const ();
         let _ = gpu_create_render_pipeline_simple as *const ();
+        let _ = gpu_create_bind_group_layout as *const ();
+        let _ = gpu_create_render_pipeline_with_layout as *const ();
         let _ = gpu_render_set_pipeline as *const ();
         let _ = gpu_render_set_bind_group as *const ();
         let _ = gpu_render_set_vertex_buffer as *const ();
         let _ = gpu_render_draw as *const ();
         // DO NOT DELETE
-        eprintln!("FFI function addresses: create={:p}, write={:p}, draw={:p}, shader={:p}, pipeline={:p}, set_pipeline={:p}, set_bind_group={:p}, set_vertex_buffer={:p}, draw={:p}",
+        eprintln!("FFI function addresses: create={:p}, write={:p}, draw={:p}, shader={:p}, pipeline={:p}, bind_layout={:p}, pipeline_layout={:p}, set_pipeline={:p}, set_bind_group={:p}, set_vertex_buffer={:p}, draw={:p}",
                  gpu_create_buffer as *const (),
                  gpu_write_buffer as *const (),
                  gpu_draw_vertices as *const (),
                  gpu_create_shader_module as *const (),
                  gpu_create_render_pipeline_simple as *const (),
+                 gpu_create_bind_group_layout as *const (),
+                 gpu_create_render_pipeline_with_layout as *const (),
                  gpu_render_set_pipeline as *const (),
                  gpu_render_set_bind_group as *const (),
                  gpu_render_set_vertex_buffer as *const (),

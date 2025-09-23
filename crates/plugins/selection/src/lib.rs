@@ -7,7 +7,7 @@ use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
-    ffi::{BufferId, PipelineId, ShaderModuleId},
+    ffi::{BufferId, PipelineId, ShaderModuleId, BindGroupLayoutId},
     Capability, Configurable, Initializable, LayoutRect, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext,
 };
@@ -363,11 +363,34 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Create shader modules
         let shader_id = ShaderModuleId::create_from_wgsl(shader_source);
 
-        // Create pipeline with the same shader for vertex and fragment
-        let pipeline_id = PipelineId::create_simple(shader_id, shader_id);
+        // Create bind group layout for uniforms
+        let bind_group_layout = BindGroupLayoutId::create_uniform();
+
+        // Define vertex attributes for our SelectionVertex layout
+        let attributes = vec![
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 0,
+                location: 0,
+                format: tiny_sdk::ffi::VertexFormat::Float32x2, // position
+            },
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 8,
+                location: 1,
+                format: tiny_sdk::ffi::VertexFormat::Uint32, // color
+            },
+        ];
+
+        // Create pipeline with custom vertex layout
+        let pipeline_id = PipelineId::create_with_layout(
+            shader_id,
+            shader_id,
+            bind_group_layout,
+            12, // vertex stride: 2 floats + 1 u32 = 12 bytes
+            &attributes,
+        );
         self.custom_pipeline_id = Some(pipeline_id);
 
-        eprintln!("Selection plugin created custom pipeline");
+        eprintln!("Selection plugin created custom pipeline with proper vertex layout");
 
         Ok(())
     }

@@ -57,6 +57,20 @@ extern "C" {
         layout_len: usize,
     ) -> PipelineId;
 
+    // Advanced pipeline creation
+    pub fn gpu_create_bind_group_layout(
+        entries: *const u8,
+        entries_len: usize,
+    ) -> BindGroupLayoutId;
+    pub fn gpu_create_render_pipeline_with_layout(
+        vertex_shader: ShaderModuleId,
+        fragment_shader: ShaderModuleId,
+        bind_group_layout: BindGroupLayoutId,
+        vertex_stride: u32,
+        vertex_attributes: *const u8,
+        attributes_len: usize,
+    ) -> PipelineId;
+
     // Atomic render operations
     pub fn gpu_render_set_pipeline(render_pass: *mut c_void, pipeline_id: PipelineId);
     pub fn gpu_render_set_bind_group(
@@ -93,10 +107,66 @@ impl ShaderModuleId {
     }
 }
 
+impl BindGroupLayoutId {
+    pub fn create_uniform() -> Self {
+        // Create standard uniform bind group layout
+        unsafe { gpu_create_bind_group_layout(std::ptr::null(), 0) }
+    }
+}
+
+/// Vertex attribute descriptor for pipeline creation
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VertexAttributeDescriptor {
+    pub offset: u32,
+    pub location: u32,
+    pub format: VertexFormat,
+}
+
+/// Vertex format enum matching wgpu
+#[repr(u32)]
+#[derive(Debug, Clone, Copy)]
+pub enum VertexFormat {
+    Float32x2 = 0,
+    Float32x3 = 1,
+    Float32x4 = 2,
+    Uint32 = 3,
+    Uint32x2 = 4,
+    Uint32x3 = 5,
+    Uint32x4 = 6,
+}
+
 impl PipelineId {
     pub fn create_simple(vertex_shader: ShaderModuleId, fragment_shader: ShaderModuleId) -> Self {
         // For now, pass empty layout data - the host will use defaults
         unsafe { gpu_create_render_pipeline_simple(vertex_shader, fragment_shader, std::ptr::null(), 0) }
+    }
+
+    pub fn create_with_layout(
+        vertex_shader: ShaderModuleId,
+        fragment_shader: ShaderModuleId,
+        bind_group_layout: BindGroupLayoutId,
+        vertex_stride: u32,
+        attributes: &[VertexAttributeDescriptor],
+    ) -> Self {
+        // Serialize attributes to bytes
+        let mut attr_bytes = Vec::with_capacity(attributes.len() * 12);
+        for attr in attributes {
+            attr_bytes.extend_from_slice(&attr.offset.to_le_bytes());
+            attr_bytes.extend_from_slice(&attr.location.to_le_bytes());
+            attr_bytes.extend_from_slice(&(attr.format as u32).to_le_bytes());
+        }
+
+        unsafe {
+            gpu_create_render_pipeline_with_layout(
+                vertex_shader,
+                fragment_shader,
+                bind_group_layout,
+                vertex_stride,
+                attr_bytes.as_ptr(),
+                attr_bytes.len(),
+            )
+        }
     }
 }
 
