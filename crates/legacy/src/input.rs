@@ -482,7 +482,7 @@ impl InputHandler {
         self.has_pending_syntax_update
             && self
                 .last_edit_time
-                .map_or(false, |t| t.elapsed().as_millis() > 100)
+                .map_or(false, |t| t.elapsed().as_millis() > 50)
     }
 
     pub fn pending_edits_count(&self) -> usize {
@@ -732,13 +732,13 @@ impl InputHandler {
         } else {
             match &event.logical_key {
                 // Ignore modifier keys pressed alone
-                Key::Named(NamedKey::Shift) |
-                Key::Named(NamedKey::Control) |
-                Key::Named(NamedKey::Alt) |
-                Key::Named(NamedKey::Super) => InputAction::None,
+                Key::Named(NamedKey::Shift)
+                | Key::Named(NamedKey::Control)
+                | Key::Named(NamedKey::Alt)
+                | Key::Named(NamedKey::Super) => InputAction::None,
                 Key::Character(ch) if ch.chars().all(|c| !c.is_control()) => {
                     self.handle_character_input(doc, ch, renderer)
-                },
+                }
                 Key::Named(NamedKey::Backspace) => self.delete_at_cursor(doc, false),
                 Key::Named(NamedKey::Delete) => self.delete_at_cursor(doc, true),
                 Key::Named(NamedKey::Enter) => self.insert_text(doc, "\n"),
@@ -956,7 +956,7 @@ impl InputHandler {
         viewport: &Viewport,
     ) -> (
         Option<tiny_sdk::LayoutPos>,
-        Vec<(DocPos, DocPos)>,  // Selection start/end positions
+        Vec<(DocPos, DocPos)>, // Selection start/end positions
     ) {
         let cursor_pos = self.selections.first().map(|sel| {
             let tree = doc.read();

@@ -21,7 +21,7 @@ pub use crate::types::{
     ByteRange, Color, DocPos, GlyphInstance, GlyphInstances, InputEvent, KeyEvent, LayoutPos,
     LayoutRect, LogicalPixels, LogicalPos, LogicalRect, LogicalSize, Modifiers, MouseButton,
     MouseEvent, PhysicalPixels, PhysicalPos, PhysicalSize, PhysicalSizeF, ScrollEvent, TokenType, ViewPos,
-    ViewRect, ViewportInfo,
+    ViewRect, ViewportInfo, WidgetViewport,
 };
 
 // Re-export services

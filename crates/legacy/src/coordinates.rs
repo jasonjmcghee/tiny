@@ -141,8 +141,12 @@ pub struct Viewport {
     // === Text metrics ===
     pub metrics: TextMetrics,
 
+    // === Global margin ===
+    /// Global margin for UI chrome (tabs, toolbar, etc.)
+    pub global_margin: LayoutPos,
+
     // === Document margin ===
-    /// Margin for document content (left, top)
+    /// Margin for document content (left, top) - DEPRECATED: use widget viewports instead
     pub margin: LayoutPos,
 
     // === Line rendering mode ===
@@ -175,6 +179,7 @@ impl Viewport {
             physical_size,
             scale_factor,
             metrics: TextMetrics::new(13.0),    // Default 14pt font
+            global_margin: LayoutPos::new(0.0, 0.0), // No global margin by default
             margin: LayoutPos::new(16.0, 16.0), // 4px margin left and top
             line_mode: LineMode::default(),     // Default to no wrap
             cached_doc_bounds: None,
@@ -186,6 +191,11 @@ impl Viewport {
 
     pub fn set_font_size(&mut self, font_size: f32) {
         self.metrics = TextMetrics::new(font_size);
+    }
+
+    /// Set global margin for UI chrome (tabs, toolbar, etc.)
+    pub fn set_global_margin(&mut self, x: f32, y: f32) {
+        self.global_margin = LayoutPos::new(x, y);
     }
 
     /// Set font system for accurate text measurement
@@ -219,10 +229,10 @@ impl Viewport {
     /// Document position to layout position
     pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
         // Use cached metrics (updated from font system if available)
-        // Add margin to position
+        // Add both global and document margins
         LayoutPos::new(
             self.margin.x.0 + self.metrics.column_to_x(pos.column),
-            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
+            self.global_margin.y.0 + self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
         )
     }
 
@@ -270,10 +280,10 @@ impl Viewport {
             self.metrics.column_to_x(pos.column)
         };
 
-        // Add margin to the position
+        // Add both global and document margins to the position
         LayoutPos::new(
             self.margin.x.0 + x,
-            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
+            self.global_margin.y.0 + self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
         )
     }
 
@@ -316,9 +326,9 @@ impl Viewport {
 
     /// Layout position to document position (approximate)
     pub fn layout_to_doc(&self, pos: LayoutPos) -> DocPos {
-        // Subtract margin to get document position
+        // Subtract both global and document margins to get document position
         let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
-        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
+        let doc_y = (pos.y.0 - self.global_margin.y.0 - self.margin.y.0).max(0.0);
 
         let line = (doc_y / self.metrics.line_height) as u32;
         let column = (doc_x / self.metrics.space_width) as u32;
@@ -332,9 +342,9 @@ impl Viewport {
 
     /// Layout position to document position using font system's binary search hit testing
     pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &DocTree) -> DocPos {
-        // Subtract margin to get document position
+        // Subtract both global and document margins to get document position
         let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
-        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
+        let doc_y = (pos.y.0 - self.global_margin.y.0 - self.margin.y.0).max(0.0);
 
         let line = (doc_y / self.metrics.line_height) as u32;
 
@@ -588,6 +598,7 @@ impl Viewport {
             scale_factor: self.scale_factor,
             line_height: self.metrics.line_height,
             margin: self.margin.clone(),
+            global_margin: self.global_margin.clone(),
         }
     }
 

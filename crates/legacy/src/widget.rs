@@ -98,6 +98,8 @@ pub enum ContentType {
 // === Widget Implementations ===
 /// Text widget - renders text using the consolidated FontSystem
 pub struct TextWidget {
+    /// Widget's viewport (position, scroll, margins)
+    pub viewport: Option<tiny_sdk::WidgetViewport>,
     /// UTF-8 text content
     pub text: Arc<[u8]>,
     /// Style ID for font/size/color
@@ -113,6 +115,7 @@ pub struct TextWidget {
 impl Clone for TextWidget {
     fn clone(&self) -> Self {
         Self {
+            viewport: self.viewport.clone(),
             text: Arc::clone(&self.text),
             style: self.style,
             size: self.size,
@@ -210,7 +213,11 @@ impl Widget for TextWidget {
     }
 
     fn bounds(&self) -> LayoutRect {
-        LayoutRect::new(0.0, 0.0, self.size.width.0, self.size.height.0)
+        if let Some(ref viewport) = self.viewport {
+            viewport.bounds.clone()
+        } else {
+            LayoutRect::new(0.0, 0.0, self.size.width.0, self.size.height.0)
+        }
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
@@ -243,12 +250,26 @@ impl Widget for TextWidget {
             _ => 0.0,
         };
 
-        // Text should include margin positioning to match cursor/selection
-        // Add margin to align with cursor/selection coordinate system
-        let layout_pos = LayoutPos::new(
-            ctx.viewport.margin.x.0 + x_base_offset,
-            ctx.viewport.margin.y.0,
-        );
+        // Use widget viewport if available, otherwise fall back to global viewport margin
+        let layout_pos = if let Some(ref viewport) = self.viewport {
+            // Widget has its own viewport - use it for positioning
+            LayoutPos::new(
+                viewport.bounds.x.0 + viewport.content_margin.x.0 + x_base_offset - viewport.scroll.x.0,
+                viewport.bounds.y.0 + viewport.content_margin.y.0 - viewport.scroll.y.0,
+            )
+        } else if let Some(ref widget_vp) = ctx.widget_viewport {
+            // Use widget viewport from context if available
+            LayoutPos::new(
+                widget_vp.bounds.x.0 + widget_vp.content_margin.x.0 + x_base_offset - widget_vp.scroll.x.0,
+                widget_vp.bounds.y.0 + widget_vp.content_margin.y.0 - widget_vp.scroll.y.0,
+            )
+        } else {
+            // Fall back to global viewport margin (legacy behavior)
+            LayoutPos::new(
+                ctx.viewport.margin.x.0 + x_base_offset,
+                ctx.viewport.margin.y.0,
+            )
+        };
 
         // Get effects for this text if available
         let effects = if let Some(ref text_styles) = text_style_service {
@@ -272,7 +293,17 @@ impl Widget for TextWidget {
 
         // Transform all glyphs from layout to physical coordinates for GPU
         for glyph in &mut all_glyph_instances {
-            let physical_pos = ctx.viewport.layout_to_physical(glyph.pos);
+            // If widget has its own viewport, it's positioned in window space (no document scroll)
+            let physical_pos = if self.viewport.is_some() {
+                // Widget-positioned text: transform directly to physical without document scroll
+                tiny_sdk::PhysicalPos::new(
+                    glyph.pos.x.0 * ctx.viewport.scale_factor,
+                    glyph.pos.y.0 * ctx.viewport.scale_factor,
+                )
+            } else {
+                // Document text: apply viewport scroll transformation
+                ctx.viewport.layout_to_physical(glyph.pos)
+            };
             glyph.pos = LayoutPos::new(physical_pos.x.0, physical_pos.y.0);
         }
 
@@ -363,6 +394,7 @@ impl Widget for LineNumberWidget {
         let width = text.len() as f32 * 8.4;
         let height = 19.6;
         let widget = TextWidget {
+            viewport: None,  // Line numbers use global positioning for now
             text: Arc::from(text.as_bytes()),
             style: self.style,
             size: LogicalSize::new(width, height),
@@ -387,11 +419,30 @@ impl Widget for LineNumberWidget {
 /// Note: This creates a widget with default size - use render_text() for accurate sizing
 pub fn text(s: &str) -> Arc<dyn Widget> {
     Arc::new(TextWidget {
+        viewport: None,  // No viewport by default
         text: Arc::from(s.as_bytes()),
         style: 0,                         // Default style
         size: LogicalSize::new(0.0, 0.0), // Will be calculated properly in render_text
         content_type: ContentType::default(),
         original_byte_offset: 0, // Default offset
+    })
+}
+
+/// Create text widget with specific positioning
+pub fn positioned_text(s: &str, x: f32, y: f32, width: f32, height: f32) -> Arc<dyn Widget> {
+    use tiny_sdk::WidgetViewport;
+    Arc::new(TextWidget {
+        viewport: Some(WidgetViewport {
+            bounds: LayoutRect::new(x, y, width, height),
+            scroll: LayoutPos::new(0.0, 0.0),
+            content_margin: LayoutPos::new(0.0, 0.0),
+            widget_id: 0,
+        }),
+        text: Arc::from(s.as_bytes()),
+        style: 0,
+        size: LogicalSize::new(width, height),
+        content_type: ContentType::default(),
+        original_byte_offset: 0,
     })
 }
 

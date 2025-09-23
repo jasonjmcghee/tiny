@@ -1,10 +1,19 @@
 //! Renderer manages widget rendering and viewport transformations
 
-use std::sync::{Arc, Mutex};
-use tiny_core::{plugin_loader::PluginLoader, tree::{self, Tree}, GpuRenderer};
-use tiny_sdk::{GlyphInstance, LayoutPos, ServiceRegistry};
-use crate::{coordinates::Viewport, input, syntax, text_effects, text_renderer::{self, TextRenderer}, widget::{PaintContext, WidgetManager}};
+use crate::{
+    coordinates::Viewport,
+    input, syntax, text_effects,
+    text_renderer::{self, TextRenderer},
+    widget::{PaintContext, WidgetManager},
+};
 use notify::{Event, RecursiveMode, Watcher};
+use std::sync::{Arc, Mutex};
+use tiny_core::{
+    plugin_loader::PluginLoader,
+    tree::{self, Tree},
+    GpuRenderer,
+};
+use tiny_sdk::{GlyphInstance, LayoutPos, ServiceRegistry};
 
 // Plugin state synchronization
 #[derive(Clone, Debug)]
@@ -32,6 +41,9 @@ impl PluginState {
         args.extend_from_slice(&viewport.scale_factor.to_le_bytes());
         args.extend_from_slice(&viewport.scroll.x.0.to_le_bytes());
         args.extend_from_slice(&viewport.scroll.y.0.to_le_bytes());
+        // Add global margin to the viewport info sent to plugins
+        args.extend_from_slice(&viewport.global_margin.x.0.to_le_bytes());
+        args.extend_from_slice(&viewport.global_margin.y.0.to_le_bytes());
         args
     }
 
@@ -51,7 +63,9 @@ impl PluginState {
         if let Some(plugin) = loader.get_plugin_mut(plugin_name) {
             if let Some(library) = plugin.instance.as_library_mut() {
                 // Send viewport info to plugins that need it
-                if !self.viewport_info.is_empty() && (plugin_name == "selection" || plugin_name == "cursor") {
+                if !self.viewport_info.is_empty()
+                    && (plugin_name == "selection" || plugin_name == "cursor")
+                {
                     let _ = library.call("set_viewport_info", &self.viewport_info);
                 }
 
@@ -130,7 +144,7 @@ impl Renderer {
         }
     }
 
-pub fn set_font_size(&mut self, font_size: f32) {
+    pub fn set_font_size(&mut self, font_size: f32) {
         self.viewport.set_font_size(font_size);
         self.layout_dirty = true;
 
@@ -155,14 +169,15 @@ pub fn set_font_size(&mut self, font_size: f32) {
     }
 
     fn initialize_plugins(&mut self, gpu_renderer: &GpuRenderer) {
-        let app_config = crate::config::AppConfig::load()
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to load init.toml: {}, using defaults", e);
-                crate::config::AppConfig::default()
-            });
+        let app_config = crate::config::AppConfig::load().unwrap_or_else(|e| {
+            eprintln!("Failed to load init.toml: {}, using defaults", e);
+            crate::config::AppConfig::default()
+        });
 
         let plugin_dir = std::path::PathBuf::from(&app_config.plugins.plugin_dir);
-        if !plugin_dir.exists() { return; }
+        if !plugin_dir.exists() {
+            return;
+        }
 
         let mut loader = PluginLoader::new(plugin_dir.clone());
         let device = gpu_renderer.device_arc();
@@ -201,21 +216,36 @@ pub fn set_font_size(&mut self, font_size: f32) {
         self.plugin_loader = Some(loader_arc);
     }
 
-
-    fn setup_hot_reload(&mut self, config: &crate::config::AppConfig, loader_arc: &Arc<Mutex<PluginLoader>>, gpu_renderer: &GpuRenderer) {
+    fn setup_hot_reload(
+        &mut self,
+        config: &crate::config::AppConfig,
+        loader_arc: &Arc<Mutex<PluginLoader>>,
+        gpu_renderer: &GpuRenderer,
+    ) {
         for plugin_name in &config.plugins.enabled {
             if let Some(plugin_config) = config.plugins.plugins.get(plugin_name) {
                 if plugin_config.auto_reload {
-                    self.setup_lib_watcher(plugin_name, plugin_config, config, loader_arc.clone(), gpu_renderer);
+                    self.setup_lib_watcher(
+                        plugin_name,
+                        plugin_config,
+                        config,
+                        loader_arc.clone(),
+                        gpu_renderer,
+                    );
                 }
                 self.setup_config_watcher(plugin_name, plugin_config, config, loader_arc.clone());
             }
         }
     }
 
-    fn setup_lib_watcher(&mut self, plugin_name: &str, plugin_config: &crate::config::PluginConfig,
-                         app_config: &crate::config::AppConfig, loader_arc: Arc<Mutex<PluginLoader>>,
-                         gpu_renderer: &GpuRenderer) {
+    fn setup_lib_watcher(
+        &mut self,
+        plugin_name: &str,
+        plugin_config: &crate::config::PluginConfig,
+        app_config: &crate::config::AppConfig,
+        loader_arc: Arc<Mutex<PluginLoader>>,
+        gpu_renderer: &GpuRenderer,
+    ) {
         let lib_path = plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
         let lib_path_buf = std::path::PathBuf::from(&lib_path);
         let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
@@ -228,14 +258,24 @@ pub fn set_font_size(&mut self, font_size: f32) {
         let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
                 if event.kind.is_create() || event.kind.is_modify() {
-                    Self::handle_lib_reload(&loader_arc, &plugin_name, &lib_path, &config_path,
-                                          device.clone(), queue.clone(), plugin_state.clone());
+                    Self::handle_lib_reload(
+                        &loader_arc,
+                        &plugin_name,
+                        &lib_path,
+                        &config_path,
+                        device.clone(),
+                        queue.clone(),
+                        plugin_state.clone(),
+                    );
                 }
             }
         });
 
         if let Ok(mut watcher) = watcher {
-            if watcher.watch(&lib_path_buf, RecursiveMode::NonRecursive).is_err() {
+            if watcher
+                .watch(&lib_path_buf, RecursiveMode::NonRecursive)
+                .is_err()
+            {
                 if let Some(parent) = lib_path_buf.parent() {
                     if watcher.watch(parent, RecursiveMode::NonRecursive).is_ok() {
                         self.lib_watchers.push(watcher);
@@ -247,20 +287,35 @@ pub fn set_font_size(&mut self, font_size: f32) {
         }
     }
 
-    fn handle_lib_reload(loader_arc: &Arc<Mutex<PluginLoader>>, plugin_name: &str, lib_path: &str,
-                        config_path: &str, device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>,
-                        plugin_state: Arc<Mutex<PluginState>>) {
+    fn handle_lib_reload(
+        loader_arc: &Arc<Mutex<PluginLoader>>,
+        plugin_name: &str,
+        lib_path: &str,
+        config_path: &str,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        plugin_state: Arc<Mutex<PluginState>>,
+    ) {
         // Wait for file to be ready
         for _ in 0..10 {
             if let Ok(meta) = std::fs::metadata(lib_path) {
-                if meta.len() > 0 { break; }
+                if meta.len() > 0 {
+                    break;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         if let Ok(mut loader) = loader_arc.lock() {
-            if loader.unload_plugin(plugin_name).is_err() { return; }
-            if loader.load_plugin_from_path(plugin_name, lib_path, config_path).is_err() { return; }
+            if loader.unload_plugin(plugin_name).is_err() {
+                return;
+            }
+            if loader
+                .load_plugin_from_path(plugin_name, lib_path, config_path)
+                .is_err()
+            {
+                return;
+            }
             if loader.initialize_plugin(plugin_name, device, queue).is_ok() {
                 eprintln!("Successfully hot-reloaded plugin: {}", plugin_name);
 
@@ -273,12 +328,19 @@ pub fn set_font_size(&mut self, font_size: f32) {
         }
     }
 
-    fn setup_config_watcher(&mut self, plugin_name: &str, plugin_config: &crate::config::PluginConfig,
-                           app_config: &crate::config::AppConfig, loader_arc: Arc<Mutex<PluginLoader>>) {
+    fn setup_config_watcher(
+        &mut self,
+        plugin_name: &str,
+        plugin_config: &crate::config::PluginConfig,
+        app_config: &crate::config::AppConfig,
+        loader_arc: Arc<Mutex<PluginLoader>>,
+    ) {
         let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
         let config_path_buf = std::path::PathBuf::from(&config_path);
 
-        if !config_path_buf.exists() { return; }
+        if !config_path_buf.exists() {
+            return;
+        }
 
         let plugin_name = plugin_name.to_string();
         let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
@@ -300,7 +362,10 @@ pub fn set_font_size(&mut self, font_size: f32) {
         });
 
         if let Ok(mut watcher) = watcher {
-            if watcher.watch(&config_path_buf, RecursiveMode::NonRecursive).is_ok() {
+            if watcher
+                .watch(&config_path_buf, RecursiveMode::NonRecursive)
+                .is_ok()
+            {
                 self.config_watchers.push(watcher);
             }
         }
@@ -372,8 +437,11 @@ pub fn set_font_size(&mut self, font_size: f32) {
         }
     }
 
-
-    pub fn render_with_pass_and_context(&mut self, tree: &Tree, mut render_pass: Option<&mut wgpu::RenderPass>) {
+    pub fn render_with_pass_and_context(
+        &mut self,
+        tree: &Tree,
+        mut render_pass: Option<&mut wgpu::RenderPass>,
+    ) {
         if tree.version == self.last_rendered_version && !self.layout_dirty && !self.syntax_dirty {
             return;
         }
@@ -381,7 +449,7 @@ pub fn set_font_size(&mut self, font_size: f32) {
         self.prepare_render(tree);
 
         if let Some(pass) = render_pass.as_deref_mut() {
-            self.paint_layers(pass, true);  // Paint background layers (z < 0)
+            self.paint_layers(pass, true); // Paint background layers (z < 0)
         }
 
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
@@ -405,9 +473,11 @@ pub fn set_font_size(&mut self, font_size: f32) {
         if let Some(font_system) = &self.font_system {
             // Force layout update if layout is marked dirty (e.g., after font size change)
             if self.layout_dirty {
-                self.text_renderer.update_layout_internal(tree, font_system, &self.viewport, true);
+                self.text_renderer
+                    .update_layout_internal(tree, font_system, &self.viewport, true);
             } else {
-                self.text_renderer.update_layout(tree, font_system, &self.viewport);
+                self.text_renderer
+                    .update_layout(tree, font_system, &self.viewport);
             }
         }
 
@@ -424,10 +494,12 @@ pub fn set_font_size(&mut self, font_size: f32) {
                     _ => None,
                 })
                 .collect();
-            self.text_renderer.update_syntax(&tokens, highlighter.cached_version() == tree.version);
+            self.text_renderer
+                .update_syntax(&tokens, highlighter.cached_version() == tree.version);
         }
 
-        self.text_renderer.update_visible_range(&self.viewport, tree);
+        self.text_renderer
+            .update_visible_range(&self.viewport, tree);
 
         if self.cached_doc_text.is_none() || tree.version != self.cached_doc_version {
             self.cached_doc_text = Some(tree.flatten_to_string());
@@ -447,9 +519,14 @@ pub fn set_font_size(&mut self, font_size: f32) {
             );
             ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
 
-            let z_filter = if background { |z: i32| z < 0 } else { |z: i32| z >= 0 };
+            let z_filter = if background {
+                |z: i32| z < 0
+            } else {
+                |z: i32| z >= 0
+            };
 
-            self.widget_manager.widgets_in_order()
+            self.widget_manager
+                .widgets_in_order()
                 .into_iter()
                 .filter(|w| z_filter(w.priority()))
                 .for_each(|w| w.paint(&ctx, pass));
@@ -470,15 +547,20 @@ pub fn set_font_size(&mut self, font_size: f32) {
         }
     }
 
-    fn walk_visible_range_with_pass(&mut self, tree: &Tree, byte_range: std::ops::Range<usize>,
-                                    mut render_pass: Option<&mut wgpu::RenderPass>) {
+    fn walk_visible_range_with_pass(
+        &mut self,
+        tree: &Tree,
+        byte_range: std::ops::Range<usize>,
+        mut render_pass: Option<&mut wgpu::RenderPass>,
+    ) {
         if let Some(pass) = render_pass.as_mut() {
             if let (Some(gpu_ptr), Some(_)) = (self.gpu_renderer, &self.font_system) {
                 let gpu_renderer = unsafe { &*gpu_ptr };
                 let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
 
                 if gpu_renderer.has_styled_pipeline() && !visible_glyphs.is_empty() {
-                    let style_buffer: Vec<u32> = visible_glyphs.iter().map(|g| g.token_id as u32).collect();
+                    let style_buffer: Vec<u32> =
+                        visible_glyphs.iter().map(|g| g.token_id as u32).collect();
                     let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
                     gpu_mut.upload_style_buffer_u32(&style_buffer);
                 }
@@ -498,7 +580,8 @@ pub fn set_font_size(&mut self, font_size: f32) {
                     .collect();
 
                 if !glyph_instances.is_empty() {
-                    let use_styled = self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
+                    let use_styled =
+                        self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
                     gpu_renderer.draw_glyphs_styled(pass, &glyph_instances, use_styled);
                 }
 
@@ -545,13 +628,18 @@ impl text_effects::TextStyleProvider for ViewportEffectsProvider {
             .iter()
             .filter(|e| e.range.start < doc_range.end && e.range.end > doc_range.start)
             .map(|e| text_effects::TextEffect {
-                range: e.range.start.saturating_sub(self.byte_offset)..e.range.end.saturating_sub(self.byte_offset),
+                range: e.range.start.saturating_sub(self.byte_offset)
+                    ..e.range.end.saturating_sub(self.byte_offset),
                 effect: e.effect.clone(),
                 priority: e.priority,
             })
             .collect()
     }
     fn request_update(&self, _: &str, _: u64) {}
-    fn name(&self) -> &str { "viewport_effects" }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "viewport_effects"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

@@ -9,6 +9,8 @@ use crate::{
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
 };
+use ahash::AHasher;
+use std::hash::{Hash, Hasher};
 #[allow(unused)]
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -217,8 +219,7 @@ pub struct TinyApp<T: AppLogic> {
     font_size: f32,
 
     // Title bar settings
-    title_bar_height: f32,     // Logical pixels
-    title_bar_color: [f32; 4], // RGBA
+    title_bar_height: f32, // Logical pixels
 
     // Scroll lock settings
     scroll_lock_enabled: bool, // true = lock to one direction at a time
@@ -292,9 +293,8 @@ impl<T: AppLogic> TinyApp<T> {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             font_size: 14.0,
-            title_bar_height: 30.0,                   // Logical pixels
-            title_bar_color: [0.11, 0.12, 0.13, 1.0], // Your specified color
-            scroll_lock_enabled: true,                // Enabled by default
+            title_bar_height: 20.0,    // Logical pixels
+            scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
             cursor_position: None,
             modifiers: input_types::Modifiers::default(),
@@ -383,12 +383,14 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 ))
                 .with_theme(Some(winit::window::Theme::Dark));
 
+            let mut global_margin_y = 0.0;
             // Apply macOS-specific transparent titlebar
             #[cfg(target_os = "macos")]
             {
                 window_attributes = window_attributes
                     .with_titlebar_transparent(true)
                     .with_fullsize_content_view(true);
+                global_margin_y = 20.0;
             }
 
             let window = Arc::new(
@@ -600,13 +602,22 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                 .drag_start
                                 .and_then(|p| self.physical_to_logical_point(p))
                             {
-                                if self.logic.on_drag(
-                                    from,
-                                    point,
-                                    &cpu_renderer.viewport,
-                                    &self.modifiers,
-                                ) {
-                                    self.request_redraw();
+                                // Check if drag started in titlebar area (for transparent titlebar on macOS)
+                                #[cfg(target_os = "macos")]
+                                let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
+                                #[cfg(not(target_os = "macos"))]
+                                let drag_started_in_titlebar = false;
+
+                                // Only pass drag to editor if drag didn't start in titlebar area
+                                if !drag_started_in_titlebar {
+                                    if self.logic.on_drag(
+                                        from,
+                                        point,
+                                        &cpu_renderer.viewport,
+                                        &self.modifiers,
+                                    ) {
+                                        self.request_redraw();
+                                    }
                                 }
                             }
                         }
@@ -624,13 +635,22 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             self.drag_start = Some(position);
 
                             if let Some(point) = self.physical_to_logical_point(position) {
-                                if let Some(cpu_renderer) = &self.cpu_renderer {
-                                    if self.logic.on_click(
-                                        point,
-                                        &cpu_renderer.viewport,
-                                        &self.modifiers,
-                                    ) {
-                                        self.request_redraw();
+                                // Check if click is in titlebar area (for transparent titlebar on macOS)
+                                #[cfg(target_os = "macos")]
+                                let is_in_titlebar = point.y.0 < self.title_bar_height;
+                                #[cfg(not(target_os = "macos"))]
+                                let is_in_titlebar = false;
+
+                                // Only pass click to editor if not in titlebar area
+                                if !is_in_titlebar {
+                                    if let Some(cpu_renderer) = &self.cpu_renderer {
+                                        if self.logic.on_click(
+                                            point,
+                                            &cpu_renderer.viewport,
+                                            &self.modifiers,
+                                        ) {
+                                            self.request_redraw();
+                                        }
                                     }
                                 }
                             }
@@ -879,7 +899,21 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Update widgets if EditorLogic
             if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                // Always update selection widgets
                 cpu_renderer.set_selection_widgets(&editor.input, &editor.doc);
+
+                // Set up global margin (only once)
+                static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
+                unsafe {
+                    if !GLOBAL_MARGIN_INITIALIZED {
+                        GLOBAL_MARGIN_INITIALIZED = true;
+
+                        // Set global margin for UI chrome space
+                        cpu_renderer
+                            .viewport
+                            .set_global_margin(0.0, self.title_bar_height);
+                    }
+                }
             }
 
             // Upload font atlas
@@ -931,8 +965,8 @@ pub struct EditorLogic {
     pub extra_text_styles: Vec<Box<dyn TextStyleProvider>>,
     /// File path if loaded from file
     pub file_path: Option<PathBuf>,
-    /// Whether document has unsaved changes
-    pub is_modified: bool,
+    /// Content hash when document was last saved
+    pub last_saved_content_hash: u64,
     /// Whether to show line numbers
     pub show_line_numbers: bool,
 }
@@ -1023,10 +1057,26 @@ impl EditorLogic {
         self
     }
 
+    /// Check if document has unsaved changes by comparing content hash
+    pub fn is_modified(&self) -> bool {
+        let current_text = self.doc.read().flatten_to_string();
+        let mut hasher = AHasher::default();
+        current_text.hash(&mut hasher);
+        let current_hash = hasher.finish();
+
+        current_hash != self.last_saved_content_hash
+    }
+
     pub fn save(&mut self) -> std::io::Result<()> {
         if let Some(ref path) = self.file_path {
             io::autosave(&self.doc, path)?;
-            self.is_modified = false;
+
+            // Update saved content hash
+            let current_text = self.doc.read().flatten_to_string();
+            let mut hasher = AHasher::default();
+            current_text.hash(&mut hasher);
+            self.last_saved_content_hash = hasher.finish();
+
             Ok(())
         } else {
             Err(std::io::Error::new(
@@ -1046,7 +1096,11 @@ impl EditorLogic {
             "Demo Text".to_string()
         };
 
-        let modified_marker = if self.is_modified { " (modified)" } else { "" };
+        let modified_marker = if self.is_modified() {
+            " (modified)"
+        } else {
+            ""
+        };
         format!("{}{}", filename, modified_marker)
     }
 
@@ -1078,6 +1132,12 @@ impl EditorLogic {
             input.set_syntax_highlighter(shared_highlighter);
         }
 
+        // Calculate initial content hash
+        let initial_text = doc.read().flatten_to_string();
+        let mut hasher = AHasher::default();
+        initial_text.hash(&mut hasher);
+        let initial_hash = hasher.finish();
+
         Self {
             doc,
             input,
@@ -1085,7 +1145,7 @@ impl EditorLogic {
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
             file_path: None,
-            is_modified: false,
+            last_saved_content_hash: initial_hash,
             show_line_numbers: true,
         }
     }
@@ -1103,7 +1163,6 @@ impl EditorLogic {
             InputAction::Undo => {
                 if self.input.undo(&self.doc) {
                     self.widgets_dirty = true;
-                    self.is_modified = true;
                     true
                 } else {
                     false
@@ -1112,7 +1171,6 @@ impl EditorLogic {
             InputAction::Redo => {
                 if self.input.redo(&self.doc) {
                     self.widgets_dirty = true;
-                    self.is_modified = true;
                     true
                 } else {
                     false
@@ -1120,7 +1178,6 @@ impl EditorLogic {
             }
             InputAction::Redraw => {
                 self.widgets_dirty = true;
-                self.is_modified = true;
                 true
             }
             InputAction::None => false,

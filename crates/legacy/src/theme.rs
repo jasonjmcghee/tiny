@@ -36,7 +36,8 @@ impl Theme {
         // Ensure we have enough slots
         while self.token_colors.len() <= token_id as usize {
             self.token_colors.push(TokenColors {
-                colors: vec![[1.0, 1.0, 1.0, 1.0]], // Default white
+                // TODO: why is this happening? (falling back on some tokens)
+                colors: vec![[0.882, 0.882, 0.882, 1.0]], // Default white
             });
         }
 

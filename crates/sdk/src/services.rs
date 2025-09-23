@@ -3,8 +3,8 @@
 //! Provides a service-oriented architecture for accessing shared resources
 //! like fonts and text styling across the FFI boundary.
 
+use ahash::AHashMap as HashMap;
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Text layout result from font service
@@ -46,7 +46,13 @@ pub trait FontService: Send + Sync {
     fn prerasterize_ascii(&self, font_size_px: f32);
 
     /// Hit test: find character position at x coordinate
-    fn hit_test_line(&self, line_text: &str, font_size: f32, scale_factor: f32, target_x: f32) -> u32;
+    fn hit_test_line(
+        &self,
+        line_text: &str,
+        font_size: f32,
+        scale_factor: f32,
+        target_x: f32,
+    ) -> u32;
 }
 
 /// Type of text effect
@@ -100,17 +106,20 @@ impl ServiceRegistry {
     /// Get a service by type
     pub fn get<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         let type_id = TypeId::of::<T>();
-        eprintln!("Looking for service with TypeId: {:?} for type: {}", type_id, std::any::type_name::<T>());
-        eprintln!("Registry contains {} services", self.services.len());
-        for (id, _) in &self.services {
-            eprintln!("  - Service TypeId: {:?}", id);
-        }
+        // eprintln!(
+        //     "Looking for service with TypeId: {:?} for type: {}",
+        //     type_id,
+        //     std::any::type_name::<T>()
+        // );
+        // eprintln!("Registry contains {} services", self.services.len());
+        // for (id, _) in &self.services {
+        //     eprintln!("  - Service TypeId: {:?}", id);
+        // }
 
         self.services
             .get(&type_id)
             .and_then(|service| service.clone().downcast::<T>().ok())
     }
-
 
     /// Check if a service is registered
     pub fn has<T: Any + Send + Sync + 'static>(&self) -> bool {
@@ -123,7 +132,6 @@ impl Default for ServiceRegistry {
         Self::new()
     }
 }
-
 
 /// Context data that can be passed through FFI boundary
 /// This wraps the service registry for plugin access

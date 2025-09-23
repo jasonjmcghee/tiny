@@ -101,6 +101,8 @@ pub struct PaintContext {
     pub queue: std::sync::Arc<wgpu::Queue>,
     /// Viewport information for coordinate transformations
     pub viewport: crate::types::ViewportInfo,
+    /// Widget-specific viewport (if rendering within a widget)
+    pub widget_viewport: Option<crate::types::WidgetViewport>,
     /// Raw GPU renderer pointer for pipeline/buffer access
     /// This gives plugins full GPU power - they can create pipelines, upload buffers, etc.
     pub gpu_renderer: *mut std::ffi::c_void,
@@ -126,6 +128,7 @@ impl PaintContext {
         // eprintln!("Creating PaintContext with device: {:p}, registry pointer: {:p}", &device, registry);
         Self {
             viewport,
+            widget_viewport: None,
             device,
             queue,
             gpu_renderer,
@@ -135,15 +138,18 @@ impl PaintContext {
         }
     }
 
+    /// Create a new PaintContext with widget viewport
+    pub fn with_widget_viewport(mut self, widget_viewport: crate::types::WidgetViewport) -> Self {
+        self.widget_viewport = Some(widget_viewport);
+        self
+    }
+
     /// Get the service registry from context data
     ///
     /// # Safety
     /// Caller must ensure the context_data pointer is valid and points to a ServiceRegistry
     pub unsafe fn services(&self) -> &crate::services::ServiceRegistry {
-        eprintln!("PaintContext::services() called, context_data: {:p}", self.context_data);
-        let registry = &*(self.context_data as *const crate::services::ServiceRegistry);
-        eprintln!("Registry pointer: {:p}", registry);
-        registry
+        (&*(self.context_data as *const crate::services::ServiceRegistry)) as _
     }
 }
 

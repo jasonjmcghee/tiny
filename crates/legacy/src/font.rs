@@ -169,7 +169,7 @@ impl FontSystem {
                 pos: PhysicalPos::new(x, y),
                 size: PhysicalSizeF::new(entry.width, entry.height),
                 tex_coords: entry.tex_coords,
-                color: 0xFFFFFFFF,
+                color: 0xE1E1E1,
             });
 
             max_x = max_x.max(x + entry.advance);

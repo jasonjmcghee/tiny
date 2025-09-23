@@ -392,6 +392,57 @@ impl Color {
     }
 }
 
+// === Widget Viewport ===
+
+/// Widget-specific viewport for independent positioning and scrolling
+#[derive(Debug, Clone)]
+pub struct WidgetViewport {
+    /// Widget's bounds in window space (after global margin)
+    pub bounds: LayoutRect,
+
+    /// Widget's own scroll position
+    pub scroll: LayoutPos,
+
+    /// Widget's content margin (for line numbers, gutter, etc)
+    pub content_margin: LayoutPos,
+
+    /// Widget ID for plugin association
+    pub widget_id: u64,
+}
+
+impl WidgetViewport {
+    pub fn new(bounds: LayoutRect) -> Self {
+        Self {
+            bounds,
+            scroll: LayoutPos::new(0.0, 0.0),
+            content_margin: LayoutPos::new(0.0, 0.0),
+            widget_id: 0,
+        }
+    }
+
+    /// Transform widget-local position to window position
+    pub fn local_to_window(&self, pos: LayoutPos) -> LayoutPos {
+        LayoutPos::new(
+            self.bounds.x.0 + self.content_margin.x.0 + pos.x.0 - self.scroll.x.0,
+            self.bounds.y.0 + self.content_margin.y.0 + pos.y.0 - self.scroll.y.0,
+        )
+    }
+
+    /// Transform window position to widget-local position
+    pub fn window_to_local(&self, pos: LayoutPos) -> LayoutPos {
+        LayoutPos::new(
+            pos.x.0 - self.bounds.x.0 - self.content_margin.x.0 + self.scroll.x.0,
+            pos.y.0 - self.bounds.y.0 - self.content_margin.y.0 + self.scroll.y.0,
+        )
+    }
+
+    /// Check if a widget-local position is visible
+    pub fn is_visible(&self, pos: LayoutPos) -> bool {
+        let window_pos = self.local_to_window(pos);
+        self.bounds.contains(window_pos)
+    }
+}
+
 // === Viewport Info for Plugins ===
 
 /// Simplified viewport information for plugins
@@ -408,8 +459,10 @@ pub struct ViewportInfo {
     pub scale_factor: f32,
     /// Line height in logical pixels
     pub line_height: f32,
-    /// Document margin (left, top)
+    /// Document margin (left, top) - DEPRECATED: use widget viewports
     pub margin: LayoutPos,
+    /// Global margin for UI chrome (tabs, toolbar, etc.)
+    pub global_margin: LayoutPos,
 }
 
 impl ViewportInfo {

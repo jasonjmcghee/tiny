@@ -59,7 +59,7 @@ impl Default for CursorConfig {
             blink_rate: 1.0,
             solid_duration_ms: 500,
             style: CursorStyle {
-                color: 0xFFFFFFFF,
+                color: 0xE1E1E1,
                 width: 2.0,
                 height_scale: 1.0,
                 x_offset: 0.0,
@@ -410,14 +410,18 @@ impl Library for CursorPlugin {
                     self.viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
                     self.margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
                     self.margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
-                    self.scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
+                    self.scale_factor =
+                        f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
                     self.scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
                     self.scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
-                    eprintln!("Cursor plugin received viewport info: line_height={}, scroll=({}, {})",
-                             self.line_height, self.scroll_x, self.scroll_y);
+
+                    // If there are additional bytes for global margin, we can ignore them
+                    // since cursor gets absolute position via set_position
                     Ok(Vec::new())
                 } else {
-                    Err(PluginError::Other("Invalid args for set_viewport_info".into()))
+                    Err(PluginError::Other(
+                        "Invalid args for set_viewport_info".into(),
+                    ))
                 }
             }
             _ => Err(PluginError::Other("Unknown method".into())),
@@ -429,7 +433,7 @@ impl Library for CursorPlugin {
 
 impl Paintable for CursorPlugin {
     fn z_index(&self) -> i32 {
-       10
+        10
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
@@ -520,7 +524,7 @@ impl Configurable for CursorPlugin {
             2.0
         }
         fn default_color() -> u32 {
-            0xFFFFFFFF
+            0xE1E1E1
         }
         fn default_height_scale() -> f32 {
             1.0

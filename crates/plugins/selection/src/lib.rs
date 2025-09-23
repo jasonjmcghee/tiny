@@ -107,7 +107,7 @@ impl SelectionPlugin {
     }
 
     /// Update viewport information (including scroll offset)
-    pub fn set_viewport_info(&mut self, line_height: f32, viewport_width: f32, margin_x: f32, margin_y: f32, scale_factor: f32, scroll_x: f32, scroll_y: f32) {
+    pub fn set_viewport_info(&mut self, line_height: f32, viewport_width: f32, margin_x: f32, margin_y: f32, scale_factor: f32, scroll_x: f32, scroll_y: f32, global_margin_x: f32, global_margin_y: f32) {
         // Check if scale factor seems wrong (e.g., 1.0 on a retina display)
         if scale_factor == 1.0 {
             eprintln!("WARNING: Scale factor is 1.0, might be incorrect for high-DPI display!");
@@ -116,7 +116,8 @@ impl SelectionPlugin {
         self.line_height = line_height;
         self.viewport_width = viewport_width;
         self.margin_x = margin_x;
-        self.margin_y = margin_y;
+        // Add global margin to the document margin for positioning
+        self.margin_y = margin_y + global_margin_y;
         self.scale_factor = scale_factor;
         self.scroll_x = scroll_x;
         self.scroll_y = scroll_y;
@@ -428,20 +429,36 @@ impl Library for SelectionPlugin {
                 Ok(Vec::new())
             }
             "set_viewport_info" => {
-                // Format: line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y (f32 each)
-                if args.len() < 28 {
-                    return Err(PluginError::Other("Invalid viewport args".into()));
+                // Format: line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y, global_margin_x, global_margin_y (f32 each)
+                if args.len() < 36 {
+                    // Support both old (28 bytes) and new (36 bytes) formats
+                    if args.len() < 28 {
+                        return Err(PluginError::Other("Invalid viewport args".into()));
+                    }
+                    // Old format - no global margin
+                    let line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+                    let viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
+                    let margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
+                    let margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
+                    let scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
+                    let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
+                    let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
+
+                    self.set_viewport_info(line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y, 0.0, 0.0);
+                } else {
+                    // New format - with global margin
+                    let line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+                    let viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
+                    let margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
+                    let margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
+                    let scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
+                    let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
+                    let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
+                    let global_margin_x = f32::from_le_bytes([args[28], args[29], args[30], args[31]]);
+                    let global_margin_y = f32::from_le_bytes([args[32], args[33], args[34], args[35]]);
+
+                    self.set_viewport_info(line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y, global_margin_x, global_margin_y);
                 }
-
-                let line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
-                let viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
-                let margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
-                let margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
-                let scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
-                let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
-                let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
-
-                self.set_viewport_info(line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y);
                 Ok(Vec::new())
             }
             _ => Err(PluginError::Other("Unknown method".into())),

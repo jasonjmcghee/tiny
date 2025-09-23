@@ -133,7 +133,7 @@ impl TextRenderer {
 
         let mut char_index = 0;
         let mut byte_offset = 0;
-        let mut y_pos = viewport.margin.y.0;
+        let mut y_pos = viewport.global_margin.y.0 + viewport.margin.y.0;
 
         for (line_idx, line_text) in lines.iter().enumerate() {
             let line_start_char = char_index;
