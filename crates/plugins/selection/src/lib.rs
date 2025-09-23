@@ -114,7 +114,7 @@ impl SelectionPlugin {
         scale_factor: f32,
         scroll_x: f32,
         scroll_y: f32,
-        global_margin_x: f32,
+        _global_margin_x: f32,
         global_margin_y: f32,
     ) {
         // Check if scale factor seems wrong (e.g., 1.0 on a retina display)
@@ -139,65 +139,35 @@ impl SelectionPlugin {
         (x, y)
     }
 
-    /// Generate rectangles for a selection (matching original implementation)
-    fn selection_to_rectangles(&self, selection: &Selection) -> Vec<LayoutRect> {
-        let mut rects = Vec::new();
-
+    /// Generate a single bounding rectangle for the entire selection
+    fn selection_to_bounding_rect(&self, selection: &Selection) -> Option<LayoutRect> {
         // Skip if it's just a cursor (no selection)
         if selection.start.line == selection.end.line
             && selection.start.column == selection.end.column
         {
-            return rects;
+            return None;
         }
 
-        // Add dummy rectangle for GPU bug workaround (from original)
-        rects.push(LayoutRect::new(0.0, 0.0, 0.0, 0.0));
+        let (start_x, start_y) = self.doc_to_view(selection.start);
+        let (end_x, end_y) = self.doc_to_view(selection.end);
 
         if selection.start.line == selection.end.line {
             // Single line selection
-            let (start_x, start_y) = self.doc_to_view(selection.start);
-            let (end_x, _) = self.doc_to_view(selection.end);
-
-            rects.push(LayoutRect::new(
-                start_x - 16.0,
+            Some(LayoutRect::new(
+                start_x,
                 start_y,
                 end_x - start_x,
                 self.line_height,
-            ));
+            ))
         } else {
-            // Multi-line selection
-            let (start_x, start_y) = self.doc_to_view(selection.start);
-            let (end_x, end_y) = self.doc_to_view(selection.end);
-            let viewport_right = self.viewport_width - self.margin_x;
+            // Multi-line selection: create bounding box from top-left to bottom-right
+            let left = (self.margin_x - self.scroll_x).min(start_x);
+            let right = (self.viewport_width - self.margin_x).max(end_x);
+            let width = right - left;
+            let height = (end_y + self.line_height) - start_y;
 
-            // First line - extends to right edge
-            rects.push(LayoutRect::new(
-                start_x - 16.0,
-                start_y,
-                (viewport_right - start_x).max(0.0),
-                self.line_height,
-            ));
-
-            // Middle lines - full width
-            if selection.end.line > selection.start.line + 1 {
-                rects.push(LayoutRect::new(
-                    self.margin_x - self.scroll_x, // Account for horizontal scroll
-                    start_y + self.line_height,
-                    self.viewport_width - (self.margin_x * 2.0),
-                    (selection.end.line - selection.start.line - 1) as f32 * self.line_height,
-                ));
-            }
-
-            // Last line - from left margin to end position
-            rects.push(LayoutRect::new(
-                self.margin_x - self.scroll_x, // Account for horizontal scroll
-                end_y,
-                (end_x - self.margin_x + self.scroll_x).max(0.0) - 16.0,
-                self.line_height,
-            ));
+            Some(LayoutRect::new(left, start_y, width, height))
         }
-
-        rects
     }
 
     /// Create vertex data for all selection rectangles
@@ -208,40 +178,62 @@ impl SelectionPlugin {
         let color = self.config.style.color;
 
         for selection in &self.selections {
-            let rects = self.selection_to_rectangles(selection);
-
-            for rect in &rects {
+            if let Some(rect) = self.selection_to_bounding_rect(selection) {
                 // Rectangle is in logical view space, scale to physical pixels
                 let x = rect.x.0 * scale;
                 let y = rect.y.0 * scale;
                 let w = rect.width.0 * scale;
                 let h = rect.height.0 * scale;
 
+                // Pass selection info in vertex data for shader to determine visibility
+                let start_x = (self.doc_to_view(selection.start).0) * scale;
+                let start_y = self.doc_to_view(selection.start).1 * scale;
+                let end_x = (self.doc_to_view(selection.end).0) * scale;
+                let end_y = self.doc_to_view(selection.end).1 * scale;
+                let line_height = self.line_height * scale;
+                let margin_left = (self.margin_x - self.scroll_x) * scale;
+                let margin_right = (self.viewport_width - self.margin_x) * scale;
+
+                let selection_data = SelectionData {
+                    start_pos: [start_x, start_y],
+                    end_pos: [end_x, end_y],
+                    line_height,
+                    margin_left,
+                    margin_right,
+                    _padding: 0.0,
+                };
+
                 // Create two triangles for a quad
                 vertices.extend_from_slice(&[
                     SelectionVertex {
                         position: [x, y],
                         color,
+                        selection_data,
                     },
                     SelectionVertex {
                         position: [x + w, y],
                         color,
+                        selection_data,
                     },
                     SelectionVertex {
                         position: [x, y + h],
                         color,
+                        selection_data,
                     },
                     SelectionVertex {
                         position: [x + w, y],
                         color,
+                        selection_data,
                     },
                     SelectionVertex {
                         position: [x + w, y + h],
                         color,
+                        selection_data,
                     },
                     SelectionVertex {
                         position: [x, y + h],
                         color,
+                        selection_data,
                     },
                 ]);
             }
@@ -251,6 +243,19 @@ impl SelectionPlugin {
     }
 }
 
+/// Selection data passed to shader
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[bytemuck(crate = "self::bytemuck")]
+struct SelectionData {
+    start_pos: [f32; 2],
+    end_pos: [f32; 2],
+    line_height: f32,
+    margin_left: f32,
+    margin_right: f32,
+    _padding: f32, // Ensure 16-byte alignment
+}
+
 /// Vertex data for selection rendering
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -258,6 +263,7 @@ impl SelectionPlugin {
 struct SelectionVertex {
     position: [f32; 2],
     color: u32,
+    selection_data: SelectionData,
 }
 
 // === Plugin Trait Implementation ===
@@ -330,11 +336,22 @@ impl Initializable for SelectionPlugin {
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) color: u32,
+    @location(2) start_pos: vec2<f32>,
+    @location(3) end_pos: vec2<f32>,
+    @location(4) line_height: f32,
+    @location(5) margin_left: f32,
+    @location(6) margin_right: f32,
 }
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) pixel_pos: vec2<f32>,
+    @location(2) start_pos: vec2<f32>,
+    @location(3) end_pos: vec2<f32>,
+    @location(4) line_height: f32,
+    @location(5) margin_left: f32,
+    @location(6) margin_right: f32,
 }
 
 struct Uniforms {
@@ -353,6 +370,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let y = 1.0 - (input.position.y / uniforms.viewport_size.y) * 2.0;
 
     out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+    out.pixel_pos = input.position;
 
     // Unpack color from u32 to vec4
     let r = f32((input.color >> 24u) & 0xFFu) / 255.0;
@@ -361,13 +379,71 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let a = f32(input.color & 0xFFu) / 255.0;
     out.color = vec4<f32>(r, g, b, a);
 
+    // Pass through selection data
+    out.start_pos = input.start_pos;
+    out.end_pos = input.end_pos;
+    out.line_height = input.line_height;
+    out.margin_left = input.margin_left;
+    out.margin_right = input.margin_right;
+
     return out;
 }
 
 // Fragment shader
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return input.color;
+    let px = input.pixel_pos.x;
+    let py = input.pixel_pos.y;
+
+    // Calculate which line this pixel is on
+    let start_line = floor(input.start_pos.y / input.line_height);
+    let end_line = floor(input.end_pos.y / input.line_height);
+    let current_line = floor(py / input.line_height);
+
+    // Check if pixel should be visible based on selection shape
+    var visible = false;
+
+    if start_line == end_line {
+        // Single line selection
+        if current_line == start_line && px >= input.start_pos.x && px <= input.end_pos.x {
+            visible = true;
+        }
+    } else {
+        // Multi-line selection
+        if current_line == start_line {
+            // First line: from start_x to right margin
+            if px >= input.start_pos.x && px <= input.margin_right {
+                visible = true;
+            }
+        } else if current_line == end_line {
+            // Last line: from left margin to end_x
+            if px >= input.margin_left && px <= input.end_pos.x {
+                visible = true;
+            }
+        } else if current_line > start_line && current_line < end_line {
+            // Middle lines: full width from left to right margin
+            if px >= input.margin_left && px <= input.margin_right {
+                visible = true;
+            }
+        }
+    }
+
+    if visible {
+        // Debug: show UV coordinates instead of color
+        // Calculate UV within the bounding box
+        let min_x = min(input.start_pos.x, input.margin_left);
+        let max_x = max(input.end_pos.x, input.margin_right);
+        let min_y = input.start_pos.y;
+        let max_y = input.end_pos.y + input.line_height;
+
+        let u = (px - min_x) / (max_x - min_x);
+        let v = (py - min_y) / (max_y - min_y);
+
+        // return vec4<f32>(u, v, 1.0, 0.2);
+        return input.color;
+    } else {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0); // Transparent
+    }
 }
 "#;
 
@@ -389,6 +465,31 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 location: 1,
                 format: tiny_sdk::ffi::VertexFormat::Uint32, // color
             },
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 12,
+                location: 2,
+                format: tiny_sdk::ffi::VertexFormat::Float32x2, // start_pos
+            },
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 20,
+                location: 3,
+                format: tiny_sdk::ffi::VertexFormat::Float32x2, // end_pos
+            },
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 28,
+                location: 4,
+                format: tiny_sdk::ffi::VertexFormat::Float32, // line_height
+            },
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 32,
+                location: 5,
+                format: tiny_sdk::ffi::VertexFormat::Float32, // margin_left
+            },
+            tiny_sdk::ffi::VertexAttributeDescriptor {
+                offset: 36,
+                location: 6,
+                format: tiny_sdk::ffi::VertexFormat::Float32, // margin_right
+            },
         ];
 
         // Create pipeline with custom vertex layout
@@ -396,7 +497,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             shader_id,
             shader_id,
             bind_group_layout,
-            12, // vertex stride: 2 floats + 1 u32 = 12 bytes
+            44, // vertex stride: position (8) + color (4) + selection_data (32) = 44 bytes
             &attributes,
         );
         self.custom_pipeline_id = Some(pipeline_id);
@@ -435,7 +536,7 @@ impl Library for SelectionPlugin {
 
                 let mut selections = Vec::with_capacity(selection_count);
 
-                for i in 0..selection_count {
+                for _i in 0..selection_count {
                     if offset + 16 > args.len() {
                         return Err(PluginError::Other(
                             "Invalid args: incomplete selection data".into(),
