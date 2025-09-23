@@ -103,8 +103,18 @@ impl TextRenderer {
         font_system: &tiny_font::SharedFontSystem,
         viewport: &crate::coordinates::Viewport,
     ) {
-        // Only rebuild if text actually changed
-        if tree.version == self.layout_version {
+        self.update_layout_internal(tree, font_system, viewport, false);
+    }
+
+    pub fn update_layout_internal(
+        &mut self,
+        tree: &Tree,
+        font_system: &tiny_font::SharedFontSystem,
+        viewport: &crate::coordinates::Viewport,
+        force: bool,
+    ) {
+        // Only rebuild if text actually changed or forced
+        if !force && tree.version == self.layout_version {
             return;
         }
 

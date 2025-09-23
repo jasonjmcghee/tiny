@@ -94,7 +94,6 @@ impl ServiceRegistry {
     /// Register a service
     pub fn register<T: Any + Send + Sync + 'static>(&mut self, service: Arc<T>) {
         let type_id = TypeId::of::<T>();
-        eprintln!("Registering service with TypeId: {:?} for type: {}", type_id, std::any::type_name::<T>());
         self.services.insert(type_id, service);
     }
 

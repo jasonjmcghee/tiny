@@ -84,6 +84,15 @@ pub struct CursorPlugin {
     last_active_ms: AtomicU64,
     program_start: Instant,
 
+    // Viewport info for proper positioning
+    line_height: f32,
+    viewport_width: f32,
+    margin_x: f32,
+    margin_y: f32,
+    scale_factor: f32,
+    scroll_x: f32,
+    scroll_y: f32,
+
     // GPU resources (created during setup)
     vertex_buffer: Option<Buffer>,
     vertex_buffer_id: Option<tiny_sdk::ffi::BufferId>,
@@ -102,6 +111,13 @@ impl CursorPlugin {
             last_position: None,
             last_active_ms: AtomicU64::new(0),
             program_start: Instant::now(),
+            line_height: 20.0,
+            viewport_width: 800.0,
+            margin_x: 0.0,
+            margin_y: 0.0,
+            scale_factor: 1.0,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
             vertex_buffer: None,
             vertex_buffer_id: None,
             custom_pipeline_id: None,
@@ -386,6 +402,22 @@ impl Library for CursorPlugin {
                     Ok(Vec::new())
                 } else {
                     Err(PluginError::Other("Invalid args for set_position".into()))
+                }
+            }
+            "set_viewport_info" => {
+                if args.len() >= 28 {
+                    self.line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+                    self.viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
+                    self.margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
+                    self.margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
+                    self.scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
+                    self.scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
+                    self.scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
+                    eprintln!("Cursor plugin received viewport info: line_height={}, scroll=({}, {})",
+                             self.line_height, self.scroll_x, self.scroll_y);
+                    Ok(Vec::new())
+                } else {
+                    Err(PluginError::Other("Invalid args for set_viewport_info".into()))
                 }
             }
             _ => Err(PluginError::Other("Unknown method".into())),

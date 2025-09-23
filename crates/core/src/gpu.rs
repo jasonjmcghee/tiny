@@ -1186,9 +1186,9 @@ impl GpuRenderer {
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
+                            r: 0.11,
+                            g: 0.12,
+                            b: 0.13,
                             a: 1.0,
                         }),
                         store: StoreOp::Store,

@@ -177,7 +177,7 @@ impl FontSystem {
                 pos: PhysicalPos::new(x, y),  // No bearing adjustments in grid mode
                 size: PhysicalSizeF::new(entry.width, entry.height),
                 tex_coords: entry.tex_coords,
-                color: 0xFFFFFFFF,
+                color: 0xE1E1E1FF,
             });
 
             max_x = (i + 1) as f32 * advance;  // Total width is columns * advance
@@ -234,7 +234,7 @@ impl FontSystem {
                 pos: PhysicalPos::new(x, y),
                 size: PhysicalSizeF::new(entry.width, entry.height),
                 tex_coords: entry.tex_coords,
-                color: 0xFFFFFFFF,
+                color: 0xE1E1E1FF,
             });
 
             max_x = max_x.max(x + entry.advance);
@@ -348,6 +348,17 @@ impl FontSystem {
     pub fn char_width_coef(&self) -> f32 {
         self.char_width_coef
     }
+
+    /// Clear the glyph cache and reset atlas position
+    /// This should be called when font size changes to prevent atlas overflow
+    pub fn clear_cache(&mut self) {
+        self.glyph_cache.clear();
+        self.next_x = 0;
+        self.next_y = 0;
+        self.row_height = 0;
+        // Clear atlas data
+        self.atlas_data.fill(0);
+    }
 }
 
 /// Thread-safe wrapper for FontSystem
@@ -425,7 +436,10 @@ impl SharedFontSystem {
 
     /// Pre-rasterize ASCII - font_size_px should include scale factor
     pub fn prerasterize_ascii(&self, font_size_px: f32) {
-        self.inner.lock().prerasterize_ascii(font_size_px);
+        let mut font_system = self.inner.lock();
+        // Clear cache before prerasterizing at new size
+        font_system.clear_cache();
+        font_system.prerasterize_ascii(font_size_px);
     }
 
     /// Get atlas data

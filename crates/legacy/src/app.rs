@@ -4,13 +4,11 @@
 
 use crate::{
     input::{InputAction, InputHandler},
-    input_types,
-    io,
+    input_types, io,
     render::Renderer,
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
 };
-use tiny_font::SharedFontSystem;
 #[allow(unused)]
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -18,10 +16,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use tiny_font::SharedFontSystem;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    platform::macos::WindowAttributesExtMacOS,
     window::{Window, WindowId},
 };
 
@@ -216,6 +216,10 @@ pub struct TinyApp<T: AppLogic> {
     window_size: (f32, f32),
     font_size: f32,
 
+    // Title bar settings
+    title_bar_height: f32,     // Logical pixels
+    title_bar_color: [f32; 4], // RGBA
+
     // Scroll lock settings
     scroll_lock_enabled: bool, // true = lock to one direction at a time
     current_scroll_direction: Option<ScrollDirection>, // which direction is currently locked
@@ -288,7 +292,9 @@ impl<T: AppLogic> TinyApp<T> {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             font_size: 14.0,
-            scroll_lock_enabled: true, // Enabled by default
+            title_bar_height: 30.0,                   // Logical pixels
+            title_bar_color: [0.11, 0.12, 0.13, 1.0], // Your specified color
+            scroll_lock_enabled: true,                // Enabled by default
             current_scroll_direction: None,
             cursor_position: None,
             modifiers: input_types::Modifiers::default(),
@@ -327,22 +333,67 @@ impl<T: AppLogic> TinyApp<T> {
         event_loop.run_app(&mut self)?;
         Ok(())
     }
+
+    /// Adjust font size (for Cmd+=/Cmd+-)
+    fn adjust_font_size(&mut self, increase: bool) {
+        let delta = if increase { 1.0 } else { -1.0 };
+        self.font_size = (self.font_size + delta).clamp(6.0, 72.0); // Clamp between reasonable limits
+
+        println!("Font size changed to: {:.1}pt", self.font_size);
+
+        // Update CPU renderer with new font size
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            cpu_renderer.set_font_size(self.font_size);
+
+            // Re-set font system to recalculate line height
+            if let Some(font_system) = &self.font_system {
+                cpu_renderer.set_font_system(font_system.clone());
+            }
+        }
+
+        // Update font system with new size and clear cache
+        if let Some(font_system) = &self.font_system {
+            if let Some(window) = &self.window {
+                let scale_factor = window.scale_factor() as f32;
+                // This will clear the cache and prerasterize at the new size
+                font_system.prerasterize_ascii(self.font_size * scale_factor);
+
+                // Re-upload the font atlas to GPU
+                if let Some(gpu_renderer) = &self.gpu_renderer {
+                    let atlas_data = font_system.atlas_data();
+                    let (atlas_width, atlas_height) = font_system.atlas_size();
+                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+                }
+            }
+        }
+
+        self.request_redraw();
+    }
 }
 
 impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            // Create window
+            // Create window attributes
+            let mut window_attributes = Window::default_attributes()
+                .with_title(&self.window_title)
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    self.window_size.0,
+                    self.window_size.1,
+                ))
+                .with_theme(Some(winit::window::Theme::Dark));
+
+            // Apply macOS-specific transparent titlebar
+            #[cfg(target_os = "macos")]
+            {
+                window_attributes = window_attributes
+                    .with_titlebar_transparent(true)
+                    .with_fullsize_content_view(true);
+            }
+
             let window = Arc::new(
                 event_loop
-                    .create_window(
-                        Window::default_attributes()
-                            .with_title(&self.window_title)
-                            .with_inner_size(winit::dpi::LogicalSize::new(
-                                self.window_size.0,
-                                self.window_size.1,
-                            )),
-                    )
+                    .create_window(window_attributes)
                     .expect("Failed to create window"),
             );
 
@@ -471,6 +522,27 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     self.just_pressed_key = true;
+
+                    // Check for font size adjustment (Cmd+= and Cmd+-)
+                    #[cfg(target_os = "macos")]
+                    let cmd_held = self.modifiers.state().super_key();
+                    #[cfg(not(target_os = "macos"))]
+                    let cmd_held = self.modifiers.state().control_key();
+
+                    if cmd_held {
+                        match &event.logical_key {
+                            winit::keyboard::Key::Character(ch) if ch == "=" || ch == "+" => {
+                                self.adjust_font_size(true);
+                                return;
+                            }
+                            winit::keyboard::Key::Character(ch) if ch == "-" => {
+                                self.adjust_font_size(false);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Check for scroll lock toggle (F12 key)
                     if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) =
                         event.logical_key
@@ -542,34 +614,34 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 }
             }
 
-            WindowEvent::MouseInput {
-                state,
-                button,
-                ..
-            } if button == winit::event::MouseButton::Left => match state {
-                ElementState::Pressed => {
-                    if let Some(position) = self.cursor_position {
-                        self.mouse_pressed = true;
-                        self.drag_start = Some(position);
+            WindowEvent::MouseInput { state, button, .. }
+                if button == winit::event::MouseButton::Left =>
+            {
+                match state {
+                    ElementState::Pressed => {
+                        if let Some(position) = self.cursor_position {
+                            self.mouse_pressed = true;
+                            self.drag_start = Some(position);
 
-                        if let Some(point) = self.physical_to_logical_point(position) {
-                            if let Some(cpu_renderer) = &self.cpu_renderer {
-                                if self.logic.on_click(
-                                    point,
-                                    &cpu_renderer.viewport,
-                                    &self.modifiers,
-                                ) {
-                                    self.request_redraw();
+                            if let Some(point) = self.physical_to_logical_point(position) {
+                                if let Some(cpu_renderer) = &self.cpu_renderer {
+                                    if self.logic.on_click(
+                                        point,
+                                        &cpu_renderer.viewport,
+                                        &self.modifiers,
+                                    ) {
+                                        self.request_redraw();
+                                    }
                                 }
                             }
                         }
                     }
+                    ElementState::Released => {
+                        self.mouse_pressed = false;
+                        self.drag_start = None;
+                    }
                 }
-                ElementState::Released => {
-                    self.mouse_pressed = false;
-                    self.drag_start = None;
-                }
-            },
+            }
 
             WindowEvent::RedrawRequested => {
                 self.render_frame();
@@ -975,7 +1047,7 @@ impl EditorLogic {
         };
 
         let modified_marker = if self.is_modified { " (modified)" } else { "" };
-        format!("{}{} - Tiny Editor", filename, modified_marker)
+        format!("{}{}", filename, modified_marker)
     }
 
     pub fn new(doc: Doc) -> Self {
