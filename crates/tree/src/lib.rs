@@ -737,24 +737,21 @@ impl Tree {
         self.doc_pos_to_byte_with_tab_width(pos, 4) // Default tab width
     }
 
-    pub fn doc_pos_to_byte_with_tab_width(&self, pos: DocPos, tab_width: u32) -> usize {
+    pub fn doc_pos_to_byte_with_tab_width(&self, pos: DocPos, _tab_width: u32) -> usize {
         if let Some(line_start) = self.line_to_byte(pos.line) {
             let line_end = self.line_to_byte(pos.line + 1).unwrap_or(self.byte_count());
             let line_text = self.get_text_slice(line_start..line_end);
 
             let mut byte_offset = 0;
-            let mut visual_column = 0;
+            let mut char_count = 0;
 
+            // pos.column is now a character index, not a visual column
             for ch in line_text.chars() {
-                if visual_column >= pos.column {
+                if char_count >= pos.column {
                     break;
                 }
-                if ch == '\t' {
-                    visual_column = ((visual_column / tab_width) + 1) * tab_width;
-                } else {
-                    visual_column += 1;
-                }
                 byte_offset += ch.len_utf8();
+                char_count += 1;  // Each character (including tab) counts as 1
             }
 
             line_start + byte_offset

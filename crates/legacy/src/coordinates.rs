@@ -229,17 +229,38 @@ impl Viewport {
     /// Document position to layout with actual text (more accurate)
     pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
         let x = if let Some(font_system) = &self.font_system {
-            // Convert column to byte position in line
-            let byte_in_line = self.column_to_byte_in_line(line_text, pos.column);
-            if byte_in_line > 0 && byte_in_line <= line_text.len() {
-                // Measure the actual text up to the byte position
-                let prefix = &line_text[..byte_in_line];
+            // Build the text up to the cursor position (pos.column is character index)
+            let mut expanded = String::new();
+            let mut char_index = 0u32;
+            let mut visual_column = 0u32;
+
+            for ch in line_text.chars() {
+                if char_index >= pos.column {
+                    break;
+                }
+
+                if ch == '\t' {
+                    // Add spaces to reach next tab stop
+                    let next_tab_stop = ((visual_column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
+                    let spaces_to_add = next_tab_stop - visual_column;
+                    for _ in 0..spaces_to_add {
+                        expanded.push(' ');
+                    }
+                    visual_column = next_tab_stop;
+                } else {
+                    expanded.push(ch);
+                    visual_column += 1;
+                }
+                char_index += 1;  // Each character (including tab) increments char position by 1
+            }
+
+            // Now measure the expanded text
+            if !expanded.is_empty() {
                 let layout = font_system.layout_text_scaled(
-                    prefix,
+                    &expanded,
                     self.metrics.font_size,
                     self.scale_factor,
                 );
-                // Convert from physical pixels back to logical
                 layout.width / self.scale_factor
             } else {
                 0.0

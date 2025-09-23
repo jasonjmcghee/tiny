@@ -56,13 +56,13 @@ impl Default for CursorConfig {
     fn default() -> Self {
         Self {
             blink_enabled: true,
-            blink_rate: 2.0,
+            blink_rate: 1.0,
             solid_duration_ms: 500,
             style: CursorStyle {
                 color: 0xFFFFFFFF,
                 width: 2.0,
                 height_scale: 1.0,
-                x_offset: -2.0,
+                x_offset: 0.0,
             },
         }
     }
@@ -397,7 +397,7 @@ impl Library for CursorPlugin {
 
 impl Paintable for CursorPlugin {
     fn z_index(&self) -> i32 {
-        -10
+       -10
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
@@ -479,7 +479,7 @@ impl Configurable for CursorPlugin {
             true
         }
         fn default_blink_rate() -> f32 {
-            2.0
+            1.0
         }
         fn default_solid_duration_ms() -> u64 {
             500
@@ -494,7 +494,7 @@ impl Configurable for CursorPlugin {
             1.0
         }
         fn default_x_offset() -> f32 {
-            -2.0
+            0.0
         }
 
         match toml::from_str::<PluginToml>(config_data) {

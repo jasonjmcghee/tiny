@@ -6,19 +6,19 @@ use std::sync::Arc;
 #[allow(unused)]
 use tiny_core::wgpu::hal::{DynCommandEncoder, DynDevice, DynQueue};
 use tiny_core::{
+    plugin_loader::PluginLoader,
     tree::{self, Rect, Tree},
     GpuRenderer,
-    plugin_loader::PluginLoader,
 };
 use tiny_sdk::{GlyphInstance, LayoutPos, LayoutRect, LogicalSize};
 
 use crate::coordinates::Viewport;
-use tiny_font;
 use crate::input;
 use crate::syntax;
 use crate::text_effects;
 use crate::text_renderer::{self, TextRenderer};
 use crate::widget::{self, PaintContext, WidgetManager};
+use tiny_font;
 use tiny_sdk::ServiceRegistry;
 
 // === Renderer ===
@@ -140,9 +140,13 @@ impl Renderer {
             // Check if we have explicit config for this plugin
             if let Some(plugin_config) = app_config.plugins.plugins.get(plugin_name) {
                 let lib_path = plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
-                let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
+                let config_path =
+                    plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
 
-                println!("Using explicit paths - lib: {}, config: {}", lib_path, config_path);
+                println!(
+                    "Using explicit paths - lib: {}, config: {}",
+                    lib_path, config_path
+                );
 
                 match loader.load_plugin_from_path(plugin_name, &lib_path, &config_path) {
                     Ok(_) => {
@@ -153,12 +157,18 @@ impl Renderer {
                         let queue = gpu_renderer.queue_arc();
 
                         match loader.initialize_plugin(plugin_name, device, queue) {
-                            Ok(_) => eprintln!("Initialized {} plugin with GPU resources", plugin_name),
-                            Err(e) => eprintln!("Failed to initialize {} plugin: {}", plugin_name, e),
+                            Ok(_) => {
+                                eprintln!("Initialized {} plugin with GPU resources", plugin_name)
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to initialize {} plugin: {}", plugin_name, e)
+                            }
                         }
-
                     }
-                    Err(e) => eprintln!("Failed to load {} plugin from explicit path: {}", plugin_name, e),
+                    Err(e) => eprintln!(
+                        "Failed to load {} plugin from explicit path: {}",
+                        plugin_name, e
+                    ),
                 }
             } else {
                 // Use default paths
@@ -171,8 +181,12 @@ impl Renderer {
                         let queue = gpu_renderer.queue_arc();
 
                         match loader.initialize_plugin(plugin_name, device, queue) {
-                            Ok(_) => eprintln!("Initialized {} plugin with GPU resources", plugin_name),
-                            Err(e) => eprintln!("Failed to initialize {} plugin: {}", plugin_name, e),
+                            Ok(_) => {
+                                eprintln!("Initialized {} plugin with GPU resources", plugin_name)
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to initialize {} plugin: {}", plugin_name, e)
+                            }
                         }
                     }
                     Err(e) => eprintln!("Failed to load {} plugin: {}", plugin_name, e),
@@ -191,89 +205,143 @@ impl Renderer {
             if let Some(plugin_config) = app_config.plugins.plugins.get(plugin_name) {
                 // eprintln!("Found config for {}, auto_reload = {}", plugin_name, plugin_config.auto_reload);
                 if plugin_config.auto_reload {
-                    let lib_path = plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
+                    let lib_path =
+                        plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
                     let lib_path_buf = std::path::PathBuf::from(&lib_path);
 
-                    eprintln!("Setting up hot-reload for {} watching specific file: {:?}", plugin_name, lib_path);
+                    eprintln!(
+                        "Setting up hot-reload for {} watching specific file: {:?}",
+                        plugin_name, lib_path
+                    );
                     eprintln!("Library file exists: {}", lib_path_buf.exists());
                     if lib_path_buf.exists() {
-                        eprintln!("Library file metadata: {:?}", std::fs::metadata(&lib_path_buf).ok());
+                        eprintln!(
+                            "Library file metadata: {:?}",
+                            std::fs::metadata(&lib_path_buf).ok()
+                        );
                     }
 
                     // Create watcher for the specific library file
-                    use notify::{Watcher, RecursiveMode, Event};
+                    use notify::{Event, RecursiveMode, Watcher};
                     let loader_for_lib = loader_arc.clone();
                     let plugin_name_for_lib = plugin_name.clone();
                     let device = gpu_renderer.device_arc();
                     let queue = gpu_renderer.queue_arc();
                     let lib_path_for_reload = lib_path.clone();
-                    let config_path_for_reload = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
+                    let config_path_for_reload =
+                        plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
 
-                    let lib_watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-                        if let Ok(event) = res {
-                            eprintln!("Watcher event for {}: kind={:?}, paths={:?}", plugin_name_for_lib, event.kind, event.paths);
+                    let lib_watcher =
+                        notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                            if let Ok(event) = res {
+                                eprintln!(
+                                    "Watcher event for {}: kind={:?}, paths={:?}",
+                                    plugin_name_for_lib, event.kind, event.paths
+                                );
 
-                            // Only reload on Create or Modify, not Remove (file is being replaced during build)
-                            if event.kind.is_create() || event.kind.is_modify() {
-                                eprintln!("Library file changed for {}: {:?}", plugin_name_for_lib, event.paths);
+                                // Only reload on Create or Modify, not Remove (file is being replaced during build)
+                                if event.kind.is_create() || event.kind.is_modify() {
+                                    eprintln!(
+                                        "Library file changed for {}: {:?}",
+                                        plugin_name_for_lib, event.paths
+                                    );
 
-                                // Quick check if file exists and is not empty (cargo watch might still be writing)
-                                let mut retries = 0;
-                                while retries < 10 {
-                                    if let Ok(metadata) = std::fs::metadata(&lib_path_for_reload) {
-                                        if metadata.len() > 0 {
-                                            // File exists and has content, safe to reload
-                                            break;
+                                    // Quick check if file exists and is not empty (cargo watch might still be writing)
+                                    let mut retries = 0;
+                                    while retries < 10 {
+                                        if let Ok(metadata) =
+                                            std::fs::metadata(&lib_path_for_reload)
+                                        {
+                                            if metadata.len() > 0 {
+                                                // File exists and has content, safe to reload
+                                                break;
+                                            }
                                         }
+                                        retries += 1;
+                                        std::thread::sleep(std::time::Duration::from_millis(10));
                                     }
-                                    retries += 1;
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
 
-                                if retries == 10 {
-                                    eprintln!("File not ready after 100ms, skipping reload");
-                                    return;
-                                }
-
-                                if let Ok(mut loader) = loader_for_lib.lock() {
-                                    // First unload the plugin
-                                    if let Err(e) = loader.unload_plugin(&plugin_name_for_lib) {
-                                        eprintln!("Failed to unload plugin {}: {}", plugin_name_for_lib, e);
+                                    if retries == 10 {
+                                        eprintln!("File not ready after 100ms, skipping reload");
                                         return;
                                     }
 
-                                    // Use the original configured paths for reload
-                                    eprintln!("Reloading plugin {} from lib={}, config={}", plugin_name_for_lib, lib_path_for_reload, config_path_for_reload);
+                                    if let Ok(mut loader) = loader_for_lib.lock() {
+                                        // First unload the plugin
+                                        if let Err(e) = loader.unload_plugin(&plugin_name_for_lib) {
+                                            eprintln!(
+                                                "Failed to unload plugin {}: {}",
+                                                plugin_name_for_lib, e
+                                            );
+                                            return;
+                                        }
 
-                                    if let Err(e) = loader.load_plugin_from_path(&plugin_name_for_lib, &lib_path_for_reload, &config_path_for_reload) {
-                                        eprintln!("Failed to reload plugin {}: {}", plugin_name_for_lib, e);
-                                        return;
-                                    }
+                                        // Use the original configured paths for reload
+                                        eprintln!(
+                                            "Reloading plugin {} from lib={}, config={}",
+                                            plugin_name_for_lib,
+                                            lib_path_for_reload,
+                                            config_path_for_reload
+                                        );
 
-                                    // Re-initialize with GPU resources
-                                    if let Err(e) = loader.initialize_plugin(&plugin_name_for_lib, device.clone(), queue.clone()) {
-                                        eprintln!("Failed to reinitialize plugin {}: {}", plugin_name_for_lib, e);
-                                    } else {
-                                        eprintln!("Successfully hot-reloaded plugin: {}", plugin_name_for_lib);
+                                        if let Err(e) = loader.load_plugin_from_path(
+                                            &plugin_name_for_lib,
+                                            &lib_path_for_reload,
+                                            &config_path_for_reload,
+                                        ) {
+                                            eprintln!(
+                                                "Failed to reload plugin {}: {}",
+                                                plugin_name_for_lib, e
+                                            );
+                                            return;
+                                        }
+
+                                        // Re-initialize with GPU resources
+                                        if let Err(e) = loader.initialize_plugin(
+                                            &plugin_name_for_lib,
+                                            device.clone(),
+                                            queue.clone(),
+                                        ) {
+                                            eprintln!(
+                                                "Failed to reinitialize plugin {}: {}",
+                                                plugin_name_for_lib, e
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "Successfully hot-reloaded plugin: {}",
+                                                plugin_name_for_lib
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
+                        });
 
                     if let Ok(mut watcher) = lib_watcher {
                         // First try to watch the specific library file
-                        let watch_result = watcher.watch(&lib_path_buf, RecursiveMode::NonRecursive);
+                        let watch_result =
+                            watcher.watch(&lib_path_buf, RecursiveMode::NonRecursive);
 
                         if let Err(e) = watch_result {
-                            eprintln!("Failed to watch lib file directly {}: {}, trying parent directory", lib_path, e);
+                            eprintln!(
+                                "Failed to watch lib file directly {}: {}, trying parent directory",
+                                lib_path, e
+                            );
 
                             // Fallback: watch parent directory (required on some macOS versions)
                             if let Some(parent_dir) = lib_path_buf.parent() {
-                                if let Err(e2) = watcher.watch(parent_dir, RecursiveMode::NonRecursive) {
-                                    eprintln!("Failed to watch parent directory {:?}: {}", parent_dir, e2);
+                                if let Err(e2) =
+                                    watcher.watch(parent_dir, RecursiveMode::NonRecursive)
+                                {
+                                    eprintln!(
+                                        "Failed to watch parent directory {:?}: {}",
+                                        parent_dir, e2
+                                    );
                                 } else {
-                                    eprintln!("Watching parent directory for library: {:?}", parent_dir);
+                                    eprintln!(
+                                        "Watching parent directory for library: {:?}",
+                                        parent_dir
+                                    );
                                     self.lib_watchers.push(watcher);
                                 }
                             }
@@ -289,44 +357,61 @@ impl Renderer {
         // Set up TOML config watching for specific plugin config files
         for plugin_name in &app_config.plugins.enabled {
             if let Some(plugin_config) = app_config.plugins.plugins.get(plugin_name) {
-                let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
+                let config_path =
+                    plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
                 let config_path_buf = std::path::PathBuf::from(&config_path);
 
                 // Only watch if the config file exists
                 if config_path_buf.exists() {
                     // eprintln!("Setting up config watching for {} at: {:?}", plugin_name, config_path);
 
-                    use notify::{Watcher, RecursiveMode, Event};
+                    use notify::{Event, RecursiveMode, Watcher};
                     let loader_for_config = loader_arc.clone();
                     let plugin_name_for_config = plugin_name.clone();
 
-                    let config_watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-                        if let Ok(event) = res {
-                            if event.kind.is_modify() {
-                                // eprintln!("Config file changed for {}: {:?}", plugin_name_for_config, event.paths);
+                    let config_watcher =
+                        notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                            if let Ok(event) = res {
+                                if event.kind.is_modify() {
+                                    // eprintln!("Config file changed for {}: {:?}", plugin_name_for_config, event.paths);
 
-                                // Read the new config
-                                if let Ok(config_data) = std::fs::read_to_string(&event.paths[0]) {
-                                    // Send to plugin
-                                    if let Ok(mut loader) = loader_for_config.lock() {
-                                        if let Some(plugin) = loader.get_plugin_mut(&plugin_name_for_config) {
-                                            if let Some(configurable) = plugin.instance.as_configurable() {
-                                                if let Err(e) = configurable.config_updated(&config_data) {
-                                                    eprintln!("Failed to update config for {}: {}", plugin_name_for_config, e);
-                                                } else {
-                                                    eprintln!("Updated config for plugin: {}", plugin_name_for_config);
+                                    // Read the new config
+                                    if let Ok(config_data) =
+                                        std::fs::read_to_string(&event.paths[0])
+                                    {
+                                        // Send to plugin
+                                        if let Ok(mut loader) = loader_for_config.lock() {
+                                            if let Some(plugin) =
+                                                loader.get_plugin_mut(&plugin_name_for_config)
+                                            {
+                                                if let Some(configurable) =
+                                                    plugin.instance.as_configurable()
+                                                {
+                                                    if let Err(e) =
+                                                        configurable.config_updated(&config_data)
+                                                    {
+                                                        eprintln!(
+                                                            "Failed to update config for {}: {}",
+                                                            plugin_name_for_config, e
+                                                        );
+                                                    } else {
+                                                        eprintln!(
+                                                            "Updated config for plugin: {}",
+                                                            plugin_name_for_config
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    });
+                        });
 
                     if let Ok(mut watcher) = config_watcher {
                         // Watch the specific config file only
-                        if let Err(e) = watcher.watch(&config_path_buf, RecursiveMode::NonRecursive) {
+                        if let Err(e) = watcher.watch(&config_path_buf, RecursiveMode::NonRecursive)
+                        {
                             eprintln!("Failed to watch config file {}: {}", config_path, e);
                         } else {
                             eprintln!("Watching config file: {}", config_path);
@@ -394,19 +479,19 @@ impl Renderer {
             if let Some(ref loader_arc) = self.plugin_loader {
                 if let Ok(mut loader) = loader_arc.lock() {
                     if let Some(cursor_plugin) = loader.get_plugin_mut("cursor") {
-                    if let Some(library) = cursor_plugin.instance.as_library_mut() {
-                        // Call set_position method with binary-encoded VIEW position
-                        let x_bytes = view_pos.x.0.to_le_bytes();
-                        let y_bytes = view_pos.y.0.to_le_bytes();
-                        let mut args = Vec::new();
-                        args.extend_from_slice(&x_bytes);
-                        args.extend_from_slice(&y_bytes);
+                        if let Some(library) = cursor_plugin.instance.as_library_mut() {
+                            // Call set_position method with binary-encoded VIEW position
+                            let x_bytes = view_pos.x.0.to_le_bytes();
+                            let y_bytes = view_pos.y.0.to_le_bytes();
+                            let mut args = Vec::new();
+                            args.extend_from_slice(&x_bytes);
+                            args.extend_from_slice(&y_bytes);
 
-                        match library.call("set_position", &args) {
-                            Ok(_) => {},
-                            Err(e) => eprintln!("Failed to update cursor position: {}", e),
+                            match library.call("set_position", &args) {
+                                Ok(_) => {}
+                                Err(e) => eprintln!("Failed to update cursor position: {}", e),
+                            }
                         }
-                    }
                     }
                 }
             }

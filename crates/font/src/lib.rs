@@ -82,9 +82,7 @@ struct GlyphEntry {
     width: f32,
     height: f32,
     advance: f32,
-    #[allow(dead_code)]
     bearing_x: f32,
-    #[allow(dead_code)]
     bearing_y: f32,
 }
 
@@ -111,20 +109,86 @@ impl FontSystem {
             char_width_coef: 0.0,
         };
 
-        // Measure the actual character width at our font size
-        // This ensures consistency everywhere
-        let s = "M ";
-        let repeat_count = 1000;
-        let count = repeat_count * s.len();
-        let good_approximation = s.repeat(repeat_count);
-        let font_size_for_calc = 16.0;
-        let char_layout = self_.layout_text(&good_approximation, font_size_for_calc);
-        if char_layout.width > 0.0 {
-            // Use the actual measured width at our font size
-            self_.char_width_coef = (char_layout.width / font_size_for_calc) / (count as f32);
-        }
+        // Get the monospace advance width by measuring a single character
+        // In a monospace font, all characters should have the same advance
+        let test_size = 16.0;
+        let (metrics, _) = self_.font.rasterize('M', test_size);
+        self_.char_width_coef = metrics.advance_width / test_size;
 
         self_
+    }
+
+    /// Layout text with grid-aligned positioning for monospace fonts
+    /// This ensures perfect column alignment for cursor positioning
+    pub fn layout_text_grid_aligned(&mut self, text: &str, font_size_px: f32) -> TextLayout {
+        let expanded_text = expand_tabs(text);
+
+        // Use the same advance calculation as regular layout
+        // This should match what fontdue uses internally
+        let advance = self.char_width_coef * font_size_px;
+
+        // First, let fontdue layout the text to get proper baseline positioning
+        self.layout.clear();
+        self.layout.append(
+            &[&self.font],
+            &TextStyle::new(&expanded_text, font_size_px, 0),
+        );
+
+        // Get the y positions from fontdue (for proper baseline alignment)
+        let glyph_info: Vec<_> = self
+            .layout
+            .glyphs()
+            .iter()
+            .map(|g| (g.parent, g.y))  // We only need char and y position
+            .collect();
+
+        let mut positioned_glyphs = Vec::new();
+        let mut max_x = 0.0f32;
+        let mut max_y = 0.0f32;
+        let mut glyph_index = 0;
+
+        // Position each character on a perfect grid (x), but use fontdue's y
+        let mut char_index = 0;
+        for (i, ch) in expanded_text.chars().enumerate() {
+            if ch.is_control() && ch != ' ' {
+                continue;
+            }
+            if ch == '\n' {
+                continue;  // Skip newlines
+            }
+
+            let entry = self.get_or_rasterize(ch, font_size_px as u32);
+            let x = i as f32 * advance;  // Perfect grid positioning for x
+
+            // Use fontdue's y position for proper baseline alignment
+            let y = if glyph_index < glyph_info.len() {
+                let (_, fontdue_y) = glyph_info[glyph_index];
+                glyph_index += 1;
+                fontdue_y
+            } else {
+                0.0
+            };
+
+            // For grid alignment:
+            // - X: use grid position without bearing (cursor aligns with grid)
+            // - Y: use fontdue's baseline position without adjustment
+            positioned_glyphs.push(PositionedGlyph {
+                char: ch,
+                pos: PhysicalPos::new(x, y),  // No bearing adjustments in grid mode
+                size: PhysicalSizeF::new(entry.width, entry.height),
+                tex_coords: entry.tex_coords,
+                color: 0xFFFFFFFF,
+            });
+
+            max_x = (i + 1) as f32 * advance;  // Total width is columns * advance
+            max_y = max_y.max(y + entry.height);
+        }
+
+        TextLayout {
+            glyphs: positioned_glyphs,
+            width: max_x,
+            height: max_y,
+        }
     }
 
     /// Layout text and get positioned glyphs with texture coordinates
@@ -301,6 +365,26 @@ impl SharedFontSystem {
 
     pub fn char_width_coef(&self) -> f32 {
         self.inner.lock().char_width_coef()
+    }
+
+    /// Layout text with grid-aligned positioning for monospace fonts
+    pub fn layout_text_grid_aligned(&self, text: &str, logical_font_size: f32, scale_factor: f32) -> TextLayout {
+        let mut font_system = self.inner.lock();
+        let physical_size = logical_font_size * scale_factor;
+        let layout = font_system.layout_text_grid_aligned(text, physical_size);
+
+        // Return layout with glyphs already in physical pixels
+        TextLayout {
+            glyphs: layout.glyphs.iter().map(|g| PositionedGlyph {
+                char: g.char,
+                pos: g.pos.clone(),
+                size: g.size.clone(),
+                tex_coords: g.tex_coords,
+                color: g.color,
+            }).collect(),
+            width: layout.width,
+            height: layout.height,
+        }
     }
 
     /// Layout text with automatic crisp rasterization based on stored scale factor

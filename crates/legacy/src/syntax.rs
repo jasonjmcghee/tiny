@@ -331,8 +331,13 @@ impl SyntaxHighlighter {
                 // Apply edit to existing tree for incremental parsing
                 if let Some(edit) = &final_request.edit {
                     if let Some(ref mut existing_tree) = tree {
-                        println!("SYNTAX: Applying incremental edit: start_byte={}, old_end={}, new_end={}",
+                        println!("SYNTAX: Applying incremental edit:");
+                        println!("  bytes: start={}, old_end={}, new_end={}",
                                  edit.start_byte, edit.old_end_byte, edit.new_end_byte);
+                        println!("  positions: start=({},{}), old_end=({},{}), new_end=({},{})",
+                                 edit.start_position.row, edit.start_position.column,
+                                 edit.old_end_position.row, edit.old_end_position.column,
+                                 edit.new_end_position.row, edit.new_end_position.column);
 
                         let ts_edit = InputEdit {
                             start_byte: edit.start_byte,
@@ -815,6 +820,7 @@ impl TextStyleProvider for SyntaxHighlighter {
 
 /// Convert byte position to tree-sitter Point using efficient tree navigation
 fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
+    const TAB_WIDTH: usize = 4;  // TODO: Get from ViewportMetrics
     let line = tree.byte_to_line(byte_pos);
     let line_start = tree.line_to_byte(line).unwrap_or(0);
     let byte_in_line = byte_pos - line_start;
@@ -829,7 +835,14 @@ fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
         if byte_offset >= byte_in_line {
             break;
         }
-        column += if ch == '\t' { 4 - (column % 4) } else { 1 };
+
+        if ch == '\t' {
+            // Tab advances to next tab stop
+            let spaces_to_add = TAB_WIDTH - (column % TAB_WIDTH);
+            column += spaces_to_add;
+        } else {
+            column += 1;
+        }
         byte_offset += ch.len_utf8();
     }
 
@@ -841,12 +854,16 @@ fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
 
 /// Calculate new point position after inserting text
 fn calc_new_point(start: Point, text: &str) -> Point {
+    const TAB_WIDTH: usize = 4;  // TODO: Get from ViewportMetrics
     let mut line = start.row;
     let mut column = start.column;
     for ch in text.chars() {
         if ch == '\n' {
             line += 1;
             column = 0;
+        } else if ch == '\t' {
+            // Tab advances to next tab stop, matching byte_to_point
+            column += TAB_WIDTH - (column % TAB_WIDTH);
         } else {
             column += 1;
         }
@@ -890,6 +907,25 @@ pub fn create_text_edit(tree: &tiny_core::tree::Tree, edit: &tiny_core::tree::Ed
     } else {
         calc_new_point(start_position, content_text)
     };
+
+    // Debug tab handling
+    if content_text.contains('\t') {
+        eprintln!("Tab edit: start_byte={}, old_end_byte={}, new_end_byte={}",
+            start_byte, old_end_byte, new_end_byte);
+        eprintln!("  start_position=({},{}), old_end=({},{}), new_end=({},{})",
+            start_position.row, start_position.column,
+            old_end_position.row, old_end_position.column,
+            new_end_position.row, new_end_position.column);
+        eprintln!("  text={:?}", content_text);
+
+        // Verify the column calculation
+        let recalc_start = byte_to_point(tree, start_byte);
+        eprintln!("  recalc_start=({},{})", recalc_start.row, recalc_start.column);
+        if recalc_start.column != start_position.column {
+            eprintln!("  WARNING: Column mismatch! Expected {}, got {}",
+                start_position.column, recalc_start.column);
+        }
+    }
 
     TextEdit {
         start_byte,

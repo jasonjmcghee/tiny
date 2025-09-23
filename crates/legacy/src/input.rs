@@ -322,10 +322,8 @@ impl InputHandler {
                 if !sel.is_cursor() {
                     sel.cursor = sel.min_pos();
                 } else if sel.cursor.column > 0 {
-                    match deleted.as_deref() {
-                        Some("\t") => sel.cursor.column = ((sel.cursor.column + 3) / 4 - 1) * 4,
-                        _ => sel.cursor.column -= 1,
-                    }
+                    // Simply move back one character, regardless of what it was
+                    sel.cursor.column -= 1;
                 } else if sel.cursor.line > 0 {
                     sel.cursor.line -= 1;
                     sel.cursor.column = if deleted.as_deref() == Some("\n") {
@@ -371,7 +369,7 @@ impl InputHandler {
                     sel.cursor.line += 1;
                     sel.cursor.column = 0;
                 }
-                "\t" => sel.cursor.column = ((sel.cursor.column / 4) + 1) * 4,
+                // Tab is just one character in the document
                 _ => sel.cursor.column += text.chars().count() as u32,
             }
             sel.anchor = sel.cursor;
