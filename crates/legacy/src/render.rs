@@ -500,37 +500,11 @@ impl Renderer {
         }
     }
 
-    /// Render tree directly to GPU via widgets
-    pub fn render(
-        &mut self,
-        tree: &Tree,
-        viewport: Rect,
-        selections: &[input::Selection],
-        render_pass: &mut wgpu::RenderPass,
-    ) {
-        // Simply delegate to render_with_pass which will handle everything
-        self.render_with_pass(tree, viewport, selections, Some(render_pass));
-    }
-
-    /// Render tree with direct GPU render pass for widgets
-    pub fn render_with_pass(
-        &mut self,
-        tree: &Tree,
-        viewport: Rect,
-        selections: &[input::Selection],
-        render_pass: Option<&mut wgpu::RenderPass>,
-    ) {
-        self.render_with_pass_and_context(tree, viewport, selections, render_pass, None);
-    }
-
     /// Render tree with direct GPU render pass and optional widget paint context
     pub fn render_with_pass_and_context(
         &mut self,
         tree: &Tree,
-        _viewport: Rect,
-        _selections: &[input::Selection],
         mut render_pass: Option<&mut wgpu::RenderPass>,
-        widget_paint_context: Option<&PaintContext>,
     ) {
         // Early exit if nothing has changed - skip all expensive operations
         if tree.version == self.last_rendered_version && !self.layout_dirty && !self.syntax_dirty {

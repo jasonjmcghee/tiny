@@ -108,9 +108,6 @@ pub trait AppLogic: 'static {
         0
     }
 
-    /// Set cursor position (for compatibility)
-    fn set_cursor_pos(&mut self, _pos: usize) {}
-
     /// Get cursor document position for scrolling (returns None if no scrolling needed)
     fn get_cursor_doc_pos(&self) -> Option<DocPos> {
         None // Return None unless cursor actually moved
@@ -844,12 +841,7 @@ impl<T: AppLogic> TinyApp<T> {
             // Render using the callback API
             unsafe {
                 gpu_renderer.render_with_callback(uniforms, |render_pass| {
-                    cpu_renderer.render_with_pass(
-                        &doc_read,
-                        viewport,
-                        selections,
-                        Some(render_pass),
-                    );
+                    cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass));
                 });
             }
         }

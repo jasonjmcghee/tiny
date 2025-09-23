@@ -897,13 +897,9 @@ impl Widget for DocumentEditorWidget {
         }
 
         // Render text WITHOUT widgets first (we'll paint them manually)
-        let selections = self.logic.input.selections();
-        let _batches = self.renderer.borrow_mut().render_with_pass_and_context(
+        self.renderer.borrow_mut().render_with_pass_and_context(
             &self.logic.doc.read(),
-            widget_viewport,
-            selections,
             Some(render_pass),
-            Some(ctx),
         );
 
         // Update mouse circle shader effect parameters
