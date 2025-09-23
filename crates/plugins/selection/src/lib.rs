@@ -161,7 +161,7 @@ impl SelectionPlugin {
             ))
         } else {
             // Multi-line selection: create bounding box from top-left to bottom-right
-            let left = (self.margin_x - self.scroll_x).min(start_x);
+            let left = self.margin_x.min(start_x);
             let right = (self.viewport_width - self.margin_x).max(end_x);
             let width = right - left;
             let height = (end_y + self.line_height) - start_y;
@@ -191,7 +191,7 @@ impl SelectionPlugin {
                 let end_x = (self.doc_to_view(selection.end).0) * scale;
                 let end_y = self.doc_to_view(selection.end).1 * scale;
                 let line_height = self.line_height * scale;
-                let margin_left = (self.margin_x - self.scroll_x) * scale;
+                let margin_left = self.margin_x * scale;
                 let margin_right = (self.viewport_width - self.margin_x) * scale;
 
                 let selection_data = SelectionData {
