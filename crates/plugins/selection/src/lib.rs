@@ -301,6 +301,10 @@ impl Plugin for SelectionPlugin {
         Some(self)
     }
 
+    fn as_library(&self) -> Option<&dyn Library> {
+        Some(self)
+    }
+
     fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
         Some(self)
     }

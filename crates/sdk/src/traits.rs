@@ -260,6 +260,11 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Get Library trait if implemented (immutable)
+    fn as_library(&self) -> Option<&dyn Library> {
+        None
+    }
+
     /// Get mutable Library trait if implemented
     fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
         None

@@ -1,0 +1,38 @@
+# Text Editor Plugin Configuration
+
+[metadata]
+name = "text-editor"
+version = "0.1.0"
+author = "Tiny Editor Team"
+description = "Core text editing and rendering functionality"
+
+[dependencies]
+# This plugin depends on cursor and selection for complete editing experience
+cursor = "0.1.0"
+selection = "0.1.0"
+
+[capabilities]
+# This plugin needs frame updates for animations and state changes
+update = true
+# This plugin renders text content
+paint = true
+# This plugin provides API for other plugins
+library = true
+
+[config]
+# Font settings
+font_size = 14.0
+line_height = 19.6
+
+# Performance settings
+layout_cache_enabled = true
+incremental_rendering = true
+
+# Visual settings
+show_line_numbers = false
+tab_width = 4
+soft_wrap = false
+
+[exports]
+# Entry point function name in the compiled library
+entry_point = "text_editor_plugin_create"

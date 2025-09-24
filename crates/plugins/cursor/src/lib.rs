@@ -260,6 +260,10 @@ impl Plugin for CursorPlugin {
         Some(self)
     }
 
+    fn as_library(&self) -> Option<&dyn Library> {
+        Some(self)
+    }
+
     fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
         Some(self)
     }
@@ -294,10 +298,12 @@ impl Initializable for CursorPlugin {
 
         // Also create an FFI buffer ID for reuse
         use tiny_sdk::ffi::BufferId;
+        eprintln!("CursorPlugin: About to create FFI buffer with size {}", buffer_size);
         let buffer_id = BufferId::create(
             buffer_size,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
+        eprintln!("CursorPlugin: Created FFI buffer ID: {:?}", buffer_id);
         self.vertex_buffer_id = Some(buffer_id);
 
         // Create custom shader for cursor rendering

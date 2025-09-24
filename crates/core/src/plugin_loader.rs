@@ -5,7 +5,7 @@
 use ahash::AHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tiny_sdk::{GlyphInstances, Hook, Paintable, Plugin, PluginError, Updatable};
+use tiny_sdk::{GlyphInstances, Hook, Library, Paintable, Plugin, PluginError, Updatable};
 
 /// Plugin configuration loaded from plugin.toml
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ pub struct PluginConfig {
     pub description: String,
     pub entry_point: String,
     pub capabilities: PluginCapabilities,
+    pub dependencies: Vec<String>,
     pub config: toml::Value,
 }
 
@@ -22,6 +23,7 @@ pub struct PluginConfig {
 pub struct PluginCapabilities {
     pub update: bool,
     pub paint: bool,
+    pub library: bool,
 }
 
 /// Loaded plugin instance
@@ -60,17 +62,69 @@ impl PluginLoader {
         }
     }
 
+    /// Resolve plugin load order based on dependencies
+    fn resolve_load_order(
+        &self,
+        plugin_configs: &HashMap<String, PluginConfig>,
+    ) -> Result<Vec<String>, PluginError> {
+        let mut loaded = std::collections::HashSet::new();
+        let mut order = Vec::new();
+
+        // Helper function to recursively load dependencies
+        fn visit(
+            name: &str,
+            configs: &HashMap<String, PluginConfig>,
+            loaded: &mut std::collections::HashSet<String>,
+            order: &mut Vec<String>,
+            visiting: &mut std::collections::HashSet<String>,
+        ) -> Result<(), PluginError> {
+            if loaded.contains(name) {
+                return Ok(());
+            }
+
+            if visiting.contains(name) {
+                return Err(PluginError::Other(
+                    format!("Circular dependency detected involving plugin: {}", name).into(),
+                ));
+            }
+
+            visiting.insert(name.to_string());
+
+            if let Some(config) = configs.get(name) {
+                // Load dependencies first
+                for dep in &config.dependencies {
+                    visit(dep, configs, loaded, order, visiting)?;
+                }
+
+                // Then load this plugin
+                if !loaded.contains(name) {
+                    loaded.insert(name.to_string());
+                    order.push(name.to_string());
+                }
+            }
+
+            visiting.remove(name);
+            Ok(())
+        }
+
+        let mut visiting = std::collections::HashSet::new();
+        for name in plugin_configs.keys() {
+            visit(name, plugin_configs, &mut loaded, &mut order, &mut visiting)?;
+        }
+
+        Ok(order)
+    }
+
     /// Discover and load all plugins in the plugin directory
     pub fn load_all(&mut self) -> Result<Vec<String>, PluginError> {
-        let mut loaded = Vec::new();
-
         // Create plugin directory if it doesn't exist
         if !self.plugin_dir.exists() {
             std::fs::create_dir_all(&self.plugin_dir)
                 .map_err(|e| PluginError::Other(Box::new(e)))?;
         }
 
-        // Scan for plugin files
+        // First, discover all plugin configs
+        let mut plugin_configs = HashMap::new();
         let entries =
             std::fs::read_dir(&self.plugin_dir).map_err(|e| PluginError::Other(Box::new(e)))?;
 
@@ -90,15 +144,35 @@ impl PluginLoader {
                     continue;
                 }
 
-                // Try to load the plugin
-                match self.load_plugin(name) {
-                    Ok(_) => {
-                        loaded.push(name.to_string());
-                        println!("Loaded plugin: {}", name);
+                // Load config to check dependencies
+                match self.load_config(&path) {
+                    Ok(config) => {
+                        plugin_configs.insert(name.to_string(), config);
                     }
                     Err(e) => {
-                        eprintln!("Failed to load plugin {}: {}", name, e);
+                        eprintln!("Failed to load config for plugin {}: {}", name, e);
                     }
+                }
+            }
+        }
+
+        // Resolve load order based on dependencies
+        let load_order = self.resolve_load_order(&plugin_configs)?;
+        let mut loaded = Vec::new();
+
+        // Load plugins in dependency order
+        for name in load_order {
+            if self.plugins.contains_key(&name) {
+                continue;
+            }
+
+            match self.load_plugin(&name) {
+                Ok(_) => {
+                    loaded.push(name.to_string());
+                    println!("Loaded plugin: {}", name);
+                }
+                Err(e) => {
+                    eprintln!("Failed to load plugin {}: {}", name, e);
                 }
             }
         }
@@ -320,9 +394,22 @@ impl PluginLoader {
             PluginCapabilities {
                 update: cap.get("update").and_then(|v| v.as_bool()).unwrap_or(false),
                 paint: cap.get("paint").and_then(|v| v.as_bool()).unwrap_or(false),
+                library: cap
+                    .get("library")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             }
         } else {
             PluginCapabilities::default()
+        };
+
+        // Parse dependencies
+        let dependencies = if let Some(deps) = toml.get("dependencies") {
+            deps.as_table()
+                .map(|table| table.keys().cloned().collect())
+                .unwrap_or_else(Vec::new)
+        } else {
+            Vec::new()
         };
 
         // Parse exports
@@ -345,6 +432,7 @@ impl PluginLoader {
             description,
             entry_point,
             capabilities,
+            dependencies,
             config,
         })
     }
@@ -394,6 +482,23 @@ impl PluginLoader {
     /// Get mutable plugin by name
     pub fn get_plugin_mut(&mut self, name: &str) -> Option<&mut LoadedPlugin> {
         self.plugins.get_mut(name)
+    }
+
+    /// Get plugin's dependencies as Library implementations
+    pub fn get_plugin_dependencies(&self, name: &str) -> Vec<&dyn Library> {
+        let mut dependencies = Vec::new();
+
+        if let Some(plugin) = self.plugins.get(name) {
+            for dep_name in &plugin.config.dependencies {
+                if let Some(dep_plugin) = self.plugins.get(dep_name) {
+                    if let Some(library) = dep_plugin.instance.as_library() {
+                        dependencies.push(library);
+                    }
+                }
+            }
+        }
+
+        dependencies
     }
 
     /// List all loaded plugins
