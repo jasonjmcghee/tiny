@@ -19,7 +19,7 @@ use tiny_sdk::{GlyphInstance, LayoutPos, ServiceRegistry};
 #[derive(Clone, Debug)]
 struct PluginState {
     viewport_info: Vec<u8>,
-    selections: Vec<(tiny_sdk::DocPos, tiny_sdk::DocPos)>,
+    selections: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)>,
     cursor_pos: Option<(f32, f32)>,
 }
 
@@ -47,14 +47,15 @@ impl PluginState {
         args
     }
 
-    fn encode_selections(selections: &[(tiny_sdk::DocPos, tiny_sdk::DocPos)]) -> Vec<u8> {
+    fn encode_selections(selections: &[(tiny_sdk::ViewPos, tiny_sdk::ViewPos)]) -> Vec<u8> {
         let mut args = Vec::new();
         args.extend_from_slice(&(selections.len() as u32).to_le_bytes());
         for (start, end) in selections {
-            args.extend_from_slice(&start.line.to_le_bytes());
-            args.extend_from_slice(&start.column.to_le_bytes());
-            args.extend_from_slice(&end.line.to_le_bytes());
-            args.extend_from_slice(&end.column.to_le_bytes());
+            // Send view positions (x, y) as floats
+            args.extend_from_slice(&start.x.0.to_le_bytes());
+            args.extend_from_slice(&start.y.0.to_le_bytes());
+            args.extend_from_slice(&end.x.0.to_le_bytes());
+            args.extend_from_slice(&end.y.0.to_le_bytes());
         }
         args
     }
@@ -398,7 +399,7 @@ impl Renderer {
         self.layout_dirty = true;
     }
 
-    pub fn set_selection_widgets(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
+    pub fn set_selection_plugin(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
         let (cursor_pos, selections) = input_handler.get_selection_data(doc, &self.viewport);
         let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
         let viewport_changed = current_scroll != self.last_viewport_scroll;

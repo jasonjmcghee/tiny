@@ -18,9 +18,9 @@ use tiny_sdk::{
 
 // === Scrolloff Configuration (Neovim-style) ===
 /// Number of lines to keep visible above/below cursor when scrolling vertically
-const VERTICAL_SCROLLOFF_LINES: f32 = 4.0;
+pub const VERTICAL_SCROLLOFF_LINES: f32 = 4.0;
 /// Number of characters to keep visible left/right of cursor when scrolling horizontally
-const HORIZONTAL_SCROLLOFF_CHARS: f32 = 8.0;
+pub const HORIZONTAL_SCROLLOFF_CHARS: f32 = 8.0;
 // === Line Rendering Mode ===
 
 /// How lines should be rendered - with horizontal scroll or soft wrap

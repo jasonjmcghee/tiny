@@ -822,7 +822,7 @@ impl Widget for DocumentEditorWidget {
             renderer.set_gpu_renderer(ctx.gpu());
 
             // Update selection widgets for proper cursor/selection rendering
-            renderer.set_selection_widgets(&self.logic.input, &self.logic.doc);
+            renderer.set_selection_plugin(&self.logic.input, &self.logic.doc);
 
             // Debug: Check if widgets were actually created
             let widget_count = renderer.widget_manager().widgets.len();
@@ -897,10 +897,9 @@ impl Widget for DocumentEditorWidget {
         }
 
         // Render text WITHOUT widgets first (we'll paint them manually)
-        self.renderer.borrow_mut().render_with_pass_and_context(
-            &self.logic.doc.read(),
-            Some(render_pass),
-        );
+        self.renderer
+            .borrow_mut()
+            .render_with_pass_and_context(&self.logic.doc.read(), Some(render_pass));
 
         // Update mouse circle shader effect parameters
         if let Some(mouse_pos) = self.text_effect.mouse_pos {
@@ -1384,7 +1383,7 @@ impl ApplicationHandler for CircleApp {
                                 // Update selection widgets after drag
                                 {
                                     let mut renderer = text_widget.renderer.borrow_mut();
-                                    renderer.set_selection_widgets(
+                                    renderer.set_selection_plugin(
                                         &text_widget.logic.input,
                                         &text_widget.logic.doc,
                                     );

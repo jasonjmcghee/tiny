@@ -146,6 +146,13 @@ pub struct InputHandler {
     history: DocumentHistory,
     /// Navigation history for cursor positions (Cmd+[/])
     nav_history: SelectionHistory,
+    /// Drag anchor in document coordinates (set when drag starts)
+    drag_anchor: Option<DocPos>,
+    /// Original scroll position when drag started (to keep cursor calculation stable)
+    drag_start_scroll: Option<(f32, f32)>,
+    /// Selection anchor - when set, cursor movements extend selection from this point
+    /// Set when entering selection mode (shift pressed), cleared when leaving selection mode
+    selection_anchor: Option<DocPos>,
 }
 
 impl InputHandler {
@@ -166,6 +173,9 @@ impl InputHandler {
             has_pending_syntax_update: false,
             history: DocumentHistory::new(),
             nav_history: SelectionHistory::with_max_size(50),
+            drag_anchor: None,
+            drag_start_scroll: None,
+            selection_anchor: None,
         }
     }
 
@@ -209,8 +219,42 @@ impl InputHandler {
         InputAction::Redraw
     }
 
+    /// Move cursor to a new position, handling selection based on current state
+    fn move_cursor_to(&mut self, new_position: DocPos, extending_selection: bool) {
+        if extending_selection {
+            // When extending, use selection anchor if available, or current cursor if not
+            if self.selection_anchor.is_none() {
+                if let Some(sel) = self.selections.first() {
+                    self.selection_anchor = Some(sel.anchor);
+                }
+            }
+
+            // Update cursor while keeping anchor
+            for sel in &mut self.selections {
+                sel.cursor = new_position;
+                if let Some(anchor) = self.selection_anchor {
+                    sel.anchor = anchor;
+                }
+            }
+        } else {
+            // Not extending - move cursor and collapse selection
+            for sel in &mut self.selections {
+                sel.cursor = new_position;
+                sel.anchor = new_position;
+            }
+            // Clear selection anchor when making a non-extending movement
+            self.selection_anchor = None;
+        }
+    }
+
     /// Unified cursor movement
-    fn move_cursor(&mut self, doc: &Doc, dx: i32, dy: i32, shift_held: bool) -> InputAction {
+    fn move_cursor(
+        &mut self,
+        doc: &Doc,
+        dx: i32,
+        dy: i32,
+        extending_selection: bool,
+    ) -> InputAction {
         let tree = doc.read();
 
         // Handle vertical movement
@@ -219,49 +263,46 @@ impl InputHandler {
                 self.goal_column = Some(self.selections[0].cursor.column);
             }
 
-            for sel in &mut self.selections {
-                if dy < 0 && sel.cursor.line > 0 {
-                    sel.cursor.line -= 1;
-                } else if dy > 0 && tree.line_to_byte(sel.cursor.line + 1).is_some() {
-                    sel.cursor.line += 1;
-                }
+            // Get current cursor position
+            let mut new_pos = self.selections.first().map(|s| s.cursor).unwrap_or_default();
 
-                let line_length = tree.line_char_count(sel.cursor.line) as u32;
-                sel.cursor.column = self
-                    .goal_column
-                    .unwrap_or(sel.cursor.column)
-                    .min(line_length);
-                if !shift_held {
-                    sel.anchor = sel.cursor;
-                }
+            if dy < 0 && new_pos.line > 0 {
+                new_pos.line -= 1;
+            } else if dy > 0 && tree.line_to_byte(new_pos.line + 1).is_some() {
+                new_pos.line += 1;
             }
+
+            let line_length = tree.line_char_count(new_pos.line) as u32;
+            new_pos.column = self.goal_column.unwrap_or(new_pos.column).min(line_length);
+            new_pos.byte_offset = 0;
+            self.move_cursor_to(new_pos, extending_selection);
         }
 
         // Handle horizontal movement
         if dx != 0 {
             self.goal_column = None;
 
-            for sel in &mut self.selections {
-                if dx < 0 {
-                    if sel.cursor.column > 0 {
-                        sel.cursor.column -= 1;
-                    } else if sel.cursor.line > 0 {
-                        sel.cursor.line -= 1;
-                        sel.cursor.column = tree.line_char_count(sel.cursor.line) as u32;
-                    }
-                } else {
-                    let line_length = tree.line_char_count(sel.cursor.line) as u32;
-                    if sel.cursor.column < line_length {
-                        sel.cursor.column += 1;
-                    } else if tree.line_to_byte(sel.cursor.line + 1).is_some() {
-                        sel.cursor.line += 1;
-                        sel.cursor.column = 0;
-                    }
+            // Get current cursor position
+            let mut new_pos = self.selections.first().map(|s| s.cursor).unwrap_or_default();
+
+            if dx < 0 {
+                if new_pos.column > 0 {
+                    new_pos.column -= 1;
+                } else if new_pos.line > 0 {
+                    new_pos.line -= 1;
+                    new_pos.column = tree.line_char_count(new_pos.line) as u32;
                 }
-                if !shift_held {
-                    sel.anchor = sel.cursor;
+            } else {
+                let line_length = tree.line_char_count(new_pos.line) as u32;
+                if new_pos.column < line_length {
+                    new_pos.column += 1;
+                } else if tree.line_to_byte(new_pos.line + 1).is_some() {
+                    new_pos.line += 1;
+                    new_pos.column = 0;
                 }
             }
+            new_pos.byte_offset = 0;
+            self.move_cursor_to(new_pos, extending_selection);
         }
 
         InputAction::Redraw
@@ -378,23 +419,28 @@ impl InputHandler {
     }
 
     /// Move cursor to start or end of line
-    fn move_to_line_edge(&mut self, doc: &Doc, to_end: bool, shift_held: bool) -> InputAction {
+    fn move_to_line_edge(&mut self, doc: &Doc, to_end: bool, extending_selection: bool) -> InputAction {
         self.goal_column = None;
-        for sel in &mut self.selections {
-            sel.cursor.column = if to_end {
-                doc.read().line_char_count(sel.cursor.line) as u32
-            } else {
-                0
+        let tree = doc.read();
+
+        if let Some(sel) = self.selections.first() {
+            let new_pos = DocPos {
+                line: sel.cursor.line,
+                column: if to_end {
+                    tree.line_char_count(sel.cursor.line) as u32
+                } else {
+                    0
+                },
+                byte_offset: 0,
             };
-            if !shift_held {
-                sel.anchor = sel.cursor;
-            }
+            self.move_cursor_to(new_pos, extending_selection);
         }
+
         InputAction::Redraw
     }
 
     /// Page navigation (up/down)
-    fn page_jump(&mut self, doc: &Doc, up: bool, shift_held: bool) -> InputAction {
+    fn page_jump(&mut self, doc: &Doc, up: bool, extending_selection: bool) -> InputAction {
         self.nav_history
             .checkpoint_if_changed(self.primary_cursor_doc_pos(doc));
         if self.goal_column.is_none() && !self.selections.is_empty() {
@@ -402,23 +448,27 @@ impl InputHandler {
         }
 
         const PAGE_SIZE: u32 = 20;
-        for sel in &mut self.selections {
+
+        if let Some(sel) = self.selections.first() {
             let tree = doc.read();
             let total_lines = tree.line_count();
-            if up {
-                sel.cursor.line = sel.cursor.line.saturating_sub(PAGE_SIZE);
+
+            let new_line = if up {
+                sel.cursor.line.saturating_sub(PAGE_SIZE)
             } else {
-                sel.cursor.line = (sel.cursor.line + PAGE_SIZE).min(total_lines.saturating_sub(1));
-            }
-            let line_length = doc.read().line_char_count(sel.cursor.line) as u32;
-            sel.cursor.column = self
-                .goal_column
-                .unwrap_or(sel.cursor.column)
-                .min(line_length);
-            if !shift_held {
-                sel.anchor = sel.cursor;
-            }
+                (sel.cursor.line + PAGE_SIZE).min(total_lines.saturating_sub(1))
+            };
+
+            let line_length = tree.line_char_count(new_line) as u32;
+            let new_pos = DocPos {
+                line: new_line,
+                column: self.goal_column.unwrap_or(sel.cursor.column).min(line_length),
+                byte_offset: 0,
+            };
+
+            self.move_cursor_to(new_pos, extending_selection);
         }
+
         InputAction::Redraw
     }
 
@@ -765,6 +815,7 @@ impl InputHandler {
         pos: Point,
         button: MouseButton,
         alt_held: bool,
+        shift_held: bool,
     ) -> bool {
         if button != MouseButton::Left {
             return false;
@@ -785,13 +836,41 @@ impl InputHandler {
             self.nav_history.checkpoint_if_changed(current_pos);
         }
 
-        if alt_held {
+        if shift_held {
+            // Shift-click: extend selection from current position to click point
+            if let Some(sel) = self.selections.first() {
+                // Use existing anchor or cursor as the selection start
+                let anchor = if sel.anchor != sel.cursor {
+                    // Already have a selection, keep its anchor
+                    sel.anchor
+                } else {
+                    // No selection yet, use current cursor as anchor
+                    sel.cursor
+                };
+                // Don't set selection_anchor here - that's only for keyboard-based selection extension
+                self.selections = vec![Selection {
+                    cursor: doc_pos,
+                    anchor,
+                    id: self.next_id,
+                }];
+            } else {
+                // No existing selection, create one
+                self.selections = vec![Selection {
+                    cursor: doc_pos,
+                    anchor: doc_pos,
+                    id: self.next_id,
+                }];
+            }
+        } else if alt_held {
+            // Alt-click: add a new cursor
             self.selections.push(Selection {
                 cursor: doc_pos,
                 anchor: doc_pos,
                 id: self.next_id,
             });
         } else {
+            // Regular click: start fresh selection at click point
+            self.selection_anchor = None; // Clear any existing selection mode
             self.selections = vec![Selection {
                 cursor: doc_pos,
                 anchor: doc_pos,
@@ -807,18 +886,18 @@ impl InputHandler {
         &mut self,
         doc: &Doc,
         viewport: &Viewport,
-        from: Point,
+        _from: Point,  // Unused - we use the stored drag_anchor
         to: Point,
         alt_held: bool,
-    ) -> bool {
+    ) -> (bool, Option<(f32, f32)>) {
+        // Use the stored drag anchor, or calculate it if missing
+        let anchor_doc = self.drag_anchor.unwrap_or_else(|| {
+            self.selections.first().map(|s| s.anchor).unwrap_or_default()
+        });
+
+        // Calculate cursor position (where we're dragging to) in DOCUMENT coordinates
+        // This is crucial - we convert to document space so the position doesn't drift with scroll
         let tree = doc.read();
-        let start_doc = viewport.layout_to_doc_with_tree(
-            LayoutPos {
-                x: from.x + viewport.scroll.x,
-                y: from.y + viewport.scroll.y,
-            },
-            &tree,
-        );
         let end_doc = viewport.layout_to_doc_with_tree(
             LayoutPos {
                 x: to.x + viewport.scroll.x,
@@ -827,18 +906,49 @@ impl InputHandler {
             &tree,
         );
 
+        // Update selection using the anchor we stored at click time
+        // This ensures consistent selection behavior regardless of drag direction
         let selection = Selection {
             cursor: end_doc,
-            anchor: start_doc,
+            anchor: anchor_doc,  // Always use the original click position as anchor
             id: self.next_id,
         };
+
         if alt_held {
             self.selections.push(selection);
         } else {
             self.selections = vec![selection];
         }
         self.next_id += 1;
-        true
+
+        // Calculate scroll delta based on mouse position relative to VIEWPORT edges
+        // Only scroll when mouse is outside the text area
+        let mut scroll_delta = (0.0, 0.0);
+
+        // Check if mouse is outside viewport boundaries for scrolling
+        let margin_x = viewport.margin.x.0;
+        let text_area_right = viewport.logical_size.width.0 - margin_x;
+
+        // Vertical scrolling - only when mouse is outside viewport vertically
+        if to.y.0 < 0.0 {
+            // Above viewport - scroll up
+            scroll_delta.1 = -3.0; // Fixed scroll speed
+        } else if to.y.0 > viewport.logical_size.height.0 {
+            // Below viewport - scroll down
+            scroll_delta.1 = 3.0; // Fixed scroll speed
+        }
+
+        // Horizontal scrolling - only when mouse is outside text area horizontally
+        if to.x.0 < margin_x {
+            // Left of text area - scroll left
+            scroll_delta.0 = -3.0; // Fixed scroll speed
+        } else if to.x.0 > text_area_right {
+            // Right of text area - scroll right
+            scroll_delta.0 = 3.0; // Fixed scroll speed
+        }
+
+        let needs_scroll = scroll_delta.0 != 0.0 || scroll_delta.1 != 0.0;
+        (true, if needs_scroll { Some(scroll_delta) } else { None })
     }
 
     /// Copy selection to clipboard
@@ -937,6 +1047,11 @@ impl InputHandler {
         }
     }
 
+    /// Clear the drag anchor (called when mouse button is released)
+    pub fn clear_drag_anchor(&mut self) {
+        self.drag_anchor = None;
+    }
+
     /// Get primary cursor position in document space
     pub fn primary_cursor_doc_pos(&self, doc: &Doc) -> DocPos {
         self.selections.first().map_or(DocPos::default(), |sel| {
@@ -956,7 +1071,7 @@ impl InputHandler {
         viewport: &Viewport,
     ) -> (
         Option<tiny_sdk::LayoutPos>,
-        Vec<(DocPos, DocPos)>, // Selection start/end positions
+        Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)>, // Selection start/end positions in view coordinates
     ) {
         let cursor_pos = self.selections.first().map(|sel| {
             let tree = doc.read();
@@ -964,8 +1079,9 @@ impl InputHandler {
             viewport.doc_to_layout_with_text(sel.cursor, &line_text)
         });
 
-        // Collect selection positions (not rectangles - plugin will calculate those)
-        let selection_positions: Vec<(DocPos, DocPos)> = self
+        // Collect selection positions in view coordinates (with scroll applied)
+        let tree = doc.read();
+        let selection_positions: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = self
             .selections
             .iter()
             .filter(|sel| !sel.is_cursor())
@@ -976,7 +1092,18 @@ impl InputHandler {
                 } else {
                     (sel.anchor, sel.cursor)
                 };
-                (start, end)
+
+                // Convert to layout positions with proper font metrics
+                let start_line_text = tree.line_text(start.line);
+                let end_line_text = tree.line_text(end.line);
+                let start_layout = viewport.doc_to_layout_with_text(start, &start_line_text);
+                let end_layout = viewport.doc_to_layout_with_text(end, &end_line_text);
+
+                // Convert to view positions (apply scroll)
+                let start_view = viewport.layout_to_view(start_layout);
+                let end_view = viewport.layout_to_view(end_layout);
+
+                (start_view, end_view)
             })
             .collect();
 

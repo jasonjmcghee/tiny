@@ -32,7 +32,9 @@ use tiny_core::{
     tree::{Doc, Point, Rect},
     GpuRenderer, Uniforms,
 };
-use tiny_sdk::{types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
+use tiny_sdk::{
+    types::DocPos, Hook, LayoutPos, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {
@@ -46,6 +48,12 @@ pub trait AppLogic: 'static {
     fn as_any(&self) -> &dyn std::any::Any {
         // Default implementation returns empty reference
         &()
+    }
+
+    /// Get as mutable Any for downcasting
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        // Default implementation returns empty reference
+        unreachable!("as_any_mut not implemented")
     }
 
     /// Handle keyboard input with optional renderer for incremental updates
@@ -95,6 +103,11 @@ pub trait AppLogic: 'static {
     /// Handle mouse move (for tracking position)
     fn on_mouse_move(&mut self, _pos: Point, _viewport: &crate::coordinates::Viewport) -> bool {
         false
+    }
+
+    /// Handle mouse button release (for cleaning up drag state)
+    fn on_mouse_release(&mut self) {
+        // Default implementation does nothing
     }
 
     /// Get document to render
@@ -589,19 +602,24 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some(position);
 
-                if let Some(point) = self.physical_to_logical_point(position) {
-                    if let Some(cpu_renderer) = &self.cpu_renderer {
+                // Pre-compute logical positions to avoid borrow issues
+                let logical_point = self.physical_to_logical_point(position);
+                let drag_from = self
+                    .drag_start
+                    .and_then(|p| self.physical_to_logical_point(p));
+
+                if let Some(point) = logical_point {
+                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
                         // Mouse move
                         if self.logic.on_mouse_move(point, &cpu_renderer.viewport) {
-                            self.request_redraw();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
                         }
 
                         // Mouse drag
                         if self.mouse_pressed {
-                            if let Some(from) = self
-                                .drag_start
-                                .and_then(|p| self.physical_to_logical_point(p))
-                            {
+                            if let Some(from) = drag_from {
                                 // Check if drag started in titlebar area (for transparent titlebar on macOS)
                                 #[cfg(target_os = "macos")]
                                 let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
@@ -616,7 +634,26 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                         &cpu_renderer.viewport,
                                         &self.modifiers,
                                     ) {
-                                        self.request_redraw();
+                                        // Apply pending scroll from EditorLogic
+                                        if let Some(editor) =
+                                            self.logic.as_any_mut().downcast_mut::<EditorLogic>()
+                                        {
+                                            if let Some((dx, dy)) = editor.pending_scroll {
+                                                cpu_renderer.viewport.scroll.x.0 += dx;
+                                                cpu_renderer.viewport.scroll.y.0 += dy;
+
+                                                // Clamp scroll to bounds using doc from editor directly
+                                                let tree = editor.doc.read();
+                                                cpu_renderer.viewport.clamp_scroll_to_bounds(&tree);
+
+                                                // Clear the scroll so it doesn't keep applying
+                                                editor.pending_scroll = None;
+                                            }
+                                        }
+
+                                        if let Some(window) = &self.window {
+                                            window.request_redraw();
+                                        }
                                     }
                                 }
                             }
@@ -643,7 +680,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                                 // Only pass click to editor if not in titlebar area
                                 if !is_in_titlebar {
-                                    if let Some(cpu_renderer) = &self.cpu_renderer {
+                                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
                                         if self.logic.on_click(
                                             point,
                                             &cpu_renderer.viewport,
@@ -659,6 +696,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     ElementState::Released => {
                         self.mouse_pressed = false;
                         self.drag_start = None;
+
+                        // Clear drag state in editor
+                        self.logic.on_mouse_release();
                     }
                 }
             }
@@ -900,7 +940,7 @@ impl<T: AppLogic> TinyApp<T> {
             // Update widgets if EditorLogic
             if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
                 // Always update selection widgets
-                cpu_renderer.set_selection_widgets(&editor.input, &editor.doc);
+                cpu_renderer.set_selection_plugin(&editor.input, &editor.doc);
 
                 // Set up global margin (only once)
                 static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
@@ -969,6 +1009,8 @@ pub struct EditorLogic {
     pub last_saved_content_hash: u64,
     /// Whether to show line numbers
     pub show_line_numbers: bool,
+    /// Pending scroll delta from drag operations
+    pub pending_scroll: Option<(f32, f32)>,
 }
 
 impl EditorLogic {
@@ -1147,6 +1189,7 @@ impl EditorLogic {
             file_path: None,
             last_saved_content_hash: initial_hash,
             show_line_numbers: true,
+            pending_scroll: None,
         }
     }
 }
@@ -1190,6 +1233,10 @@ impl AppLogic for EditorLogic {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn on_key_with_renderer(
         &mut self,
         event: &input_types::KeyEvent,
@@ -1221,12 +1268,14 @@ impl AppLogic for EditorLogic {
     ) -> bool {
         // Convert to mouse click for InputHandler
         let alt_held = modifiers.state().alt_key();
+        let shift_held = modifiers.state().shift_key();
         self.input.on_mouse_click(
             &self.doc,
             viewport,
             pos,
             input_types::MouseButton::Left,
             alt_held,
+            shift_held,
         );
         self.widgets_dirty = true; // Mark widgets for update
         true
@@ -1241,10 +1290,22 @@ impl AppLogic for EditorLogic {
     ) -> bool {
         // Convert to mouse drag for InputHandler
         let alt_held = modifiers.state().alt_key();
-        self.input
+        let (_redraw, scroll_delta) = self
+            .input
             .on_mouse_drag(&self.doc, viewport, from, to, alt_held);
+
+        // Store scroll delta to be applied in render loop
+        if scroll_delta.is_some() {
+            self.pending_scroll = scroll_delta;
+        }
+
         self.widgets_dirty = true; // Mark widgets for update
         true
+    }
+
+    fn on_mouse_release(&mut self) {
+        self.input.clear_drag_anchor();
+        self.pending_scroll = None;
     }
 
     fn doc(&self) -> &Doc {

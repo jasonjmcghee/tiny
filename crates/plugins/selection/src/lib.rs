@@ -12,20 +12,20 @@ use tiny_sdk::{
     PluginError, SetupContext,
 };
 
-/// Document position
+/// View position (x, y in logical pixels, with scroll already applied)
 #[derive(Debug, Clone, Copy)]
-pub struct DocPos {
-    pub line: u32,
-    pub column: u32,
+pub struct ViewPos {
+    pub x: f32,
+    pub y: f32,
 }
 
 /// Single selection with start and end positions
 #[derive(Debug, Clone)]
 pub struct Selection {
-    /// Start position (inclusive)
-    pub start: DocPos,
-    /// End position (exclusive)
-    pub end: DocPos,
+    /// Start position in view coordinates (inclusive)
+    pub start: ViewPos,
+    /// End position in view coordinates (exclusive)
+    pub end: ViewPos,
 }
 
 /// Selection appearance configuration
@@ -96,11 +96,18 @@ impl SelectionPlugin {
         }
     }
 
-    /// Update selections from start/end positions
-    pub fn set_selections(&mut self, selections: Vec<(DocPos, DocPos)>) {
+    /// Update selections from start/end view positions
+    pub fn set_selections(&mut self, selections: Vec<(ViewPos, ViewPos)>) {
         self.selections = selections
             .into_iter()
-            .map(|(start, end)| Selection { start, end })
+            .map(|(start, end)| {
+                // Ensure start comes before end for proper rendering
+                if start.y < end.y || (start.y == end.y && start.x <= end.x) {
+                    Selection { start, end }
+                } else {
+                    Selection { start: end, end: start }
+                }
+            })
             .collect();
     }
 
@@ -132,27 +139,26 @@ impl SelectionPlugin {
         self.scroll_y = scroll_y;
     }
 
-    /// Convert DocPos to view position (accounting for scroll)
-    fn doc_to_view(&self, pos: DocPos) -> (f32, f32) {
-        let x = self.margin_x + (pos.column as f32 * 8.4) - self.scroll_x; // Account for horizontal scroll
-        let y = self.margin_y + (pos.line as f32 * self.line_height) - self.scroll_y;
-        (x, y)
-    }
 
     /// Generate a single bounding rectangle for the entire selection
     fn selection_to_bounding_rect(&self, selection: &Selection) -> Option<LayoutRect> {
         // Skip if it's just a cursor (no selection)
-        if selection.start.line == selection.end.line
-            && selection.start.column == selection.end.column
+        let epsilon = 0.1;
+        if (selection.start.x - selection.end.x).abs() < epsilon
+            && (selection.start.y - selection.end.y).abs() < epsilon
         {
             return None;
         }
 
-        let (start_x, start_y) = self.doc_to_view(selection.start);
-        let (end_x, end_y) = self.doc_to_view(selection.end);
+        // View positions are already in screen coordinates
+        let start_x = selection.start.x;
+        let start_y = selection.start.y;
+        let end_x = selection.end.x;
+        let end_y = selection.end.y;
 
-        if selection.start.line == selection.end.line {
-            // Single line selection
+        // Check if single line (same y position)
+        if (start_y - end_y).abs() < epsilon {
+            // Single line selection - simple rectangle from start to end
             Some(LayoutRect::new(
                 start_x,
                 start_y,
@@ -160,9 +166,10 @@ impl SelectionPlugin {
                 self.line_height,
             ))
         } else {
-            // Multi-line selection: create bounding box from top-left to bottom-right
-            let left = self.margin_x.min(start_x);
-            let right = (self.viewport_width - self.margin_x).max(end_x);
+            // Multi-line selection: always use full width from margin to margin
+            // The shader will handle per-line clipping based on selection data
+            let left = self.margin_x;
+            let right = self.viewport_width - self.margin_x;
             let width = right - left;
             let height = (end_y + self.line_height) - start_y;
 
@@ -186,11 +193,13 @@ impl SelectionPlugin {
                 let h = rect.height.0 * scale;
 
                 // Pass selection info in vertex data for shader to determine visibility
-                let start_x = (self.doc_to_view(selection.start).0) * scale;
-                let start_y = self.doc_to_view(selection.start).1 * scale;
-                let end_x = (self.doc_to_view(selection.end).0) * scale;
-                let end_y = self.doc_to_view(selection.end).1 * scale;
+                // View positions are already in logical pixels (screen coordinates)
+                let start_x = selection.start.x * scale;
+                let start_y = selection.start.y * scale;
+                let end_x = selection.end.x * scale;
+                let end_y = selection.end.y * scale;
                 let line_height = self.line_height * scale;
+                // Margins are also in view coordinates now
                 let margin_left = self.margin_x * scale;
                 let margin_right = (self.viewport_width - self.margin_x) * scale;
 
@@ -395,32 +404,29 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let px = input.pixel_pos.x;
     let py = input.pixel_pos.y;
 
-    // Calculate which line this pixel is on
-    let start_line = floor(input.start_pos.y / input.line_height);
-    let end_line = floor(input.end_pos.y / input.line_height);
-    let current_line = floor(py / input.line_height);
-
     // Check if pixel should be visible based on selection shape
     var visible = false;
 
-    if start_line == end_line {
-        // Single line selection
-        if current_line == start_line && px >= input.start_pos.x && px <= input.end_pos.x {
+    // For single line selections
+    if abs(input.start_pos.y - input.end_pos.y) < 0.1 {
+        // Single line selection - simple range check
+        if py >= input.start_pos.y && py < input.start_pos.y + input.line_height &&
+           px >= input.start_pos.x && px <= input.end_pos.x {
             visible = true;
         }
     } else {
-        // Multi-line selection
-        if current_line == start_line {
+        // Multi-line selection - check which part of the selection we're in
+        if py >= input.start_pos.y && py < input.start_pos.y + input.line_height {
             // First line: from start_x to right margin
             if px >= input.start_pos.x && px <= input.margin_right {
                 visible = true;
             }
-        } else if current_line == end_line {
+        } else if py >= input.end_pos.y && py < input.end_pos.y + input.line_height {
             // Last line: from left margin to end_x
             if px >= input.margin_left && px <= input.end_pos.x {
                 visible = true;
             }
-        } else if current_line > start_line && current_line < end_line {
+        } else if py > input.start_pos.y && py < input.end_pos.y {
             // Middle lines: full width from left to right margin
             if px >= input.margin_left && px <= input.margin_right {
                 visible = true;
@@ -519,7 +525,7 @@ impl Library for SelectionPlugin {
         match method {
             "set_selections" => {
                 // Format: count (u32), then for each selection:
-                //   start_line, start_column, end_line, end_column (u32 each)
+                //   start_x, start_y, end_x, end_y (f32 each)
 
                 if args.len() < 4 {
                     return Err(PluginError::Other("Invalid args: too short".into()));
@@ -543,25 +549,25 @@ impl Library for SelectionPlugin {
                         ));
                     }
 
-                    let start_line = u32::from_le_bytes([
+                    let start_x = f32::from_le_bytes([
                         args[offset],
                         args[offset + 1],
                         args[offset + 2],
                         args[offset + 3],
                     ]);
-                    let start_column = u32::from_le_bytes([
+                    let start_y = f32::from_le_bytes([
                         args[offset + 4],
                         args[offset + 5],
                         args[offset + 6],
                         args[offset + 7],
                     ]);
-                    let end_line = u32::from_le_bytes([
+                    let end_x = f32::from_le_bytes([
                         args[offset + 8],
                         args[offset + 9],
                         args[offset + 10],
                         args[offset + 11],
                     ]);
-                    let end_column = u32::from_le_bytes([
+                    let end_y = f32::from_le_bytes([
                         args[offset + 12],
                         args[offset + 13],
                         args[offset + 14],
@@ -571,13 +577,13 @@ impl Library for SelectionPlugin {
                     offset += 16;
 
                     selections.push((
-                        DocPos {
-                            line: start_line,
-                            column: start_column,
+                        ViewPos {
+                            x: start_x,
+                            y: start_y,
                         },
-                        DocPos {
-                            line: end_line,
-                            column: end_column,
+                        ViewPos {
+                            x: end_x,
+                            y: end_y,
                         },
                     ));
                 }
