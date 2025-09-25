@@ -178,10 +178,10 @@ impl Viewport {
             logical_size: LogicalSize::new(logical_width, logical_height),
             physical_size,
             scale_factor,
-            metrics: TextMetrics::new(13.0),    // Default 14pt font
+            metrics: TextMetrics::new(13.0), // Default 14pt font
             global_margin: LayoutPos::new(0.0, 0.0), // No global margin by default
             margin: LayoutPos::new(16.0, 16.0), // 4px margin left and top
-            line_mode: LineMode::default(),     // Default to no wrap
+            line_mode: LineMode::default(),  // Default to no wrap
             cached_doc_bounds: None,
             cached_bounds_version: 0,
             cached_longest_line_chars: 0,
@@ -251,7 +251,8 @@ impl Viewport {
 
                 if ch == '\t' {
                     // Add spaces to reach next tab stop
-                    let next_tab_stop = ((visual_column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
+                    let next_tab_stop =
+                        ((visual_column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
                     let spaces_to_add = next_tab_stop - visual_column;
                     for _ in 0..spaces_to_add {
                         expanded.push(' ');
@@ -261,7 +262,7 @@ impl Viewport {
                     expanded.push(ch);
                     visual_column += 1;
                 }
-                char_index += 1;  // Each character (including tab) increments char position by 1
+                char_index += 1; // Each character (including tab) increments char position by 1
             }
 
             // Now measure the expanded text
@@ -780,27 +781,5 @@ impl Viewport {
 
             (start_byte, end_byte, x_offset)
         }
-    }
-
-    // === Helpers ===
-
-    fn column_to_byte_in_line(&self, line_text: &str, target_column: u32) -> usize {
-        let mut column = 0;
-        let mut byte_pos = 0;
-
-        for ch in line_text.chars() {
-            if column >= target_column {
-                break;
-            }
-            if ch == '\t' {
-                column = ((column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
-            } else {
-                column += 1;
-            }
-            if column <= target_column {
-                byte_pos += ch.len_utf8();
-            }
-        }
-        byte_pos
     }
 }

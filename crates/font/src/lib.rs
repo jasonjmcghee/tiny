@@ -6,8 +6,10 @@ use ahash::HashMap;
 use fontdue::layout::{CoordinateSystem, Layout, TextStyle};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tiny_sdk::types::{PhysicalSizeF, GlyphInstance, LayoutPos, PhysicalPos};
-use tiny_sdk::services::{FontService, TextLayout as SdkTextLayout, PositionedGlyph as SdkPositionedGlyph};
+use tiny_sdk::services::{
+    FontService, PositionedGlyph as SdkPositionedGlyph, TextLayout as SdkTextLayout,
+};
+use tiny_sdk::types::{GlyphInstance, LayoutPos, PhysicalPos, PhysicalSizeF};
 
 /// Helper to expand tabs to spaces
 fn expand_tabs(text: &str) -> String {
@@ -82,7 +84,9 @@ struct GlyphEntry {
     width: f32,
     height: f32,
     advance: f32,
+    #[allow(dead_code)]
     bearing_x: f32,
+    #[allow(dead_code)]
     bearing_y: f32,
 }
 
@@ -139,7 +143,7 @@ impl FontSystem {
             .layout
             .glyphs()
             .iter()
-            .map(|g| (g.parent, g.y))  // We only need char and y position
+            .map(|g| (g.parent, g.y)) // We only need char and y position
             .collect();
 
         let mut positioned_glyphs = Vec::new();
@@ -148,17 +152,16 @@ impl FontSystem {
         let mut glyph_index = 0;
 
         // Position each character on a perfect grid (x), but use fontdue's y
-        let mut char_index = 0;
         for (i, ch) in expanded_text.chars().enumerate() {
             if ch.is_control() && ch != ' ' {
                 continue;
             }
             if ch == '\n' {
-                continue;  // Skip newlines
+                continue; // Skip newlines
             }
 
             let entry = self.get_or_rasterize(ch, font_size_px as u32);
-            let x = i as f32 * advance;  // Perfect grid positioning for x
+            let x = i as f32 * advance; // Perfect grid positioning for x
 
             // Use fontdue's y position for proper baseline alignment
             let y = if glyph_index < glyph_info.len() {
@@ -174,13 +177,13 @@ impl FontSystem {
             // - Y: use fontdue's baseline position without adjustment
             positioned_glyphs.push(PositionedGlyph {
                 char: ch,
-                pos: PhysicalPos::new(x, y),  // No bearing adjustments in grid mode
+                pos: PhysicalPos::new(x, y), // No bearing adjustments in grid mode
                 size: PhysicalSizeF::new(entry.width, entry.height),
                 tex_coords: entry.tex_coords,
                 color: 0xE1E1E1FF,
             });
 
-            max_x = (i + 1) as f32 * advance;  // Total width is columns * advance
+            max_x = (i + 1) as f32 * advance; // Total width is columns * advance
             max_y = max_y.max(y + entry.height);
         }
 
@@ -379,20 +382,29 @@ impl SharedFontSystem {
     }
 
     /// Layout text with grid-aligned positioning for monospace fonts
-    pub fn layout_text_grid_aligned(&self, text: &str, logical_font_size: f32, scale_factor: f32) -> TextLayout {
+    pub fn layout_text_grid_aligned(
+        &self,
+        text: &str,
+        logical_font_size: f32,
+        scale_factor: f32,
+    ) -> TextLayout {
         let mut font_system = self.inner.lock();
         let physical_size = logical_font_size * scale_factor;
         let layout = font_system.layout_text_grid_aligned(text, physical_size);
 
         // Return layout with glyphs already in physical pixels
         TextLayout {
-            glyphs: layout.glyphs.iter().map(|g| PositionedGlyph {
-                char: g.char,
-                pos: g.pos.clone(),
-                size: g.size.clone(),
-                tex_coords: g.tex_coords,
-                color: g.color,
-            }).collect(),
+            glyphs: layout
+                .glyphs
+                .iter()
+                .map(|g| PositionedGlyph {
+                    char: g.char,
+                    pos: g.pos.clone(),
+                    size: g.size.clone(),
+                    tex_coords: g.tex_coords,
+                    color: g.color,
+                })
+                .collect(),
             width: layout.width,
             height: layout.height,
         }
@@ -653,13 +665,17 @@ impl FontService for SharedFontSystem {
         let layout = self.inner.lock().layout_text(text, font_size);
 
         // Convert to SDK types
-        let glyphs = layout.glyphs.iter().map(|g| SdkPositionedGlyph {
-            char: g.char,
-            pos: LayoutPos::new(g.pos.x.0, g.pos.y.0),
-            size: g.size.clone(),
-            tex_coords: g.tex_coords,
-            color: g.color,
-        }).collect();
+        let glyphs = layout
+            .glyphs
+            .iter()
+            .map(|g| SdkPositionedGlyph {
+                char: g.char,
+                pos: LayoutPos::new(g.pos.x.0, g.pos.y.0),
+                size: g.size.clone(),
+                tex_coords: g.tex_coords,
+                color: g.color,
+            })
+            .collect();
 
         SdkTextLayout {
             glyphs,
@@ -669,16 +685,23 @@ impl FontService for SharedFontSystem {
     }
 
     fn layout_text_scaled(&self, text: &str, font_size: f32, scale_factor: f32) -> SdkTextLayout {
-        let layout = self.inner.lock().layout_text_scaled(text, font_size, scale_factor);
+        let layout = self
+            .inner
+            .lock()
+            .layout_text_scaled(text, font_size, scale_factor);
 
         // Convert to SDK types
-        let glyphs = layout.glyphs.iter().map(|g| SdkPositionedGlyph {
-            char: g.char,
-            pos: LayoutPos::new(g.pos.x.0, g.pos.y.0),
-            size: g.size.clone(),
-            tex_coords: g.tex_coords,
-            color: g.color,
-        }).collect();
+        let glyphs = layout
+            .glyphs
+            .iter()
+            .map(|g| SdkPositionedGlyph {
+                char: g.char,
+                pos: LayoutPos::new(g.pos.x.0, g.pos.y.0),
+                size: g.size.clone(),
+                tex_coords: g.tex_coords,
+                color: g.color,
+            })
+            .collect();
 
         SdkTextLayout {
             glyphs,
@@ -703,7 +726,13 @@ impl FontService for SharedFontSystem {
         self.inner.lock().prerasterize_ascii(font_size_px);
     }
 
-    fn hit_test_line(&self, line_text: &str, font_size: f32, scale_factor: f32, target_x: f32) -> u32 {
+    fn hit_test_line(
+        &self,
+        line_text: &str,
+        font_size: f32,
+        scale_factor: f32,
+        target_x: f32,
+    ) -> u32 {
         self.hit_test_line(line_text, font_size, scale_factor, target_x)
     }
 }

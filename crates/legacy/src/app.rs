@@ -32,9 +32,7 @@ use tiny_core::{
     tree::{Doc, Point, Rect},
     GpuRenderer, Uniforms,
 };
-use tiny_sdk::{
-    types::DocPos, Hook, LayoutPos, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate,
-};
+use tiny_sdk::{types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {

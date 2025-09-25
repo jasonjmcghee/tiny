@@ -4,11 +4,13 @@
 //! we pass integer IDs and maintain a registry on the host side.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use wgpu::*;
 
-pub use tiny_sdk::ffi::{BufferId, PipelineId, BindGroupId, PluginGpuContext, ShaderModuleId, BindGroupLayoutId};
+pub use tiny_sdk::ffi::{
+    BindGroupId, BindGroupLayoutId, BufferId, PipelineId, PluginGpuContext, ShaderModuleId,
+};
 
 /// GPU resource registry - maintains the actual wgpu objects
 pub struct GpuRegistry {
@@ -20,8 +22,6 @@ pub struct GpuRegistry {
     bind_groups: RwLock<HashMap<u64, BindGroup>>,
     bind_group_layouts: RwLock<HashMap<u64, BindGroupLayout>>,
     shader_modules: RwLock<HashMap<u64, ShaderModule>>,
-    textures: RwLock<HashMap<u64, Texture>>,
-    samplers: RwLock<HashMap<u64, Sampler>>,
 
     // Core objects (not created by plugins, just referenced)
     pub device: Arc<Device>,
@@ -37,8 +37,6 @@ impl GpuRegistry {
             bind_groups: RwLock::new(HashMap::new()),
             bind_group_layouts: RwLock::new(HashMap::new()),
             shader_modules: RwLock::new(HashMap::new()),
-            textures: RwLock::new(HashMap::new()),
-            samplers: RwLock::new(HashMap::new()),
             device,
             queue,
         }

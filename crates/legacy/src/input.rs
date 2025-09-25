@@ -148,8 +148,6 @@ pub struct InputHandler {
     nav_history: SelectionHistory,
     /// Drag anchor in document coordinates (set when drag starts)
     drag_anchor: Option<DocPos>,
-    /// Original scroll position when drag started (to keep cursor calculation stable)
-    drag_start_scroll: Option<(f32, f32)>,
     /// Selection anchor - when set, cursor movements extend selection from this point
     /// Set when entering selection mode (shift pressed), cleared when leaving selection mode
     selection_anchor: Option<DocPos>,
@@ -174,7 +172,6 @@ impl InputHandler {
             history: DocumentHistory::new(),
             nav_history: SelectionHistory::with_max_size(50),
             drag_anchor: None,
-            drag_start_scroll: None,
             selection_anchor: None,
         }
     }
@@ -264,7 +261,11 @@ impl InputHandler {
             }
 
             // Get current cursor position
-            let mut new_pos = self.selections.first().map(|s| s.cursor).unwrap_or_default();
+            let mut new_pos = self
+                .selections
+                .first()
+                .map(|s| s.cursor)
+                .unwrap_or_default();
 
             if dy < 0 && new_pos.line > 0 {
                 new_pos.line -= 1;
@@ -283,7 +284,11 @@ impl InputHandler {
             self.goal_column = None;
 
             // Get current cursor position
-            let mut new_pos = self.selections.first().map(|s| s.cursor).unwrap_or_default();
+            let mut new_pos = self
+                .selections
+                .first()
+                .map(|s| s.cursor)
+                .unwrap_or_default();
 
             if dx < 0 {
                 if new_pos.column > 0 {
@@ -419,7 +424,12 @@ impl InputHandler {
     }
 
     /// Move cursor to start or end of line
-    fn move_to_line_edge(&mut self, doc: &Doc, to_end: bool, extending_selection: bool) -> InputAction {
+    fn move_to_line_edge(
+        &mut self,
+        doc: &Doc,
+        to_end: bool,
+        extending_selection: bool,
+    ) -> InputAction {
         self.goal_column = None;
         let tree = doc.read();
 
@@ -462,7 +472,10 @@ impl InputHandler {
             let line_length = tree.line_char_count(new_line) as u32;
             let new_pos = DocPos {
                 line: new_line,
-                column: self.goal_column.unwrap_or(sel.cursor.column).min(line_length),
+                column: self
+                    .goal_column
+                    .unwrap_or(sel.cursor.column)
+                    .min(line_length),
                 byte_offset: 0,
             };
 
@@ -886,13 +899,16 @@ impl InputHandler {
         &mut self,
         doc: &Doc,
         viewport: &Viewport,
-        _from: Point,  // Unused - we use the stored drag_anchor
+        _from: Point, // Unused - we use the stored drag_anchor
         to: Point,
         alt_held: bool,
     ) -> (bool, Option<(f32, f32)>) {
         // Use the stored drag anchor, or calculate it if missing
         let anchor_doc = self.drag_anchor.unwrap_or_else(|| {
-            self.selections.first().map(|s| s.anchor).unwrap_or_default()
+            self.selections
+                .first()
+                .map(|s| s.anchor)
+                .unwrap_or_default()
         });
 
         // Calculate cursor position (where we're dragging to) in DOCUMENT coordinates
@@ -910,7 +926,7 @@ impl InputHandler {
         // This ensures consistent selection behavior regardless of drag direction
         let selection = Selection {
             cursor: end_doc,
-            anchor: anchor_doc,  // Always use the original click position as anchor
+            anchor: anchor_doc, // Always use the original click position as anchor
             id: self.next_id,
         };
 
@@ -948,7 +964,14 @@ impl InputHandler {
         }
 
         let needs_scroll = scroll_delta.0 != 0.0 || scroll_delta.1 != 0.0;
-        (true, if needs_scroll { Some(scroll_delta) } else { None })
+        (
+            true,
+            if needs_scroll {
+                Some(scroll_delta)
+            } else {
+                None
+            },
+        )
     }
 
     /// Copy selection to clipboard

@@ -4,14 +4,11 @@
 //! They must NOT be compiled into plugins - plugins should only have extern declarations.
 
 use tiny_core::gpu_ffi::{
-    get_gpu_registry, BindGroupId, BindGroupLayoutId, BufferId, PipelineId, PluginGpuContext,
-    ShaderModuleId,
+    get_gpu_registry, BindGroupId, BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId,
 };
-use wgpu::hal::DynDevice;
 use wgpu::{BufferUsages, RenderPass};
 
 /// Create a buffer
-#[no_mangle]
 #[export_name = "gpu_create_buffer"]
 pub extern "C" fn gpu_create_buffer(size: u64, usage: u32) -> BufferId {
     unsafe {
@@ -28,7 +25,6 @@ pub extern "C" fn gpu_create_buffer(size: u64, usage: u32) -> BufferId {
 }
 
 /// Write data to a buffer
-#[no_mangle]
 #[export_name = "gpu_write_buffer"]
 pub extern "C" fn gpu_write_buffer(buffer_id: BufferId, offset: u64, data: *const u8, size: usize) {
     unsafe {
@@ -53,7 +49,6 @@ pub extern "C" fn gpu_write_buffer(buffer_id: BufferId, offset: u64, data: *cons
 }
 
 /// Draw with vertices (using host's rect pipeline)
-#[no_mangle]
 #[export_name = "gpu_draw_vertices"]
 pub extern "C" fn gpu_draw_vertices(
     render_pass: *mut RenderPass,
@@ -102,7 +97,6 @@ pub extern "C" fn gpu_draw_vertices(
 }
 
 /// Create a shader module from WGSL source
-#[no_mangle]
 #[export_name = "gpu_create_shader_module"]
 pub extern "C" fn gpu_create_shader_module(source: *const u8, len: usize) -> ShaderModuleId {
     unsafe {
@@ -117,7 +111,6 @@ pub extern "C" fn gpu_create_shader_module(source: *const u8, len: usize) -> Sha
 
 /// Simple render pipeline creation with vertex buffer layout
 /// Kept for backward compatibility - plugins should use gpu_create_render_pipeline_with_layout
-#[no_mangle]
 #[export_name = "gpu_create_render_pipeline_simple"]
 pub extern "C" fn gpu_create_render_pipeline_simple(
     vertex_shader: ShaderModuleId,
@@ -227,11 +220,10 @@ pub extern "C" fn gpu_create_render_pipeline_simple(
 }
 
 /// Create a bind group layout
-#[no_mangle]
 #[export_name = "gpu_create_bind_group_layout"]
 pub extern "C" fn gpu_create_bind_group_layout(
     entries: *const u8,
-    entries_len: usize,
+    _entries_len: usize,
 ) -> BindGroupLayoutId {
     unsafe {
         if let Some(registry) = get_gpu_registry() {
@@ -263,7 +255,6 @@ pub extern "C" fn gpu_create_bind_group_layout(
 }
 
 /// Create a render pipeline with custom vertex layout
-#[no_mangle]
 #[export_name = "gpu_create_render_pipeline_with_layout"]
 pub extern "C" fn gpu_create_render_pipeline_with_layout(
     vertex_shader: ShaderModuleId,
@@ -279,7 +270,9 @@ pub extern "C" fn gpu_create_render_pipeline_with_layout(
             let fragment_shader_module = registry.get_shader_module(fragment_shader);
             let bind_layout = registry.get_bind_group_layout(bind_group_layout);
 
-            if let (Some(vs), Some(fs), Some(layout)) = (vertex_shader_module, fragment_shader_module, bind_layout) {
+            if let (Some(vs), Some(fs), Some(layout)) =
+                (vertex_shader_module, fragment_shader_module, bind_layout)
+            {
                 use wgpu::*;
 
                 // Parse vertex attributes from buffer
@@ -289,16 +282,22 @@ pub extern "C" fn gpu_create_render_pipeline_with_layout(
                 let mut i = 0;
                 while i + 12 <= attributes_len {
                     let offset = u32::from_le_bytes([
-                        attr_slice[i], attr_slice[i+1],
-                        attr_slice[i+2], attr_slice[i+3]
+                        attr_slice[i],
+                        attr_slice[i + 1],
+                        attr_slice[i + 2],
+                        attr_slice[i + 3],
                     ]);
                     let location = u32::from_le_bytes([
-                        attr_slice[i+4], attr_slice[i+5],
-                        attr_slice[i+6], attr_slice[i+7]
+                        attr_slice[i + 4],
+                        attr_slice[i + 5],
+                        attr_slice[i + 6],
+                        attr_slice[i + 7],
                     ]);
                     let format_id = u32::from_le_bytes([
-                        attr_slice[i+8], attr_slice[i+9],
-                        attr_slice[i+10], attr_slice[i+11]
+                        attr_slice[i + 8],
+                        attr_slice[i + 9],
+                        attr_slice[i + 10],
+                        attr_slice[i + 11],
                     ]);
 
                     // Map format ID to VertexFormat (matching wgpu enum values)
@@ -360,13 +359,14 @@ pub extern "C" fn gpu_create_render_pipeline_with_layout(
                     i += 12;
                 }
 
-                let pipeline_layout = registry
-                    .device
-                    .create_pipeline_layout(&PipelineLayoutDescriptor {
-                        label: Some("Plugin Custom Pipeline Layout"),
-                        bind_group_layouts: &[&layout],
-                        push_constant_ranges: &[],
-                    });
+                let pipeline_layout =
+                    registry
+                        .device
+                        .create_pipeline_layout(&PipelineLayoutDescriptor {
+                            label: Some("Plugin Custom Pipeline Layout"),
+                            bind_group_layouts: &[&layout],
+                            push_constant_ranges: &[],
+                        });
 
                 let pipeline = registry
                     .device
@@ -419,7 +419,6 @@ pub extern "C" fn gpu_create_render_pipeline_with_layout(
 }
 
 /// Set pipeline for rendering
-#[no_mangle]
 #[export_name = "gpu_render_set_pipeline"]
 pub extern "C" fn gpu_render_set_pipeline(render_pass: *mut RenderPass, pipeline_id: PipelineId) {
     unsafe {
@@ -433,7 +432,6 @@ pub extern "C" fn gpu_render_set_pipeline(render_pass: *mut RenderPass, pipeline
 }
 
 /// Set bind group for rendering
-#[no_mangle]
 #[export_name = "gpu_render_set_bind_group"]
 pub extern "C" fn gpu_render_set_bind_group(
     render_pass: *mut RenderPass,
@@ -451,7 +449,6 @@ pub extern "C" fn gpu_render_set_bind_group(
 }
 
 /// Set vertex buffer for rendering
-#[no_mangle]
 #[export_name = "gpu_render_set_vertex_buffer"]
 pub extern "C" fn gpu_render_set_vertex_buffer(
     render_pass: *mut RenderPass,
@@ -469,7 +466,6 @@ pub extern "C" fn gpu_render_set_vertex_buffer(
 }
 
 /// Draw vertices
-#[no_mangle]
 #[export_name = "gpu_render_draw"]
 pub extern "C" fn gpu_render_draw(render_pass: *mut RenderPass, vertices: u32, instances: u32) {
     unsafe {
@@ -483,32 +479,29 @@ pub fn init_ffi() {
     // eprintln!("Host FFI functions initialized");
     // Force linker to include FFI functions by taking their addresses
     // This prevents dead code elimination
-    unsafe {
-        let _ = gpu_create_buffer as *const ();
-        let _ = gpu_write_buffer as *const ();
-        let _ = gpu_draw_vertices as *const ();
-        let _ = gpu_create_shader_module as *const ();
-        let _ = gpu_create_render_pipeline_simple as *const ();
-        let _ = gpu_create_bind_group_layout as *const ();
-        let _ = gpu_create_render_pipeline_with_layout as *const ();
-        let _ = gpu_render_set_pipeline as *const ();
-        let _ = gpu_render_set_bind_group as *const ();
-        let _ = gpu_render_set_vertex_buffer as *const ();
-        let _ = gpu_render_draw as *const ();
-        // DO NOT DELETE
-        eprintln!("FFI function addresses: create={:p}, write={:p}, draw={:p}, shader={:p}, pipeline={:p}, bind_layout={:p}, pipeline_layout={:p}, set_pipeline={:p}, set_bind_group={:p}, set_vertex_buffer={:p}, draw={:p}",
-                 gpu_create_buffer as *const (),
-                 gpu_write_buffer as *const (),
-                 gpu_draw_vertices as *const (),
-                 gpu_create_shader_module as *const (),
-                 gpu_create_render_pipeline_simple as *const (),
-                 gpu_create_bind_group_layout as *const (),
-                 gpu_create_render_pipeline_with_layout as *const (),
-                 gpu_render_set_pipeline as *const (),
-                 gpu_render_set_bind_group as *const (),
-                 gpu_render_set_vertex_buffer as *const (),
-                 gpu_render_draw as *const (),
-        );
-    }
+    let _ = gpu_create_buffer as *const ();
+    let _ = gpu_write_buffer as *const ();
+    let _ = gpu_draw_vertices as *const ();
+    let _ = gpu_create_shader_module as *const ();
+    let _ = gpu_create_render_pipeline_simple as *const ();
+    let _ = gpu_create_bind_group_layout as *const ();
+    let _ = gpu_create_render_pipeline_with_layout as *const ();
+    let _ = gpu_render_set_pipeline as *const ();
+    let _ = gpu_render_set_bind_group as *const ();
+    let _ = gpu_render_set_vertex_buffer as *const ();
+    let _ = gpu_render_draw as *const ();
+    // DO NOT DELETE
+    eprintln!("FFI function addresses: create={:p}, write={:p}, draw={:p}, shader={:p}, pipeline={:p}, bind_layout={:p}, pipeline_layout={:p}, set_pipeline={:p}, set_bind_group={:p}, set_vertex_buffer={:p}, draw={:p}",
+                gpu_create_buffer as *const (),
+                gpu_write_buffer as *const (),
+                gpu_draw_vertices as *const (),
+                gpu_create_shader_module as *const (),
+                gpu_create_render_pipeline_simple as *const (),
+                gpu_create_bind_group_layout as *const (),
+                gpu_create_render_pipeline_with_layout as *const (),
+                gpu_render_set_pipeline as *const (),
+                gpu_render_set_bind_group as *const (),
+                gpu_render_set_vertex_buffer as *const (),
+                gpu_render_draw as *const (),
+    );
 }
-

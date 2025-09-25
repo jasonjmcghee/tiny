@@ -616,31 +616,3 @@ impl Renderer {
         &mut self.widget_manager
     }
 }
-
-struct ViewportEffectsProvider {
-    effects: Vec<text_effects::TextEffect>,
-    byte_offset: usize,
-}
-
-impl text_effects::TextStyleProvider for ViewportEffectsProvider {
-    fn get_effects_in_range(&self, range: std::ops::Range<usize>) -> Vec<text_effects::TextEffect> {
-        let doc_range = (range.start + self.byte_offset)..(range.end + self.byte_offset);
-        self.effects
-            .iter()
-            .filter(|e| e.range.start < doc_range.end && e.range.end > doc_range.start)
-            .map(|e| text_effects::TextEffect {
-                range: e.range.start.saturating_sub(self.byte_offset)
-                    ..e.range.end.saturating_sub(self.byte_offset),
-                effect: e.effect.clone(),
-                priority: e.priority,
-            })
-            .collect()
-    }
-    fn request_update(&self, _: &str, _: u64) {}
-    fn name(&self) -> &str {
-        "viewport_effects"
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
