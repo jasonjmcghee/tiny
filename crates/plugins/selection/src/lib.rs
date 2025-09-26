@@ -7,7 +7,10 @@ use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
-    ffi::{BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId},
+    ffi::{
+        BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId, VertexAttributeDescriptor,
+        VertexFormat,
+    },
     Capability, Configurable, Initializable, LayoutRect, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext, ViewPos, ViewportInfo,
 };
@@ -65,7 +68,7 @@ pub struct SelectionPlugin {
 impl SelectionPlugin {
     /// Create a new selection plugin with default configuration
     pub fn new() -> Self {
-        use tiny_sdk::{LogicalSize, LayoutPos, PhysicalSize};
+        use tiny_sdk::{LayoutPos, LogicalSize, PhysicalSize};
 
         Self {
             config: SelectionConfig::default(),
@@ -73,7 +76,10 @@ impl SelectionPlugin {
             viewport: ViewportInfo {
                 scroll: LayoutPos::new(0.0, 0.0),
                 logical_size: LogicalSize::new(800.0, 600.0),
-                physical_size: PhysicalSize { width: 800, height: 600 },
+                physical_size: PhysicalSize {
+                    width: 800,
+                    height: 600,
+                },
                 scale_factor: 1.0,
                 line_height: 19.6,
                 font_size: 14.0,
@@ -97,7 +103,10 @@ impl SelectionPlugin {
                 if start.y.0 < end.y.0 || (start.y.0 == end.y.0 && start.x.0 <= end.x.0) {
                     Selection { start, end }
                 } else {
-                    Selection { start: end, end: start }
+                    Selection {
+                        start: end,
+                        end: start,
+                    }
                 }
             })
             .collect();
@@ -111,7 +120,6 @@ impl SelectionPlugin {
         }
         self.viewport = viewport;
     }
-
 
     /// Generate a single bounding rectangle for the entire selection
     fn selection_to_bounding_rect(&self, selection: &Selection) -> Option<LayoutRect> {
@@ -174,7 +182,8 @@ impl SelectionPlugin {
                 let line_height = self.viewport.line_height * scale;
                 // Margins are also in view coordinates now
                 let margin_left = self.viewport.margin.x.0 * scale;
-                let margin_right = (self.viewport.logical_size.width.0 - self.viewport.margin.x.0) * scale;
+                let margin_right =
+                    (self.viewport.logical_size.width.0 - self.viewport.margin.x.0) * scale;
 
                 let selection_data = SelectionData {
                     start_pos: [start_x, start_y],
@@ -317,118 +326,7 @@ impl Initializable for SelectionPlugin {
         self.vertex_buffer_id = Some(buffer_id);
 
         // Create custom shader for selection rendering
-        let shader_source = r#"
-// Vertex shader
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) color: u32,
-    @location(2) start_pos: vec2<f32>,
-    @location(3) end_pos: vec2<f32>,
-    @location(4) line_height: f32,
-    @location(5) margin_left: f32,
-    @location(6) margin_right: f32,
-}
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) pixel_pos: vec2<f32>,
-    @location(2) start_pos: vec2<f32>,
-    @location(3) end_pos: vec2<f32>,
-    @location(4) line_height: f32,
-    @location(5) margin_left: f32,
-    @location(6) margin_right: f32,
-}
-
-struct Uniforms {
-    viewport_size: vec2<f32>,
-}
-
-@group(0) @binding(0)
-var<uniform> uniforms: Uniforms;
-
-@vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-
-    // Convert from pixel coordinates to normalized device coordinates
-    let x = (input.position.x / uniforms.viewport_size.x) * 2.0 - 1.0;
-    let y = 1.0 - (input.position.y / uniforms.viewport_size.y) * 2.0;
-
-    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
-    out.pixel_pos = input.position;
-
-    // Unpack color from u32 to vec4
-    let r = f32((input.color >> 24u) & 0xFFu) / 255.0;
-    let g = f32((input.color >> 16u) & 0xFFu) / 255.0;
-    let b = f32((input.color >> 8u) & 0xFFu) / 255.0;
-    let a = f32(input.color & 0xFFu) / 255.0;
-    out.color = vec4<f32>(r, g, b, a);
-
-    // Pass through selection data
-    out.start_pos = input.start_pos;
-    out.end_pos = input.end_pos;
-    out.line_height = input.line_height;
-    out.margin_left = input.margin_left;
-    out.margin_right = input.margin_right;
-
-    return out;
-}
-
-// Fragment shader
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let px = input.pixel_pos.x;
-    let py = input.pixel_pos.y;
-
-    // Check if pixel should be visible based on selection shape
-    var visible = false;
-
-    // For single line selections
-    if abs(input.start_pos.y - input.end_pos.y) < 0.1 {
-        // Single line selection - simple range check
-        if py >= input.start_pos.y && py < input.start_pos.y + input.line_height &&
-           px >= input.start_pos.x && px <= input.end_pos.x {
-            visible = true;
-        }
-    } else {
-        // Multi-line selection - check which part of the selection we're in
-        if py >= input.start_pos.y && py < input.start_pos.y + input.line_height {
-            // First line: from start_x to right margin
-            if px >= input.start_pos.x && px <= input.margin_right {
-                visible = true;
-            }
-        } else if py >= input.end_pos.y && py < input.end_pos.y + input.line_height {
-            // Last line: from left margin to end_x
-            if px >= input.margin_left && px <= input.end_pos.x {
-                visible = true;
-            }
-        } else if py > input.start_pos.y && py < input.end_pos.y {
-            // Middle lines: full width from left to right margin
-            if px >= input.margin_left && px <= input.margin_right {
-                visible = true;
-            }
-        }
-    }
-
-    if visible {
-        // Debug: show UV coordinates instead of color
-        // Calculate UV within the bounding box
-        let min_x = min(input.start_pos.x, input.margin_left);
-        let max_x = max(input.end_pos.x, input.margin_right);
-        let min_y = input.start_pos.y;
-        let max_y = input.end_pos.y + input.line_height;
-
-        let u = (px - min_x) / (max_x - min_x);
-        let v = (py - min_y) / (max_y - min_y);
-
-        // return vec4<f32>(u, v, 1.0, 0.2);
-        return input.color;
-    } else {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0); // Transparent
-    }
-}
-"#;
+        let shader_source = include_str!("shader.wgsl");
 
         // Create shader modules
         let shader_id = ShaderModuleId::create_from_wgsl(shader_source);
@@ -438,40 +336,40 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         // Define vertex attributes for our SelectionVertex layout
         let attributes = vec![
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 0,
                 location: 0,
-                format: tiny_sdk::ffi::VertexFormat::Float32x2, // position
+                format: VertexFormat::Float32x2, // position
             },
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 8,
                 location: 1,
-                format: tiny_sdk::ffi::VertexFormat::Uint32, // color
+                format: VertexFormat::Uint32, // color
             },
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 12,
                 location: 2,
-                format: tiny_sdk::ffi::VertexFormat::Float32x2, // start_pos
+                format: VertexFormat::Float32x2, // start_pos
             },
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 20,
                 location: 3,
-                format: tiny_sdk::ffi::VertexFormat::Float32x2, // end_pos
+                format: VertexFormat::Float32x2, // end_pos
             },
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 28,
                 location: 4,
-                format: tiny_sdk::ffi::VertexFormat::Float32, // line_height
+                format: VertexFormat::Float32, // line_height
             },
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 32,
                 location: 5,
-                format: tiny_sdk::ffi::VertexFormat::Float32, // margin_left
+                format: VertexFormat::Float32, // margin_left
             },
-            tiny_sdk::ffi::VertexAttributeDescriptor {
+            VertexAttributeDescriptor {
                 offset: 36,
                 location: 6,
-                format: tiny_sdk::ffi::VertexFormat::Float32, // margin_right
+                format: VertexFormat::Float32, // margin_right
             },
         ];
 
@@ -507,14 +405,17 @@ impl Library for SelectionPlugin {
                 }
 
                 // Read count
-                let count_bytes: [u8; 4] = args[0..4].try_into()
+                let count_bytes: [u8; 4] = args[0..4]
+                    .try_into()
                     .map_err(|_| PluginError::Other("Invalid count".into()))?;
                 let selection_count = u32::from_le_bytes(count_bytes) as usize;
 
                 let view_pos_size = std::mem::size_of::<ViewPos>();
                 let expected_size = 4 + (selection_count * 2 * view_pos_size);
                 if args.len() < expected_size {
-                    return Err(PluginError::Other("Invalid args: incomplete selection data".into()));
+                    return Err(PluginError::Other(
+                        "Invalid args: incomplete selection data".into(),
+                    ));
                 }
 
                 let mut selections = Vec::with_capacity(selection_count);
@@ -544,7 +445,8 @@ impl Library for SelectionPlugin {
                 }
 
                 // Use bytemuck to deserialize ViewportInfo directly
-                let viewport_info: &ViewportInfo = bytemuck::from_bytes(&args[0..viewport_info_size]);
+                let viewport_info: &ViewportInfo =
+                    bytemuck::from_bytes(&args[0..viewport_info_size]);
                 self.set_viewport_info(*viewport_info);
                 Ok(Vec::new())
             }
