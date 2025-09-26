@@ -308,7 +308,7 @@ impl<T: AppLogic> TinyApp<T> {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             font_size: 14.0,
-            title_bar_height: 20.0,    // Logical pixels
+            title_bar_height: 28.0,    // Logical pixels
             scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
             cursor_position: None,
@@ -405,7 +405,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 window_attributes = window_attributes
                     .with_titlebar_transparent(true)
                     .with_fullsize_content_view(true);
-                global_margin_y = 20.0;
+                global_margin_y = self.title_bar_height;
             }
 
             let window = Arc::new(

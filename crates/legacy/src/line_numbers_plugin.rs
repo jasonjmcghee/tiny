@@ -60,29 +60,39 @@ impl LineNumbersPlugin {
             None => return,
         };
 
+        // Use widget viewport if available for proper bounds
+        let widget_viewport = collector.widget_viewport.as_ref();
+
         let line_height = collector.viewport.line_height;
         let scale_factor = collector.viewport.scale_factor;
-        let scroll_y = collector.viewport.scroll.y.0;
-        let global_margin_y = collector.viewport.global_margin.y.0;
+        // Use widget viewport's scroll if available
+        let scroll_y = widget_viewport
+            .map(|w| w.scroll.y.0)
+            .unwrap_or(0.0);
         let font_size = collector.viewport.font_size;
 
         // Get total lines in document
         let tree = doc.read();
         let total_lines = tree.line_count();
 
-        // Calculate visible lines - show ALL lines, not just viewport
-        let viewport_height = collector.viewport.logical_size.height.0;
-        let visible_lines = total_lines as usize; // Show all lines
+        // Use widget bounds for height if available
+        let viewport_height = widget_viewport
+            .map(|w| w.bounds.height.0)
+            .unwrap_or(collector.viewport.logical_size.height.0);
+
+        let first_visible_line = (scroll_y / line_height).floor() as usize;
+        let last_visible_line = ((scroll_y + viewport_height) / line_height).ceil() as usize + 1;
 
         let mut line_number_glyphs = Vec::new();
 
-        // Generate line number glyphs for all lines
-        for line_num in 0..visible_lines {
+        // Generate line number glyphs for visible lines only
+        for line_num in first_visible_line..last_visible_line.min(total_lines as usize) {
             let line_text = (line_num + 1).to_string();
 
             let text_width = line_text.len() as f32 * 7.0;
-            let x_pos = 45.0 - text_width; // Right-align at x=45 (like before)
-            let y_pos = global_margin_y + (line_num as f32 * line_height); // Add global margin
+            let x_pos = 45.0 - text_width; // Right-align at x=45
+            // Y position in LOCAL widget space (0,0 is top-left of line numbers area)
+            let y_pos = (line_num as f32 * line_height) - scroll_y;
 
             let pos = LayoutPos::new(x_pos, y_pos);
 
@@ -102,13 +112,14 @@ impl LineNumbersPlugin {
                 let height = g.tex_coords[3] - g.tex_coords[1];
 
                 if width > 0.0001 && height > 0.0001 {
-                    // Convert to physical like main renderer does: layout_to_physical
-                    // This subtracts scroll then multiplies by scale
-                    let view_x = g.pos.x.0;
-                    let view_y = g.pos.y.0 - scroll_y;
-                    g.pos = LayoutPos::new(view_x * scale_factor, view_y * scale_factor);
+                    // Transform from widget-local space to screen space
+                    // Add the widget bounds offset to position on screen
+                    let screen_x = g.pos.x.0 + widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
+                    let screen_y = g.pos.y.0 + widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
+                    // Convert to physical coordinates
+                    g.pos = LayoutPos::new(screen_x * scale_factor, screen_y * scale_factor);
 
-                    // Set token_id to 54 for line numbers
+                    // Set token_id for line numbers
                     g.token_id = 255;
 
                     line_number_glyphs.push(g);
@@ -172,39 +183,126 @@ impl Paintable for LineNumbersPlugin {
             None => return,
         };
 
+        // Use widget viewport if available (for proper bounds)
+        let widget_viewport = ctx.widget_viewport.as_ref();
+        let bounds = widget_viewport.map(|w| &w.bounds);
+
+        eprintln!("LineNumbers paint() called");
+        if let Some(wv) = widget_viewport {
+            eprintln!("  Widget viewport bounds: x={}, y={}, w={}, h={}",
+                wv.bounds.x.0, wv.bounds.y.0, wv.bounds.width.0, wv.bounds.height.0);
+            eprintln!("  Widget viewport scroll: x={}, y={}", wv.scroll.x.0, wv.scroll.y.0);
+        } else {
+            eprintln!("  No widget viewport!");
+        }
+
         let line_height = ctx.viewport.line_height;
         let scale_factor = ctx.viewport.scale_factor;
-        let scroll_y = ctx.viewport.scroll.y.0;
-        let global_margin_y = ctx.viewport.global_margin.y.0;
-        // Now we have the actual font_size from ViewportInfo
+        // Use widget viewport scroll if available, otherwise main viewport
+        let scroll_y = widget_viewport
+            .map(|w| w.scroll.y.0)
+            .unwrap_or(ctx.viewport.scroll.y.0);
         let font_size = ctx.viewport.font_size;
+
+        eprintln!("  line_height={}, scale={}, scroll_y={}, font_size={}",
+            line_height, scale_factor, scroll_y, font_size);
 
         // Get total lines in document
         let tree = doc.read();
         let total_lines = tree.line_count();
 
-        // Calculate visible lines based on viewport
-        let viewport_height = ctx.viewport.logical_size.height.0;
-        let visible_lines =
-            ((viewport_height / line_height).ceil() as usize).min(total_lines as usize);
+        // Use widget bounds for height if available
+        let viewport_height = bounds
+            .map(|b| b.height.0)
+            .unwrap_or(ctx.viewport.logical_size.height.0);
 
-        // First draw a background rectangle to see where line numbers should be
+        // Draw line numbers
         if ctx.gpu_renderer != std::ptr::null_mut() {
             unsafe {
                 let gpu_renderer = &*(ctx.gpu_renderer as *const tiny_core::GpuRenderer);
 
-                // Draw a semi-transparent background for the line number area
-                use tiny_sdk::types::{LayoutRect, RectInstance};
-                let bg_rect = RectInstance {
-                    rect: LayoutRect::new(
-                        0.0,
-                        0.0,
-                        50.0, // Line number area width
-                        viewport_height,
-                    ),
-                    color: 0x00000000, // Dark gray with some transparency
-                };
-                gpu_renderer.draw_rects(pass, &[bg_rect], scale_factor);
+                // Generate and draw line number glyphs
+                let mut line_number_glyphs = Vec::new();
+
+                // Calculate the first visible line based on scroll
+                let first_visible_line = (scroll_y / line_height).floor() as usize;
+                let last_visible_line = ((scroll_y + viewport_height) / line_height).ceil() as usize;
+
+                eprintln!("  Generating line numbers {} to {} (total={})",
+                    first_visible_line + 1, last_visible_line, total_lines);
+
+                for line_num in first_visible_line..last_visible_line.min(total_lines as usize) {
+                    let line_text = (line_num + 1).to_string();
+
+                    let text_width = line_text.len() as f32 * 7.0;
+                    let x_pos = 45.0 - text_width; // Right-align at x=45
+
+                    // Y position in document space
+                    let doc_y = line_num as f32 * line_height;
+                    // Convert to view space (subtract scroll)
+                    let view_y = doc_y - scroll_y;
+
+                    // Position in logical coordinates relative to the scissor rect
+                    let pos = LayoutPos::new(x_pos, view_y);
+
+                    let glyphs = create_glyph_instances(
+                        &font_service,
+                        &line_text,
+                        pos,
+                        font_size,
+                        scale_factor,
+                        line_height,
+                        None,
+                        0,
+                    );
+
+                    if line_num == first_visible_line {
+                        eprintln!("  Line {}: pos=({}, {}), {} glyphs created",
+                            line_num + 1, x_pos, view_y, glyphs.len());
+                    }
+
+                    for (i, mut g) in glyphs.into_iter().enumerate() {
+                        let width = g.tex_coords[2] - g.tex_coords[0];
+                        let height = g.tex_coords[3] - g.tex_coords[1];
+
+                        if line_num == first_visible_line && i == 0 {
+                            eprintln!("    First glyph: pos=({}, {}), tex=[{}, {}, {}, {}], token={}",
+                                g.pos.x.0, g.pos.y.0,
+                                g.tex_coords[0], g.tex_coords[1], g.tex_coords[2], g.tex_coords[3],
+                                g.token_id);
+                        }
+
+                        if width > 0.0001 && height > 0.0001 {
+                            // The scissor rect is at (0, global_margin.y * scale) in screen space
+                            // Glyphs need to be positioned in screen space, not scissor-relative space
+                            let physical_x = g.pos.x.0 * scale_factor;
+                            // Add the scissor rect's Y offset to position in screen space
+                            let physical_y = g.pos.y.0 * scale_factor + (ctx.viewport.global_margin.y.0 * scale_factor);
+                            g.pos = LayoutPos::new(physical_x, physical_y);
+
+                            // Set token_id for line numbers styling
+                            g.token_id = 255; // Use max token for line numbers
+
+                            line_number_glyphs.push(g);
+                        }
+                    }
+                }
+
+                // Draw the line number glyphs
+                if !line_number_glyphs.is_empty() {
+                    eprintln!("Drawing {} line number glyphs, first at ({}, {}), tex=[{:.3}, {:.3}, {:.3}, {:.3}]",
+                        line_number_glyphs.len(),
+                        line_number_glyphs[0].pos.x.0,
+                        line_number_glyphs[0].pos.y.0,
+                        line_number_glyphs[0].tex_coords[0],
+                        line_number_glyphs[0].tex_coords[1],
+                        line_number_glyphs[0].tex_coords[2],
+                        line_number_glyphs[0].tex_coords[3]);
+
+                    // Check if font atlas is available
+                    eprintln!("  Calling draw_glyphs_styled with use_styled=false");
+                    gpu_renderer.draw_glyphs_styled(pass, &line_number_glyphs, false);
+                }
             }
         }
     }

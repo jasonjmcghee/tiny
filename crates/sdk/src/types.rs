@@ -13,6 +13,8 @@
 
 // === Logical Pixels (DPI-independent unit) ===
 
+use std::fmt::Display;
+
 /// Logical pixels - DPI-independent unit used by Layout and View spaces
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 pub struct LogicalPixels(pub f32);
@@ -111,6 +113,42 @@ impl LayoutPos {
             x: LogicalPixels(x),
             y: LogicalPixels(y),
         }
+    }
+}
+
+impl std::ops::Add for LayoutPos {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+        }
+    }
+}
+
+impl std::ops::Sub for LayoutPos {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+        }
+    }
+}
+
+impl std::ops::Mul<f32> for LayoutPos {
+    type Output = Self;
+    fn mul(self, rhs: f32) -> Self {
+        Self {
+            x: self.x * rhs,
+            y: self.y * rhs,
+        }
+    }
+}
+
+impl Display for LayoutPos {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
     }
 }
 
@@ -494,6 +532,6 @@ impl ViewportInfo {
 
     /// Get font size from line height (approximate)
     pub fn font_size(&self) -> f32 {
-        self.line_height / 1.4  // Standard line height multiplier
+        self.line_height / 1.4 // Standard line height multiplier
     }
 }

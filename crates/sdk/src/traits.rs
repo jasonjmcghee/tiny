@@ -85,14 +85,6 @@ pub struct UpdateContext {
     pub elapsed: f32,
 }
 
-/// FFI-safe function pointer for drawing rect vertices
-pub type DrawRectVerticesFn = unsafe extern "C" fn(
-    pass: *mut wgpu::RenderPass,
-    vertices: *const u8,
-    vertices_len: usize,
-    count: u32,
-);
-
 /// Context provided during paint - with full GPU access
 pub struct PaintContext {
     /// GPU device
@@ -106,8 +98,6 @@ pub struct PaintContext {
     /// Raw GPU renderer pointer for pipeline/buffer access
     /// This gives plugins full GPU power - they can create pipelines, upload buffers, etc.
     pub gpu_renderer: *mut std::ffi::c_void,
-    /// Function pointer to draw rect vertices (FFI-safe)
-    pub draw_rect_vertices_fn: Option<DrawRectVerticesFn>,
     /// Any additional context data plugins might need
     /// This is opaque to the SDK but the runtime knows what it is
     pub context_data: *const std::ffi::c_void,
@@ -132,7 +122,6 @@ impl PaintContext {
             device,
             queue,
             gpu_renderer,
-            draw_rect_vertices_fn: None, // Will be set by caller if needed
             context_data: registry as *const _ as *const std::ffi::c_void,
             gpu_context: None,
         }
