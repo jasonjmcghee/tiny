@@ -66,9 +66,7 @@ impl LineNumbersPlugin {
         let line_height = collector.viewport.line_height;
         let scale_factor = collector.viewport.scale_factor;
         // Use widget viewport's scroll if available
-        let scroll_y = widget_viewport
-            .map(|w| w.scroll.y.0)
-            .unwrap_or(0.0);
+        let scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(0.0);
         let font_size = collector.viewport.font_size;
 
         // Get total lines in document
@@ -91,7 +89,7 @@ impl LineNumbersPlugin {
 
             let text_width = line_text.len() as f32 * 7.0;
             let x_pos = 45.0 - text_width; // Right-align at x=45
-            // Y position in LOCAL widget space (0,0 is top-left of line numbers area)
+                                           // Y position in LOCAL widget space (0,0 is top-left of line numbers area)
             let y_pos = (line_num as f32 * line_height) - scroll_y;
 
             let pos = LayoutPos::new(x_pos, y_pos);
@@ -189,9 +187,14 @@ impl Paintable for LineNumbersPlugin {
 
         eprintln!("LineNumbers paint() called");
         if let Some(wv) = widget_viewport {
-            eprintln!("  Widget viewport bounds: x={}, y={}, w={}, h={}",
-                wv.bounds.x.0, wv.bounds.y.0, wv.bounds.width.0, wv.bounds.height.0);
-            eprintln!("  Widget viewport scroll: x={}, y={}", wv.scroll.x.0, wv.scroll.y.0);
+            eprintln!(
+                "  Widget viewport bounds: x={}, y={}, w={}, h={}",
+                wv.bounds.x.0, wv.bounds.y.0, wv.bounds.width.0, wv.bounds.height.0
+            );
+            eprintln!(
+                "  Widget viewport scroll: x={}, y={}",
+                wv.scroll.x.0, wv.scroll.y.0
+            );
         } else {
             eprintln!("  No widget viewport!");
         }
@@ -204,8 +207,10 @@ impl Paintable for LineNumbersPlugin {
             .unwrap_or(ctx.viewport.scroll.y.0);
         let font_size = ctx.viewport.font_size;
 
-        eprintln!("  line_height={}, scale={}, scroll_y={}, font_size={}",
-            line_height, scale_factor, scroll_y, font_size);
+        eprintln!(
+            "  line_height={}, scale={}, scroll_y={}, font_size={}",
+            line_height, scale_factor, scroll_y, font_size
+        );
 
         // Get total lines in document
         let tree = doc.read();
@@ -226,10 +231,15 @@ impl Paintable for LineNumbersPlugin {
 
                 // Calculate the first visible line based on scroll
                 let first_visible_line = (scroll_y / line_height).floor() as usize;
-                let last_visible_line = ((scroll_y + viewport_height) / line_height).ceil() as usize;
+                let last_visible_line =
+                    ((scroll_y + viewport_height) / line_height).ceil() as usize;
 
-                eprintln!("  Generating line numbers {} to {} (total={})",
-                    first_visible_line + 1, last_visible_line, total_lines);
+                eprintln!(
+                    "  Generating line numbers {} to {} (total={})",
+                    first_visible_line + 1,
+                    last_visible_line,
+                    total_lines
+                );
 
                 for line_num in first_visible_line..last_visible_line.min(total_lines as usize) {
                     let line_text = (line_num + 1).to_string();
@@ -257,8 +267,13 @@ impl Paintable for LineNumbersPlugin {
                     );
 
                     if line_num == first_visible_line {
-                        eprintln!("  Line {}: pos=({}, {}), {} glyphs created",
-                            line_num + 1, x_pos, view_y, glyphs.len());
+                        eprintln!(
+                            "  Line {}: pos=({}, {}), {} glyphs created",
+                            line_num + 1,
+                            x_pos,
+                            view_y,
+                            glyphs.len()
+                        );
                     }
 
                     for (i, mut g) in glyphs.into_iter().enumerate() {
@@ -266,10 +281,16 @@ impl Paintable for LineNumbersPlugin {
                         let height = g.tex_coords[3] - g.tex_coords[1];
 
                         if line_num == first_visible_line && i == 0 {
-                            eprintln!("    First glyph: pos=({}, {}), tex=[{}, {}, {}, {}], token={}",
-                                g.pos.x.0, g.pos.y.0,
-                                g.tex_coords[0], g.tex_coords[1], g.tex_coords[2], g.tex_coords[3],
-                                g.token_id);
+                            eprintln!(
+                                "    First glyph: pos=({}, {}), tex=[{}, {}, {}, {}], token={}",
+                                g.pos.x.0,
+                                g.pos.y.0,
+                                g.tex_coords[0],
+                                g.tex_coords[1],
+                                g.tex_coords[2],
+                                g.tex_coords[3],
+                                g.token_id
+                            );
                         }
 
                         if width > 0.0001 && height > 0.0001 {
@@ -277,7 +298,8 @@ impl Paintable for LineNumbersPlugin {
                             // Glyphs need to be positioned in screen space, not scissor-relative space
                             let physical_x = g.pos.x.0 * scale_factor;
                             // Add the scissor rect's Y offset to position in screen space
-                            let physical_y = g.pos.y.0 * scale_factor + (ctx.viewport.global_margin.y.0 * scale_factor);
+                            let physical_y = g.pos.y.0 * scale_factor
+                                + (ctx.viewport.global_margin.y.0 * scale_factor);
                             g.pos = LayoutPos::new(physical_x, physical_y);
 
                             // Set token_id for line numbers styling
@@ -308,6 +330,6 @@ impl Paintable for LineNumbersPlugin {
     }
 
     fn z_index(&self) -> i32 {
-        100 // Render AFTER main text so our vertices aren't overwritten
+        100
     }
 }

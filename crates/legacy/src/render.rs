@@ -5,6 +5,7 @@ use crate::{
     input, syntax, text_effects,
     text_renderer::{self, TextRenderer},
 };
+use bytemuck;
 use notify::{Event, RecursiveMode, Watcher};
 use std::sync::{Arc, Mutex};
 use tiny_core::{
@@ -12,7 +13,6 @@ use tiny_core::{
     tree::{self, Tree},
     GpuRenderer,
 };
-use bytemuck;
 use tiny_sdk::{GlyphInstance, LayoutPos, ServiceRegistry};
 use tiny_sdk::{PaintContext, Paintable};
 
@@ -421,32 +421,24 @@ impl Renderer {
         );
     }
 
+    /// Convert screen coordinates to editor-local coordinates
+    /// This accounts for the editor bounds offset (line numbers area, title bar, etc)
+    pub fn screen_to_editor_local(&self, screen_pos: crate::Point) -> crate::Point {
+        crate::Point {
+            x: tiny_sdk::LogicalPixels(screen_pos.x.0 - self.editor_bounds.x.0),
+            y: tiny_sdk::LogicalPixels(screen_pos.y.0 - self.editor_bounds.y.0),
+        }
+    }
+
     pub fn set_selection_plugin(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
         let (cursor_pos, selections) = input_handler.get_selection_data(doc, &self.viewport);
 
-        // Plugins now receive editor-local coordinates through WidgetViewport
-        // So we pass the original layout positions without transformation
-        // The WidgetViewport will handle the bounds and clipping
-        let transformed_cursor_pos = cursor_pos.map(|pos| {
-            // Just pass through - plugins will get editor-local coordinates via WidgetViewport
-            pos - self.viewport.margin
-        });
+        // Cursor and selection positions are now in document layout space
+        // (no global_margin included after our fix to coordinates.rs)
+        // They match how text is rendered (starting at 0,0 in editor space)
+        let transformed_cursor_pos = cursor_pos;
 
-        let transformed_selections: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = selections
-            .into_iter()
-            .map(|(start, end)| {
-                // Convert to editor-local coordinates (relative to editor bounds)
-                let new_start = tiny_sdk::ViewPos::new(
-                    start.x.0 - self.viewport.margin.x.0,
-                    start.y.0 - self.viewport.margin.y.0,
-                );
-                let new_end = tiny_sdk::ViewPos::new(
-                    end.x.0 - self.viewport.margin.x.0,
-                    end.y.0 - self.viewport.margin.y.0,
-                );
-                (new_start, new_end)
-            })
-            .collect();
+        let transformed_selections: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = selections;
 
         let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
         let viewport_changed = current_scroll != self.last_viewport_scroll;
@@ -505,39 +497,19 @@ impl Renderer {
         if let Some(pass) = render_pass.as_deref_mut() {
             let scale = self.viewport.scale_factor;
 
-            // === DRAW LINE NUMBERS REGION ===
+            // === COLLECT GLYPHS ===
             // Collect line number glyphs first
             self.line_number_glyphs.clear();
             self.collect_line_number_glyphs();
 
-            // Set scissor rect for line numbers (left panel)
-            // pass.set_scissor_rect(
-            //     0,
-            //     (self.viewport.global_margin.y.0 * scale) as u32,
-            //     (60.0 * scale) as u32,
-            //     ((self.viewport.logical_size.height.0 - self.viewport.global_margin.y.0) * scale) as u32,
-            // );
-
-            // Draw line numbers using the main renderer's glyph pipeline
-            if !self.line_number_glyphs.is_empty() {
-                if let Some(gpu) = self.gpu_renderer {
-                    unsafe {
-                        let gpu_renderer = &*gpu;
-                        // Use the main rendering path but with line numbers
-                        gpu_renderer.draw_glyphs_styled(pass, &self.line_number_glyphs, false);
-                    }
-                }
-            }
-
-            // === DRAW EDITOR REGION ===
+            // === DRAW EDITOR CONTENT FIRST ===
             // Set scissor rect for text editor region
-            // Debug: intentionally make scissor smaller to test if it's working
-            // pass.set_scissor_rect(
-            //     ((self.editor_bounds.x.0 + 100.0) * scale) as u32, // Move right by 100 pixels
-            //     (self.editor_bounds.y.0 * scale) as u32,
-            //     ((self.editor_bounds.width.0 - 100.0) * scale) as u32, // Make narrower
-            //     (self.editor_bounds.height.0 * scale) as u32,
-            // );
+            pass.set_scissor_rect(
+                (self.editor_bounds.x.0 * scale) as u32,
+                (self.editor_bounds.y.0 * scale) as u32,
+                (self.editor_bounds.width.0 * scale) as u32,
+                (self.editor_bounds.height.0 * scale) as u32,
+            );
 
             // Paint background layers (selection)
             self.paint_layers(pass, true);
@@ -547,6 +519,25 @@ impl Renderer {
 
             // Paint foreground layers (cursor)
             self.paint_layers(pass, false);
+
+            // === DRAW LINE NUMBERS LAST (with separate buffer) ===
+            // Set scissor rect for line numbers (left panel)
+            pass.set_scissor_rect(
+                0,
+                (self.viewport.global_margin.y.0 * scale) as u32,
+                (60.0 * scale) as u32,
+                ((self.viewport.logical_size.height.0 - self.viewport.global_margin.y.0) * scale) as u32,
+            );
+
+            // Draw line numbers using dedicated buffer (won't conflict with main text)
+            if !self.line_number_glyphs.is_empty() {
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        gpu_renderer.draw_line_number_glyphs(pass, &self.line_number_glyphs);
+                    }
+                }
+            }
         }
 
         // Update uniforms if needed

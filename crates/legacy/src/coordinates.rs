@@ -260,10 +260,10 @@ impl Viewport {
     /// Document position to layout position
     pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
         // Use cached metrics (updated from font system if available)
-        // Add both global and document margins
+        // Only add document margins (not global UI margins)
         LayoutPos::new(
             self.margin.x.0 + self.metrics.column_to_x(pos.column),
-            self.global_margin.y.0 + self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
+            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
         )
     }
 
@@ -312,10 +312,10 @@ impl Viewport {
             self.metrics.column_to_x(pos.column)
         };
 
-        // Add both global and document margins to the position
+        // Only add document margins (not global UI margins)
         LayoutPos::new(
             self.margin.x.0 + x,
-            self.global_margin.y.0 + self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
+            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
         )
     }
 
@@ -358,9 +358,9 @@ impl Viewport {
 
     /// Layout position to document position (approximate)
     pub fn layout_to_doc(&self, pos: LayoutPos) -> DocPos {
-        // Subtract both global and document margins to get document position
+        // Subtract only document margins (matching doc_to_layout)
         let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
-        let doc_y = (pos.y.0 - self.global_margin.y.0 - self.margin.y.0).max(0.0);
+        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
 
         let line = (doc_y / self.metrics.line_height) as u32;
         let column = (doc_x / self.metrics.space_width) as u32;
@@ -374,9 +374,9 @@ impl Viewport {
 
     /// Layout position to document position using font system's binary search hit testing
     pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &DocTree) -> DocPos {
-        // Subtract both global and document margins to get document position
+        // Subtract only document margins (matching doc_to_layout)
         let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
-        let doc_y = (pos.y.0 - self.global_margin.y.0 - self.margin.y.0).max(0.0);
+        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
 
         let line = (doc_y / self.metrics.line_height) as u32;
 
@@ -604,7 +604,9 @@ impl Viewport {
         // Maximum scroll = document width - viewport width + small padding
         // This ensures we can see the end of the line but can't scroll into empty space
 
-        let viewport_width = self.logical_size.width.0;
+        // Account for line numbers taking up 60 pixels on the left
+        let line_numbers_width = 60.0;
+        let viewport_width = self.logical_size.width.0 - line_numbers_width;
 
         // At maximum scroll, we want the last part of the line visible
         // Maximum scroll should be: doc_width - viewport_width

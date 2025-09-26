@@ -160,12 +160,17 @@ impl SelectionPlugin {
 
     /// Create vertex data for all selection rectangles
     fn create_vertices(&self, viewport: &tiny_sdk::ViewportInfo) -> Vec<SelectionVertex> {
+        self.create_vertices_for_selections(viewport, &self.selections)
+    }
+
+    /// Create vertex data for given selections
+    fn create_vertices_for_selections(&self, viewport: &tiny_sdk::ViewportInfo, selections: &[Selection]) -> Vec<SelectionVertex> {
         let mut vertices = Vec::new();
         // Use viewport's scale factor, not our stored one (which might be wrong)
         let scale = viewport.scale_factor;
         let color = self.config.style.color;
 
-        for selection in &self.selections {
+        for selection in selections {
             if let Some(rect) = self.selection_to_bounding_rect(selection) {
                 // Rectangle is in logical view space, scale to physical pixels
                 let x = rect.x.0 * scale;
@@ -463,8 +468,29 @@ impl Paintable for SelectionPlugin {
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Create vertices for current frame
-        let vertices = self.create_vertices(&ctx.viewport);
+        // Transform selections to screen coordinates if we have widget viewport
+        let transformed_selections = if let Some(ref widget_viewport) = ctx.widget_viewport {
+            let offset_x = widget_viewport.bounds.x.0;
+            let offset_y = widget_viewport.bounds.y.0;
+
+            self.selections.iter().map(|sel| {
+                Selection {
+                    start: ViewPos::new(
+                        sel.start.x.0 + offset_x,
+                        sel.start.y.0 + offset_y,
+                    ),
+                    end: ViewPos::new(
+                        sel.end.x.0 + offset_x,
+                        sel.end.y.0 + offset_y,
+                    ),
+                }
+            }).collect()
+        } else {
+            self.selections.clone()
+        };
+
+        // Create vertices for current frame with transformed selections
+        let vertices = self.create_vertices_for_selections(&ctx.viewport, &transformed_selections);
         if vertices.is_empty() {
             return;
         }

@@ -386,10 +386,11 @@ impl Paintable for CursorPlugin {
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Get cursor position from our API
+        // Get cursor position from our API (in editor-local coordinates)
         let mut pos = self.api.get_position();
 
-        // If we have a widget viewport, add its bounds offset
+        // Transform to screen coordinates by adding widget viewport bounds
+        // This matches how text glyphs are transformed
         if let Some(ref widget_viewport) = ctx.widget_viewport {
             pos = LayoutPos::new(
                 pos.x.0 + widget_viewport.bounds.x.0,

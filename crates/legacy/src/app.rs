@@ -641,9 +641,13 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                     // Store old cursor position before handling the drag
                                     let old_cursor_pos = self.logic.get_cursor_doc_pos();
 
+                                    // Convert screen coordinates to editor-local coordinates
+                                    let editor_local_from = cpu_renderer.screen_to_editor_local(from);
+                                    let editor_local_to = cpu_renderer.screen_to_editor_local(point);
+
                                     if self.logic.on_drag(
-                                        from,
-                                        point,
+                                        editor_local_from,
+                                        editor_local_to,
                                         &cpu_renderer.viewport,
                                         &self.modifiers,
                                     ) {
@@ -703,8 +707,11 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                         // Store old cursor position before handling the click
                                         let old_cursor_pos = self.logic.get_cursor_doc_pos();
 
+                                        // Convert screen coordinates to editor-local coordinates
+                                        let editor_local_point = cpu_renderer.screen_to_editor_local(point);
+
                                         if self.logic.on_click(
-                                            point,
+                                            editor_local_point,
                                             &cpu_renderer.viewport,
                                             &self.modifiers,
                                         ) {

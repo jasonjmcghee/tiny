@@ -123,6 +123,7 @@ pub struct GpuRenderer {
     // Vertex buffers
     rect_vertex_buffer: Buffer,
     glyph_vertex_buffer: Buffer,
+    line_number_vertex_buffer: Buffer,
 
     // Store registered IDs for plugin context
     rect_pipeline_id: gpu_ffi::PipelineId,
@@ -1074,6 +1075,7 @@ impl GpuRenderer {
 
         let rect_vertex_buffer = create_vertex_buffer("Rect Vertex Buffer", RECT_BUFFER_SIZE);
         let glyph_vertex_buffer = create_vertex_buffer("Glyph Vertex Buffer", GLYPH_BUFFER_SIZE);
+        let line_number_vertex_buffer = create_vertex_buffer("Line Number Vertex Buffer", 256 * 1024); // 256KB for line numbers
 
         let builder = PipelineBuilder {
             device: &device,
@@ -1129,6 +1131,7 @@ impl GpuRenderer {
             glyph_bind_group,
             rect_vertex_buffer,
             glyph_vertex_buffer,
+            line_number_vertex_buffer,
             themed_uniform_bind_group_layout: None,
             theme_bind_group_layout: None,
             themed_uniform_buffer: None,
@@ -1240,12 +1243,13 @@ impl GpuRenderer {
         render_pass.draw(0..vertices.len() as u32, 0..1);
     }
 
-    /// Draw glyphs with styled rendering (token-based or color-based)
-    pub fn draw_glyphs_styled(
+    /// Draw glyphs with styled rendering at a specific buffer offset
+    pub fn draw_glyphs_styled_with_offset(
         &self,
         render_pass: &mut RenderPass,
         instances: &[GlyphInstance],
         use_styled_pipeline: bool,
+        buffer_offset: u64,
     ) {
         if instances.is_empty() {
             return;
@@ -1259,7 +1263,7 @@ impl GpuRenderer {
             let vertices = self.generate_glyph_vertices(instances);
             self.queue.write_buffer(
                 &self.glyph_vertex_buffer,
-                0,
+                buffer_offset,
                 bytemuck::cast_slice(&vertices),
             );
 
@@ -1284,12 +1288,80 @@ impl GpuRenderer {
             render_pass.set_bind_group(0, themed_bind_group, &[]);
             render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
             render_pass.set_bind_group(2, theme_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(buffer_offset..));
             render_pass.draw(0..vertices.len() as u32, 0..1);
         } else if use_styled_pipeline {
             panic!("Styled rendering requested but themed pipeline not available! Make sure to call upload_theme_for_interpolation() or upload_theme() first.");
         } else {
             self.draw_glyphs(render_pass, instances, None);
+        }
+    }
+
+    /// Draw glyphs with styled rendering (token-based or color-based)
+    pub fn draw_glyphs_styled(
+        &self,
+        render_pass: &mut RenderPass,
+        instances: &[GlyphInstance],
+        use_styled_pipeline: bool,
+    ) {
+        self.draw_glyphs_styled_with_offset(render_pass, instances, use_styled_pipeline, 0)
+    }
+
+    /// Draw line number glyphs using a separate buffer to avoid conflicts
+    pub fn draw_line_number_glyphs(
+        &self,
+        render_pass: &mut RenderPass,
+        instances: &[GlyphInstance],
+    ) {
+        if instances.is_empty() {
+            return;
+        }
+
+        self.update_uniforms(self.config.width as f32, self.config.height as f32);
+
+        let vertices = self.generate_glyph_vertices(instances);
+        self.queue.write_buffer(
+            &self.line_number_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&vertices),
+        );
+
+        // Use themed pipeline if available for proper coloring
+        if let (Some(themed_pipeline), Some(theme_bind_group), Some(themed_bind_group)) = (
+            &self.themed_glyph_pipeline,
+            &self.theme_bind_group,
+            &self.themed_uniform_bind_group,
+        ) {
+            // Update themed uniforms
+            if let Some(themed_uniform_buffer) = &self.themed_uniform_buffer {
+                let uniforms = Uniforms {
+                    viewport_size: [self.config.width as f32, self.config.height as f32],
+                    scale_factor: 1.0,
+                    time: self.current_time,
+                    theme_mode: self.current_theme_mode,
+                    _padding: [0.0, 0.0, 0.0],
+                };
+                self.queue.write_buffer(
+                    themed_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[uniforms]),
+                );
+            }
+
+            // Draw with themed pipeline
+            render_pass.set_pipeline(themed_pipeline);
+            render_pass.set_bind_group(0, themed_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+            render_pass.set_bind_group(2, theme_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.line_number_vertex_buffer.slice(..));
+            render_pass.draw(0..vertices.len() as u32, 0..1);
+        } else {
+            // Fall back to basic pipeline
+            render_pass.set_pipeline(&self.glyph_pipeline);
+            render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.line_number_vertex_buffer.slice(..));
+            render_pass.draw(0..vertices.len() as u32, 0..1);
         }
     }
 
