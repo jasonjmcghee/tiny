@@ -551,7 +551,7 @@ impl Configurable for CursorPlugin {
                 self.config.style.x_offset = plugin_toml.config.x_offset;
 
                 eprintln!(
-                    "Cursor plugin config updated: width={}, color={:#010x}, blink_rate={}",
+                    "Cursor: plugin config updated: width={}, color={:#010x}, blink_rate={}",
                     self.config.style.width, self.config.style.color, self.config.blink_rate
                 );
 

@@ -4,8 +4,8 @@ use crate::{
     coordinates::Viewport,
     input, syntax, text_effects,
     text_renderer::{self, TextRenderer},
-    widget::{PaintContext, WidgetManager},
 };
+use tiny_sdk::{PaintContext, Paintable};
 use notify::{Event, RecursiveMode, Watcher};
 use std::sync::{Arc, Mutex};
 use tiny_core::{
@@ -105,7 +105,6 @@ pub struct Renderer {
     gpu_renderer: Option<*const GpuRenderer>,
     pub cached_doc_text: Option<Arc<String>>,
     pub cached_doc_version: u64,
-    pub widget_manager: WidgetManager,
     pub text_renderer: TextRenderer,
     last_rendered_version: u64,
     layout_dirty: bool,
@@ -115,7 +114,12 @@ pub struct Renderer {
     config_watchers: Vec<notify::RecommendedWatcher>,
     plugin_state: Arc<Mutex<PluginState>>,
     last_viewport_scroll: (f32, f32),
-    service_registry: ServiceRegistry,
+    pub service_registry: ServiceRegistry,
+    pub line_numbers_plugin: Option<*mut crate::line_numbers_plugin::LineNumbersPlugin>,
+    /// Editor widget bounds (where main text renders)
+    pub editor_bounds: tiny_sdk::types::LayoutRect,
+    /// Accumulated glyphs for batched rendering
+    accumulated_glyphs: Vec<GlyphInstance>,
 }
 
 unsafe impl Send for Renderer {}
@@ -123,15 +127,18 @@ unsafe impl Sync for Renderer {}
 
 impl Renderer {
     pub fn new(size: (f32, f32), scale_factor: f32) -> Self {
+        let mut viewport = Viewport::new(size.0, size.1, scale_factor);
+        // Ensure margin is 0 - we use editor bounds instead
+        viewport.margin = LayoutPos::new(0.0, 0.0);
+
         Self {
             text_styles: None,
             syntax_highlighter: None,
             font_system: None,
-            viewport: Viewport::new(size.0, size.1, scale_factor),
+            viewport,
             gpu_renderer: None,
             cached_doc_text: None,
             cached_doc_version: 0,
-            widget_manager: WidgetManager::new(),
             text_renderer: TextRenderer::new(),
             last_rendered_version: 0,
             layout_dirty: true,
@@ -142,6 +149,10 @@ impl Renderer {
             plugin_state: Arc::new(Mutex::new(PluginState::new())),
             last_viewport_scroll: (0.0, 0.0),
             service_registry: ServiceRegistry::new(),
+            line_numbers_plugin: None,
+            // Default editor bounds - will be updated based on layout
+            editor_bounds: tiny_sdk::types::LayoutRect::new(60.0, 0.0, 800.0, 600.0),
+            accumulated_glyphs: Vec::new(),
         }
     }
 
@@ -390,6 +401,12 @@ impl Renderer {
         self.layout_dirty = true;
     }
 
+    pub fn set_line_numbers_plugin(&mut self, plugin: &mut crate::line_numbers_plugin::LineNumbersPlugin, doc: &tree::Doc) {
+        plugin.set_document(doc);
+        self.line_numbers_plugin = Some(plugin as *mut _);
+    }
+
+
     pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
         self.text_renderer.apply_incremental_edit(edit);
     }
@@ -397,10 +414,43 @@ impl Renderer {
     pub fn update_viewport(&mut self, width: f32, height: f32, scale_factor: f32) {
         self.viewport.resize(width, height, scale_factor);
         self.layout_dirty = true;
+
+        // Update editor bounds based on new viewport size
+        self.editor_bounds = tiny_sdk::types::LayoutRect::new(
+            60.0,  // Start after line numbers
+            self.viewport.global_margin.y.0,
+            width - 60.0,  // Rest of the width
+            height - self.viewport.global_margin.y.0,
+        );
     }
 
     pub fn set_selection_plugin(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
         let (cursor_pos, selections) = input_handler.get_selection_data(doc, &self.viewport);
+
+        // Transform cursor and selection positions to respect editor bounds
+        let transformed_cursor_pos = cursor_pos.map(|pos| {
+            // Convert from old margin-based coordinates to editor bounds coordinates
+            tiny_sdk::LayoutPos::new(
+                pos.x.0 - self.viewport.margin.x.0 + self.editor_bounds.x.0,
+                pos.y.0, // Y is fine as-is (includes global margin)
+            )
+        });
+
+        let transformed_selections: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = selections
+            .into_iter()
+            .map(|(start, end)| {
+                let new_start = tiny_sdk::ViewPos::new(
+                    start.x.0 - self.viewport.margin.x.0 + self.editor_bounds.x.0,
+                    start.y.0,
+                );
+                let new_end = tiny_sdk::ViewPos::new(
+                    end.x.0 - self.viewport.margin.x.0 + self.editor_bounds.x.0,
+                    end.y.0,
+                );
+                (new_start, new_end)
+            })
+            .collect();
+
         let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
         let viewport_changed = current_scroll != self.last_viewport_scroll;
 
@@ -414,12 +464,12 @@ impl Renderer {
             needs_sync = true;
         }
 
-        if state.selections != selections {
-            state.selections = selections.clone();
+        if state.selections != transformed_selections {
+            state.selections = transformed_selections.clone();
             needs_sync = true;
         }
 
-        if let Some(pos) = cursor_pos {
+        if let Some(pos) = transformed_cursor_pos {
             let view_pos = self.viewport.layout_to_view(pos);
             let cursor_changed = state.cursor_pos != Some((view_pos.x.0, view_pos.y.0));
             if cursor_changed {
@@ -449,19 +499,34 @@ impl Renderer {
 
         self.prepare_render(tree);
 
+        // Clear accumulated glyphs from previous frame
+        self.accumulated_glyphs.clear();
+
+        // Collect glyphs from line numbers and main text
+        self.collect_background_glyphs();
+        let visible_range = self.viewport.visible_byte_range_with_tree(tree);
+        self.collect_main_text_glyphs(tree, visible_range.clone());
+
         if let Some(pass) = render_pass.as_deref_mut() {
             self.paint_layers(pass, true); // Paint background layers (z < 0)
         }
 
-        let visible_range = self.viewport.visible_byte_range_with_tree(tree);
-        self.walk_visible_range_with_pass(tree, visible_range, render_pass.as_deref_mut());
+        // Draw all text glyphs in one batch (replaces the individual draw calls)
+        if let Some(pass) = render_pass.as_deref_mut() {
+            self.draw_all_accumulated_glyphs(pass);
+        }
 
+        // Continue with original order for other elements
         if let Some(pass) = render_pass.as_deref_mut() {
             if let Some(gpu) = self.gpu_renderer {
                 let gpu_renderer = unsafe { &*gpu };
                 let (width, height) = gpu_renderer.viewport_size();
                 gpu_renderer.update_uniforms(width, height);
             }
+
+            // Draw spatial widgets (the main text glyph drawing is now in batched call)
+            self.walk_visible_range_no_glyphs(tree, visible_range, pass);
+
             self.paint_layers(pass, false); // Paint foreground layers (z >= 0)
         }
 
@@ -471,6 +536,9 @@ impl Renderer {
     }
 
     fn prepare_render(&mut self, tree: &Tree) {
+        // Set editor bounds on text_renderer
+        self.text_renderer.set_editor_bounds(self.editor_bounds);
+
         if let Some(font_system) = &self.font_system {
             // Force layout update if layout is marked dirty (e.g., after font size change)
             if self.layout_dirty {
@@ -508,32 +576,27 @@ impl Renderer {
         }
     }
 
-    fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
-        if let Some(gpu) = self.gpu_renderer {
-            let gpu_renderer = unsafe { &*gpu };
-            let mut ctx = PaintContext::new(
-                self.viewport.to_viewport_info(),
-                gpu_renderer.device_arc(),
-                gpu_renderer.queue_arc(),
-                gpu as *mut _,
-                &self.service_registry,
-            );
-            ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+    pub fn paint_plugins(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
+        // Extract just the plugin painting logic
+        if let Some(ref loader_arc) = self.plugin_loader {
+            if let Ok(loader) = loader_arc.lock() {
+                let z_filter = if background {
+                    |z: i32| z < 0
+                } else {
+                    |z: i32| z >= 0
+                };
 
-            let z_filter = if background {
-                |z: i32| z < 0
-            } else {
-                |z: i32| z >= 0
-            };
+                if let Some(gpu) = self.gpu_renderer {
+                    let gpu_renderer = unsafe { &*gpu };
+                    let mut ctx = PaintContext::new(
+                        self.viewport.to_viewport_info(),
+                        gpu_renderer.device_arc(),
+                        gpu_renderer.queue_arc(),
+                        gpu as *mut _,
+                        &self.service_registry,
+                    );
+                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
 
-            self.widget_manager
-                .widgets_in_order()
-                .into_iter()
-                .filter(|w| z_filter(w.priority()))
-                .for_each(|w| w.paint(&ctx, pass));
-
-            if let Some(ref loader_arc) = self.plugin_loader {
-                if let Ok(loader) = loader_arc.lock() {
                     for key in loader.list_plugins() {
                         if let Some(plugin) = loader.get_plugin(&key) {
                             if let Some(paintable) = plugin.instance.as_paintable() {
@@ -548,6 +611,46 @@ impl Renderer {
         }
     }
 
+    fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
+        // Paint line numbers plugin if available (background layer)
+        if background {
+            if let Some(plugin_ptr) = self.line_numbers_plugin {
+                if let Some(gpu) = self.gpu_renderer {
+                    let gpu_renderer = unsafe { &*gpu };
+
+                    // Create bounds for line numbers (60px wide strip on the left)
+                    let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
+                        self.viewport.global_margin.x.0,
+                        self.viewport.global_margin.y.0,
+                        60.0, // Fixed width for line numbers
+                        self.viewport.logical_size.height.0,
+                    );
+
+                    let widget_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: line_numbers_bounds,
+                        scroll: tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0), // Sync vertical scroll
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 1, // Line numbers widget ID
+                    };
+
+                    let ctx = PaintContext::new(
+                        self.viewport.to_viewport_info(),
+                        gpu_renderer.device_arc(),
+                        gpu_renderer.queue_arc(),
+                        gpu as *mut _,
+                        &self.service_registry,
+                    ).with_widget_viewport(widget_viewport);
+
+                    let plugin = unsafe { &*plugin_ptr };
+                    plugin.paint(&ctx, pass);
+                }
+            }
+        }
+
+        // Paint other plugins (cursor, selection, etc.)
+        self.paint_plugins(pass, background);
+    }
+
     fn walk_visible_range_with_pass(
         &mut self,
         tree: &Tree,
@@ -555,8 +658,10 @@ impl Renderer {
         mut render_pass: Option<&mut wgpu::RenderPass>,
     ) {
         if let Some(pass) = render_pass.as_mut() {
-            if let (Some(gpu_ptr), Some(_)) = (self.gpu_renderer, &self.font_system) {
+            if let Some(gpu_ptr) = self.gpu_renderer {
                 let gpu_renderer = unsafe { &*gpu_ptr };
+
+                // Always use text_renderer for main document rendering
                 let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
 
                 if gpu_renderer.has_styled_pipeline() && !visible_glyphs.is_empty() {
@@ -568,8 +673,18 @@ impl Renderer {
 
                 let glyph_instances: Vec<_> = visible_glyphs
                     .into_iter()
-                    .map(|g| {
-                        let physical = self.viewport.layout_to_physical(g.layout_pos);
+                    .enumerate()
+                    .map(|(i, g)| {
+                        // Debug: Print first few glyphs' texture coordinates
+                        if i < 3 {
+                            println!("Main text glyph {}: tex_coords={:?}", i, g.tex_coords);
+                        }
+                        // Transform from local editor coordinates to screen coordinates
+                        let screen_pos = LayoutPos::new(
+                            g.layout_pos.x.0 + self.editor_bounds.x.0,
+                            g.layout_pos.y.0 + self.editor_bounds.y.0,
+                        );
+                        let physical = self.viewport.layout_to_physical(screen_pos);
                         GlyphInstance {
                             pos: LayoutPos::new(physical.x.0, physical.y.0),
                             tex_coords: g.tex_coords,
@@ -583,9 +698,11 @@ impl Renderer {
                 if !glyph_instances.is_empty() {
                     let use_styled =
                         self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
+                    println!("MAIN TEXT: Drawing {} glyphs (styled={})", glyph_instances.len(), use_styled);
                     gpu_renderer.draw_glyphs_styled(pass, &glyph_instances, use_styled);
                 }
 
+                // Still handle inline spatial widgets
                 tree.walk_visible_range(byte_range, |spans, _, _| {
                     for span in spans {
                         if let tree::Span::Spatial(widget) = span {
@@ -604,15 +721,170 @@ impl Renderer {
         }
     }
 
-    pub fn update_widgets(&mut self, dt: f32) -> bool {
-        self.widget_manager.update_all(dt)
+    fn collect_background_glyphs(&mut self) {
+        // Collect line numbers glyphs
+        if let Some(plugin_ptr) = self.line_numbers_plugin {
+            if let Some(gpu) = self.gpu_renderer {
+                let gpu_renderer = unsafe { &*gpu };
+
+                let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
+                    self.viewport.global_margin.x.0,
+                    self.viewport.global_margin.y.0,
+                    60.0,
+                    self.viewport.logical_size.height.0 - self.viewport.global_margin.y.0,
+                );
+
+                let widget_viewport = tiny_sdk::types::WidgetViewport {
+                    bounds: line_numbers_bounds,
+                    scroll: tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0),
+                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                    widget_id: 1,
+                };
+
+                // Use a special glyph collector instead of draw context
+                let mut collector = GlyphCollector::new(
+                    self.viewport.to_viewport_info(),
+                    &self.service_registry,
+                    widget_viewport
+                );
+
+                let plugin = unsafe { &*plugin_ptr };
+                plugin.collect_glyphs(&mut collector);
+
+                // Add collected glyphs to our batch
+                self.accumulated_glyphs.extend(collector.glyphs);
+            }
+        }
     }
 
-    pub fn widget_manager(&self) -> &WidgetManager {
-        &self.widget_manager
+    fn collect_main_text_glyphs(&mut self, tree: &Tree, visible_range: std::ops::Range<usize>) {
+        // Collect main document glyphs without drawing
+        let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
+
+        let glyph_instances: Vec<_> = visible_glyphs
+            .into_iter()
+            .map(|g| {
+                let screen_pos = LayoutPos::new(
+                    g.layout_pos.x.0 + self.editor_bounds.x.0,
+                    g.layout_pos.y.0 + self.editor_bounds.y.0,
+                );
+                let physical = self.viewport.layout_to_physical(screen_pos);
+                GlyphInstance {
+                    pos: LayoutPos::new(physical.x.0, physical.y.0),
+                    tex_coords: g.tex_coords,
+                    token_id: g.token_id as u8,
+                    relative_pos: g.relative_pos,
+                    shader_id: None,
+                }
+            })
+            .collect();
+
+        self.accumulated_glyphs.extend(glyph_instances);
     }
 
-    pub fn widget_manager_mut(&mut self) -> &mut WidgetManager {
-        &mut self.widget_manager
+    fn collect_foreground_glyphs(&mut self) {
+        // For other plugins that generate glyphs
+        // Currently none, but this is where they'd go
+    }
+
+    fn draw_all_accumulated_glyphs(&mut self, pass: &mut wgpu::RenderPass) {
+        if self.accumulated_glyphs.is_empty() {
+            return;
+        }
+
+        if let Some(gpu) = self.gpu_renderer {
+            unsafe {
+                let gpu_renderer = &*(gpu);
+                let gpu_mut = &mut *(gpu as *mut GpuRenderer);
+
+                // Upload style buffer for all glyphs
+                if gpu_renderer.has_styled_pipeline() {
+                    let style_buffer: Vec<u32> = self.accumulated_glyphs
+                        .iter()
+                        .map(|g| g.token_id as u32)
+                        .collect();
+                    gpu_mut.upload_style_buffer_u32(&style_buffer);
+                }
+
+                let use_styled = self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
+                // println!("Drawing ALL {} glyphs in one batch (styled={})",
+                    // self.accumulated_glyphs.len(), use_styled);
+
+                gpu_renderer.draw_glyphs_styled(pass, &self.accumulated_glyphs, use_styled);
+            }
+        }
+    }
+
+    fn paint_spatial_widgets(&mut self, tree: &Tree, visible_range: std::ops::Range<usize>, pass: &mut wgpu::RenderPass) {
+        if let Some(gpu_ptr) = self.gpu_renderer {
+            let gpu_renderer = unsafe { &*gpu_ptr };
+
+            tree.walk_visible_range(visible_range, |spans, _, _| {
+                for span in spans {
+                    if let tree::Span::Spatial(widget) = span {
+                        let ctx = PaintContext::new(
+                            self.viewport.to_viewport_info(),
+                            gpu_renderer.device_arc(),
+                            gpu_renderer.queue_arc(),
+                            gpu_ptr as *mut _,
+                            &self.service_registry,
+                        );
+                        widget.paint(&ctx, pass);
+                    }
+                }
+            });
+        }
+    }
+
+    fn walk_visible_range_no_glyphs(&mut self, tree: &Tree, visible_range: std::ops::Range<usize>, pass: &mut wgpu::RenderPass) {
+        // Same as walk_visible_range_with_pass but skip the main text glyph drawing
+        // (since we do that in the batched call)
+        if let Some(gpu_ptr) = self.gpu_renderer {
+            let gpu_renderer = unsafe { &*gpu_ptr };
+
+            // Skip the main text glyph rendering - just do spatial widgets
+            tree.walk_visible_range(visible_range, |spans, _, _| {
+                for span in spans {
+                    if let tree::Span::Spatial(widget) = span {
+                        let ctx = PaintContext::new(
+                            self.viewport.to_viewport_info(),
+                            gpu_renderer.device_arc(),
+                            gpu_renderer.queue_arc(),
+                            gpu_ptr as *mut _,
+                            &self.service_registry,
+                        );
+                        widget.paint(&ctx, pass);
+                    }
+                }
+            });
+        }
+    }
+
+}
+
+// Helper struct for collecting glyphs from plugins
+pub struct GlyphCollector {
+    pub glyphs: Vec<GlyphInstance>,
+    pub viewport: tiny_sdk::ViewportInfo,
+    pub widget_viewport: Option<tiny_sdk::types::WidgetViewport>,
+    services: *const ServiceRegistry,
+}
+
+impl GlyphCollector {
+    fn new(viewport: tiny_sdk::ViewportInfo, services: &ServiceRegistry, widget_viewport: tiny_sdk::types::WidgetViewport) -> Self {
+        Self {
+            glyphs: Vec::new(),
+            viewport,
+            widget_viewport: Some(widget_viewport),
+            services: services as *const _,
+        }
+    }
+
+    pub fn add_glyphs(&mut self, glyphs: Vec<GlyphInstance>) {
+        self.glyphs.extend(glyphs);
+    }
+
+    pub fn services(&self) -> &ServiceRegistry {
+        unsafe { &*self.services }
     }
 }

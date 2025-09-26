@@ -76,6 +76,10 @@ pub struct TextRenderer {
     pub gpu_style_buffer: Option<wgpu::Buffer>,
     /// Palette texture (256 colors, RGBA8)
     pub palette_texture: Option<wgpu::Texture>,
+
+    // === WIDGET BOUNDS ===
+    /// Editor widget bounds (where text should render)
+    pub editor_bounds: Option<tiny_sdk::types::LayoutRect>,
 }
 
 impl TextRenderer {
@@ -93,7 +97,13 @@ impl TextRenderer {
             visible_chars: Vec::new(),
             gpu_style_buffer: None,
             palette_texture: None,
+            editor_bounds: None,
         }
+    }
+
+    /// Set the editor bounds for this renderer
+    pub fn set_editor_bounds(&mut self, bounds: tiny_sdk::types::LayoutRect) {
+        self.editor_bounds = Some(bounds);
     }
 
     /// Update layout cache when text changes
@@ -133,7 +143,13 @@ impl TextRenderer {
 
         let mut char_index = 0;
         let mut byte_offset = 0;
-        let mut y_pos = viewport.global_margin.y.0 + viewport.margin.y.0;
+
+        // Use editor bounds if available, otherwise fall back to margins
+        let (x_offset, mut y_pos) = if let Some(bounds) = &self.editor_bounds {
+            (0.0, 0.0)  // Local coordinates within bounds
+        } else {
+            (viewport.margin.x.0, viewport.global_margin.y.0 + viewport.margin.y.0)
+        };
 
         for (line_idx, line_text) in lines.iter().enumerate() {
             let line_start_char = char_index;
@@ -149,7 +165,7 @@ impl TextRenderer {
             // Add glyphs to cache
             for glyph in layout.glyphs {
                 let layout_pos = LayoutPos::new(
-                    viewport.margin.x.0 + glyph.pos.x.0 / viewport.scale_factor,
+                    x_offset + glyph.pos.x.0 / viewport.scale_factor,
                     y_pos + glyph.pos.y.0 / viewport.scale_factor,
                 );
 
@@ -189,9 +205,9 @@ impl TextRenderer {
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
-                    layout_pos: LayoutPos::new(viewport.margin.x.0, y_pos),
+                    layout_pos: LayoutPos::new(x_offset, y_pos),
                     physical_pos: PhysicalPos::new(
-                        viewport.margin.x.0 * viewport.scale_factor,
+                        x_offset * viewport.scale_factor,
                         y_pos * viewport.scale_factor,
                     ),
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
@@ -209,9 +225,9 @@ impl TextRenderer {
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
-                    layout_pos: LayoutPos::new(viewport.margin.x.0, y_pos),
+                    layout_pos: LayoutPos::new(x_offset, y_pos),
                     physical_pos: PhysicalPos::new(
-                        viewport.margin.x.0 * viewport.scale_factor,
+                        x_offset * viewport.scale_factor,
                         y_pos * viewport.scale_factor,
                     ),
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible

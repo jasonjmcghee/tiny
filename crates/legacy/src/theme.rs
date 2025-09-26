@@ -202,6 +202,9 @@ impl Themes {
         theme.set_token_colors(52, vec![[0.380, 0.686, 0.937, 1.0]]); // Trait - blue
         theme.set_token_colors(53, vec![[0.776, 0.471, 0.867, 1.0]]); // Derive - purple
 
+        // Line numbers - dim gray
+        theme.set_token_colors(255, vec![[0.3, 0.32, 0.34, 1.0]]); // Line numbers - 40% gray, 80% opacity
+
         theme
     }
 
@@ -279,6 +282,9 @@ impl Themes {
         theme.set_token_colors(51, vec![[0.400, 0.851, 0.937, 1.0]]); // Generic - cyan
         theme.set_token_colors(52, vec![[0.651, 0.886, 0.180, 1.0]]); // Trait - green
         theme.set_token_colors(53, vec![[0.976, 0.149, 0.447, 1.0]]); // Derive - pink
+
+        // Line numbers - dim gray (Monokai style)
+        theme.set_token_colors(255, vec![[0.459, 0.443, 0.369, 0.8]]); // Line numbers - brown-gray, 80% opacity
 
         theme
     }

@@ -10,14 +10,14 @@ theme = "dark"
 # Default plugin directory
 plugin_dir = "plugins"
 # Enabled plugins - text-editor will load first, then its dependencies
-enabled = ["text-editor", "cursor", "selection"]
+enabled = ["cursor", "selection"]
 
 # Text editor plugin configuration
-[plugins.text-editor]
-lib = "crates/plugins/text-editor/target/debug/libtext_editor_plugin.dylib"
-config = "crates/plugins/text-editor/plugin.toml"
+#[plugins.text-editor]
+#lib = "crates/plugins/text-editor/target/debug/libtext_editor_plugin.dylib"
+#config = "crates/plugins/text-editor/plugin.toml"
 # Watch lib and swap it in if it changes
-auto_reload = true
+#auto_reload = true
 
 # Cursor plugin configuration
 [plugins.cursor]

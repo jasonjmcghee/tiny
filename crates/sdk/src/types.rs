@@ -459,6 +459,8 @@ pub struct ViewportInfo {
     pub scale_factor: f32,
     /// Line height in logical pixels
     pub line_height: f32,
+    /// Font size in logical pixels
+    pub font_size: f32,
     /// Document margin (left, top) - DEPRECATED: use widget viewports
     pub margin: LayoutPos,
     /// Global margin for UI chrome (tabs, toolbar, etc.)

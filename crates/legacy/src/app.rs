@@ -7,6 +7,7 @@ use crate::{
     input_types, io,
     render::Renderer,
     syntax::SyntaxHighlighter,
+    text_editor_plugin::TextEditorPlugin,
     text_effects::TextStyleProvider,
 };
 use ahash::AHasher;
@@ -32,7 +33,10 @@ use tiny_core::{
     tree::{Doc, Point, Rect},
     GpuRenderer, Uniforms,
 };
-use tiny_sdk::{types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
+use tiny_sdk::{
+    types::DocPos, Hook, LogicalPixels, PaintContext, Paintable as SdkPaint, ServiceRegistry,
+    Updatable as SdkUpdate,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {
@@ -246,8 +250,8 @@ pub struct TinyApp<T: AppLogic> {
     mouse_pressed: bool,
     drag_start: Option<winit::dpi::PhysicalPosition<f64>>,
 
-    // Key track
-    just_pressed_key: bool,
+    // Track if cursor moved for scrolling
+    cursor_needs_scroll: bool,
 
     // Animation timer
     animation_timer_started: Arc<AtomicBool>,
@@ -311,7 +315,7 @@ impl<T: AppLogic> TinyApp<T> {
             modifiers: input_types::Modifiers::default(),
             mouse_pressed: false,
             drag_start: None,
-            just_pressed_key: false,
+            cursor_needs_scroll: false,
             animation_timer_started: Arc::new(AtomicBool::new(false)),
             continuous_rendering: false,
             target_frame_time_ms: 16, // Default to 16ms (60fps), will be updated based on monitor
@@ -534,8 +538,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    self.just_pressed_key = true;
-
                     // Check for font size adjustment (Cmd+= and Cmd+-)
                     #[cfg(target_os = "macos")]
                     let cmd_held = self.modifiers.state().super_key();
@@ -574,6 +576,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     }
 
                     if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                        // Store old cursor position before handling the key
+                        let old_cursor_pos = self.logic.get_cursor_doc_pos();
+
                         // Extract viewport to avoid borrow conflicts
                         let viewport = cpu_renderer.viewport.clone();
                         // Convert winit event to our types
@@ -584,7 +589,14 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             &self.modifiers,
                             Some(cpu_renderer),
                         );
+
                         if should_redraw {
+                            // Check if cursor position changed
+                            let new_cursor_pos = self.logic.get_cursor_doc_pos();
+                            if old_cursor_pos != new_cursor_pos {
+                                self.cursor_needs_scroll = true;
+                            }
+
                             self.update_window_title();
                             self.request_redraw();
                         }
@@ -626,12 +638,21 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                                 // Only pass drag to editor if drag didn't start in titlebar area
                                 if !drag_started_in_titlebar {
+                                    // Store old cursor position before handling the drag
+                                    let old_cursor_pos = self.logic.get_cursor_doc_pos();
+
                                     if self.logic.on_drag(
                                         from,
                                         point,
                                         &cpu_renderer.viewport,
                                         &self.modifiers,
                                     ) {
+                                        // Check if cursor position changed
+                                        let new_cursor_pos = self.logic.get_cursor_doc_pos();
+                                        if old_cursor_pos != new_cursor_pos {
+                                            self.cursor_needs_scroll = true;
+                                        }
+
                                         // Apply pending scroll from EditorLogic
                                         if let Some(editor) =
                                             self.logic.as_any_mut().downcast_mut::<EditorLogic>()
@@ -641,7 +662,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                                 cpu_renderer.viewport.scroll.y.0 += dy;
 
                                                 // Clamp scroll to bounds using doc from editor directly
-                                                let tree = editor.doc.read();
+                                                let tree = editor.plugin.doc.read();
                                                 cpu_renderer.viewport.clamp_scroll_to_bounds(&tree);
 
                                                 // Clear the scroll so it doesn't keep applying
@@ -679,11 +700,20 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                 // Only pass click to editor if not in titlebar area
                                 if !is_in_titlebar {
                                     if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                                        // Store old cursor position before handling the click
+                                        let old_cursor_pos = self.logic.get_cursor_doc_pos();
+
                                         if self.logic.on_click(
                                             point,
                                             &cpu_renderer.viewport,
                                             &self.modifiers,
                                         ) {
+                                            // Check if cursor position changed
+                                            let new_cursor_pos = self.logic.get_cursor_doc_pos();
+                                            if old_cursor_pos != new_cursor_pos {
+                                                self.cursor_needs_scroll = true;
+                                            }
+
                                             self.request_redraw();
                                         }
                                     }
@@ -892,9 +922,9 @@ impl<T: AppLogic> TinyApp<T> {
             }
         }
 
-        // Handle cursor scroll
-        if self.just_pressed_key {
-            self.just_pressed_key = false;
+        // Handle cursor scroll when selection actually changed
+        if self.cursor_needs_scroll {
+            self.cursor_needs_scroll = false;
             if let Some(cursor_pos) = self.logic.get_cursor_doc_pos() {
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
@@ -906,7 +936,7 @@ impl<T: AppLogic> TinyApp<T> {
         if let (Some(window), Some(gpu_renderer), Some(cpu_renderer)) =
             (&self.window, &mut self.gpu_renderer, &mut self.cpu_renderer)
         {
-            cpu_renderer.update_widgets(dt);
+            // Widgets are now handled by plugins
             gpu_renderer.update_time(dt);
 
             // Update viewport
@@ -935,10 +965,13 @@ impl<T: AppLogic> TinyApp<T> {
                 height: LogicalPixels(logical_height),
             };
 
-            // Update widgets if EditorLogic
-            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+            // Update plugins if EditorLogic
+            if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
                 // Always update selection widgets
-                cpu_renderer.set_selection_plugin(&editor.input, &editor.doc);
+                cpu_renderer.set_selection_plugin(&editor.plugin.input, &editor.plugin.doc);
+
+                // Set line numbers plugin with fresh document reference
+                cpu_renderer.set_line_numbers_plugin(&mut editor.line_numbers, &editor.plugin.doc);
 
                 // Set up global margin (only once)
                 static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
@@ -952,6 +985,8 @@ impl<T: AppLogic> TinyApp<T> {
                             .set_global_margin(0.0, self.title_bar_height);
                     }
                 }
+
+                // No longer need margin - editor bounds are handled properly in renderer
             }
 
             // Upload font atlas
@@ -982,7 +1017,7 @@ impl<T: AppLogic> TinyApp<T> {
             cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
             cpu_renderer.cached_doc_version = doc_read.version;
 
-            // Render using the callback API
+            // Just use the existing render pipeline - it was working!
             unsafe {
                 gpu_renderer.render_with_callback(uniforms, |render_pass| {
                     cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass));
@@ -994,19 +1029,13 @@ impl<T: AppLogic> TinyApp<T> {
 
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {
-    pub doc: Doc,
-    pub input: InputHandler,
-    pub syntax_highlighter: Option<Box<dyn TextStyleProvider>>,
+    pub plugin: TextEditorPlugin,
+    /// Line numbers plugin
+    pub line_numbers: crate::line_numbers_plugin::LineNumbersPlugin,
     /// Flag to indicate widgets need updating
     widgets_dirty: bool,
     /// Extra text style providers (e.g., for effects)
     pub extra_text_styles: Vec<Box<dyn TextStyleProvider>>,
-    /// File path if loaded from file
-    pub file_path: Option<PathBuf>,
-    /// Content hash when document was last saved
-    pub last_saved_content_hash: u64,
-    /// Whether to show line numbers
-    pub show_line_numbers: bool,
     /// Pending scroll delta from drag operations
     pub pending_scroll: Option<(f32, f32)>,
 }
@@ -1015,7 +1044,7 @@ impl EditorLogic {
     fn needs_syntax_highlighter_update(&self, path: &str) -> bool {
         let desired_language = crate::syntax::SyntaxHighlighter::file_extension_to_language(path);
 
-        if let Some(ref current_highlighter) = self.syntax_highlighter {
+        if let Some(ref current_highlighter) = self.plugin.syntax_highlighter {
             if let Some(syntax_hl) = current_highlighter
                 .as_any()
                 .downcast_ref::<crate::syntax::SyntaxHighlighter>()
@@ -1037,15 +1066,15 @@ impl EditorLogic {
                 path
             );
             let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
-            self.syntax_highlighter = Some(syntax_highlighter);
+            self.plugin.syntax_highlighter = Some(syntax_highlighter);
 
-            if let Some(ref syntax_highlighter) = self.syntax_highlighter {
+            if let Some(ref syntax_highlighter) = self.plugin.syntax_highlighter {
                 if let Some(syntax_hl) = syntax_highlighter
                     .as_any()
                     .downcast_ref::<crate::syntax::SyntaxHighlighter>()
                 {
                     let shared_highlighter = Arc::new(syntax_hl.clone());
-                    self.input.set_syntax_highlighter(shared_highlighter);
+                    self.plugin.input.set_syntax_highlighter(shared_highlighter);
                 }
             }
         } else {
@@ -1057,13 +1086,13 @@ impl EditorLogic {
     }
 
     fn request_syntax_update(&self) {
-        if let Some(ref syntax_highlighter) = self.syntax_highlighter {
-            let text = self.doc.read().flatten_to_string();
+        if let Some(ref syntax_highlighter) = self.plugin.syntax_highlighter {
+            let text = self.plugin.doc.read().flatten_to_string();
             if let Some(syntax_hl) = syntax_highlighter
                 .as_any()
                 .downcast_ref::<crate::syntax::SyntaxHighlighter>()
             {
-                syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
+                syntax_hl.request_update_with_edit(&text, self.plugin.doc.version(), None);
             }
         }
     }
@@ -1080,7 +1109,8 @@ impl EditorLogic {
             } else {
                 println!(
                     "EditorLogic: Keeping existing {} syntax highlighter for {}",
-                    self.syntax_highlighter
+                    self.plugin
+                        .syntax_highlighter
                         .as_ref()
                         .unwrap()
                         .as_any()
@@ -1093,29 +1123,29 @@ impl EditorLogic {
             self.request_syntax_update();
         }
 
-        self.file_path = Some(path);
+        self.plugin.file_path = Some(path);
         self
     }
 
     /// Check if document has unsaved changes by comparing content hash
     pub fn is_modified(&self) -> bool {
-        let current_text = self.doc.read().flatten_to_string();
+        let current_text = self.plugin.doc.read().flatten_to_string();
         let mut hasher = AHasher::default();
         current_text.hash(&mut hasher);
         let current_hash = hasher.finish();
 
-        current_hash != self.last_saved_content_hash
+        current_hash != self.plugin.last_saved_content_hash
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
-        if let Some(ref path) = self.file_path {
-            io::autosave(&self.doc, path)?;
+        if let Some(ref path) = self.plugin.file_path {
+            io::autosave(&self.plugin.doc, path)?;
 
             // Update saved content hash
-            let current_text = self.doc.read().flatten_to_string();
+            let current_text = self.plugin.doc.read().flatten_to_string();
             let mut hasher = AHasher::default();
             current_text.hash(&mut hasher);
-            self.last_saved_content_hash = hasher.finish();
+            self.plugin.last_saved_content_hash = hasher.finish();
 
             Ok(())
         } else {
@@ -1127,7 +1157,7 @@ impl EditorLogic {
     }
 
     pub fn title(&self) -> String {
-        let filename = if let Some(ref path) = self.file_path {
+        let filename = if let Some(ref path) = self.plugin.file_path {
             path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("Untitled")
@@ -1145,10 +1175,13 @@ impl EditorLogic {
     }
 
     pub fn new(doc: Doc) -> Self {
+        let mut plugin = TextEditorPlugin::new(doc);
+
+        // Setup default Rust syntax highlighter
         let syntax_highlighter: Box<dyn TextStyleProvider> =
             Box::new(SyntaxHighlighter::new_rust());
 
-        let text = doc.read().flatten_to_string();
+        let text = plugin.doc.read().flatten_to_string();
         println!(
             "EditorLogic: Requesting initial syntax highlighting for {} bytes of text",
             text.len()
@@ -1158,35 +1191,35 @@ impl EditorLogic {
             .as_any()
             .downcast_ref::<crate::syntax::SyntaxHighlighter>()
         {
-            syntax_hl.request_update_with_edit(&text, doc.version(), None);
+            syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
         } else {
             panic!("Syntax highlighter could not be used to update")
         }
 
-        let mut input = InputHandler::new();
         if let Some(syntax_hl) = syntax_highlighter
             .as_any()
             .downcast_ref::<crate::syntax::SyntaxHighlighter>()
         {
             let shared_highlighter = Arc::new(syntax_hl.clone());
-            input.set_syntax_highlighter(shared_highlighter);
+            plugin.input.set_syntax_highlighter(shared_highlighter);
         }
 
         // Calculate initial content hash
-        let initial_text = doc.read().flatten_to_string();
+        let initial_text = plugin.doc.read().flatten_to_string();
         let mut hasher = AHasher::default();
         initial_text.hash(&mut hasher);
-        let initial_hash = hasher.finish();
+        plugin.last_saved_content_hash = hasher.finish();
+
+        plugin.syntax_highlighter = Some(syntax_highlighter);
+
+        // Create line numbers plugin (document will be set each frame)
+        let line_numbers = crate::line_numbers_plugin::LineNumbersPlugin::new();
 
         Self {
-            doc,
-            input,
-            syntax_highlighter: Some(syntax_highlighter),
+            plugin,
+            line_numbers,
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
-            file_path: None,
-            last_saved_content_hash: initial_hash,
-            show_line_numbers: true,
             pending_scroll: None,
         }
     }
@@ -1194,35 +1227,23 @@ impl EditorLogic {
 
 impl EditorLogic {
     fn handle_input_action(&mut self, action: InputAction) -> bool {
-        match action {
+        let result = match action {
             InputAction::Save => {
                 if let Err(e) = self.save() {
                     eprintln!("Failed to save: {}", e);
                 }
                 true
             }
-            InputAction::Undo => {
-                if self.input.undo(&self.doc) {
-                    self.widgets_dirty = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            InputAction::Redo => {
-                if self.input.redo(&self.doc) {
-                    self.widgets_dirty = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            InputAction::Redraw => {
-                self.widgets_dirty = true;
-                true
-            }
+            InputAction::Undo => self.plugin.input.undo(&self.plugin.doc),
+            InputAction::Redo => self.plugin.input.redo(&self.plugin.doc),
+            InputAction::Redraw => true,
             InputAction::None => false,
+        };
+
+        if result {
+            self.widgets_dirty = true;
         }
+        result
     }
 }
 
@@ -1242,9 +1263,13 @@ impl AppLogic for EditorLogic {
         modifiers: &input_types::Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
     ) -> bool {
-        let action = self
-            .input
-            .on_key_with_renderer(&self.doc, viewport, event, modifiers, renderer);
+        let action = self.plugin.input.on_key_with_renderer(
+            &self.plugin.doc,
+            viewport,
+            event,
+            modifiers,
+            renderer,
+        );
         self.handle_input_action(action)
     }
 
@@ -1254,8 +1279,11 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &input_types::Modifiers,
     ) -> bool {
-        let action = self.input.on_key(&self.doc, viewport, event, modifiers);
-        self.handle_input_action(action)
+        let result = self.plugin.on_key(event, viewport, modifiers);
+        if result {
+            self.widgets_dirty = true;
+        }
+        result
     }
 
     fn on_click(
@@ -1267,8 +1295,8 @@ impl AppLogic for EditorLogic {
         // Convert to mouse click for InputHandler
         let alt_held = modifiers.state().alt_key();
         let shift_held = modifiers.state().shift_key();
-        self.input.on_mouse_click(
-            &self.doc,
+        self.plugin.input.on_mouse_click(
+            &self.plugin.doc,
             viewport,
             pos,
             input_types::MouseButton::Left,
@@ -1288,9 +1316,10 @@ impl AppLogic for EditorLogic {
     ) -> bool {
         // Convert to mouse drag for InputHandler
         let alt_held = modifiers.state().alt_key();
-        let (_redraw, scroll_delta) = self
-            .input
-            .on_mouse_drag(&self.doc, viewport, from, to, alt_held);
+        let (_redraw, scroll_delta) =
+            self.plugin
+                .input
+                .on_mouse_drag(&self.plugin.doc, viewport, from, to, alt_held);
 
         // Store scroll delta to be applied in render loop
         if scroll_delta.is_some() {
@@ -1302,21 +1331,22 @@ impl AppLogic for EditorLogic {
     }
 
     fn on_mouse_release(&mut self) {
-        self.input.clear_drag_anchor();
+        self.plugin.input.clear_drag_anchor();
         self.pending_scroll = None;
     }
 
     fn doc(&self) -> &Doc {
-        &self.doc
+        &self.plugin.doc
     }
 
     fn doc_mut(&mut self) -> &mut Doc {
-        &mut self.doc
+        &mut self.plugin.doc
     }
 
     fn cursor_pos(&self) -> usize {
         // Return first selection's cursor byte position for compatibility
-        self.input
+        self.plugin
+            .input
             .selections()
             .first()
             .map(|s| s.cursor.byte_offset)
@@ -1324,22 +1354,22 @@ impl AppLogic for EditorLogic {
     }
 
     fn get_cursor_doc_pos(&self) -> Option<DocPos> {
-        Some(self.input.primary_cursor_doc_pos(&self.doc))
+        self.plugin.get_cursor_doc_pos()
     }
 
     fn selections(&self) -> &[crate::input::Selection] {
-        self.input.selections()
+        self.plugin.selections()
     }
 
     fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
-        self.syntax_highlighter.as_deref()
+        self.plugin.syntax_highlighter.as_deref()
     }
 
     fn on_update(&mut self) {
         // Check if we should send pending syntax updates (debounce timer expired)
-        if self.input.should_flush() {
+        if self.plugin.input.should_flush() {
             println!("DEBOUNCE: Sending pending syntax updates after idle timeout");
-            self.input.flush_syntax_updates(&self.doc);
+            self.plugin.input.flush_syntax_updates(&self.plugin.doc);
         }
     }
 }

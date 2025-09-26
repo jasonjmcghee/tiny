@@ -277,6 +277,6 @@ pub trait Plugin: Send + Sync {
 }
 
 // Something that has some size
-pub trait Spatial: Paintable {
+pub trait Spatial: Paintable + Send + Sync {
     fn measure(&self) -> LogicalSize;
 }

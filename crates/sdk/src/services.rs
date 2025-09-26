@@ -133,6 +133,18 @@ impl Default for ServiceRegistry {
     }
 }
 
+/// Service for collecting and batching glyph submissions from plugins
+pub trait TextRenderingService: Send + Sync {
+    /// Submit glyphs to be rendered at a specific z-index
+    fn submit_glyphs(&self, glyphs: Vec<crate::types::GlyphInstance>, z_index: i32);
+
+    /// Collect all submissions sorted by z-index
+    fn collect_submissions(&self) -> Vec<(Vec<crate::types::GlyphInstance>, i32)>;
+
+    /// Clear all submissions (called after rendering)
+    fn clear_submissions(&self);
+}
+
 /// Context data that can be passed through FFI boundary
 /// This wraps the service registry for plugin access
 #[repr(C)]

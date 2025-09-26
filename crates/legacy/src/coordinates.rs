@@ -90,6 +90,16 @@ impl TextMetrics {
         }
     }
 
+    pub fn with_line_height(line_height: f32) -> Self {
+        let font_size = line_height / 1.4; // Derive font size from line height
+        Self {
+            font_size,
+            line_height,
+            space_width: font_size * 0.6,
+            tab_stops: 4,
+        }
+    }
+
     /// Get tab width in logical pixels
     pub fn tab_width(&self) -> f32 {
         self.space_width * self.tab_stops as f32
@@ -166,6 +176,27 @@ pub struct Viewport {
 }
 
 impl Viewport {
+    /// Create from SDK ViewportInfo
+    pub fn from_viewport_info(info: &tiny_sdk::types::ViewportInfo) -> Self {
+        Self {
+            scroll: LayoutPos::new(info.scroll.x.0, info.scroll.y.0),
+            logical_size: LogicalSize::new(info.logical_size.width.0, info.logical_size.height.0),
+            physical_size: PhysicalSize {
+                width: (info.logical_size.width.0 * info.scale_factor) as u32,
+                height: (info.logical_size.height.0 * info.scale_factor) as u32,
+            },
+            scale_factor: info.scale_factor,
+            metrics: TextMetrics::with_line_height(info.line_height),
+            global_margin: LayoutPos::new(info.global_margin.x.0, info.global_margin.y.0),
+            margin: LayoutPos::new(info.margin.x.0, info.margin.y.0),
+            line_mode: LineMode::default(),
+            cached_doc_bounds: None,
+            cached_bounds_version: 0,
+            cached_longest_line_chars: 0,
+            font_system: None,
+        }
+    }
+
     /// Create new viewport with metrics
     pub fn new(logical_width: f32, logical_height: f32, scale_factor: f32) -> Self {
         let physical_size = PhysicalSize {
@@ -598,6 +629,7 @@ impl Viewport {
             physical_size: self.physical_size.clone(),
             scale_factor: self.scale_factor,
             line_height: self.metrics.line_height,
+            font_size: self.metrics.font_size,
             margin: self.margin.clone(),
             global_margin: self.global_margin.clone(),
         }

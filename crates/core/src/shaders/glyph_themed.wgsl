@@ -130,7 +130,7 @@ fn theme_with_shine_effect(token_id: f32, relative_pos: f32, time: f32) -> vec3<
     let base_color = textureSample(theme_texture, theme_sampler, vec2<f32>(theme_x, theme_y)).rgb;
 
     // Create a ROTATING shine that continuously sweeps left to right
-    let wave_speed = 0.3; // Speed of rotation
+    let wave_speed = 0.2; // Speed of rotation
     let wave_width = 0.15; // Width of the shine band
     let wave_intensity = 0.25; // Brightness of the shine
 
@@ -197,30 +197,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     theme = 2;
 
-    switch theme {
-        case 0u: {
-            // Pastel rotating rainbow
-            final_color = pastel_rainbow_effect(in.token_id, in.relative_pos, uniforms.time);
-        }
-        case 1u: {
-            // Vibrant rotating rainbow
-            final_color = vibrant_rainbow_effect(in.token_id, in.relative_pos, uniforms.time);
-        }
-        case 2u: {
-            // Theme with shine wave effect
-            final_color = theme_with_shine_effect(in.token_id, in.relative_pos, uniforms.time);
-        }
-        case 3u: {
-            // Static theme (no animation)
-            final_color = static_theme_effect(in.token_id, in.relative_pos);
-        }
-        case 4u: {
-            // Theme interpolation
-            final_color = theme_interpolation_effect(in.token_id, in.relative_pos, uniforms.time);
-        }
-        default: {
-            // Default to pastel rainbow
-            final_color = pastel_rainbow_effect(in.token_id, in.relative_pos, uniforms.time);
+    if u32(in.token_id) == 255u {
+        final_color = static_theme_effect(in.token_id, in.relative_pos);
+    } else {
+        switch theme {
+            case 0u: {
+                // Pastel rotating rainbow
+                final_color = pastel_rainbow_effect(in.token_id, in.relative_pos, uniforms.time);
+            }
+            case 1u: {
+                // Vibrant rotating rainbow
+                final_color = vibrant_rainbow_effect(in.token_id, in.relative_pos, uniforms.time);
+            }
+            case 2u: {
+                // Theme with shine wave effect
+                final_color = theme_with_shine_effect(in.token_id, in.relative_pos, uniforms.time);
+            }
+            case 3u: {
+                // Static theme (no animation)
+                final_color = static_theme_effect(in.token_id, in.relative_pos);
+            }
+            case 4u: {
+                // Theme interpolation
+                final_color = theme_interpolation_effect(in.token_id, in.relative_pos, uniforms.time);
+            }
+            default: {
+                // Default to pastel rainbow
+                final_color = pastel_rainbow_effect(in.token_id, in.relative_pos, uniforms.time);
+            }
         }
     }
 
