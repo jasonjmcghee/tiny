@@ -15,8 +15,11 @@
 
 use std::fmt::Display;
 
+use bytemuck::{Pod, Zeroable};
+
 /// Logical pixels - DPI-independent unit used by Layout and View spaces
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Pod, Zeroable)]
 pub struct LogicalPixels(pub f32);
 
 impl LogicalPixels {
@@ -76,7 +79,8 @@ impl std::fmt::Display for LogicalPixels {
 // === Physical Pixels (device pixels) ===
 
 /// Physical pixels - actual device pixels
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct PhysicalPixels(pub f32);
 
 impl PhysicalPixels {
@@ -88,7 +92,8 @@ impl PhysicalPixels {
 // === Document Space ===
 
 /// Position in document (text/editing operations)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Pod, Zeroable)]
 pub struct DocPos {
     /// Byte offset in the document
     pub byte_offset: usize,
@@ -101,7 +106,8 @@ pub struct DocPos {
 // === Layout Space (pre-scroll) ===
 
 /// Position in layout space - where things are before scrolling
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct LayoutPos {
     pub x: LogicalPixels,
     pub y: LogicalPixels,
@@ -153,7 +159,8 @@ impl Display for LayoutPos {
 }
 
 /// Size in layout/logical space
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct LogicalSize {
     pub width: LogicalPixels,
     pub height: LogicalPixels,
@@ -169,7 +176,8 @@ impl LogicalSize {
 }
 
 /// Rectangle in layout space
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct LayoutRect {
     pub x: LogicalPixels,
     pub y: LogicalPixels,
@@ -198,7 +206,8 @@ impl LayoutRect {
 // === View Space (post-scroll) ===
 
 /// Position in view space - layout minus scroll offset
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct ViewPos {
     pub x: LogicalPixels,
     pub y: LogicalPixels,
@@ -214,7 +223,8 @@ impl ViewPos {
 }
 
 /// Rectangle in view space
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct ViewRect {
     pub x: LogicalPixels,
     pub y: LogicalPixels,
@@ -243,7 +253,8 @@ impl ViewRect {
 // === Physical Space ===
 
 /// Position in physical pixels
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct PhysicalPos {
     pub x: PhysicalPixels,
     pub y: PhysicalPixels,
@@ -259,14 +270,16 @@ impl PhysicalPos {
 }
 
 /// Size in physical pixels (for GPU)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct PhysicalSize {
     pub width: u32,
     pub height: u32,
 }
 
 /// Size in physical pixels (float version for calculations)
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct PhysicalSizeF {
     pub width: PhysicalPixels,
     pub height: PhysicalPixels,
@@ -295,24 +308,28 @@ pub struct GlyphInstances {
 }
 
 /// Single glyph instance
-#[derive(Debug, Clone)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct GlyphInstance {
     /// Position in layout space
     pub pos: LayoutPos,
     /// Texture coordinates in font atlas [u0, v0, u1, v1]
     pub tex_coords: [f32; 4],
-    /// Token ID for syntax coloring (0 = default)
-    pub token_id: u8,
     /// Relative position within token (0.0-1.0) for effects
     pub relative_pos: f32,
-    /// Optional shader effect ID
-    pub shader_id: Option<u32>,
+    /// Optional shader effect ID (0 = none)
+    pub shader_id: u32,
+    /// Token ID for syntax coloring (0 = default)
+    pub token_id: u8,
+    /// Padding for alignment
+    pub _padding: [u8; 3],
 }
 
 // === Rect ===
 
 #[allow(dead_code)]
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct RectInstance {
     pub rect: LayoutRect,
     pub color: u32,
@@ -321,78 +338,16 @@ pub struct RectInstance {
 // === Text Data ===
 
 /// Text range in bytes
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct ByteRange {
     pub start: usize,
     pub end: usize,
 }
 
-// === Event Types ===
-
-/// Input events that plugins might handle
-#[derive(Debug, Clone)]
-pub enum InputEvent {
-    KeyPress(KeyEvent),
-    MouseClick(MouseEvent),
-    MouseMove(LogicalPos),
-    Scroll(ScrollEvent),
-}
-
-#[derive(Debug, Clone)]
-pub struct KeyEvent {
-    pub key: String,
-    pub modifiers: Modifiers,
-}
-
-#[derive(Debug, Clone)]
-pub struct MouseEvent {
-    pub pos: LogicalPos,
-    pub button: MouseButton,
-    pub modifiers: Modifiers,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScrollEvent {
-    pub delta: (f32, f32),
-    pub pos: LogicalPos,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Modifiers {
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
-    pub cmd: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum MouseButton {
-    Left,
-    Right,
-    Middle,
-}
-
-// === Theme/Style Types ===
-
-/// Token types for syntax highlighting
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenType {
-    Default = 0,
-    Keyword = 1,
-    String = 2,
-    Number = 3,
-    Comment = 4,
-    Function = 5,
-    Type = 6,
-    Variable = 7,
-    Operator = 8,
-    Punctuation = 9,
-    // ... up to 255
-}
-
 /// RGBA color
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct Color {
     pub r: f32,
     pub g: f32,
@@ -485,7 +440,8 @@ impl WidgetViewport {
 
 /// Simplified viewport information for plugins
 /// This provides the essential coordinate transformation data
-#[derive(Debug, Clone)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ViewportInfo {
     /// Current scroll position in layout space
     pub scroll: LayoutPos,

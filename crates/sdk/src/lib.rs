@@ -18,25 +18,25 @@ pub use crate::traits::{
 
 // Re-export all types
 pub use crate::types::{
-    ByteRange, Color, DocPos, GlyphInstance, GlyphInstances, InputEvent, KeyEvent, LayoutPos,
-    LayoutRect, LogicalPixels, LogicalPos, LogicalRect, LogicalSize, Modifiers, MouseButton,
-    MouseEvent, PhysicalPixels, PhysicalPos, PhysicalSize, PhysicalSizeF, ScrollEvent, TokenType, ViewPos,
-    ViewRect, ViewportInfo, WidgetViewport,
+    ByteRange, Color, DocPos, GlyphInstance, GlyphInstances, LayoutPos, LayoutRect, LogicalPixels,
+    LogicalPos, LogicalRect, LogicalSize, PhysicalPixels, PhysicalPos, PhysicalSize, PhysicalSizeF,
+    ViewPos, ViewRect, ViewportInfo, WidgetViewport,
 };
 
 // Re-export services
 pub use crate::services::{
-    ContextData, FontService, PositionedGlyph, ServiceRegistry, TextEffect, TextLayout, TextStyleService,
+    ContextData, FontService, PositionedGlyph, ServiceRegistry, TextEffect, TextLayout,
+    TextStyleService,
 };
 
 pub use bytemuck;
 pub use bytemuck::{Pod, Zeroable};
 pub use wgpu;
 
+pub mod ffi;
+pub mod services;
 mod traits;
 pub mod types;
-pub mod services;
-pub mod ffi;
 
 /// Macro to simplify plugin declaration
 ///

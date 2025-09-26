@@ -647,7 +647,8 @@ pub fn create_glyph_instances(
                 tex_coords: glyph.tex_coords,
                 token_id: found_token_id.unwrap_or(0),
                 relative_pos: 0.0,
-                shader_id: None,
+                shader_id: 0,
+                _padding: [0; 3],
             });
         }
 

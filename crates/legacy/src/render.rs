@@ -12,6 +12,7 @@ use tiny_core::{
     tree::{self, Tree},
     GpuRenderer,
 };
+use bytemuck;
 use tiny_sdk::{GlyphInstance, LayoutPos, ServiceRegistry};
 use tiny_sdk::{PaintContext, Paintable};
 
@@ -33,29 +34,19 @@ impl PluginState {
     }
 
     fn from_viewport(viewport: &Viewport) -> Vec<u8> {
-        let mut args = Vec::new();
-        args.extend_from_slice(&viewport.metrics.line_height.to_le_bytes());
-        args.extend_from_slice(&viewport.logical_size.width.0.to_le_bytes());
-        args.extend_from_slice(&viewport.margin.x.0.to_le_bytes());
-        args.extend_from_slice(&viewport.margin.y.0.to_le_bytes());
-        args.extend_from_slice(&viewport.scale_factor.to_le_bytes());
-        args.extend_from_slice(&viewport.scroll.x.0.to_le_bytes());
-        args.extend_from_slice(&viewport.scroll.y.0.to_le_bytes());
-        // Add global margin to the viewport info sent to plugins
-        args.extend_from_slice(&viewport.global_margin.x.0.to_le_bytes());
-        args.extend_from_slice(&viewport.global_margin.y.0.to_le_bytes());
-        args
+        // Use ViewportInfo which is already Pod/Zeroable
+        let info = viewport.to_viewport_info();
+        bytemuck::bytes_of(&info).to_vec()
     }
 
     fn encode_selections(selections: &[(tiny_sdk::ViewPos, tiny_sdk::ViewPos)]) -> Vec<u8> {
         let mut args = Vec::new();
-        args.extend_from_slice(&(selections.len() as u32).to_le_bytes());
+        let len = selections.len() as u32;
+        args.extend_from_slice(bytemuck::bytes_of(&len));
+        // ViewPos is Pod/Zeroable, we can directly serialize the pairs
         for (start, end) in selections {
-            // Send view positions (x, y) as floats
-            args.extend_from_slice(&start.x.0.to_le_bytes());
-            args.extend_from_slice(&start.y.0.to_le_bytes());
-            args.extend_from_slice(&end.x.0.to_le_bytes());
-            args.extend_from_slice(&end.y.0.to_le_bytes());
+            args.extend_from_slice(bytemuck::bytes_of(start));
+            args.extend_from_slice(bytemuck::bytes_of(end));
         }
         args
     }
@@ -79,10 +70,10 @@ impl PluginState {
                     }
                     "cursor" => {
                         if let Some((x, y)) = self.cursor_pos {
-                            let mut args = Vec::new();
-                            args.extend_from_slice(&x.to_le_bytes());
-                            args.extend_from_slice(&y.to_le_bytes());
-                            let _ = library.call("set_position", &args);
+                            // Use ViewPos which is Pod/Zeroable
+                            let pos = tiny_sdk::ViewPos::new(x, y);
+                            let args = bytemuck::bytes_of(&pos);
+                            let _ = library.call("set_position", args);
                         }
                     }
                     _ => {}
@@ -752,7 +743,8 @@ impl Renderer {
                             tex_coords: g.tex_coords,
                             token_id: g.token_id as u8,
                             relative_pos: g.relative_pos,
-                            shader_id: None,
+                            shader_id: 0,
+                            _padding: [0; 3],
                         }
                     })
                     .collect();
@@ -838,7 +830,8 @@ impl Renderer {
                     tex_coords: g.tex_coords,
                     token_id: g.token_id as u8,
                     relative_pos: g.relative_pos,
-                    shader_id: None,
+                    shader_id: 0,
+                    _padding: [0; 3],
                 }
             })
             .collect();

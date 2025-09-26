@@ -9,15 +9,8 @@ use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
     ffi::{BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId},
     Capability, Configurable, Initializable, LayoutRect, Library, PaintContext, Paintable, Plugin,
-    PluginError, SetupContext,
+    PluginError, SetupContext, ViewPos, ViewportInfo,
 };
-
-/// View position (x, y in logical pixels, with scroll already applied)
-#[derive(Debug, Clone, Copy)]
-pub struct ViewPos {
-    pub x: f32,
-    pub y: f32,
-}
 
 /// Single selection with start and end positions
 #[derive(Debug, Clone)]
@@ -58,14 +51,8 @@ pub struct SelectionPlugin {
     // Current selections
     selections: Vec<Selection>,
 
-    // Viewport info needed for rectangle calculation
-    line_height: f32,
-    viewport_width: f32,
-    margin_x: f32,
-    margin_y: f32,
-    scale_factor: f32,
-    scroll_x: f32,
-    scroll_y: f32,
+    // Viewport info
+    viewport: ViewportInfo,
 
     // GPU resources (created during setup)
     vertex_buffer: Option<Buffer>,
@@ -78,16 +65,21 @@ pub struct SelectionPlugin {
 impl SelectionPlugin {
     /// Create a new selection plugin with default configuration
     pub fn new() -> Self {
+        use tiny_sdk::{LogicalSize, LayoutPos, PhysicalSize};
+
         Self {
             config: SelectionConfig::default(),
             selections: Vec::new(),
-            line_height: 19.6,     // Default
-            viewport_width: 800.0, // Default
-            margin_x: 60.0,        // Default
-            margin_y: 10.0,        // Default
-            scale_factor: 1.0,     // Default
-            scroll_x: 0.0,         // Default
-            scroll_y: 0.0,         // Default
+            viewport: ViewportInfo {
+                scroll: LayoutPos::new(0.0, 0.0),
+                logical_size: LogicalSize::new(800.0, 600.0),
+                physical_size: PhysicalSize { width: 800, height: 600 },
+                scale_factor: 1.0,
+                line_height: 19.6,
+                font_size: 14.0,
+                margin: LayoutPos::new(60.0, 10.0),
+                global_margin: LayoutPos::new(0.0, 0.0),
+            },
             vertex_buffer: None,
             vertex_buffer_id: None,
             custom_pipeline_id: None,
@@ -102,7 +94,7 @@ impl SelectionPlugin {
             .into_iter()
             .map(|(start, end)| {
                 // Ensure start comes before end for proper rendering
-                if start.y < end.y || (start.y == end.y && start.x <= end.x) {
+                if start.y.0 < end.y.0 || (start.y.0 == end.y.0 && start.x.0 <= end.x.0) {
                     Selection { start, end }
                 } else {
                     Selection { start: end, end: start }
@@ -111,32 +103,13 @@ impl SelectionPlugin {
             .collect();
     }
 
-    /// Update viewport information (including scroll offset)
-    pub fn set_viewport_info(
-        &mut self,
-        line_height: f32,
-        viewport_width: f32,
-        margin_x: f32,
-        margin_y: f32,
-        scale_factor: f32,
-        scroll_x: f32,
-        scroll_y: f32,
-        _global_margin_x: f32,
-        global_margin_y: f32,
-    ) {
+    /// Update viewport information
+    pub fn set_viewport_info(&mut self, viewport: ViewportInfo) {
         // Check if scale factor seems wrong (e.g., 1.0 on a retina display)
-        if scale_factor == 1.0 {
+        if viewport.scale_factor == 1.0 {
             eprintln!("WARNING: Scale factor is 1.0, might be incorrect for high-DPI display!");
         }
-
-        self.line_height = line_height;
-        self.viewport_width = viewport_width;
-        self.margin_x = margin_x;
-        // Add global margin to the document margin for positioning
-        self.margin_y = margin_y + global_margin_y;
-        self.scale_factor = scale_factor;
-        self.scroll_x = scroll_x;
-        self.scroll_y = scroll_y;
+        self.viewport = viewport;
     }
 
 
@@ -144,17 +117,17 @@ impl SelectionPlugin {
     fn selection_to_bounding_rect(&self, selection: &Selection) -> Option<LayoutRect> {
         // Skip if it's just a cursor (no selection)
         let epsilon = 0.1;
-        if (selection.start.x - selection.end.x).abs() < epsilon
-            && (selection.start.y - selection.end.y).abs() < epsilon
+        if (selection.start.x.0 - selection.end.x.0).abs() < epsilon
+            && (selection.start.y.0 - selection.end.y.0).abs() < epsilon
         {
             return None;
         }
 
         // View positions are already in screen coordinates
-        let start_x = selection.start.x;
-        let start_y = selection.start.y;
-        let end_x = selection.end.x;
-        let end_y = selection.end.y;
+        let start_x = selection.start.x.0;
+        let start_y = selection.start.y.0;
+        let end_x = selection.end.x.0;
+        let end_y = selection.end.y.0;
 
         // Check if single line (same y position)
         if (start_y - end_y).abs() < epsilon {
@@ -163,15 +136,15 @@ impl SelectionPlugin {
                 start_x,
                 start_y,
                 end_x - start_x,
-                self.line_height,
+                self.viewport.line_height,
             ))
         } else {
             // Multi-line selection: always use full width from margin to margin
             // The shader will handle per-line clipping based on selection data
-            let left = self.margin_x;
-            let right = self.viewport_width - self.margin_x;
+            let left = self.viewport.margin.x.0;
+            let right = self.viewport.logical_size.width.0 - self.viewport.margin.x.0;
             let width = right - left;
-            let height = (end_y + self.line_height) - start_y;
+            let height = (end_y + self.viewport.line_height) - start_y;
 
             Some(LayoutRect::new(left, start_y, width, height))
         }
@@ -194,14 +167,14 @@ impl SelectionPlugin {
 
                 // Pass selection info in vertex data for shader to determine visibility
                 // View positions are already in logical pixels (screen coordinates)
-                let start_x = selection.start.x * scale;
-                let start_y = selection.start.y * scale;
-                let end_x = selection.end.x * scale;
-                let end_y = selection.end.y * scale;
-                let line_height = self.line_height * scale;
+                let start_x = selection.start.x.0 * scale;
+                let start_y = selection.start.y.0 * scale;
+                let end_x = selection.end.x.0 * scale;
+                let end_y = selection.end.y.0 * scale;
+                let line_height = self.viewport.line_height * scale;
                 // Margins are also in view coordinates now
-                let margin_left = self.margin_x * scale;
-                let margin_right = (self.viewport_width - self.margin_x) * scale;
+                let margin_left = self.viewport.margin.x.0 * scale;
+                let margin_right = (self.viewport.logical_size.width.0 - self.viewport.margin.x.0) * scale;
 
                 let selection_data = SelectionData {
                     start_pos: [start_x, start_y],
@@ -528,68 +501,35 @@ impl Library for SelectionPlugin {
     fn call(&mut self, method: &str, args: &[u8]) -> Result<Vec<u8>, PluginError> {
         match method {
             "set_selections" => {
-                // Format: count (u32), then for each selection:
-                //   start_x, start_y, end_x, end_y (f32 each)
-
+                // Format: count (u32), then ViewPos pairs
                 if args.len() < 4 {
                     return Err(PluginError::Other("Invalid args: too short".into()));
                 }
 
-                let mut offset = 0;
-                let selection_count = u32::from_le_bytes([
-                    args[offset],
-                    args[offset + 1],
-                    args[offset + 2],
-                    args[offset + 3],
-                ]) as usize;
-                offset += 4;
+                // Read count
+                let count_bytes: [u8; 4] = args[0..4].try_into()
+                    .map_err(|_| PluginError::Other("Invalid count".into()))?;
+                let selection_count = u32::from_le_bytes(count_bytes) as usize;
+
+                let view_pos_size = std::mem::size_of::<ViewPos>();
+                let expected_size = 4 + (selection_count * 2 * view_pos_size);
+                if args.len() < expected_size {
+                    return Err(PluginError::Other("Invalid args: incomplete selection data".into()));
+                }
 
                 let mut selections = Vec::with_capacity(selection_count);
+                let mut offset = 4;
 
-                for _i in 0..selection_count {
-                    if offset + 16 > args.len() {
-                        return Err(PluginError::Other(
-                            "Invalid args: incomplete selection data".into(),
-                        ));
-                    }
+                for _ in 0..selection_count {
+                    // Use bytemuck to deserialize ViewPos directly
+                    let start_bytes = &args[offset..offset + view_pos_size];
+                    let end_bytes = &args[offset + view_pos_size..offset + 2 * view_pos_size];
 
-                    let start_x = f32::from_le_bytes([
-                        args[offset],
-                        args[offset + 1],
-                        args[offset + 2],
-                        args[offset + 3],
-                    ]);
-                    let start_y = f32::from_le_bytes([
-                        args[offset + 4],
-                        args[offset + 5],
-                        args[offset + 6],
-                        args[offset + 7],
-                    ]);
-                    let end_x = f32::from_le_bytes([
-                        args[offset + 8],
-                        args[offset + 9],
-                        args[offset + 10],
-                        args[offset + 11],
-                    ]);
-                    let end_y = f32::from_le_bytes([
-                        args[offset + 12],
-                        args[offset + 13],
-                        args[offset + 14],
-                        args[offset + 15],
-                    ]);
+                    let start: &ViewPos = bytemuck::from_bytes(start_bytes);
+                    let end: &ViewPos = bytemuck::from_bytes(end_bytes);
 
-                    offset += 16;
-
-                    selections.push((
-                        ViewPos {
-                            x: start_x,
-                            y: start_y,
-                        },
-                        ViewPos {
-                            x: end_x,
-                            y: end_y,
-                        },
-                    ));
+                    selections.push((*start, *end));
+                    offset += 2 * view_pos_size;
                 }
 
                 // Update our selections
@@ -597,58 +537,15 @@ impl Library for SelectionPlugin {
                 Ok(Vec::new())
             }
             "set_viewport_info" => {
-                // Format: line_height, viewport_width, margin_x, margin_y, scale_factor, scroll_x, scroll_y, global_margin_x, global_margin_y (f32 each)
-                if args.len() < 36 {
-                    // Support both old (28 bytes) and new (36 bytes) formats
-                    if args.len() < 28 {
-                        return Err(PluginError::Other("Invalid viewport args".into()));
-                    }
-                    // Old format - no global margin
-                    let line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
-                    let viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
-                    let margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
-                    let margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
-                    let scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
-                    let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
-                    let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
-
-                    self.set_viewport_info(
-                        line_height,
-                        viewport_width,
-                        margin_x,
-                        margin_y,
-                        scale_factor,
-                        scroll_x,
-                        scroll_y,
-                        0.0,
-                        0.0,
-                    );
-                } else {
-                    // New format - with global margin
-                    let line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
-                    let viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
-                    let margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
-                    let margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
-                    let scale_factor = f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
-                    let scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
-                    let scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
-                    let global_margin_x =
-                        f32::from_le_bytes([args[28], args[29], args[30], args[31]]);
-                    let global_margin_y =
-                        f32::from_le_bytes([args[32], args[33], args[34], args[35]]);
-
-                    self.set_viewport_info(
-                        line_height,
-                        viewport_width,
-                        margin_x,
-                        margin_y,
-                        scale_factor,
-                        scroll_x,
-                        scroll_y,
-                        global_margin_x,
-                        global_margin_y,
-                    );
+                // Expect ViewportInfo struct
+                let viewport_info_size = std::mem::size_of::<ViewportInfo>();
+                if args.len() < viewport_info_size {
+                    return Err(PluginError::Other("Invalid viewport args".into()));
                 }
+
+                // Use bytemuck to deserialize ViewportInfo directly
+                let viewport_info: &ViewportInfo = bytemuck::from_bytes(&args[0..viewport_info_size]);
+                self.set_viewport_info(*viewport_info);
                 Ok(Vec::new())
             }
             _ => Err(PluginError::Other("Unknown method".into())),

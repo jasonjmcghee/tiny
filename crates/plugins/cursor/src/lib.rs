@@ -10,7 +10,7 @@ use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
     ffi::{PipelineId, ShaderModuleId},
     Capability, Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
-    PluginError, SetupContext, Updatable, UpdateContext,
+    PluginError, SetupContext, Updatable, UpdateContext, ViewportInfo,
 };
 
 /// API exposed by cursor plugin
@@ -85,13 +85,7 @@ pub struct CursorPlugin {
     program_start: Instant,
 
     // Viewport info for proper positioning
-    line_height: f32,
-    viewport_width: f32,
-    margin_x: f32,
-    margin_y: f32,
-    scale_factor: f32,
-    scroll_x: f32,
-    scroll_y: f32,
+    viewport: ViewportInfo,
 
     // GPU resources (created during setup)
     vertex_buffer: Option<Buffer>,
@@ -104,6 +98,8 @@ pub struct CursorPlugin {
 impl CursorPlugin {
     /// Create a new cursor plugin with default configuration
     pub fn new() -> Self {
+        use tiny_sdk::{LogicalSize, PhysicalSize};
+
         Self {
             config: CursorConfig::default(),
             api: CursorAPI::new(),
@@ -111,13 +107,16 @@ impl CursorPlugin {
             last_position: None,
             last_active_ms: AtomicU64::new(0),
             program_start: Instant::now(),
-            line_height: 20.0,
-            viewport_width: 800.0,
-            margin_x: 0.0,
-            margin_y: 0.0,
-            scale_factor: 1.0,
-            scroll_x: 0.0,
-            scroll_y: 0.0,
+            viewport: ViewportInfo {
+                scroll: LayoutPos::new(0.0, 0.0),
+                logical_size: LogicalSize::new(800.0, 600.0),
+                physical_size: PhysicalSize { width: 800, height: 600 },
+                scale_factor: 1.0,
+                line_height: 20.0,
+                font_size: 14.0,
+                margin: LayoutPos::new(0.0, 0.0),
+                global_margin: LayoutPos::new(0.0, 0.0),
+            },
             vertex_buffer: None,
             vertex_buffer_id: None,
             custom_pipeline_id: None,
@@ -298,7 +297,10 @@ impl Initializable for CursorPlugin {
 
         // Also create an FFI buffer ID for reuse
         use tiny_sdk::ffi::BufferId;
-        eprintln!("CursorPlugin: About to create FFI buffer with size {}", buffer_size);
+        eprintln!(
+            "CursorPlugin: About to create FFI buffer with size {}",
+            buffer_size
+        );
         let buffer_id = BufferId::create(
             buffer_size,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -400,29 +402,18 @@ impl Library for CursorPlugin {
     fn call(&mut self, method: &str, args: &[u8]) -> Result<Vec<u8>, PluginError> {
         match method {
             "set_position" => {
-                if args.len() == 8 {
-                    let x = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
-                    let y = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
-                    // Call the plugin's set_position method to update activity
-                    self.set_position(x, y);
+                if args.len() == std::mem::size_of::<LayoutPos>() {
+                    let pos: &LayoutPos = bytemuck::from_bytes(args);
+                    self.set_position(pos.x.0, pos.y.0);
                     Ok(Vec::new())
                 } else {
                     Err(PluginError::Other("Invalid args for set_position".into()))
                 }
             }
             "set_viewport_info" => {
-                if args.len() >= 28 {
-                    self.line_height = f32::from_le_bytes([args[0], args[1], args[2], args[3]]);
-                    self.viewport_width = f32::from_le_bytes([args[4], args[5], args[6], args[7]]);
-                    self.margin_x = f32::from_le_bytes([args[8], args[9], args[10], args[11]]);
-                    self.margin_y = f32::from_le_bytes([args[12], args[13], args[14], args[15]]);
-                    self.scale_factor =
-                        f32::from_le_bytes([args[16], args[17], args[18], args[19]]);
-                    self.scroll_x = f32::from_le_bytes([args[20], args[21], args[22], args[23]]);
-                    self.scroll_y = f32::from_le_bytes([args[24], args[25], args[26], args[27]]);
-
-                    // If there are additional bytes for global margin, we can ignore them
-                    // since cursor gets absolute position via set_position
+                if args.len() >= std::mem::size_of::<ViewportInfo>() {
+                    let viewport: &ViewportInfo = bytemuck::from_bytes(&args[..std::mem::size_of::<ViewportInfo>()]);
+                    self.viewport = *viewport;
                     Ok(Vec::new())
                 } else {
                     Err(PluginError::Other(
@@ -444,7 +435,15 @@ impl Paintable for CursorPlugin {
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
         // Get cursor position from our API
-        let pos = self.api.get_position();
+        let mut pos = self.api.get_position();
+
+        // If we have a widget viewport, add its bounds offset
+        if let Some(ref widget_viewport) = ctx.widget_viewport {
+            pos = LayoutPos::new(
+                pos.x.0 + widget_viewport.bounds.x.0,
+                pos.y.0 + widget_viewport.bounds.y.0,
+            );
+        }
 
         // Create vertices for current frame
         let vertices = self.create_vertices_at_position(&ctx.viewport, pos);
