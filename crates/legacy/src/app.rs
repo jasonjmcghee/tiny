@@ -297,6 +297,25 @@ impl<T: AppLogic> TinyApp<T> {
     }
 
     pub fn new(logic: T) -> Self {
+        // Pre-warm LSP in the background for faster startup
+        // Look for workspace root from current directory (find deepest Cargo.toml)
+        let workspace_root = std::env::current_dir().ok().and_then(|dir| {
+            let mut current = dir.as_path();
+            let mut found_cargo_toml = None;
+            loop {
+                if current.join("Cargo.toml").exists() {
+                    found_cargo_toml = Some(current.to_path_buf());
+                    // Keep looking for a higher-level Cargo.toml (workspace root)
+                }
+                match current.parent() {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+            found_cargo_toml
+        });
+        LspManager::prewarm_for_workspace(workspace_root);
+
         Self {
             window: None,
             gpu_renderer: None,
@@ -1329,39 +1348,42 @@ impl EditorLogic {
 impl EditorLogic {
     /// Initialize LSP for the current file if applicable
     fn initialize_lsp(&mut self, file_path: &str) {
+        eprintln!("initialize_lsp called for: {}", file_path);
         if file_path.ends_with(".rs") && self.lsp_manager.is_none() {
+            eprintln!("Trying to initialize LSP for Rust file");
             // Convert to absolute path first
             let abs_path = std::fs::canonicalize(file_path)
                 .unwrap_or_else(|_| PathBuf::from(file_path));
 
-            // Try to find workspace root (look for Cargo.toml)
+            // Try to find workspace root (look for Cargo.toml, prioritize top-level workspace)
             let workspace_root = abs_path
                 .parent()
                 .and_then(|p| {
                     let mut current = p;
+                    let mut found_cargo_toml = None;
                     loop {
                         if current.join("Cargo.toml").exists() {
-                            return Some(current.to_path_buf());
+                            found_cargo_toml = Some(current.to_path_buf());
+                            // Keep looking for a higher-level Cargo.toml (workspace root)
                         }
                         match current.parent() {
                             Some(parent) => current = parent,
                             None => break,
                         }
                     }
-                    None
+                    found_cargo_toml
                 })
                 .or_else(|| abs_path.parent().map(|p| p.to_path_buf()));
 
-            match LspManager::new_for_rust(workspace_root) {
+            match LspManager::get_or_create_global(workspace_root) {
                 Ok(manager) => {
-                    let manager = Arc::new(manager);
+                    eprintln!("LSP: Using existing global instance");
                     let initial_text = self.plugin.doc.read().flatten_to_string();
                     manager.initialize(abs_path.clone(), initial_text.to_string());
                     self.lsp_manager = Some(manager);
-                    eprintln!("LSP: Initialized rust-analyzer for {:?}", abs_path);
                 }
                 Err(e) => {
-                    eprintln!("Failed to start LSP: {}", e);
+                    eprintln!("Failed to get LSP: {}", e);
                 }
             }
         }

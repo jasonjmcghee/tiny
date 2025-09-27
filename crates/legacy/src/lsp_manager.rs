@@ -7,7 +7,7 @@ use lsp_types::{
     request::{Initialize, Request, Shutdown},
     ClientCapabilities, Diagnostic as LspDiagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
+    InitializedParams, MessageType, NumberOrString, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentSyncCapability, TextDocumentSyncKind, VersionedTextDocumentIdentifier,
     WorkDoneProgressParams, Uri,
@@ -70,7 +70,11 @@ pub struct LspManager {
     tx: mpsc::Sender<LspRequest>,
     diagnostics_rx: Arc<Mutex<mpsc::Receiver<DiagnosticUpdate>>>,
     current_version: Arc<AtomicU64>,
+    workspace_root: Option<PathBuf>,
 }
+
+/// Global LSP manager instance (initialized once)
+static LSP_INSTANCE: std::sync::OnceLock<Arc<Mutex<Option<Arc<LspManager>>>>> = std::sync::OnceLock::new();
 
 impl LspManager {
     /// Create a new LSP manager for Rust files
@@ -80,10 +84,13 @@ impl LspManager {
         let diagnostics_rx = Arc::new(Mutex::new(diagnostics_rx));
         let current_version = Arc::new(AtomicU64::new(0));
 
+        // Clone before moving into thread
+        let workspace_root_clone = workspace_root.clone();
+
         // Spawn background thread for LSP communication
         let version_clone = current_version.clone();
         thread::spawn(move || {
-            if let Err(e) = run_lsp_client(request_rx, diagnostics_tx, workspace_root, version_clone) {
+            if let Err(e) = run_lsp_client(request_rx, diagnostics_tx, workspace_root_clone, version_clone) {
                 eprintln!("LSP client error: {}", e);
             }
         });
@@ -92,6 +99,7 @@ impl LspManager {
             tx: request_tx,
             diagnostics_rx,
             current_version,
+            workspace_root,
         })
     }
 
@@ -123,6 +131,46 @@ impl LspManager {
     /// Shutdown the LSP server
     pub fn shutdown(&self) {
         let _ = self.tx.send(LspRequest::Shutdown);
+    }
+
+    /// Get or create the global LSP manager instance
+    pub fn get_or_create_global(workspace_root: Option<PathBuf>) -> Result<Arc<LspManager>, std::io::Error> {
+        let instance_lock = LSP_INSTANCE.get_or_init(|| Arc::new(Mutex::new(None)));
+
+        let mut instance_guard = instance_lock.lock().unwrap();
+
+        if let Some(ref existing) = *instance_guard {
+            // Check if we can reuse the existing instance (same workspace)
+            if existing.workspace_root == workspace_root {
+                eprintln!("LSP: Reusing existing instance for workspace: {:?}", workspace_root);
+                return Ok(existing.clone());
+            }
+            // Different workspace, shutdown the old one
+            eprintln!("LSP: Shutting down old instance, workspace changed");
+            existing.shutdown();
+        }
+
+        // Create new instance
+        eprintln!("LSP: Creating new LSP instance for workspace: {:?}", workspace_root);
+        let new_manager = Arc::new(Self::new_for_rust(workspace_root)?);
+        *instance_guard = Some(new_manager.clone());
+
+        Ok(new_manager)
+    }
+
+    /// Pre-warm the LSP for faster startup
+    pub fn prewarm_for_workspace(workspace_root: Option<PathBuf>) {
+        eprintln!("LSP: Starting pre-warm for workspace: {:?}", workspace_root);
+        std::thread::spawn(move || {
+            match Self::get_or_create_global(workspace_root.clone()) {
+                Ok(_manager) => {
+                    eprintln!("LSP: Successfully pre-warmed rust-analyzer for {:?}", workspace_root);
+                }
+                Err(e) => {
+                    eprintln!("LSP: Failed to pre-warm: {}", e);
+                }
+            }
+        });
     }
 }
 
@@ -196,7 +244,8 @@ fn run_lsp_client(
                             send_initialize(&mut stdin, &mut next_id, root_uri)?;
 
                             // Wait a bit for initialize response
-                            std::thread::sleep(Duration::from_millis(500));
+                            // TODO - revisit this
+                            std::thread::sleep(Duration::from_millis(0));
 
                             initialized = true;
 
@@ -284,8 +333,14 @@ fn handle_lsp_responses(
 
             // Parse and handle the message
             if let Ok(content) = String::from_utf8(buffer) {
-                if let Ok(msg) = serde_json::from_str::<JsonRpcMessage>(&content) {
-                    handle_lsp_message(msg, &diagnostics_tx, &current_file);
+                eprintln!("LSP: Raw message: {}", content.chars().take(200).collect::<String>());
+                match serde_json::from_str::<JsonRpcMessage>(&content) {
+                    Ok(msg) => {
+                        handle_lsp_message(msg, &diagnostics_tx, &current_file);
+                    }
+                    Err(e) => {
+                        eprintln!("LSP: Failed to parse message: {}", e);
+                    }
                 }
             }
         }
@@ -330,20 +385,55 @@ fn handle_lsp_message(
 fn parse_diagnostics(lsp_diagnostics: Vec<LspDiagnostic>) -> Vec<ParsedDiagnostic> {
     lsp_diagnostics
         .into_iter()
-        .map(|d| {
+        .flat_map(|d| {
             let severity = match d.severity {
                 Some(DiagnosticSeverity::ERROR) => diagnostics_plugin::DiagnosticSeverity::Error,
                 Some(DiagnosticSeverity::WARNING) => diagnostics_plugin::DiagnosticSeverity::Warning,
                 _ => diagnostics_plugin::DiagnosticSeverity::Info,
             };
 
-            ParsedDiagnostic {
+            let mut diagnostics = Vec::new();
+
+            // Enhanced message with source and code
+            let mut enhanced_message = d.message.clone();
+            if let Some(source) = d.source {
+                enhanced_message = format!("[{}] {}", source, enhanced_message);
+            }
+            if let Some(code) = d.code {
+                match code {
+                    lsp_types::NumberOrString::Number(n) => {
+                        enhanced_message = format!("{} ({})", enhanced_message, n);
+                    }
+                    lsp_types::NumberOrString::String(s) => {
+                        enhanced_message = format!("{} ({})", enhanced_message, s);
+                    }
+                }
+            }
+
+            // Add related information to the message if available
+            if let Some(related_info) = d.related_information {
+                if !related_info.is_empty() {
+                    enhanced_message.push_str("\n\nRelated:");
+                    for info in related_info {
+                        enhanced_message.push_str(&format!(
+                            "\n• {} (line {})",
+                            info.message,
+                            info.location.range.start.line + 1
+                        ));
+                    }
+                }
+            }
+
+            // Main diagnostic
+            diagnostics.push(ParsedDiagnostic {
                 line: d.range.start.line as usize,
                 column_start: d.range.start.character as usize,
                 column_end: d.range.end.character as usize,
-                message: d.message,
+                message: enhanced_message,
                 severity,
-            }
+            });
+
+            diagnostics
         })
         .collect()
 }
@@ -353,6 +443,7 @@ fn parse_diagnostics(lsp_diagnostics: Vec<LspDiagnostic>) -> Vec<ParsedDiagnosti
 fn send_message(writer: &mut dyn Write, msg: &JsonRpcMessage) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string(msg)?;
     let content_length = json.len();
+    eprintln!("LSP: Sending {} chars: {}", content_length, json.chars().take(200).collect::<String>());
     write!(writer, "Content-Length: {}\r\n\r\n{}", content_length, json)?;
     writer.flush()?;
     Ok(())
@@ -363,11 +454,57 @@ fn send_initialize(
     next_id: &mut u64,
     root_uri: Option<Uri>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Fast initialization with minimal capabilities
+    let mut capabilities = ClientCapabilities::default();
+
+    // Only enable what we need for diagnostics
+    capabilities.text_document = Some(lsp_types::TextDocumentClientCapabilities {
+        diagnostic: Some(lsp_types::DiagnosticClientCapabilities {
+            dynamic_registration: Some(false),
+            related_document_support: Some(false),
+        }),
+        publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+            related_information: Some(true),
+            version_support: Some(false),
+            tag_support: None,
+            data_support: Some(false),
+            code_description_support: Some(false),
+        }),
+        synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+            dynamic_registration: Some(false),
+            will_save: Some(false),
+            will_save_wait_until: Some(false),
+            did_save: Some(false),
+        }),
+        ..Default::default()
+    });
+
+    // Disable expensive features for faster startup
+    let init_options = serde_json::json!({
+        "diagnostics": {
+            "enable": true,
+            "disabled": [],
+            "enableExperimental": false
+        },
+        "completion": {
+            "enable": false  // We don't need completion yet
+        },
+        "hover": {
+            "enable": false  // We don't need hover yet
+        },
+        "inlayHints": {
+            "enable": false
+        },
+        "lens": {
+            "enable": false
+        }
+    });
+
     let params = InitializeParams {
         process_id: Some(std::process::id()),
         root_uri,
-        initialization_options: None,
-        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(init_options),
+        capabilities,
         trace: Some(lsp_types::TraceValue::Off),
         workspace_folders: None,
         client_info: Some(lsp_types::ClientInfo {
