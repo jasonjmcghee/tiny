@@ -9,8 +9,8 @@ use crate::syntax::SyntaxHighlighter;
 use arboard::Clipboard;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
-use tiny_core::tree::{Content, Doc, Edit, Point};
+use std::time::{Duration, Instant};
+use tiny_core::tree::{Content, Doc, Edit, Point, SearchOptions};
 use tiny_sdk::{DocPos, LayoutPos, LayoutRect};
 
 /// Actions that can be triggered by input
@@ -151,6 +151,12 @@ pub struct InputHandler {
     /// Selection anchor - when set, cursor movements extend selection from this point
     /// Set when entering selection mode (shift pressed), cleared when leaving selection mode
     selection_anchor: Option<DocPos>,
+    /// Track click count and timing for double/triple click detection
+    last_click_time: Option<Instant>,
+    last_click_pos: Option<DocPos>,
+    click_count: u32,
+    /// Ignore drag events after multi-click to prevent selection loss
+    ignore_next_drag: bool,
 }
 
 impl InputHandler {
@@ -173,6 +179,10 @@ impl InputHandler {
             nav_history: SelectionHistory::with_max_size(50),
             drag_anchor: None,
             selection_anchor: None,
+            last_click_time: None,
+            last_click_pos: None,
+            click_count: 0,
+            ignore_next_drag: false,
         }
     }
 
@@ -849,6 +859,47 @@ impl InputHandler {
             self.nav_history.checkpoint_if_changed(current_pos);
         }
 
+        // Detect double/triple click
+        const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(500);
+        const CLICK_POS_TOLERANCE: u32 = 2; // Allow 2 character tolerance for position
+
+        let now = Instant::now();
+        let is_multi_click = if let (Some(last_time), Some(last_pos)) = (self.last_click_time, self.last_click_pos) {
+            now.duration_since(last_time) < DOUBLE_CLICK_TIME
+                && last_pos.line == doc_pos.line
+                && last_pos.column.abs_diff(doc_pos.column) <= CLICK_POS_TOLERANCE
+        } else {
+            false
+        };
+
+        if is_multi_click {
+            self.click_count += 1;
+        } else {
+            self.click_count = 1;
+        }
+
+        self.last_click_time = Some(now);
+        self.last_click_pos = Some(doc_pos);
+
+        // Handle multi-click selection
+        if self.click_count == 2 && !shift_held && !alt_held {
+            // Double-click: select word
+            self.select_word_at(doc, doc_pos);
+            self.ignore_next_drag = true; // Don't let drag events override the word selection
+            return true;
+        } else if self.click_count >= 3 && !shift_held && !alt_held {
+            // Triple-click: select line
+            self.select_line_at(doc, doc_pos);
+            self.ignore_next_drag = true; // Don't let drag events override the line selection
+            return true;
+        }
+
+        // Clear ignore flag on regular single click
+        if self.click_count == 1 {
+            self.ignore_next_drag = false;
+        }
+
+        // Normal click handling
         if shift_held {
             // Shift-click: extend selection from current position to click point
             if let Some(sel) = self.selections.first() {
@@ -903,6 +954,11 @@ impl InputHandler {
         to: Point,
         alt_held: bool,
     ) -> (bool, Option<(f32, f32)>) {
+        // Ignore drag events if we just did a double/triple click
+        if self.ignore_next_drag {
+            return (true, None);
+        }
+
         // Use the stored drag anchor, or calculate it if missing
         let anchor_doc = self.drag_anchor.unwrap_or_else(|| {
             self.selections
@@ -1058,6 +1114,113 @@ impl InputHandler {
         self.next_id += 1;
     }
 
+    /// Select word at the given position (for double-click)
+    fn select_word_at(&mut self, doc: &Doc, click_pos: DocPos) {
+        let tree = doc.read();
+        let click_byte = tree.doc_pos_to_byte(click_pos);
+
+        // Define word boundary characters
+        let word_boundaries = " \t\n()[]{}\"'`,;:.!?<>@#$%^&*+=|\\~-/";
+
+        // Search backwards for word start
+        let mut word_start_byte = click_byte;
+        for boundary in word_boundaries.chars() {
+            let pattern = boundary.to_string();
+            let options = SearchOptions::default();
+            if let Some(prev_match) = tree.search_prev(&pattern, click_byte, options) {
+                if prev_match.byte_range.end > word_start_byte || word_start_byte == click_byte {
+                    word_start_byte = prev_match.byte_range.end;
+                }
+            }
+        }
+
+        // Search forwards for word end
+        let mut word_end_byte = click_byte;
+        for boundary in word_boundaries.chars() {
+            let pattern = boundary.to_string();
+            let options = SearchOptions::default();
+            if let Some(next_match) = tree.search_next(&pattern, click_byte, options) {
+                if word_end_byte == click_byte || next_match.byte_range.start < word_end_byte {
+                    word_end_byte = next_match.byte_range.start;
+                }
+            }
+        }
+
+        // If no boundaries found, use document bounds
+        if word_start_byte == click_byte && word_end_byte == click_byte {
+            // Check beginning of document
+            if click_byte == 0 || word_start_byte == 0 {
+                word_start_byte = 0;
+            }
+            // Check end of document
+            if word_end_byte == click_byte {
+                word_end_byte = tree.byte_count();
+            }
+        }
+
+        // Convert byte positions back to DocPos
+        let word_start_line = tree.byte_to_line(word_start_byte);
+        let word_start_line_byte = tree.line_to_byte(word_start_line).unwrap_or(0);
+        let word_start_column = tree.get_text_slice(word_start_line_byte..word_start_byte).chars().count() as u32;
+        let word_start = DocPos {
+            line: word_start_line,
+            column: word_start_column,
+            byte_offset: 0,
+        };
+
+        let word_end_line = tree.byte_to_line(word_end_byte);
+        let word_end_line_byte = tree.line_to_byte(word_end_line).unwrap_or(0);
+        let word_end_column = tree.get_text_slice(word_end_line_byte..word_end_byte).chars().count() as u32;
+        let word_end = DocPos {
+            line: word_end_line,
+            column: word_end_column,
+            byte_offset: 0,
+        };
+
+        // Create selection from word start to end
+        self.selections = vec![Selection {
+            cursor: word_end,
+            anchor: word_start,
+            id: self.next_id,
+        }];
+        self.next_id += 1;
+    }
+
+    /// Select entire line at the given position (for triple-click)
+    fn select_line_at(&mut self, doc: &Doc, click_pos: DocPos) {
+        let tree = doc.read();
+
+        // Get the start of the line
+        let line_start = DocPos {
+            line: click_pos.line,
+            column: 0,
+            byte_offset: 0,
+        };
+
+        // Get the end of the line (including newline if present)
+        let line_char_count = tree.line_char_count(click_pos.line) as u32;
+        let mut line_end = DocPos {
+            line: click_pos.line,
+            column: line_char_count,
+            byte_offset: 0,
+        };
+
+        // If not the last line, include the newline character
+        if click_pos.line < tree.line_count() - 1 {
+            // Move to start of next line to include the newline
+            line_end.line += 1;
+            line_end.column = 0;
+        }
+
+        // Create selection for the entire line
+        self.selections = vec![Selection {
+            cursor: line_end,
+            anchor: line_start,
+            id: self.next_id,
+        }];
+        self.next_id += 1;
+    }
+
     /// Get current selections
     pub fn selections(&self) -> &[Selection] {
         &self.selections
@@ -1073,6 +1236,8 @@ impl InputHandler {
     /// Clear the drag anchor (called when mouse button is released)
     pub fn clear_drag_anchor(&mut self) {
         self.drag_anchor = None;
+        // Clear the ignore flag when mouse is released
+        self.ignore_next_drag = false;
     }
 
     /// Get primary cursor position in document space

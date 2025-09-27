@@ -139,6 +139,16 @@ impl Tree {
         matches.into_iter().find(|m| m.byte_range.start > start_pos)
     }
 
+    /// Find previous occurrence before given position
+    pub fn search_prev(&self, pattern: &str, end_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
+        // Search for all matches and return the last one before end_pos
+        let matches = self.search(pattern, options);
+
+        matches.into_iter()
+            .filter(|m| m.byte_range.end <= end_pos)
+            .last()
+    }
+
     /// Replace all occurrences - returns new tree
     pub fn replace_all(&self, pattern: &str, replacement: &str, options: SearchOptions) -> Self {
         let matches = self.search(pattern, options);
@@ -206,6 +216,12 @@ impl Doc {
     pub fn search_next(&self, pattern: &str, start_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
         self.flush();
         self.read().search_next(pattern, start_pos, options)
+    }
+
+    /// Find previous occurrence before given position
+    pub fn search_prev(&self, pattern: &str, end_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
+        self.flush();
+        self.read().search_prev(pattern, end_pos, options)
     }
 
     /// Replace all occurrences and return new tree
@@ -653,6 +669,32 @@ mod tests {
     }
 
     #[test]
+    fn test_search_prev() {
+        let tree = Tree::from_str("first test second test third test");
+
+        let options = SearchOptions::default();
+
+        // Find last occurrence from the end
+        let match1 = tree.search_prev("test", tree.byte_count(), options.clone());
+        assert!(match1.is_some());
+        assert_eq!(match1.as_ref().unwrap().byte_range.start, 29);
+
+        // Find previous occurrence before last
+        let match2 = tree.search_prev("test", match1.unwrap().byte_range.start, options.clone());
+        assert!(match2.is_some());
+        assert_eq!(match2.as_ref().unwrap().byte_range.start, 18);
+
+        // Find first occurrence
+        let match3 = tree.search_prev("test", match2.unwrap().byte_range.start, options.clone());
+        assert!(match3.is_some());
+        assert_eq!(match3.as_ref().unwrap().byte_range.start, 6);
+
+        // No match before first occurrence
+        let match4 = tree.search_prev("test", match3.unwrap().byte_range.start, options);
+        assert!(match4.is_none());
+    }
+
+    #[test]
     fn test_search_multiline() {
         let tree = Tree::from_str("line1\nline2\nline3\nline4");
 
@@ -775,6 +817,53 @@ mod tests {
         assert_eq!(matches[1].text(&tree), "TEST");
         assert_eq!(matches[2].text(&tree), "test");
         assert_eq!(matches[3].text(&tree), "TeSt");
+    }
+
+    #[test]
+    fn test_word_boundary_search() {
+        // Test for double-click word selection scenario
+        let tree = Tree::from_str("hello world\tfoo\nbar baz");
+
+        // Click position in middle of "world" (at 'r')
+        let click_pos = 8;
+
+        // Search backwards for whitespace (space, tab, newline)
+        let prev_space = tree.search_prev(" ", click_pos, SearchOptions::default());
+        let prev_tab = tree.search_prev("\t", click_pos, SearchOptions::default());
+        let prev_newline = tree.search_prev("\n", click_pos, SearchOptions::default());
+
+        // Find the closest boundary before click
+        let mut word_start = 0;
+        if let Some(m) = prev_space {
+            word_start = word_start.max(m.byte_range.end);
+        }
+        if let Some(m) = prev_tab {
+            word_start = word_start.max(m.byte_range.end);
+        }
+        if let Some(m) = prev_newline {
+            word_start = word_start.max(m.byte_range.end);
+        }
+
+        // Search forwards for whitespace
+        let next_space = tree.search_next(" ", click_pos, SearchOptions::default());
+        let next_tab = tree.search_next("\t", click_pos, SearchOptions::default());
+        let next_newline = tree.search_next("\n", click_pos, SearchOptions::default());
+
+        // Find the closest boundary after click
+        let mut word_end = tree.byte_count();
+        if let Some(m) = next_space {
+            word_end = word_end.min(m.byte_range.start);
+        }
+        if let Some(m) = next_tab {
+            word_end = word_end.min(m.byte_range.start);
+        }
+        if let Some(m) = next_newline {
+            word_end = word_end.min(m.byte_range.start);
+        }
+
+        // Extract the word
+        let word = tree.get_text_slice(word_start..word_end);
+        assert_eq!(word, "world");
     }
 
     #[test]
