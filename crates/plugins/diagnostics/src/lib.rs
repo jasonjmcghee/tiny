@@ -18,7 +18,7 @@ use tiny_sdk::{
 };
 
 /// Diagnostic severity levels
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticSeverity {
     Error = 0,
     Warning = 1,

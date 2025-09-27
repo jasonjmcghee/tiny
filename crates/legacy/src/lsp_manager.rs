@@ -21,7 +21,9 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// LSP request types for the background thread
 #[derive(Debug, Clone)]
@@ -40,13 +42,23 @@ pub struct DiagnosticUpdate {
 }
 
 /// Parsed diagnostic ready for the plugin
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDiagnostic {
     pub line: usize,
     pub column_start: usize,
     pub column_end: usize,
     pub message: String,
     pub severity: diagnostics_plugin::DiagnosticSeverity,
+}
+
+/// Cached diagnostics with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedDiagnostics {
+    pub diagnostics: Vec<ParsedDiagnostic>,
+    pub file_path: PathBuf,
+    pub content_hash: u64,
+    pub modification_time: SystemTime,
+    pub cached_at: SystemTime,
 }
 
 /// JSON-RPC message structure
@@ -171,6 +183,85 @@ impl LspManager {
                 }
             }
         });
+    }
+
+    /// Load cached diagnostics if available and valid
+    pub fn load_cached_diagnostics(file_path: &PathBuf, content: &str) -> Option<Vec<ParsedDiagnostic>> {
+        let cache_key = Self::compute_cache_key(file_path, content)?;
+        let cache_file = Self::get_cache_path(&cache_key);
+
+        if !cache_file.exists() {
+            return None;
+        }
+
+        // Check if file was modified since cache
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            if let Ok(mod_time) = metadata.modified() {
+                if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
+                    if let Ok(cached) = serde_json::from_str::<CachedDiagnostics>(&cache_content) {
+                        // Cache is valid if file hasn't been modified and content hash matches
+                        if cached.modification_time <= mod_time && cached.content_hash == Self::hash_content(content) {
+                            eprintln!("LSP: Loaded {} cached diagnostics for {:?}", cached.diagnostics.len(), file_path);
+                            return Some(cached.diagnostics);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save diagnostics to cache
+    pub fn cache_diagnostics(file_path: &PathBuf, content: &str, diagnostics: &[ParsedDiagnostic]) {
+        if let Some(cache_key) = Self::compute_cache_key(file_path, content) {
+            let cache_file = Self::get_cache_path(&cache_key);
+
+            // Create cache directory if it doesn't exist
+            if let Some(parent) = cache_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            if let Ok(metadata) = std::fs::metadata(file_path) {
+                if let Ok(mod_time) = metadata.modified() {
+                    let cached = CachedDiagnostics {
+                        diagnostics: diagnostics.to_vec(),
+                        file_path: file_path.clone(),
+                        content_hash: Self::hash_content(content),
+                        modification_time: mod_time,
+                        cached_at: SystemTime::now(),
+                    };
+
+                    if let Ok(json) = serde_json::to_string_pretty(&cached) {
+                        let _ = std::fs::write(&cache_file, json);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute cache key from file path and content
+    fn compute_cache_key(file_path: &PathBuf, content: &str) -> Option<String> {
+        let mut hasher = DefaultHasher::new();
+        file_path.hash(&mut hasher);
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+        Some(format!("{:x}", hash))
+    }
+
+    /// Hash content for cache validation
+    fn hash_content(content: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Get cache file path
+    fn get_cache_path(cache_key: &str) -> PathBuf {
+        let cache_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".cache")
+            .join("diagnostics");
+        cache_dir.join(format!("{}.json", cache_key))
     }
 }
 

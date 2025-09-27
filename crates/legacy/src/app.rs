@@ -3,9 +3,10 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
+    diagnostics_manager::DiagnosticsManager,
     input::{InputAction, InputHandler},
     input_types, io,
-    lsp_manager::{LspManager, DiagnosticUpdate},
+    lsp_manager::LspManager,
     render::Renderer,
     syntax::SyntaxHighlighter,
     text_editor_plugin::TextEditorPlugin,
@@ -1018,37 +1019,11 @@ impl<T: AppLogic> TinyApp<T> {
                 // Set line numbers plugin with fresh document reference
                 cpu_renderer.set_line_numbers_plugin(&mut editor.line_numbers, &editor.plugin.doc);
 
-                // Set diagnostics plugin
-                cpu_renderer.set_diagnostics_plugin(&mut editor.diagnostics, &editor.plugin.doc);
+                // Update diagnostics manager (handles LSP polling, caching, plugin updates)
+                editor.diagnostics.update(&editor.plugin.doc);
 
-                // Poll LSP for diagnostic updates
-                if let Some(ref lsp) = editor.lsp_manager {
-                    if let Some(update) = lsp.poll_diagnostics() {
-
-                        // Clear existing diagnostics
-                        editor.diagnostics.clear_diagnostics();
-
-                        // Add new diagnostics from LSP
-                        for diag in update.diagnostics {
-                            // Get line text for accurate positioning
-                            let doc_text = editor.plugin.doc.read().flatten_to_string();
-                            let lines: Vec<&str> = doc_text.lines().collect();
-
-                            if let Some(line_text) = lines.get(diag.line) {
-                                editor.diagnostics.add_diagnostic_with_line_text(
-                                    diagnostics_plugin::Diagnostic {
-                                        line: diag.line,
-                                        column_range: (diag.column_start, diag.column_end),
-                                        byte_range: None,
-                                        message: diag.message,
-                                        severity: diag.severity,
-                                    },
-                                    line_text.to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
+                // Set diagnostics plugin for rendering
+                cpu_renderer.set_diagnostics_plugin(editor.diagnostics.plugin_mut(), &editor.plugin.doc);
 
                 // Initialize diagnostics plugin with GPU resources (first time only)
                 static mut DIAGNOSTICS_INITIALIZED: bool = false;
@@ -1135,10 +1110,8 @@ pub struct EditorLogic {
     pub plugin: TextEditorPlugin,
     /// Line numbers plugin
     pub line_numbers: crate::line_numbers_plugin::LineNumbersPlugin,
-    /// Diagnostics plugin
-    pub diagnostics: diagnostics_plugin::DiagnosticsPlugin,
-    /// LSP manager for real-time diagnostics
-    lsp_manager: Option<Arc<LspManager>>,
+    /// Diagnostics manager (encapsulates plugin + LSP + caching)
+    pub diagnostics: DiagnosticsManager,
     /// Flag to indicate widgets need updating
     widgets_dirty: bool,
     /// Extra text style providers (e.g., for effects)
@@ -1229,8 +1202,9 @@ impl EditorLogic {
             }
             self.request_syntax_update();
 
-            // Initialize LSP for Rust files
-            self.initialize_lsp(path_str);
+            // Open file in diagnostics manager (handles LSP + caching)
+            let content = self.plugin.doc.read().flatten_to_string();
+            self.diagnostics.open_file(PathBuf::from(path_str), content.to_string());
         }
 
         self.plugin.file_path = Some(path);
@@ -1257,10 +1231,8 @@ impl EditorLogic {
             current_text.hash(&mut hasher);
             self.plugin.last_saved_content_hash = hasher.finish();
 
-            // Notify LSP of save
-            if let Some(ref lsp) = self.lsp_manager {
-                lsp.document_saved(path.clone(), current_text.to_string());
-            }
+            // Notify diagnostics manager of save
+            self.diagnostics.document_saved(current_text.to_string());
 
             Ok(())
         } else {
@@ -1330,14 +1302,13 @@ impl EditorLogic {
         // Create line numbers plugin (document will be set each frame)
         let line_numbers = crate::line_numbers_plugin::LineNumbersPlugin::new();
 
-        // Create diagnostics plugin
-        let diagnostics = diagnostics_plugin::DiagnosticsPlugin::new();
+        // Create diagnostics manager
+        let diagnostics = DiagnosticsManager::new();
 
         Self {
             plugin,
             line_numbers,
             diagnostics,
-            lsp_manager: None,
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
             pending_scroll: None,
@@ -1346,49 +1317,6 @@ impl EditorLogic {
 }
 
 impl EditorLogic {
-    /// Initialize LSP for the current file if applicable
-    fn initialize_lsp(&mut self, file_path: &str) {
-        eprintln!("initialize_lsp called for: {}", file_path);
-        if file_path.ends_with(".rs") && self.lsp_manager.is_none() {
-            eprintln!("Trying to initialize LSP for Rust file");
-            // Convert to absolute path first
-            let abs_path = std::fs::canonicalize(file_path)
-                .unwrap_or_else(|_| PathBuf::from(file_path));
-
-            // Try to find workspace root (look for Cargo.toml, prioritize top-level workspace)
-            let workspace_root = abs_path
-                .parent()
-                .and_then(|p| {
-                    let mut current = p;
-                    let mut found_cargo_toml = None;
-                    loop {
-                        if current.join("Cargo.toml").exists() {
-                            found_cargo_toml = Some(current.to_path_buf());
-                            // Keep looking for a higher-level Cargo.toml (workspace root)
-                        }
-                        match current.parent() {
-                            Some(parent) => current = parent,
-                            None => break,
-                        }
-                    }
-                    found_cargo_toml
-                })
-                .or_else(|| abs_path.parent().map(|p| p.to_path_buf()));
-
-            match LspManager::get_or_create_global(workspace_root) {
-                Ok(manager) => {
-                    eprintln!("LSP: Using existing global instance");
-                    let initial_text = self.plugin.doc.read().flatten_to_string();
-                    manager.initialize(abs_path.clone(), initial_text.to_string());
-                    self.lsp_manager = Some(manager);
-                }
-                Err(e) => {
-                    eprintln!("Failed to get LSP: {}", e);
-                }
-            }
-        }
-    }
-
     fn handle_input_action(&mut self, action: InputAction) -> bool {
         let result = match action {
             InputAction::Save => {
@@ -1435,12 +1363,10 @@ impl AppLogic for EditorLogic {
         );
         let result = self.handle_input_action(action);
 
-        // Notify LSP of document changes
+        // Notify diagnostics manager of document changes
         if result {
-            if let Some(ref lsp) = self.lsp_manager {
-                let text = self.plugin.doc.read().flatten_to_string();
-                lsp.document_changed(text.to_string());
-            }
+            let text = self.plugin.doc.read().flatten_to_string();
+            self.diagnostics.document_changed(text.to_string());
         }
 
         result
@@ -1456,11 +1382,9 @@ impl AppLogic for EditorLogic {
         if result {
             self.widgets_dirty = true;
 
-            // Notify LSP of document changes
-            if let Some(ref lsp) = self.lsp_manager {
-                let text = self.plugin.doc.read().flatten_to_string();
-                lsp.document_changed(text.to_string());
-            }
+            // Notify diagnostics manager of document changes
+            let text = self.plugin.doc.read().flatten_to_string();
+            self.diagnostics.document_changed(text.to_string());
         }
         result
     }
