@@ -60,10 +60,6 @@ winit = ["dep:winit"]
 criterion = "0.7"  # Benchmarking
 pollster = "0.3"   # Async executor for examples
 
-[[bench]]
-name = "tree_bench"
-harness = false
-
 [[example]]
 name = "minimal_typing"
 path = "examples/minimal_typing.rs"

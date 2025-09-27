@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tiny_sdk::{DocPos, LayoutPos, LayoutRect, LogicalPixels, Spatial};
 
+mod search;
+pub use search::{SearchMatch, SearchOptions};
+
 /// Maximum spans per leaf node (tuned for cache line)
 const MAX_SPANS: usize = 16;
 

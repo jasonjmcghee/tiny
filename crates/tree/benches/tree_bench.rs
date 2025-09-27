@@ -10,7 +10,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tiny_editor::tree::{Content, Doc, Edit};
+use tiny_tree::{Content, Doc, Edit, SearchOptions};
 
 /// Generate a realistic document with mixed content
 fn generate_document(lines: usize) -> String {
@@ -363,6 +363,201 @@ fn bench_realistic_session(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark search operations
+fn bench_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("search");
+
+    for size in [1000, 10000, 100000].iter() {
+        let text = generate_document(*size);
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        // Plain text search
+        group.bench_with_input(BenchmarkId::new("plain_search", size), size, |b, _| {
+            b.iter(|| {
+                let matches = tree.search("function", SearchOptions::default());
+                std::hint::black_box(matches);
+            });
+        });
+
+        // Case-insensitive search
+        group.bench_with_input(BenchmarkId::new("case_insensitive", size), size, |b, _| {
+            b.iter(|| {
+                let options = SearchOptions {
+                    case_sensitive: false,
+                    ..Default::default()
+                };
+                let matches = tree.search("FUNCTION", options);
+                std::hint::black_box(matches);
+            });
+        });
+
+        // Whole word search
+        group.bench_with_input(BenchmarkId::new("whole_word", size), size, |b, _| {
+            b.iter(|| {
+                let options = SearchOptions {
+                    whole_word: true,
+                    ..Default::default()
+                };
+                let matches = tree.search("let", options);
+                std::hint::black_box(matches);
+            });
+        });
+
+        // Regex search
+        group.bench_with_input(BenchmarkId::new("regex_search", size), size, |b, _| {
+            b.iter(|| {
+                let options = SearchOptions {
+                    regex: true,
+                    ..Default::default()
+                };
+                let matches = tree.search(r"function_\d+", options);
+                std::hint::black_box(matches);
+            });
+        });
+
+        // Search with limit
+        group.bench_with_input(BenchmarkId::new("limited_search", size), size, |b, _| {
+            b.iter(|| {
+                let options = SearchOptions {
+                    limit: Some(10),
+                    ..Default::default()
+                };
+                let matches = tree.search("variable", options);
+                std::hint::black_box(matches);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Benchmark search and replace operations
+fn bench_replace(c: &mut Criterion) {
+    let mut group = c.benchmark_group("replace");
+
+    for size in [1000, 10000, 100000].iter() {
+        let text = generate_document(*size);
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        // Replace all occurrences
+        group.bench_with_input(BenchmarkId::new("replace_all", size), size, |b, _| {
+            b.iter(|| {
+                let new_tree = tree.replace_all("variable", "var", SearchOptions::default());
+                std::hint::black_box(new_tree);
+            });
+        });
+
+        // Replace with callback (selective replacement)
+        group.bench_with_input(BenchmarkId::new("replace_selective", size), size, |b, _| {
+            b.iter(|| {
+                let mut counter = 0;
+                let new_tree = tree.replace_with("function", SearchOptions::default(), |_match| {
+                    counter += 1;
+                    // Replace every other match
+                    if counter % 2 == 0 {
+                        Some("func".to_string())
+                    } else {
+                        None
+                    }
+                });
+                std::hint::black_box(new_tree);
+            });
+        });
+
+        // Complex regex replace
+        group.bench_with_input(BenchmarkId::new("regex_replace", size), size, |b, _| {
+            b.iter(|| {
+                let options = SearchOptions {
+                    regex: true,
+                    ..Default::default()
+                };
+                let new_tree = tree.replace_all(r"function_(\d+)", "fn_$1", options);
+                std::hint::black_box(new_tree);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Benchmark incremental search (search_next)
+fn bench_incremental_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("incremental_search");
+
+    for size in [1000, 10000, 100000].iter() {
+        let text = generate_document(*size);
+        let doc = Doc::from_str(&text);
+        let tree = doc.read();
+
+        // Find next occurrence
+        group.bench_with_input(BenchmarkId::new("search_next", size), size, |b, _| {
+            b.iter(|| {
+                let mut pos = 0;
+                let mut matches = Vec::new();
+
+                // Find first 10 matches incrementally
+                for _ in 0..10 {
+                    if let Some(m) = tree.search_next("let", pos, SearchOptions::default()) {
+                        pos = m.byte_range.end;
+                        matches.push(m);
+                    } else {
+                        break;
+                    }
+                }
+
+                std::hint::black_box(matches);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Benchmark search in documents with different characteristics
+fn bench_search_patterns(c: &mut Criterion) {
+    let mut group = c.benchmark_group("search_patterns");
+
+    // Document with many short lines (like a log file)
+    let short_lines = (0..10000)
+        .map(|i| format!("[INFO] Processing item {} completed\n", i))
+        .collect::<String>();
+
+    let doc_short = Doc::from_str(&short_lines);
+    let tree_short = doc_short.read();
+
+    group.bench_function("many_short_lines", |b| {
+        b.iter(|| {
+            let matches = tree_short.search("Processing", SearchOptions::default());
+            std::hint::black_box(matches);
+        });
+    });
+
+    // Document with very long lines (like minified code)
+    let long_line = "function ".repeat(1000) + &"x".repeat(10000);
+    let doc_long = Doc::from_str(&long_line);
+    let tree_long = doc_long.read();
+
+    group.bench_function("very_long_lines", |b| {
+        b.iter(|| {
+            let matches = tree_long.search("function", SearchOptions::default());
+            std::hint::black_box(matches);
+        });
+    });
+
+    // Document with Unicode content
+    let unicode_text = "Hello 世界 function 测试 variable 函数 ".repeat(1000);
+    let doc_unicode = Doc::from_str(&unicode_text);
+    let tree_unicode = doc_unicode.read();
+
+    group.bench_function("unicode_search", |b| {
+        b.iter(|| {
+            let matches = tree_unicode.search("函数", SearchOptions::default());
+            std::hint::black_box(matches);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_insert,
@@ -373,7 +568,11 @@ criterion_group!(
     bench_deletion,
     bench_tree_traversal,
     bench_memory_usage,
-    bench_realistic_session
+    bench_realistic_session,
+    bench_search,
+    bench_replace,
+    bench_incremental_search,
+    bench_search_patterns
 );
 
 criterion_main!(benches);
