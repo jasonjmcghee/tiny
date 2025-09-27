@@ -5,15 +5,16 @@
 use lsp_types::{
     notification::{Notification, PublishDiagnostics},
     request::{Initialize, Request, Shutdown},
-    ClientCapabilities, Diagnostic as LspDiagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, NumberOrString, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentSyncCapability, TextDocumentSyncKind, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, Uri,
+    ClientCapabilities, Diagnostic as LspDiagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, NumberOrString, Position,
+    PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncCapability, TextDocumentSyncKind,
+    Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 };
 use serde::{Deserialize, Serialize};
-use url::Url;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -22,8 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use url::Url;
 
 /// LSP request types for the background thread
 #[derive(Debug, Clone)]
@@ -86,7 +86,8 @@ pub struct LspManager {
 }
 
 /// Global LSP manager instance (initialized once)
-static LSP_INSTANCE: std::sync::OnceLock<Arc<Mutex<Option<Arc<LspManager>>>>> = std::sync::OnceLock::new();
+static LSP_INSTANCE: std::sync::OnceLock<Arc<Mutex<Option<Arc<LspManager>>>>> =
+    std::sync::OnceLock::new();
 
 impl LspManager {
     /// Create a new LSP manager for Rust files
@@ -102,7 +103,12 @@ impl LspManager {
         // Spawn background thread for LSP communication
         let version_clone = current_version.clone();
         thread::spawn(move || {
-            if let Err(e) = run_lsp_client(request_rx, diagnostics_tx, workspace_root_clone, version_clone) {
+            if let Err(e) = run_lsp_client(
+                request_rx,
+                diagnostics_tx,
+                workspace_root_clone,
+                version_clone,
+            ) {
                 eprintln!("LSP client error: {}", e);
             }
         });
@@ -146,7 +152,9 @@ impl LspManager {
     }
 
     /// Get or create the global LSP manager instance
-    pub fn get_or_create_global(workspace_root: Option<PathBuf>) -> Result<Arc<LspManager>, std::io::Error> {
+    pub fn get_or_create_global(
+        workspace_root: Option<PathBuf>,
+    ) -> Result<Arc<LspManager>, std::io::Error> {
         let instance_lock = LSP_INSTANCE.get_or_init(|| Arc::new(Mutex::new(None)));
 
         let mut instance_guard = instance_lock.lock().unwrap();
@@ -154,7 +162,10 @@ impl LspManager {
         if let Some(ref existing) = *instance_guard {
             // Check if we can reuse the existing instance (same workspace)
             if existing.workspace_root == workspace_root {
-                eprintln!("LSP: Reusing existing instance for workspace: {:?}", workspace_root);
+                eprintln!(
+                    "LSP: Reusing existing instance for workspace: {:?}",
+                    workspace_root
+                );
                 return Ok(existing.clone());
             }
             // Different workspace, shutdown the old one
@@ -163,7 +174,10 @@ impl LspManager {
         }
 
         // Create new instance
-        eprintln!("LSP: Creating new LSP instance for workspace: {:?}", workspace_root);
+        eprintln!(
+            "LSP: Creating new LSP instance for workspace: {:?}",
+            workspace_root
+        );
         let new_manager = Arc::new(Self::new_for_rust(workspace_root)?);
         *instance_guard = Some(new_manager.clone());
 
@@ -173,20 +187,26 @@ impl LspManager {
     /// Pre-warm the LSP for faster startup
     pub fn prewarm_for_workspace(workspace_root: Option<PathBuf>) {
         eprintln!("LSP: Starting pre-warm for workspace: {:?}", workspace_root);
-        std::thread::spawn(move || {
-            match Self::get_or_create_global(workspace_root.clone()) {
+        std::thread::spawn(
+            move || match Self::get_or_create_global(workspace_root.clone()) {
                 Ok(_manager) => {
-                    eprintln!("LSP: Successfully pre-warmed rust-analyzer for {:?}", workspace_root);
+                    eprintln!(
+                        "LSP: Successfully pre-warmed rust-analyzer for {:?}",
+                        workspace_root
+                    );
                 }
                 Err(e) => {
                     eprintln!("LSP: Failed to pre-warm: {}", e);
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Load cached diagnostics if available and valid
-    pub fn load_cached_diagnostics(file_path: &PathBuf, content: &str) -> Option<Vec<ParsedDiagnostic>> {
+    pub fn load_cached_diagnostics(
+        file_path: &PathBuf,
+        content: &str,
+    ) -> Option<Vec<ParsedDiagnostic>> {
         let cache_key = Self::compute_cache_key(file_path, content)?;
         let cache_file = Self::get_cache_path(&cache_key);
 
@@ -200,8 +220,14 @@ impl LspManager {
                 if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
                     if let Ok(cached) = serde_json::from_str::<CachedDiagnostics>(&cache_content) {
                         // Cache is valid if file hasn't been modified and content hash matches
-                        if cached.modification_time <= mod_time && cached.content_hash == Self::hash_content(content) {
-                            eprintln!("LSP: Loaded {} cached diagnostics for {:?}", cached.diagnostics.len(), file_path);
+                        if cached.modification_time <= mod_time
+                            && cached.content_hash == Self::hash_content(content)
+                        {
+                            eprintln!(
+                                "LSP: Loaded {} cached diagnostics for {:?}",
+                                cached.diagnostics.len(),
+                                file_path
+                            );
                             return Some(cached.diagnostics);
                         }
                     }
@@ -279,7 +305,10 @@ fn run_lsp_client(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    eprintln!("LSP: rust-analyzer process started with PID: {:?}", child.id());
+    eprintln!(
+        "LSP: rust-analyzer process started with PID: {:?}",
+        child.id()
+    );
 
     let mut stdin = child.stdin.take().expect("Failed to get stdin");
     let stdout = child.stdout.take().expect("Failed to get stdout");
@@ -326,10 +355,12 @@ fn run_lsp_client(
                     LspRequest::Initialize { file_path, text } => {
                         if !initialized {
                             // Send initialize request
-                            let root_uri = workspace_root.as_ref()
+                            let root_uri = workspace_root
+                                .as_ref()
                                 .and_then(|p| Url::from_file_path(p).ok())
-                                .or_else(|| file_path.parent()
-                                    .and_then(|p| Url::from_file_path(p).ok()))
+                                .or_else(|| {
+                                    file_path.parent().and_then(|p| Url::from_file_path(p).ok())
+                                })
                                 .map(|url| Uri::from_str(url.as_str()).unwrap());
 
                             send_initialize(&mut stdin, &mut next_id, root_uri)?;
@@ -345,8 +376,8 @@ fn run_lsp_client(
                         }
 
                         // Open the document
-                        let file_url = Url::from_file_path(&file_path)
-                            .map_err(|_| "Invalid file path")?;
+                        let file_url =
+                            Url::from_file_path(&file_path).map_err(|_| "Invalid file path")?;
                         let file_uri = Uri::from_str(file_url.as_str()).unwrap();
                         *current_file.write().unwrap() = Some(file_uri.clone());
                         last_text = text.clone();
@@ -358,8 +389,8 @@ fn run_lsp_client(
                         last_change_time = std::time::Instant::now();
                     }
                     LspRequest::DocumentSaved { path, text } => {
-                        let file_url = Url::from_file_path(&path)
-                            .map_err(|_| "Invalid file path")?;
+                        let file_url =
+                            Url::from_file_path(&path).map_err(|_| "Invalid file path")?;
                         let file_uri = Uri::from_str(file_url.as_str()).unwrap();
                         send_did_save(&mut stdin, &file_uri, Some(&text))?;
                     }
@@ -424,7 +455,6 @@ fn handle_lsp_responses(
 
             // Parse and handle the message
             if let Ok(content) = String::from_utf8(buffer) {
-                eprintln!("LSP: Raw message: {}", content.chars().take(200).collect::<String>());
                 match serde_json::from_str::<JsonRpcMessage>(&content) {
                     Ok(msg) => {
                         handle_lsp_message(msg, &diagnostics_tx, &current_file);
@@ -442,20 +472,18 @@ fn handle_lsp_responses(
 fn handle_lsp_message(
     msg: JsonRpcMessage,
     diagnostics_tx: &mpsc::Sender<DiagnosticUpdate>,
-    current_file: &Arc<RwLock<Option<Uri>>>
+    current_file: &Arc<RwLock<Option<Uri>>>,
 ) {
     if let Some(method) = msg.method {
         if method == "textDocument/publishDiagnostics" {
             if let Some(params) = msg.params {
-                if let Ok(publish_params) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
+                if let Ok(publish_params) =
+                    serde_json::from_value::<PublishDiagnosticsParams>(params)
+                {
                     // Only process diagnostics for the currently open file
                     if let Ok(current_uri_guard) = current_file.read() {
                         if let Some(ref current_uri) = *current_uri_guard {
                             if publish_params.uri == *current_uri {
-                                // Only log if we actually have diagnostics
-                            if !publish_params.diagnostics.is_empty() {
-                                eprintln!("LSP: Got {} diagnostics for current file", publish_params.diagnostics.len());
-                            }
                                 let diagnostics = parse_diagnostics(publish_params.diagnostics);
                                 let update = DiagnosticUpdate {
                                     diagnostics,
@@ -479,7 +507,9 @@ fn parse_diagnostics(lsp_diagnostics: Vec<LspDiagnostic>) -> Vec<ParsedDiagnosti
         .flat_map(|d| {
             let severity = match d.severity {
                 Some(DiagnosticSeverity::ERROR) => diagnostics_plugin::DiagnosticSeverity::Error,
-                Some(DiagnosticSeverity::WARNING) => diagnostics_plugin::DiagnosticSeverity::Warning,
+                Some(DiagnosticSeverity::WARNING) => {
+                    diagnostics_plugin::DiagnosticSeverity::Warning
+                }
                 _ => diagnostics_plugin::DiagnosticSeverity::Info,
             };
 
@@ -531,10 +561,12 @@ fn parse_diagnostics(lsp_diagnostics: Vec<LspDiagnostic>) -> Vec<ParsedDiagnosti
 
 // === JSON-RPC Message Senders ===
 
-fn send_message(writer: &mut dyn Write, msg: &JsonRpcMessage) -> Result<(), Box<dyn std::error::Error>> {
+fn send_message(
+    writer: &mut dyn Write,
+    msg: &JsonRpcMessage,
+) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string(msg)?;
     let content_length = json.len();
-    eprintln!("LSP: Sending {} chars: {}", content_length, json.chars().take(200).collect::<String>());
     write!(writer, "Content-Length: {}\r\n\r\n{}", content_length, json)?;
     writer.flush()?;
     Ok(())

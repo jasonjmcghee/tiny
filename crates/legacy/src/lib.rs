@@ -17,6 +17,7 @@ pub mod io;
 pub mod diagnostics_manager;
 pub mod line_numbers_plugin;
 pub mod lsp_manager;
+pub mod lsp_service;
 pub use diagnostics_plugin;
 pub mod render;
 pub mod syntax;
