@@ -17,6 +17,8 @@ unsafe impl Sync for DocPtr {}
 pub struct LineNumbersPlugin {
     /// Whether to show line numbers
     pub enabled: bool,
+    // The width
+    pub width: f32,
     /// X position for line numbers (offset from margin)
     pub line_number_offset: f32,
     /// Reference to the document (for line count)
@@ -27,6 +29,7 @@ impl LineNumbersPlugin {
     pub fn new() -> Self {
         Self {
             enabled: true,
+            width: 60.0,
             line_number_offset: -50.0, // Default offset to the left of text
             doc: None,
         }

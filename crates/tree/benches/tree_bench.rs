@@ -512,6 +512,79 @@ fn bench_incremental_search(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark cached vs uncached search patterns
+fn bench_searcher_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("searcher_cache");
+
+    let text = generate_document(10000);
+    let doc = Doc::from_str(&text);
+    let tree = doc.read();
+
+    // Benchmark repeated searches with same pattern (should hit cache)
+    group.bench_function("repeated_same_pattern", |b| {
+        b.iter(|| {
+            // Simulate incremental search as user types
+            let patterns = ["f", "fu", "fun", "func", "funct", "functi", "functio", "function"];
+            let mut results = Vec::new();
+
+            for pattern in &patterns {
+                let matches = tree.search(pattern, SearchOptions::default());
+                results.push(matches.len());
+            }
+
+            std::hint::black_box(results);
+        });
+    });
+
+    // Benchmark searches with different patterns (cache misses)
+    group.bench_function("different_patterns", |b| {
+        b.iter(|| {
+            let patterns = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+            let mut results = Vec::new();
+
+            for pattern in &patterns {
+                let matches = tree.search(pattern, SearchOptions::default());
+                results.push(matches.len());
+            }
+
+            std::hint::black_box(results);
+        });
+    });
+
+    // Benchmark the same pattern searched many times (maximum cache benefit)
+    group.bench_function("same_pattern_100x", |b| {
+        b.iter(|| {
+            let mut count = 0;
+            for _ in 0..100 {
+                let matches = tree.search("variable", SearchOptions::default());
+                count += matches.len();
+            }
+            std::hint::black_box(count);
+        });
+    });
+
+    // Benchmark with different search options (tests cache key discrimination)
+    group.bench_function("same_pattern_different_options", |b| {
+        b.iter(|| {
+            let mut results = Vec::new();
+
+            // Same pattern, different options
+            let options1 = SearchOptions { case_sensitive: true, ..Default::default() };
+            let options2 = SearchOptions { case_sensitive: false, ..Default::default() };
+            let options3 = SearchOptions { whole_word: true, ..Default::default() };
+
+            results.push(tree.search("test", options1).len());
+            results.push(tree.search("test", options2).len());
+            results.push(tree.search("test", options3).len());
+
+            // Should all create different cache entries
+            std::hint::black_box(results);
+        });
+    });
+
+    group.finish();
+}
+
 /// Benchmark search in documents with different characteristics
 fn bench_search_patterns(c: &mut Criterion) {
     let mut group = c.benchmark_group("search_patterns");
@@ -572,6 +645,7 @@ criterion_group!(
     bench_search,
     bench_replace,
     bench_incremental_search,
+    bench_searcher_cache,
     bench_search_patterns
 );
 

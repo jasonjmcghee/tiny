@@ -16,6 +16,9 @@ use tiny_core::{
 use tiny_sdk::{GlyphInstance, LayoutPos, ServiceRegistry};
 use tiny_sdk::{PaintContext, Paintable};
 
+const FILE_EXPLORER_WIDTH: f32 = 0.0;
+const STATUS_BAR_HEIGHT: f32 = 0.0;
+
 // Plugin state synchronization
 #[derive(Clone, Debug)]
 struct PluginState {
@@ -144,7 +147,7 @@ impl Renderer {
             service_registry: ServiceRegistry::new(),
             line_numbers_plugin: None,
             // Default editor bounds - will be updated based on layout
-            editor_bounds: tiny_sdk::types::LayoutRect::new(60.0, 0.0, 800.0, 600.0),
+            editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
             line_number_glyphs: Vec::new(),
         }
@@ -412,12 +415,22 @@ impl Renderer {
         self.viewport.resize(width, height, scale_factor);
         self.layout_dirty = true;
 
+        let mut offset_x = 0.0;
+        let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT;
+        if let Some(plugin_ptr) = self.line_numbers_plugin {
+            let plugin = unsafe { &*plugin_ptr };
+            offset_x = plugin.width;
+
+            // File explorer
+            offset_x += FILE_EXPLORER_WIDTH;
+        }
+
         // Update editor bounds based on new viewport size
         self.editor_bounds = tiny_sdk::types::LayoutRect::new(
-            60.0, // Start after line numbers
-            self.viewport.global_margin.y.0,
-            width - 60.0, // Rest of the width
-            height - self.viewport.global_margin.y.0,
+            offset_x, // Start after line numbers
+            offset_y,
+            width - offset_x, // Rest of the width
+            height - offset_y,
         );
     }
 
@@ -520,21 +533,27 @@ impl Renderer {
             // Paint foreground layers (cursor)
             self.paint_layers(pass, false);
 
-            // === DRAW LINE NUMBERS LAST (with separate buffer) ===
-            // Set scissor rect for line numbers (left panel)
-            pass.set_scissor_rect(
-                0,
-                (self.viewport.global_margin.y.0 * scale) as u32,
-                (60.0 * scale) as u32,
-                ((self.viewport.logical_size.height.0 - self.viewport.global_margin.y.0) * scale) as u32,
-            );
+            if let Some(plugin_ptr) = self.line_numbers_plugin {
+                let plugin = unsafe { &*plugin_ptr };
 
-            // Draw line numbers using dedicated buffer (won't conflict with main text)
-            if !self.line_number_glyphs.is_empty() {
-                if let Some(gpu) = self.gpu_renderer {
-                    unsafe {
-                        let gpu_renderer = &*gpu;
-                        gpu_renderer.draw_line_number_glyphs(pass, &self.line_number_glyphs);
+                let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT;
+
+                // === DRAW LINE NUMBERS LAST (with separate buffer) ===
+                // Set scissor rect for line numbers (left panel)
+                pass.set_scissor_rect(
+                    (FILE_EXPLORER_WIDTH * scale) as u32,
+                    (offset_y * scale) as u32,
+                    ((plugin.width) * scale) as u32,
+                    ((self.viewport.logical_size.height.0 - offset_y) * scale) as u32,
+                );
+
+                // Draw line numbers using dedicated buffer (won't conflict with main text)
+                if !self.line_number_glyphs.is_empty() {
+                    if let Some(gpu) = self.gpu_renderer {
+                        unsafe {
+                            let gpu_renderer = &*gpu;
+                            gpu_renderer.draw_line_number_glyphs(pass, &self.line_number_glyphs);
+                        }
                     }
                 }
             }
@@ -654,42 +673,6 @@ impl Renderer {
         }
     }
 
-    fn paint_line_numbers(&mut self, pass: &mut wgpu::RenderPass) {
-        // Paint line numbers plugin with its own viewport
-        if let Some(plugin_ptr) = self.line_numbers_plugin {
-            if let Some(gpu) = self.gpu_renderer {
-                let gpu_renderer = unsafe { &*gpu };
-
-                // Create bounds for line numbers (60px wide strip on the left)
-                let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
-                    self.viewport.global_margin.x.0,
-                    self.viewport.global_margin.y.0,
-                    60.0, // Fixed width for line numbers
-                    self.viewport.logical_size.height.0,
-                );
-
-                let widget_viewport = tiny_sdk::types::WidgetViewport {
-                    bounds: line_numbers_bounds,
-                    scroll: tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0), // Sync vertical scroll
-                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                    widget_id: 1, // Line numbers widget ID
-                };
-
-                let ctx = PaintContext::new(
-                    self.viewport.to_viewport_info(),
-                    gpu_renderer.device_arc(),
-                    gpu_renderer.queue_arc(),
-                    gpu as *mut _,
-                    &self.service_registry,
-                )
-                .with_widget_viewport(widget_viewport);
-
-                let plugin = unsafe { &*plugin_ptr };
-                plugin.paint(&ctx, pass);
-            }
-        }
-    }
-
     fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
         // Paint other plugins (cursor, selection, etc.)
         self.paint_plugins(pass, background);
@@ -777,9 +760,9 @@ impl Renderer {
 
             // Use the collect_glyphs method to get glyphs
             let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
-                self.viewport.global_margin.x.0,
+                self.viewport.global_margin.x.0 + FILE_EXPLORER_WIDTH,
                 self.viewport.global_margin.y.0,
-                60.0,
+                plugin.width,
                 self.viewport.logical_size.height.0 - self.viewport.global_margin.y.0,
             );
 

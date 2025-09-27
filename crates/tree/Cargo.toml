@@ -16,6 +16,7 @@ simdutf8 = "0.1.5"  # SIMD-UTF8
 bytecount = "0.6.9" # SIMD byte counting (Faster than others)
 regex = "1.11.3"
 aho-corasick = "1.1.3"
+ahash.workspace = true
 
 [dev-dependencies]
 criterion = "0.7"  # Benchmarking

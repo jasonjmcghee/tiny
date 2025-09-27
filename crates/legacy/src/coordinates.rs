@@ -594,7 +594,7 @@ impl Viewport {
     }
 
     /// Clamp scroll position to document bounds
-    pub fn clamp_scroll_to_bounds(&mut self, tree: &DocTree) {
+    pub fn clamp_scroll_to_bounds(&mut self, tree: &DocTree, bounds: LayoutRect) {
         // Invalidate cache if it might be stale (temporary fix)
         self.cached_doc_bounds = None;
 
@@ -604,9 +604,9 @@ impl Viewport {
         // Maximum scroll = document width - viewport width + small padding
         // This ensures we can see the end of the line but can't scroll into empty space
 
-        // Account for line numbers taking up 60 pixels on the left
-        let line_numbers_width = 60.0;
-        let viewport_width = self.logical_size.width.0 - line_numbers_width;
+        // Account for the location of the bounds
+        let viewport_width = self.logical_size.width.0 - bounds.x.0;
+        let viewport_height = self.logical_size.height.0 - bounds.y.0;
 
         // At maximum scroll, we want the last part of the line visible
         // Maximum scroll should be: doc_width - viewport_width
@@ -614,7 +614,7 @@ impl Viewport {
         let max_scroll_x = (doc_width - viewport_width).max(0.0);
 
         // For vertical, standard scrolling
-        let max_scroll_y = (doc_height - self.logical_size.height.0).max(0.0);
+        let max_scroll_y = (doc_height - viewport_height).max(0.0);
 
         // Apply the clamping
         self.scroll.x.0 = self.scroll.x.0.clamp(0.0, max_scroll_x);

@@ -667,7 +667,10 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                                                 // Clamp scroll to bounds using doc from editor directly
                                                 let tree = editor.plugin.doc.read();
-                                                cpu_renderer.viewport.clamp_scroll_to_bounds(&tree);
+
+                                                cpu_renderer.viewport.clamp_scroll_to_bounds(
+                                                    &tree, cpu_renderer.editor_bounds
+                                                );
 
                                                 // Clear the scroll so it doesn't keep applying
                                                 editor.pending_scroll = None;
@@ -794,7 +797,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     // Apply document-based scroll bounds
                     let doc = self.logic.doc();
                     let tree = doc.read();
-                    viewport.clamp_scroll_to_bounds(&tree);
+                    viewport.clamp_scroll_to_bounds(&tree, cpu_renderer.editor_bounds);
 
                     if let Some(window) = &self.window {
                         window.request_redraw();

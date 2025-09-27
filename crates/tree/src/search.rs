@@ -2,7 +2,9 @@
 
 use super::*;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use ahash::AHashMap;
 use regex::Regex;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -42,6 +44,72 @@ impl Default for SearchOptions {
     }
 }
 
+// === Search Cache ===
+
+// Thread-local cache for compiled searchers (each thread has its own to avoid locking)
+thread_local! {
+    static SEARCHER_CACHE: RefCell<SearcherCache> = RefCell::new(SearcherCache::new());
+}
+
+/// Cache for compiled search patterns to avoid recompilation
+struct SearcherCache {
+    // Cache key is (pattern, case_sensitive, whole_word, is_regex)
+    cache: AHashMap<(String, bool, bool, bool), Arc<SearchEngine>>,
+    max_size: usize,
+    // Simple LRU: track access order
+    access_order: Vec<(String, bool, bool, bool)>,
+}
+
+impl SearcherCache {
+    fn new() -> Self {
+        Self {
+            cache: AHashMap::new(),
+            max_size: 32, // Keep last 32 patterns
+            access_order: Vec::new(),
+        }
+    }
+
+    fn get_or_create(&mut self, pattern: &str, options: &SearchOptions) -> Arc<SearchEngine> {
+        let key = (pattern.to_string(), options.case_sensitive, options.whole_word, options.regex);
+
+        // Check if we have it cached
+        if let Some(engine) = self.cache.get(&key) {
+            // Move to end of access order (most recently used)
+            self.access_order.retain(|k| k != &key);
+            self.access_order.push(key.clone());
+            return Arc::clone(engine);
+        }
+
+        // Create new searcher
+        let engine = Arc::new(if options.regex {
+            SearchEngine::Regex(RegexSearcher::new(pattern, options))
+        } else {
+            SearchEngine::Plain(PlainSearcher::new(pattern, options))
+        });
+
+        // Add to cache
+        self.cache.insert(key.clone(), Arc::clone(&engine));
+        self.access_order.push(key);
+
+        // Evict oldest if cache is too large
+        if self.cache.len() > self.max_size {
+            if let Some(oldest) = self.access_order.first().cloned() {
+                self.access_order.remove(0);
+                self.cache.remove(&oldest);
+            }
+        }
+
+        engine
+    }
+
+    /// Clear the cache (useful for testing)
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.access_order.clear();
+    }
+}
+
 // === Tree Search Implementation ===
 
 impl Tree {
@@ -52,14 +120,14 @@ impl Tree {
         }
 
         let mut matches = Vec::new();
-        let searcher = if options.regex {
-            SearchEngine::Regex(RegexSearcher::new(pattern, &options))
-        } else {
-            SearchEngine::Plain(PlainSearcher::new(pattern, &options))
-        };
+
+        // Get cached searcher or create new one
+        let searcher = SEARCHER_CACHE.with(|cache| {
+            cache.borrow_mut().get_or_create(pattern, &options)
+        });
 
         let mut cursor = self.cursor();
-        cursor.search_with_engine(searcher, &mut matches, options.limit);
+        cursor.search_with_engine_arc(searcher, &mut matches, options.limit);
         matches
     }
 
@@ -257,16 +325,26 @@ impl RegexSearcher {
 // === Cursor Search Extensions ===
 
 impl<'a> TreeCursor<'a> {
+    /// Search using an Arc'd engine (for cache sharing)
+    pub(super) fn search_with_engine_arc(
+        &mut self,
+        engine: Arc<SearchEngine>,
+        matches: &mut Vec<SearchMatch>,
+        limit: Option<usize>,
+    ) {
+        self.search_with_engine(&*engine, matches, limit)
+    }
+
     pub(super) fn search_with_engine(
         &mut self,
-        engine: SearchEngine,
+        engine: &SearchEngine,
         matches: &mut Vec<SearchMatch>,
         limit: Option<usize>,
     ) {
         self.reset();
 
         // Buffer to handle patterns spanning boundaries
-        let max_pattern_len = match &engine {
+        let max_pattern_len = match engine {
             SearchEngine::Plain(p) => p.pattern.len(),
             SearchEngine::Regex(_) => 100, // Reasonable max for regex patterns
         };
@@ -303,7 +381,7 @@ impl<'a> TreeCursor<'a> {
                                 &overlap_buffer,
                                 overlap_start,
                                 prev_line,
-                                &engine,
+                                engine,
                                 matches,
                                 limit,
                             );
@@ -314,7 +392,7 @@ impl<'a> TreeCursor<'a> {
                             bytes,
                             *offset,
                             current_line_offset,
-                            &engine,
+                            engine,
                             matches,
                             limit,
                         );

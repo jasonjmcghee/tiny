@@ -3047,6 +3047,7 @@ dependencies = [
 name = "tiny-tree"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "aho-corasick",
  "arc-swap",
  "bytecount",
