@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tiny_font::{create_glyph_instances, measure_text_width, SharedFontSystem};
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
@@ -89,11 +89,11 @@ pub struct DiagnosticsPlugin {
     // Viewport info
     viewport: ViewportInfo,
 
-    // GPU resources
-    vertex_buffer: Option<Buffer>,
-    vertex_buffer_id: Option<BufferId>,
-    popup_vertex_buffer: Option<Buffer>,
-    popup_vertex_buffer_id: Option<BufferId>,
+    // GPU resources (RwLock for interior mutability in paint())
+    vertex_buffer: RwLock<Option<Buffer>>,
+    vertex_buffer_id: RwLock<Option<BufferId>>,
+    popup_vertex_buffer: RwLock<Option<Buffer>>,
+    popup_vertex_buffer_id: RwLock<Option<BufferId>>,
     custom_pipeline_id: Option<PipelineId>,
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
@@ -104,18 +104,9 @@ impl DiagnosticsPlugin {
     pub fn new() -> Self {
         use tiny_sdk::{LogicalSize, PhysicalSize};
 
-        // Hard-coded test diagnostic
-        let test_diagnostic = Diagnostic {
-            line: 4, // Line 5 (0-indexed)
-            column_range: (10, 20),
-            byte_range: None,
-            message: "Type error: expected string,\ngot number".to_string(),
-            severity: DiagnosticSeverity::Error,
-        };
-
         Self {
             config: DiagnosticsConfig::default(),
-            diagnostics: vec![test_diagnostic],
+            diagnostics: Vec::new(),  // Start empty, LSP will provide real diagnostics
             line_texts: HashMap::new(),
             hovered_diagnostic: None,
             mouse_position: (0.0, 0.0),
@@ -132,10 +123,10 @@ impl DiagnosticsPlugin {
                 margin: LayoutPos::new(60.0, 10.0),
                 global_margin: LayoutPos::new(0.0, 0.0),
             },
-            vertex_buffer: None,
-            vertex_buffer_id: None,
-            popup_vertex_buffer: None,
-            popup_vertex_buffer_id: None,
+            vertex_buffer: RwLock::new(None),
+            vertex_buffer_id: RwLock::new(None),
+            popup_vertex_buffer: RwLock::new(None),
+            popup_vertex_buffer_id: RwLock::new(None),
             custom_pipeline_id: None,
             device: None,
             queue: None,
@@ -523,7 +514,8 @@ impl Initializable for DiagnosticsPlugin {
 
         // Create vertex buffers
         let vertex_size = std::mem::size_of::<DiagnosticVertex>();
-        let buffer_size = (vertex_size * 100) as u64; // Space for multiple diagnostics
+        // Each diagnostic creates 6 vertices (2 triangles), support up to 50 diagnostics
+        let buffer_size = (vertex_size * 6 * 50) as u64; // Space for 50 diagnostics
 
         // Buffer for squiggly lines
         let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -532,13 +524,13 @@ impl Initializable for DiagnosticsPlugin {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.vertex_buffer = Some(vertex_buffer);
+        *self.vertex_buffer.write().unwrap() = Some(vertex_buffer);
 
         let buffer_id = BufferId::create(
             buffer_size,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
-        self.vertex_buffer_id = Some(buffer_id);
+        *self.vertex_buffer_id.write().unwrap() = Some(buffer_id);
 
         // Buffer for popup backgrounds
         let popup_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -547,13 +539,13 @@ impl Initializable for DiagnosticsPlugin {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.popup_vertex_buffer = Some(popup_buffer);
+        *self.popup_vertex_buffer.write().unwrap() = Some(popup_buffer);
 
         let popup_buffer_id = BufferId::create(
             buffer_size,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
-        self.popup_vertex_buffer_id = Some(popup_buffer_id);
+        *self.popup_vertex_buffer_id.write().unwrap() = Some(popup_buffer_id);
 
         // Create shader and pipeline
         let shader_source = include_str!("shader.wgsl");
@@ -710,15 +702,42 @@ impl Paintable for DiagnosticsPlugin {
         if !vertices.is_empty() {
             let vertex_data = bytemuck::cast_slice(&vertices);
             let vertex_count = vertices.len() as u32;
+            let required_size = vertex_data.len() as u64;
 
-            if let Some(buffer_id) = self.vertex_buffer_id {
+            // Recreate buffer if it's too small
+            if let Some(device) = &self.device {
+                let needs_new_buffer = {
+                    let buffer = self.vertex_buffer.read().unwrap();
+                    buffer.is_none() || buffer.as_ref().map(|b| b.size() < required_size).unwrap_or(true)
+                };
+
+                if needs_new_buffer {
+                    // Create new buffer with exact size needed (plus some padding)
+                    let buffer_size = (required_size + 1024).max(required_size * 2); // Add padding for growth
+                    let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Diagnostics Vertex Buffer (Dynamic)"),
+                        size: buffer_size,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    *self.vertex_buffer.write().unwrap() = Some(new_buffer);
+
+                    let new_buffer_id = BufferId::create(
+                        buffer_size,
+                        wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    );
+                    *self.vertex_buffer_id.write().unwrap() = Some(new_buffer_id);
+                }
+            }
+
+            if let Some(buffer_id) = self.vertex_buffer_id.read().unwrap().as_ref() {
                 buffer_id.write(0, vertex_data);
 
                 if let Some(ref gpu_ctx) = ctx.gpu_context {
                     if let Some(pipeline_id) = self.custom_pipeline_id {
                         gpu_ctx.set_pipeline(render_pass, pipeline_id);
                         gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
-                        gpu_ctx.set_vertex_buffer(render_pass, 0, buffer_id);
+                        gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
                         gpu_ctx.draw(render_pass, vertex_count, 1);
                     }
                 }
@@ -733,15 +752,41 @@ impl Paintable for DiagnosticsPlugin {
                 if !popup_vertices.is_empty() {
                     let vertex_data = bytemuck::cast_slice(&popup_vertices);
                     let vertex_count = popup_vertices.len() as u32;
+                    let required_size = vertex_data.len() as u64;
 
-                    if let Some(buffer_id) = self.popup_vertex_buffer_id {
+                    // Recreate popup buffer if needed
+                    if let Some(device) = &self.device {
+                        let needs_new_buffer = {
+                            let buffer = self.popup_vertex_buffer.read().unwrap();
+                            buffer.is_none() || buffer.as_ref().map(|b| b.size() < required_size).unwrap_or(true)
+                        };
+
+                        if needs_new_buffer {
+                            let buffer_size = (required_size + 512).max(required_size * 2);
+                            let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("Diagnostics Popup Buffer (Dynamic)"),
+                                size: buffer_size,
+                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                            *self.popup_vertex_buffer.write().unwrap() = Some(new_buffer);
+
+                            let new_buffer_id = BufferId::create(
+                                buffer_size,
+                                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                            );
+                            *self.popup_vertex_buffer_id.write().unwrap() = Some(new_buffer_id);
+                        }
+                    }
+
+                    if let Some(buffer_id) = self.popup_vertex_buffer_id.read().unwrap().as_ref() {
                         buffer_id.write(0, vertex_data);
 
                         if let Some(ref gpu_ctx) = ctx.gpu_context {
                             if let Some(pipeline_id) = self.custom_pipeline_id {
                                 gpu_ctx.set_pipeline(render_pass, pipeline_id);
                                 gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
-                                gpu_ctx.set_vertex_buffer(render_pass, 0, buffer_id);
+                                gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
                                 gpu_ctx.draw(render_pass, vertex_count, 1);
                             }
                         }

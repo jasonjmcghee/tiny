@@ -15,6 +15,7 @@ pub mod input;
 pub mod input_types;
 pub mod io;
 pub mod line_numbers_plugin;
+pub mod lsp_manager;
 pub use diagnostics_plugin;
 pub mod render;
 pub mod syntax;
