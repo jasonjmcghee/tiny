@@ -102,8 +102,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let u = (px - min_x) / (max_x - min_x);
         let v = (py - min_y) / (max_y - min_y);
 
-        // return vec4<f32>(u, v, 1.0, 0.2);
-        return input.color;
+        return vec4<f32>(u, v, 1.0, 0.2);
+        // return input.color;
     } else {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0); // Transparent
     }

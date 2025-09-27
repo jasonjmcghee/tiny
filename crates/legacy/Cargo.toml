@@ -19,6 +19,7 @@ tiny-sdk = { path = "../sdk" }
 tiny-core = { path = "../core" }
 tiny-tree = { path = "../tree" }
 tiny-font = { path = "../font" }
+diagnostics-plugin = { path = "../plugins/diagnostics" }
 
 winit = { version = "0.30", optional = true }
 

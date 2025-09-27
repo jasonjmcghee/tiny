@@ -620,6 +620,21 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                 if let Some(point) = logical_point {
                     if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                        // Update diagnostics hover state
+                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                            if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
+                                let diagnostics = unsafe { &mut *diagnostics_ptr };
+                                // Create widget viewport for diagnostics
+                                let editor_viewport = tiny_sdk::types::WidgetViewport {
+                                    bounds: cpu_renderer.editor_bounds,
+                                    scroll: cpu_renderer.viewport.scroll,
+                                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                                    widget_id: 3,
+                                };
+                                diagnostics.set_mouse_position(point.x.0, point.y.0, Some(&editor_viewport), Some(&cpu_renderer.service_registry));
+                            }
+                        }
+
                         // Mouse move
                         if self.logic.on_mouse_move(point, &cpu_renderer.viewport) {
                             if let Some(window) = &self.window {
@@ -983,6 +998,34 @@ impl<T: AppLogic> TinyApp<T> {
                 // Set line numbers plugin with fresh document reference
                 cpu_renderer.set_line_numbers_plugin(&mut editor.line_numbers, &editor.plugin.doc);
 
+                // Set diagnostics plugin
+                cpu_renderer.set_diagnostics_plugin(&mut editor.diagnostics, &editor.plugin.doc);
+
+                // Initialize diagnostics plugin with GPU resources (first time only)
+                static mut DIAGNOSTICS_INITIALIZED: bool = false;
+                unsafe {
+                    if !DIAGNOSTICS_INITIALIZED {
+                        if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
+                            let diagnostics = &mut *diagnostics_ptr;
+                            if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
+                                let gpu_renderer = &*gpu;
+                                use tiny_sdk::Initializable;
+                                let mut setup_ctx = tiny_sdk::SetupContext {
+                                    device: gpu_renderer.device_arc(),
+                                    queue: gpu_renderer.queue_arc(),
+                                    registry: tiny_sdk::PluginRegistry::empty(),
+                                };
+                                if let Err(e) = diagnostics.setup(&mut setup_ctx) {
+                                    eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
+                                } else {
+                                    DIAGNOSTICS_INITIALIZED = true;
+                                    eprintln!("Diagnostics plugin initialized successfully");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Set up global margin (only once)
                 static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
                 unsafe {
@@ -1023,6 +1066,7 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Set up CPU renderer state
             cpu_renderer.set_gpu_renderer(gpu_renderer);
+
             let doc_read = doc.read();
             cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
             cpu_renderer.cached_doc_version = doc_read.version;
@@ -1042,6 +1086,8 @@ pub struct EditorLogic {
     pub plugin: TextEditorPlugin,
     /// Line numbers plugin
     pub line_numbers: crate::line_numbers_plugin::LineNumbersPlugin,
+    /// Diagnostics plugin
+    pub diagnostics: diagnostics_plugin::DiagnosticsPlugin,
     /// Flag to indicate widgets need updating
     widgets_dirty: bool,
     /// Extra text style providers (e.g., for effects)
@@ -1225,9 +1271,13 @@ impl EditorLogic {
         // Create line numbers plugin (document will be set each frame)
         let line_numbers = crate::line_numbers_plugin::LineNumbersPlugin::new();
 
+        // Create diagnostics plugin
+        let diagnostics = diagnostics_plugin::DiagnosticsPlugin::new();
+
         Self {
             plugin,
             line_numbers,
+            diagnostics,
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
             pending_scroll: None,

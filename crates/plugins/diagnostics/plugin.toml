@@ -1,0 +1,14 @@
+# Diagnostics plugin configuration
+
+[plugin]
+name = "diagnostics"
+version = "0.1.0"
+description = "Renders diagnostic squiggly lines and hover popups"
+author = "Tiny Editor"
+
+[config]
+# Popup appearance
+popup_background_color = 0x2D2D30FF  # Dark gray background
+popup_text_color = 0xCCCCCCFF       # Light gray text
+popup_border_color = 0x464647FF     # Border color
+popup_padding = 8.0                 # Padding inside popup

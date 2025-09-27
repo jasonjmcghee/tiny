@@ -110,6 +110,7 @@ pub struct Renderer {
     last_viewport_scroll: (f32, f32),
     pub service_registry: ServiceRegistry,
     pub line_numbers_plugin: Option<*mut crate::line_numbers_plugin::LineNumbersPlugin>,
+    pub diagnostics_plugin: Option<*mut diagnostics_plugin::DiagnosticsPlugin>,
     /// Editor widget bounds (where main text renders)
     pub editor_bounds: tiny_sdk::types::LayoutRect,
     /// Accumulated glyphs for batched rendering
@@ -146,6 +147,7 @@ impl Renderer {
             last_viewport_scroll: (0.0, 0.0),
             service_registry: ServiceRegistry::new(),
             line_numbers_plugin: None,
+            diagnostics_plugin: None,
             // Default editor bounds - will be updated based on layout
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
@@ -405,6 +407,20 @@ impl Renderer {
     ) {
         plugin.set_document(doc);
         self.line_numbers_plugin = Some(plugin as *mut _);
+    }
+
+    pub fn set_diagnostics_plugin(
+        &mut self,
+        plugin: &mut diagnostics_plugin::DiagnosticsPlugin,
+        _doc: &tree::Doc,
+    ) {
+        // Update the plugin's viewport info with the correct scale factor
+        plugin.set_viewport_info(self.viewport.to_viewport_info());
+        self.diagnostics_plugin = Some(plugin as *mut _);
+    }
+
+    pub fn get_gpu_renderer(&self) -> Option<*const GpuRenderer> {
+        self.gpu_renderer
     }
 
     pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
@@ -676,6 +692,37 @@ impl Renderer {
     fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
         // Paint other plugins (cursor, selection, etc.)
         self.paint_plugins(pass, background);
+
+        // Paint diagnostics plugin if present
+        if !background {  // Diagnostics renders on foreground (z-index 50)
+            if let Some(diagnostics_ptr) = self.diagnostics_plugin {
+                let diagnostics = unsafe { &*diagnostics_ptr };
+
+                if let Some(gpu) = self.gpu_renderer {
+                    let gpu_renderer = unsafe { &*gpu };
+
+                    // Create editor-specific viewport for diagnostics
+                    let editor_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: self.editor_bounds,
+                        scroll: self.viewport.scroll,
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 3, // Diagnostics widget ID
+                    };
+
+                    let mut ctx = PaintContext::new(
+                        self.viewport.to_viewport_info(),
+                        gpu_renderer.device_arc(),
+                        gpu_renderer.queue_arc(),
+                        gpu as *mut _,
+                        &self.service_registry,
+                    )
+                    .with_widget_viewport(editor_viewport);
+                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                    diagnostics.paint(&ctx, pass);
+                }
+            }
+        }
     }
 
     fn walk_visible_range_with_pass(
