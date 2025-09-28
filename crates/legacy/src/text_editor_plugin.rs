@@ -67,7 +67,9 @@ impl TextEditorPlugin {
         modifiers: &crate::input_types::Modifiers,
     ) -> bool {
         // Use on_key_with_renderer to ensure LSP changes are collected properly
-        let action = self.input.on_key_with_renderer(&self.doc, viewport, event, modifiers, None);
+        // Create a temporary event bus for compatibility
+        let mut temp_bus = crate::input::EventBus::new();
+        let action = self.input.on_key_with_renderer(&self.doc, viewport, event, modifiers, None, &mut temp_bus);
         self.handle_input_action(action)
     }
 

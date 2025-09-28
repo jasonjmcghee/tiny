@@ -4,7 +4,7 @@
 
 use crate::{
     diagnostics_manager::DiagnosticsManager,
-    input::{InputAction, InputHandler},
+    input::{EventBus, EventResult, InputAction, InputHandler},
     input_types, io,
     lsp_manager::LspManager,
     render::Renderer,
@@ -67,6 +67,7 @@ pub trait AppLogic: 'static {
         _viewport: &crate::coordinates::Viewport,
         _modifiers: &input_types::Modifiers,
         _renderer: Option<&mut crate::render::Renderer>,
+        _bus: &mut EventBus,
     ) -> bool {
         // Default fallback to regular on_key
         self.on_key(_key, _viewport, _modifiers)
@@ -227,6 +228,9 @@ pub struct TinyApp<T: AppLogic> {
     // Application-specific logic
     logic: T,
 
+    // Event bus for event-driven architecture
+    event_bus: EventBus,
+
     // Plugin orchestrator (will eventually move to core)
     orchestrator: PluginOrchestrator,
 
@@ -325,6 +329,7 @@ impl<T: AppLogic> TinyApp<T> {
             _shader_watcher: None,
             shader_reload_pending: Arc::new(AtomicBool::new(false)),
             logic,
+            event_bus: EventBus::new(),
             orchestrator: PluginOrchestrator::new(),
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
@@ -558,8 +563,64 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Convert winit event to proper JSON format for event bus
+                use serde_json::json;
+
+                // Build proper key data
+                let key_data = match &event.logical_key {
+                    winit::keyboard::Key::Character(ch) => json!({
+                        "type": "character",
+                        "value": ch.to_string(),
+                    }),
+                    winit::keyboard::Key::Named(named) => {
+                        use winit::keyboard::NamedKey;
+                        let name = match named {
+                            NamedKey::Enter => "Enter",
+                            NamedKey::Tab => "Tab",
+                            NamedKey::Backspace => "Backspace",
+                            NamedKey::Delete => "Delete",
+                            NamedKey::ArrowLeft => "ArrowLeft",
+                            NamedKey::ArrowRight => "ArrowRight",
+                            NamedKey::ArrowUp => "ArrowUp",
+                            NamedKey::ArrowDown => "ArrowDown",
+                            NamedKey::Home => "Home",
+                            NamedKey::End => "End",
+                            NamedKey::PageUp => "PageUp",
+                            NamedKey::PageDown => "PageDown",
+                            NamedKey::Space => "Space",
+                            NamedKey::F12 => "F12",
+                            _ => "Unknown",
+                        };
+                        json!({
+                            "type": "named",
+                            "value": name,
+                        })
+                    }
+                    _ => json!({
+                        "type": "unknown",
+                        "value": null,
+                    }),
+                };
+
+                self.event_bus.emit(
+                    "app.keyboard.keypress",
+                    json!({
+                        "key": key_data,
+                        "state": if event.state == ElementState::Pressed { "pressed" } else { "released" },
+                        "modifiers": {
+                            "shift": self.modifiers.state().shift_key(),
+                            "ctrl": self.modifiers.state().control_key(),
+                            "alt": self.modifiers.state().alt_key(),
+                            "cmd": self.modifiers.state().super_key(),
+                        }
+                    }),
+                    10, // Input priority
+                    "winit",
+                );
+
+                // Font size and scroll lock will be handled through event handlers
+                // Only emit these special events on key press (not release)
                 if event.state == ElementState::Pressed {
-                    // Check for font size adjustment (Cmd+= and Cmd+-)
                     #[cfg(target_os = "macos")]
                     let cmd_held = self.modifiers.state().super_key();
                     #[cfg(not(target_os = "macos"))]
@@ -568,59 +629,18 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     if cmd_held {
                         match &event.logical_key {
                             winit::keyboard::Key::Character(ch) if ch == "=" || ch == "+" => {
-                                self.adjust_font_size(true);
-                                return;
+                                self.event_bus.emit("app.action.font_increase", json!({}), 5, "winit");
                             }
                             winit::keyboard::Key::Character(ch) if ch == "-" => {
-                                self.adjust_font_size(false);
-                                return;
+                                self.event_bus.emit("app.action.font_decrease", json!({}), 5, "winit");
                             }
                             _ => {}
                         }
                     }
 
-                    // Check for scroll lock toggle (F12 key)
-                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) =
-                        event.logical_key
-                    {
-                        self.scroll_lock_enabled = !self.scroll_lock_enabled;
-                        self.current_scroll_direction = None; // Reset direction
-                        println!(
-                            "Scroll lock: {}",
-                            if self.scroll_lock_enabled {
-                                "ENABLED"
-                            } else {
-                                "DISABLED"
-                            }
-                        );
-                        return;
-                    }
-
-                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                        // Store old cursor position before handling the key
-                        let old_cursor_pos = self.logic.get_cursor_doc_pos();
-
-                        // Extract viewport to avoid borrow conflicts
-                        let viewport = cpu_renderer.viewport.clone();
-                        // Convert winit event to our types
-                        let key_event: input_types::KeyEvent = (&event).into();
-                        let should_redraw = self.logic.on_key_with_renderer(
-                            &key_event,
-                            &viewport,
-                            &self.modifiers,
-                            Some(cpu_renderer),
-                        );
-
-                        if should_redraw {
-                            // Check if cursor position changed
-                            let new_cursor_pos = self.logic.get_cursor_doc_pos();
-                            if old_cursor_pos != new_cursor_pos {
-                                self.cursor_needs_scroll = true;
-                            }
-
-                            self.update_window_title();
-                            self.request_redraw();
-                        }
+                    // F12 for scroll lock toggle
+                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) = event.logical_key {
+                        self.event_bus.emit("app.action.toggle_scroll_lock", json!({}), 5, "winit");
                     }
                 }
             }
@@ -679,7 +699,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             }
                         }
 
-                        // Mouse drag
+                        // Mouse drag - emit event
                         if self.mouse_pressed {
                             if let Some(from) = drag_from {
                                 // Check if drag started in titlebar area (for transparent titlebar on macOS)
@@ -688,51 +708,31 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                 #[cfg(not(target_os = "macos"))]
                                 let drag_started_in_titlebar = false;
 
-                                // Only pass drag to editor if drag didn't start in titlebar area
+                                // Only emit drag event if drag didn't start in titlebar area
                                 if !drag_started_in_titlebar {
-                                    // Store old cursor position before handling the drag
-                                    let old_cursor_pos = self.logic.get_cursor_doc_pos();
-
                                     // Convert screen coordinates to editor-local coordinates
                                     let editor_local_from = cpu_renderer.screen_to_editor_local(from);
                                     let editor_local_to = cpu_renderer.screen_to_editor_local(point);
 
-                                    if self.logic.on_drag(
-                                        editor_local_from,
-                                        editor_local_to,
-                                        &cpu_renderer.viewport,
-                                        &self.modifiers,
-                                    ) {
-                                        // Check if cursor position changed
-                                        let new_cursor_pos = self.logic.get_cursor_doc_pos();
-                                        if old_cursor_pos != new_cursor_pos {
-                                            self.cursor_needs_scroll = true;
-                                        }
-
-                                        // Apply pending scroll from EditorLogic
-                                        if let Some(editor) =
-                                            self.logic.as_any_mut().downcast_mut::<EditorLogic>()
-                                        {
-                                            if let Some((dx, dy)) = editor.pending_scroll {
-                                                cpu_renderer.viewport.scroll.x.0 += dx;
-                                                cpu_renderer.viewport.scroll.y.0 += dy;
-
-                                                // Clamp scroll to bounds using doc from editor directly
-                                                let tree = editor.plugin.doc.read();
-
-                                                cpu_renderer.viewport.clamp_scroll_to_bounds(
-                                                    &tree, cpu_renderer.editor_bounds
-                                                );
-
-                                                // Clear the scroll so it doesn't keep applying
-                                                editor.pending_scroll = None;
+                                    // Emit drag event
+                                    use serde_json::json;
+                                    self.event_bus.emit(
+                                        "app.mouse.drag",
+                                        json!({
+                                            "from_x": editor_local_from.x.0,
+                                            "from_y": editor_local_from.y.0,
+                                            "to_x": editor_local_to.x.0,
+                                            "to_y": editor_local_to.y.0,
+                                            "modifiers": {
+                                                "shift": self.modifiers.state().shift_key(),
+                                                "ctrl": self.modifiers.state().control_key(),
+                                                "alt": self.modifiers.state().alt_key(),
+                                                "cmd": self.modifiers.state().super_key(),
                                             }
-                                        }
-
-                                        if let Some(window) = &self.window {
-                                            window.request_redraw();
-                                        }
-                                    }
+                                        }),
+                                        10,
+                                        "winit",
+                                    );
                                 }
                             }
                         }
@@ -743,42 +743,49 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             WindowEvent::MouseInput { state, button, .. }
                 if button == winit::event::MouseButton::Left =>
             {
+                // Emit mouse events to the event bus
+                use serde_json::json;
+
+                // Update mouse state for drag tracking first
                 match state {
                     ElementState::Pressed => {
                         if let Some(position) = self.cursor_position {
                             self.mouse_pressed = true;
                             self.drag_start = Some(position);
 
+                            // Emit press event with editor-local coordinates
                             if let Some(point) = self.physical_to_logical_point(position) {
-                                // Check if click is in titlebar area (for transparent titlebar on macOS)
+                                // Check if click is in titlebar area
                                 #[cfg(target_os = "macos")]
                                 let is_in_titlebar = point.y.0 < self.title_bar_height;
                                 #[cfg(not(target_os = "macos"))]
                                 let is_in_titlebar = false;
 
-                                // Only pass click to editor if not in titlebar area
                                 if !is_in_titlebar {
-                                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                                        // Store old cursor position before handling the click
-                                        let old_cursor_pos = self.logic.get_cursor_doc_pos();
+                                    // Convert to editor-local coordinates if we have a renderer
+                                    let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
+                                        cpu_renderer.screen_to_editor_local(point)
+                                    } else {
+                                        point
+                                    };
 
-                                        // Convert screen coordinates to editor-local coordinates
-                                        let editor_local_point = cpu_renderer.screen_to_editor_local(point);
-
-                                        if self.logic.on_click(
-                                            editor_local_point,
-                                            &cpu_renderer.viewport,
-                                            &self.modifiers,
-                                        ) {
-                                            // Check if cursor position changed
-                                            let new_cursor_pos = self.logic.get_cursor_doc_pos();
-                                            if old_cursor_pos != new_cursor_pos {
-                                                self.cursor_needs_scroll = true;
+                                    self.event_bus.emit(
+                                        "app.mouse.press",
+                                        json!({
+                                            "x": editor_local.x.0,
+                                            "y": editor_local.y.0,
+                                            "button": "Left",
+                                            "state": "pressed",
+                                            "modifiers": {
+                                                "shift": self.modifiers.state().shift_key(),
+                                                "ctrl": self.modifiers.state().control_key(),
+                                                "alt": self.modifiers.state().alt_key(),
+                                                "cmd": self.modifiers.state().super_key(),
                                             }
-
-                                            self.request_redraw();
-                                        }
-                                    }
+                                        }),
+                                        10, // Input priority
+                                        "winit",
+                                    );
                                 }
                             }
                         }
@@ -787,8 +794,13 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                         self.mouse_pressed = false;
                         self.drag_start = None;
 
-                        // Clear drag state in editor
-                        self.logic.on_mouse_release();
+                        // Emit release event
+                        self.event_bus.emit(
+                            "app.mouse.release",
+                            json!({}),
+                            10,
+                            "winit",
+                        );
                     }
                 }
             }
@@ -798,6 +810,31 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // Emit mouse wheel event to the event bus
+                use serde_json::json;
+
+                let (delta_x, delta_y) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        (pos.x as f32, pos.y as f32)
+                    }
+                };
+
+                self.event_bus.emit(
+                    "app.mouse.scroll",
+                    json!({
+                        "delta_x": delta_x,
+                        "delta_y": delta_y,
+                        "type": match delta {
+                            winit::event::MouseScrollDelta::LineDelta(_, _) => "line",
+                            winit::event::MouseScrollDelta::PixelDelta(_) => "pixel",
+                        }
+                    }),
+                    15, // Slightly lower priority than direct input
+                    "winit",
+                );
+
+                // Keep existing scroll handling for now (will be replaced by event handlers)
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let (scroll_x, scroll_y) = match delta {
                         winit::event::MouseScrollDelta::LineDelta(x, y) => (
@@ -941,6 +978,99 @@ impl<T: AppLogic> TinyApp<T> {
         self._shader_watcher = Some(watcher);
     }
 
+    fn process_event_queue(&mut self) {
+        // Process all events in the queue
+        loop {
+            // Get events to process
+            let mut events_to_process = Vec::new();
+            std::mem::swap(&mut events_to_process, &mut self.event_bus.queued);
+
+            if events_to_process.is_empty() {
+                break;
+            }
+
+            // Sort by priority
+            events_to_process.sort_by_key(|e| e.priority);
+
+            // Process each event
+            for event in events_to_process {
+                // Handle app-level events
+                match event.name.as_str() {
+                    "app.action.font_increase" => {
+                        self.adjust_font_size(true);
+                        continue;
+                    }
+                    "app.action.font_decrease" => {
+                        self.adjust_font_size(false);
+                        continue;
+                    }
+                    "app.action.toggle_scroll_lock" => {
+                        self.scroll_lock_enabled = !self.scroll_lock_enabled;
+                        self.current_scroll_direction = None;
+                        println!(
+                            "Scroll lock: {}",
+                            if self.scroll_lock_enabled {
+                                "ENABLED"
+                            } else {
+                                "DISABLED"
+                            }
+                        );
+                        continue;
+                    }
+                    "app.mouse.release" => {
+                        self.logic.on_mouse_release();
+                        continue;
+                    }
+                    "app.drag.scroll" => {
+                        // Apply drag scroll delta
+                        if let (Some(dx), Some(dy)) = (
+                            event.data.get("delta_x").and_then(|v| v.as_f64()),
+                            event.data.get("delta_y").and_then(|v| v.as_f64())
+                        ) {
+                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                                cpu_renderer.viewport.scroll.x.0 += dx as f32;
+                                cpu_renderer.viewport.scroll.y.0 += dy as f32;
+
+                                // Clamp scroll to bounds
+                                if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                                    let tree = editor.plugin.doc.read();
+                                    cpu_renderer.viewport.clamp_scroll_to_bounds(
+                                        &tree, cpu_renderer.editor_bounds
+                                    );
+                                }
+
+                                self.request_redraw();
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Process with InputHandler for document events
+                if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                    let input_handler = &mut editor.plugin.input;
+                    let doc = &editor.plugin.doc;
+                    let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
+
+                    if let Some(viewport) = viewport {
+                        let action = input_handler.process_event(&event, doc, &viewport, &mut self.event_bus);
+
+                        if action != InputAction::None {
+                            let handled = editor.handle_input_action(action);
+                            if handled {
+                                self.request_redraw();
+                                self.update_window_title();
+                                self.cursor_needs_scroll = true;
+                            }
+                        }
+
+                    }
+                }
+            }
+        }
+    }
+
     fn update_frame_timing(&mut self) -> f32 {
         let current_time = std::time::Instant::now();
         let frame_duration = current_time.duration_since(self.last_frame_time);
@@ -954,6 +1084,10 @@ impl<T: AppLogic> TinyApp<T> {
     }
 
     fn render_frame(&mut self) {
+        // Process all queued events at the beginning of the frame
+        // This ensures events are handled before rendering
+        self.process_event_queue();
+
         // Check for pending shader reload
         if self.shader_reload_pending.load(Ordering::Relaxed) {
             if let Some(gpu_renderer) = &mut self.gpu_renderer {
@@ -1369,6 +1503,7 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &input_types::Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
+        bus: &mut EventBus,
     ) -> bool {
         let action = self.plugin.input.on_key_with_renderer(
             &self.plugin.doc,
@@ -1376,6 +1511,7 @@ impl AppLogic for EditorLogic {
             event,
             modifiers,
             renderer,
+            bus,
         );
         let result = self.handle_input_action(action);
 

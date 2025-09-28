@@ -8,13 +8,16 @@ use crate::input_types::{ElementState, Key, KeyEvent, Modifiers, MouseButton, Na
 use crate::lsp_manager::TextChange;
 use crate::syntax::SyntaxHighlighter;
 use arboard::Clipboard;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tiny_core::tree::{Content, Doc, Edit, Point, SearchOptions};
 use tiny_sdk::{DocPos, LayoutPos, LayoutRect};
 
 /// Actions that can be triggered by input
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputAction {
     None,
     Redraw,
@@ -123,6 +126,165 @@ impl Selection {
     }
 }
 
+/// Result of event handling
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EventResult {
+    Continue,
+    StopPropagation,
+}
+
+/// Event with JSON data payload
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub name: String,
+    pub data: Value,
+    pub priority: i32,
+    pub timestamp: Instant,
+    pub source: String,
+}
+
+/// Event handler callback type
+pub type EventHandler = Box<dyn FnMut(&Event, &mut EventBus) -> EventResult>;
+
+/// Global event bus for queuing and processing events
+pub struct EventBus {
+    pub queued: Vec<Event>,
+    processing: Vec<Event>,
+    handlers: HashMap<String, Vec<EventHandler>>,
+    patterns: Vec<(String, EventHandler)>,
+}
+
+impl EventBus {
+    /// Create a new event bus
+    pub fn new() -> Self {
+        Self {
+            queued: Vec::new(),
+            processing: Vec::new(),
+            handlers: HashMap::new(),
+            patterns: Vec::new(),
+        }
+    }
+
+    /// Emit an event to the queue
+    pub fn emit(&mut self, name: impl Into<String>, data: Value, priority: i32, source: impl Into<String>) {
+        self.queued.push(Event {
+            name: name.into(),
+            data,
+            priority,
+            timestamp: Instant::now(),
+            source: source.into(),
+        });
+    }
+
+    /// Register an event handler for a specific event or pattern
+    pub fn on(&mut self, pattern: impl Into<String>, handler: EventHandler) {
+        let pattern = pattern.into();
+        if pattern.contains('*') {
+            self.patterns.push((pattern, handler));
+        } else {
+            self.handlers.entry(pattern).or_default().push(handler);
+        }
+    }
+
+    /// Process all queued events
+    pub fn process_events(&mut self) {
+        // Swap buffers to avoid re-entrancy issues
+        std::mem::swap(&mut self.queued, &mut self.processing);
+
+        // Sort by priority (lower number = higher priority)
+        // Stable sort preserves insertion order for same priority
+        self.processing.sort_by_key(|e| e.priority);
+
+        // Process each event - we need to avoid borrow issues
+        while !self.processing.is_empty() {
+            let event = self.processing.remove(0);
+            let mut stop_propagation = false;
+
+            // Check for direct handlers
+            let has_direct_handlers = self.handlers.contains_key(&event.name);
+            if has_direct_handlers {
+                // We need to temporarily take the handlers to avoid borrow issues
+                let mut handlers = self.handlers.remove(&event.name).unwrap_or_default();
+                for handler in handlers.iter_mut() {
+                    if handler(&event, self) == EventResult::StopPropagation {
+                        stop_propagation = true;
+                        break;
+                    }
+                }
+                // Put the handlers back
+                self.handlers.insert(event.name.clone(), handlers);
+            }
+
+            // Pattern handlers (wildcards) if not stopped
+            if !stop_propagation {
+                // We need to process patterns carefully to avoid borrow issues
+                let mut i = 0;
+                while i < self.patterns.len() {
+                    let matches = Self::matches_pattern(&event.name, &self.patterns[i].0);
+                    if matches {
+                        // Temporarily remove the pattern handler
+                        let (pattern, mut handler) = self.patterns.remove(i);
+                        let result = handler(&event, self);
+                        // Put it back
+                        self.patterns.insert(i, (pattern, handler));
+
+                        if result == EventResult::StopPropagation {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Check if an event name matches a pattern (supports * wildcards)
+    fn matches_pattern(event_name: &str, pattern: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+
+        if pattern.ends_with(".*") {
+            let prefix = &pattern[..pattern.len() - 2];
+            event_name.starts_with(prefix) && event_name[prefix.len()..].starts_with('.')
+        } else if pattern.ends_with('*') {
+            let prefix = &pattern[..pattern.len() - 1];
+            event_name.starts_with(prefix)
+        } else {
+            event_name == pattern
+        }
+    }
+}
+
+/// Thread-safe wrapper for EventBus (for plugin access)
+pub struct SharedEventBus {
+    inner: Arc<Mutex<EventBus>>,
+}
+
+impl SharedEventBus {
+    pub fn new(bus: EventBus) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(bus)),
+        }
+    }
+
+    pub fn emit(&self, name: impl Into<String>, data: Value, priority: i32, source: impl Into<String>) {
+        self.inner.lock().unwrap().emit(name, data, priority, source);
+    }
+
+    pub fn on(&self, pattern: impl Into<String>, handler: EventHandler) {
+        self.inner.lock().unwrap().on(pattern, handler);
+    }
+
+    pub fn with_bus<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut EventBus) -> R,
+    {
+        let mut bus = self.inner.lock().unwrap();
+        f(&mut bus)
+    }
+}
+
 /// Input handler with multi-cursor support
 pub struct InputHandler {
     /// All active selections
@@ -187,6 +349,442 @@ impl InputHandler {
             last_click_pos: None,
             click_count: 0,
             ignore_next_drag: false,
+        }
+    }
+
+    /// Convert key event to event bus event and emit it
+    pub fn emit_key_event(&self, event: &KeyEvent, modifiers: &Modifiers, bus: &mut EventBus) {
+        // Emit all key events, but include the state
+
+        // Build proper JSON data for the key event
+        let key_data = match &event.logical_key {
+            Key::Character(ch) => json!({
+                "type": "character",
+                "value": ch.clone(),
+            }),
+            Key::Named(named) => {
+                let name = match named {
+                    NamedKey::Enter => "Enter",
+                    NamedKey::Tab => "Tab",
+                    NamedKey::Backspace => "Backspace",
+                    NamedKey::Delete => "Delete",
+                    NamedKey::ArrowLeft => "ArrowLeft",
+                    NamedKey::ArrowRight => "ArrowRight",
+                    NamedKey::ArrowUp => "ArrowUp",
+                    NamedKey::ArrowDown => "ArrowDown",
+                    NamedKey::Home => "Home",
+                    NamedKey::End => "End",
+                    NamedKey::PageUp => "PageUp",
+                    NamedKey::PageDown => "PageDown",
+                    NamedKey::Space => "Space",
+                    NamedKey::Shift => "Shift",
+                    NamedKey::Control => "Control",
+                    NamedKey::Alt => "Alt",
+                    NamedKey::Super => "Super",
+                    _ => "Unknown",
+                };
+                json!({
+                    "type": "named",
+                    "value": name,
+                })
+            }
+            _ => json!({
+                "type": "unknown",
+                "value": null,
+            }),
+        };
+
+        // Emit keyboard event with proper structure
+        bus.emit(
+            "app.keyboard.keypress",
+            json!({
+                "key": key_data,
+                "modifiers": {
+                    "shift": modifiers.state().shift_key(),
+                    "ctrl": modifiers.state().control_key(),
+                    "alt": modifiers.state().alt_key(),
+                    "cmd": modifiers.state().super_key(),
+                },
+                "state": if event.state == ElementState::Pressed { "pressed" } else { "released" },
+            }),
+            10, // Input priority
+            "input_handler",
+        );
+    }
+
+    /// Convert mouse click to event bus event and emit it
+    pub fn emit_mouse_click(
+        &self,
+        pos: Point,
+        button: MouseButton,
+        modifiers: &Modifiers,
+        bus: &mut EventBus,
+    ) {
+        bus.emit(
+            "app.mouse.click",
+            json!({
+                "x": pos.x.0,
+                "y": pos.y.0,
+                "button": format!("{:?}", button),
+                "modifiers": {
+                    "shift": modifiers.state().shift_key(),
+                    "ctrl": modifiers.state().control_key(),
+                    "alt": modifiers.state().alt_key(),
+                    "cmd": modifiers.state().super_key(),
+                },
+            }),
+            10,
+            "input_handler",
+        );
+    }
+
+    /// Convert mouse drag to event bus event and emit it
+    pub fn emit_mouse_drag(
+        &self,
+        from: Point,
+        to: Point,
+        modifiers: &Modifiers,
+        bus: &mut EventBus,
+    ) {
+        bus.emit(
+            "app.mouse.drag",
+            json!({
+                "from_x": from.x.0,
+                "from_y": from.y.0,
+                "to_x": to.x.0,
+                "to_y": to.y.0,
+                "modifiers": {
+                    "shift": modifiers.state().shift_key(),
+                    "ctrl": modifiers.state().control_key(),
+                    "alt": modifiers.state().alt_key(),
+                    "cmd": modifiers.state().super_key(),
+                },
+            }),
+            10,
+            "input_handler",
+        );
+    }
+
+    /// Process events from the bus - handles keyboard, mouse, and action events
+    pub fn process_event(
+        &mut self,
+        event: &Event,
+        doc: &Doc,
+        viewport: &Viewport,
+        bus: &mut EventBus,
+    ) -> InputAction {
+        match event.name.as_str() {
+            "app.keyboard.keypress" => {
+                // Check if this is a key press (not release)
+                let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                if state != "pressed" {
+                    return InputAction::None;
+                }
+
+                // Extract key data from proper JSON structure
+                if let Some(key_obj) = event.data.get("key") {
+                    if let Some(modifiers) = event.data.get("modifiers") {
+                        let shift = modifiers.get("shift").and_then(|s| s.as_bool()).unwrap_or(false);
+                        let cmd = modifiers.get("cmd").and_then(|c| c.as_bool()).unwrap_or(false);
+
+                        let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+                        // Handle command key combinations
+                        if cmd && key_type == "character" {
+                            match key_value {
+                                "z" if shift => bus.emit("app.action.redo", json!({}), 5, "input_handler"),
+                                "z" => bus.emit("app.action.undo", json!({}), 5, "input_handler"),
+                                "s" => bus.emit("app.action.save", json!({}), 5, "input_handler"),
+                                "c" => bus.emit("app.action.copy", json!({}), 5, "input_handler"),
+                                "x" => bus.emit("app.action.cut", json!({}), 5, "input_handler"),
+                                "v" => bus.emit("app.action.paste", json!({}), 5, "input_handler"),
+                                "a" => bus.emit("app.action.select_all", json!({}), 5, "input_handler"),
+                                "[" => bus.emit("app.action.nav_back", json!({}), 5, "input_handler"),
+                                "]" => bus.emit("app.action.nav_forward", json!({}), 5, "input_handler"),
+                                _ => {}
+                            }
+                        } else if !cmd {
+                            match key_type {
+                                "character" => {
+                                    if !key_value.chars().any(|c| c.is_control()) {
+                                        // Emit document insert event for regular characters
+                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                        bus.emit(
+                                            "app.document.insert",
+                                            json!({
+                                                "text": key_value,
+                                                "position": {
+                                                    "line": cursor_pos.line,
+                                                    "column": cursor_pos.column,
+                                                }
+                                            }),
+                                            20,
+                                            "input_handler",
+                                        );
+                                    }
+                                }
+                                "named" => {
+                                    match key_value {
+                                        "Enter" => {
+                                            let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                            bus.emit(
+                                                "app.document.insert",
+                                                json!({
+                                                    "text": "\n",
+                                                    "position": {
+                                                        "line": cursor_pos.line,
+                                                        "column": cursor_pos.column,
+                                                    }
+                                                }),
+                                                20,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "Tab" => {
+                                            let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                            bus.emit(
+                                                "app.document.insert",
+                                                json!({
+                                                    "text": "\t",
+                                                    "position": {
+                                                        "line": cursor_pos.line,
+                                                        "column": cursor_pos.column,
+                                                    }
+                                                }),
+                                                20,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "Space" => {
+                                            let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                            bus.emit(
+                                                "app.document.insert",
+                                                json!({
+                                                    "text": " ",
+                                                    "position": {
+                                                        "line": cursor_pos.line,
+                                                        "column": cursor_pos.column,
+                                                    }
+                                                }),
+                                                20,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "Backspace" => {
+                                            bus.emit("app.document.delete_backward", json!({}), 20, "input_handler");
+                                        }
+                                        "Delete" => {
+                                            bus.emit("app.document.delete_forward", json!({}), 20, "input_handler");
+                                        }
+                                        "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" => {
+                                            bus.emit(
+                                                "app.cursor.move",
+                                                json!({
+                                                    "direction": key_value,
+                                                    "extending": shift,
+                                                }),
+                                                15,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "Home" => {
+                                            bus.emit(
+                                                "app.cursor.move_line_edge",
+                                                json!({ "to_end": false, "extending": shift }),
+                                                15,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "End" => {
+                                            bus.emit(
+                                                "app.cursor.move_line_edge",
+                                                json!({ "to_end": true, "extending": shift }),
+                                                15,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "PageUp" => {
+                                            bus.emit(
+                                                "app.cursor.page_jump",
+                                                json!({ "up": true, "extending": shift }),
+                                                15,
+                                                "input_handler",
+                                            );
+                                        }
+                                        "PageDown" => {
+                                            bus.emit(
+                                                "app.cursor.page_jump",
+                                                json!({ "up": false, "extending": shift }),
+                                                15,
+                                                "input_handler",
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                InputAction::None
+            }
+            "app.document.insert" => {
+                // Handle actual text insertion
+                if let Some(text) = event.data.get("text").and_then(|t| t.as_str()) {
+                    self.insert_text(doc, text)
+                } else {
+                    InputAction::None
+                }
+            }
+            "app.document.delete_backward" => self.delete_at_cursor(doc, false),
+            "app.document.delete_forward" => self.delete_at_cursor(doc, true),
+            "app.action.undo" => InputAction::Undo,
+            "app.action.redo" => InputAction::Redo,
+            "app.action.save" => InputAction::Save,
+            "app.action.copy" => {
+                self.copy(doc);
+                InputAction::None
+            }
+            "app.action.cut" => {
+                self.cut(doc);
+                InputAction::Redraw
+            }
+            "app.action.paste" => {
+                self.paste(doc);
+                InputAction::Redraw
+            }
+            "app.action.select_all" => {
+                self.select_all(doc);
+                InputAction::Redraw
+            }
+            "app.cursor.move" => {
+                // Handle cursor movement
+                if let Some(direction) = event.data.get("direction").and_then(|d| d.as_str()) {
+                    let extending = event.data.get("extending").and_then(|e| e.as_bool()).unwrap_or(false);
+                    match direction {
+                        "ArrowLeft" => self.move_cursor(doc, -1, 0, extending),
+                        "ArrowRight" => self.move_cursor(doc, 1, 0, extending),
+                        "ArrowUp" => self.move_cursor(doc, 0, -1, extending),
+                        "ArrowDown" => self.move_cursor(doc, 0, 1, extending),
+                        _ => InputAction::None,
+                    }
+                } else {
+                    InputAction::None
+                }
+            }
+            "app.cursor.move_line_edge" => {
+                // Handle Home/End keys
+                let to_end = event.data.get("to_end").and_then(|e| e.as_bool()).unwrap_or(false);
+                let extending = event.data.get("extending").and_then(|e| e.as_bool()).unwrap_or(false);
+                self.move_to_line_edge(doc, to_end, extending)
+            }
+            "app.cursor.page_jump" => {
+                // Handle PageUp/PageDown
+                let up = event.data.get("up").and_then(|u| u.as_bool()).unwrap_or(false);
+                let extending = event.data.get("extending").and_then(|e| e.as_bool()).unwrap_or(false);
+                self.page_jump(doc, up, extending)
+            }
+            "app.action.nav_back" => self.navigate_history(doc, true),
+            "app.action.nav_forward" => self.navigate_history(doc, false),
+            "app.mouse.press" => {
+                // Handle mouse press/click
+                if let (Some(x), Some(y)) = (
+                    event.data.get("x").and_then(|v| v.as_f64()),
+                    event.data.get("y").and_then(|v| v.as_f64())
+                ) {
+                    let modifiers = event.data.get("modifiers");
+                    let shift_held = modifiers
+                        .and_then(|m| m.get("shift"))
+                        .and_then(|s| s.as_bool())
+                        .unwrap_or(false);
+                    let alt_held = modifiers
+                        .and_then(|m| m.get("alt"))
+                        .and_then(|a| a.as_bool())
+                        .unwrap_or(false);
+
+                    let pos = Point {
+                        x: tiny_sdk::LogicalPixels(x as f32),
+                        y: tiny_sdk::LogicalPixels(y as f32),
+                    };
+
+                    // Store drag anchor for potential drag operation
+                    self.drag_anchor = Some(viewport.layout_to_doc(
+                        tiny_sdk::LayoutPos {
+                            x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
+                            y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
+                        }
+                    ));
+
+                    // Handle the click
+                    self.on_mouse_click(
+                        doc,
+                        viewport,
+                        pos,
+                        MouseButton::Left,
+                        alt_held,
+                        shift_held,
+                    );
+
+                    InputAction::Redraw
+                } else {
+                    InputAction::None
+                }
+            }
+            "app.mouse.drag" => {
+                // Handle mouse drag
+                if let (Some(from_x), Some(from_y), Some(to_x), Some(to_y)) = (
+                    event.data.get("from_x").and_then(|v| v.as_f64()),
+                    event.data.get("from_y").and_then(|v| v.as_f64()),
+                    event.data.get("to_x").and_then(|v| v.as_f64()),
+                    event.data.get("to_y").and_then(|v| v.as_f64())
+                ) {
+                    let modifiers = event.data.get("modifiers");
+                    let alt_held = modifiers
+                        .and_then(|m| m.get("alt"))
+                        .and_then(|a| a.as_bool())
+                        .unwrap_or(false);
+
+                    let from = Point {
+                        x: tiny_sdk::LogicalPixels(from_x as f32),
+                        y: tiny_sdk::LogicalPixels(from_y as f32),
+                    };
+                    let to = Point {
+                        x: tiny_sdk::LogicalPixels(to_x as f32),
+                        y: tiny_sdk::LogicalPixels(to_y as f32),
+                    };
+
+                    let (redraw, scroll_delta) = self.on_mouse_drag(doc, viewport, from, to, alt_held);
+
+                    // If there's a scroll delta, emit a scroll event
+                    if let Some((dx, dy)) = scroll_delta {
+                        bus.emit(
+                            "app.drag.scroll",
+                            json!({
+                                "delta_x": dx,
+                                "delta_y": dy
+                            }),
+                            15,
+                            "input_handler"
+                        );
+                    }
+
+                    if redraw {
+                        InputAction::Redraw
+                    } else {
+                        InputAction::None
+                    }
+                } else {
+                    InputAction::None
+                }
+            }
+            "app.mouse.release" => {
+                // Clear drag anchor
+                self.clear_drag_anchor();
+                InputAction::None
+            }
+            _ => InputAction::None,
         }
     }
 
@@ -776,8 +1374,9 @@ impl InputHandler {
         event: &KeyEvent,
         modifiers: &Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
+        bus: &mut EventBus,
     ) -> InputAction {
-        self.on_key_internal(doc, viewport, event, modifiers, renderer)
+        self.on_key_internal(doc, viewport, event, modifiers, renderer, bus)
     }
 
     /// Handle keyboard input
@@ -788,59 +1387,44 @@ impl InputHandler {
         event: &KeyEvent,
         modifiers: &Modifiers,
     ) -> InputAction {
-        self.on_key_internal(doc, viewport, event, modifiers, None)
+        // For backwards compatibility, create a temporary event bus
+        let mut bus = EventBus::new();
+        self.on_key_internal(doc, viewport, event, modifiers, None, &mut bus)
     }
 
-    /// Internal key handling with optional renderer
+    /// Internal key handling with optional renderer - NOW USES EVENT BUS
     fn on_key_internal(
         &mut self,
         doc: &Doc,
-        _viewport: &Viewport,
+        viewport: &Viewport,
         event: &KeyEvent,
         modifiers: &Modifiers,
         renderer: Option<&mut crate::render::Renderer>,
+        bus: &mut EventBus,
     ) -> InputAction {
-        if event.state != ElementState::Pressed {
-            return InputAction::None;
-        }
+        // Emit the key event to the bus
+        self.emit_key_event(event, modifiers, bus);
 
-        let shift_held = modifiers.state().shift_key();
-        #[cfg(target_os = "macos")]
-        let cmd_held = modifiers.state().super_key();
-        #[cfg(not(target_os = "macos"))]
-        let cmd_held = modifiers.state().control_key();
+        // Process all queued events immediately
+        // This maintains synchronous behavior while using the event bus
+        let mut action = InputAction::None;
 
-        if cmd_held {
-            if let Key::Character(ch) = &event.logical_key {
-                return self.handle_command_key(doc, ch.to_lowercase().as_str(), shift_held);
+        // We need to handle events in a loop since processing one event might emit more
+        loop {
+            let events_to_process: Vec<Event> = bus.queued.drain(..).collect();
+            if events_to_process.is_empty() {
+                break;
             }
-            InputAction::None
-        } else {
-            match &event.logical_key {
-                // Ignore modifier keys pressed alone
-                Key::Named(NamedKey::Shift)
-                | Key::Named(NamedKey::Control)
-                | Key::Named(NamedKey::Alt)
-                | Key::Named(NamedKey::Super) => InputAction::None,
-                Key::Character(ch) if ch.chars().all(|c| !c.is_control()) => {
-                    self.handle_character_input(doc, ch, renderer)
+
+            for event in events_to_process {
+                let result = self.process_event(&event, doc, viewport, bus);
+                if result != InputAction::None {
+                    action = result;
                 }
-                Key::Named(NamedKey::Backspace) => self.delete_at_cursor(doc, false),
-                Key::Named(NamedKey::Delete) => self.delete_at_cursor(doc, true),
-                Key::Named(NamedKey::Enter) => self.insert_text(doc, "\n"),
-                Key::Named(NamedKey::Tab) => self.insert_text(doc, "\t"),
-                Key::Named(NamedKey::Space) => self.insert_text(doc, " "),
-                Key::Named(NamedKey::ArrowLeft) => self.move_cursor(doc, -1, 0, shift_held),
-                Key::Named(NamedKey::ArrowRight) => self.move_cursor(doc, 1, 0, shift_held),
-                Key::Named(NamedKey::ArrowUp) => self.move_cursor(doc, 0, -1, shift_held),
-                Key::Named(NamedKey::ArrowDown) => self.move_cursor(doc, 0, 1, shift_held),
-                Key::Named(NamedKey::Home) => self.move_to_line_edge(doc, false, shift_held),
-                Key::Named(NamedKey::End) => self.move_to_line_edge(doc, true, shift_held),
-                Key::Named(NamedKey::PageUp) => self.page_jump(doc, true, shift_held),
-                Key::Named(NamedKey::PageDown) => self.page_jump(doc, false, shift_held),
-                _ => InputAction::None,
             }
         }
+
+        action
     }
 
     /// Handle mouse click
