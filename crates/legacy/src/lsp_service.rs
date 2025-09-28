@@ -40,6 +40,7 @@ pub enum LspResult {
     Hover(Option<HoverInfo>),
     GoToDefinition(Vec<LocationRef>),
     FindReferences(Vec<LocationRef>),
+    DocumentSymbols(Vec<lsp_types::DocumentSymbol>),
 }
 
 /// Comprehensive LSP service
@@ -65,16 +66,18 @@ impl LspService {
 
     /// Open a file and initialize LSP
     pub fn open_file(&mut self, file_path: PathBuf, content: String) {
-        self.current_file = Some(file_path.clone());
-
         // Only handle Rust files for now
         if !file_path.to_string_lossy().ends_with(".rs") {
+            self.current_file = Some(file_path);
             return;
         }
 
         // Find workspace root (same logic as before)
         let abs_path = std::fs::canonicalize(&file_path)
             .unwrap_or_else(|_| file_path.clone());
+
+        // Store the absolute path for consistency with LSP
+        self.current_file = Some(abs_path.clone());
 
         let workspace_root = abs_path
             .parent()
@@ -105,10 +108,17 @@ impl LspService {
         }
     }
 
-    /// Handle document changes
+    /// Handle document changes with incremental updates
+    pub fn document_changed_incremental(&self, changes: Vec<crate::lsp_manager::TextChange>) {
+        if let Some(ref lsp) = self.lsp_manager {
+            lsp.document_changed(changes);
+        }
+    }
+
+    /// Handle document changes (legacy full text)
     pub fn document_changed(&self, content: String) {
         if let Some(ref lsp) = self.lsp_manager {
-            lsp.document_changed(content);
+            lsp.document_changed_full(content);
         }
     }
 
@@ -128,6 +138,19 @@ impl LspService {
             if let Some(diagnostic_update) = lsp.poll_diagnostics() {
                 results.push(LspResult::Diagnostics(diagnostic_update.diagnostics));
             }
+
+            // Poll hover info
+            if let Some(hover_update) = lsp.poll_hover() {
+                results.push(LspResult::Hover(Some(HoverInfo {
+                    contents: hover_update.content,
+                    range: None, // TODO: Track hover range
+                })));
+            }
+
+            // Poll document symbols
+            if let Some(symbols_update) = lsp.poll_symbols() {
+                results.push(LspResult::DocumentSymbols(symbols_update.symbols));
+            }
         }
 
         // Poll other LSP results from the channel
@@ -140,16 +163,21 @@ impl LspService {
 
     /// Request hover information at position
     pub fn request_hover(&self, position: DocPosition) {
-        // TODO: Send hover request to LSP
-        // This would involve:
-        // 1. Converting DocPosition to LSP Position
-        // 2. Sending textDocument/hover request
-        // 3. Parsing response and sending via results channel
+        if let Some(ref lsp) = self.lsp_manager {
+            lsp.request_hover(position.line as u32, position.column as u32);
+        }
     }
 
     /// Request go-to-definition at position
     pub fn request_goto_definition(&self, position: DocPosition) {
         // TODO: Send goto definition request to LSP
+    }
+
+    /// Request document symbols
+    pub fn request_document_symbols(&self) {
+        if let Some(ref lsp) = self.lsp_manager {
+            lsp.request_document_symbols();
+        }
     }
 
     /// Request find references at position

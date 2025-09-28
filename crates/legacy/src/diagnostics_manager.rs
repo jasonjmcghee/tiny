@@ -4,12 +4,15 @@ use crate::lsp_manager::{LspManager, ParsedDiagnostic};
 use crate::lsp_service::{LspService, LspResult};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tiny_tree::Doc;
 
 /// High-level diagnostics manager (now uses LspService for broader LSP support)
 pub struct DiagnosticsManager {
     plugin: diagnostics_plugin::DiagnosticsPlugin,
     lsp_service: LspService,
+    last_hover_request: Option<(usize, usize, Instant)>, // (line, col, time) for debouncing
+    current_hover_position: Option<(usize, usize)>, // Current hover position for tracking
 }
 
 impl DiagnosticsManager {
@@ -18,6 +21,8 @@ impl DiagnosticsManager {
         Self {
             plugin: diagnostics_plugin::DiagnosticsPlugin::new(),
             lsp_service: LspService::new(),
+            last_hover_request: None,
+            current_hover_position: None,
         }
     }
 
@@ -30,9 +35,17 @@ impl DiagnosticsManager {
 
         // 2. BACKGROUND: Start LSP service (handles all LSP features)
         self.lsp_service.open_file(file_path, content);
+
+        // 3. Request document symbols for hover support
+        self.lsp_service.request_document_symbols();
     }
 
-    /// Handle document changes
+    /// Handle document changes with incremental updates
+    pub fn document_changed_incremental(&mut self, changes: Vec<crate::lsp_manager::TextChange>) {
+        self.lsp_service.document_changed_incremental(changes);
+    }
+
+    /// Handle document changes (legacy full text)
     pub fn document_changed(&mut self, content: String) {
         self.lsp_service.document_changed(content);
     }
@@ -44,6 +57,12 @@ impl DiagnosticsManager {
 
     /// Update diagnostics (call this every frame)
     pub fn update(&mut self, doc: &Doc) {
+        // Check if plugin needs hover info (500ms timer elapsed)
+        if let Some((line, column)) = self.plugin.update() {
+            // Request hover from LSP
+            self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
+        }
+
         // Poll for any LSP results
         let results = self.lsp_service.poll_results();
 
@@ -60,8 +79,33 @@ impl DiagnosticsManager {
                         LspManager::cache_diagnostics(file_path, &content, &diagnostics);
                     }
                 }
-                LspResult::Hover(_) => {
-                    // TODO: Handle hover results when we implement hover UI
+                LspResult::Hover(hover_info) => {
+                    // Send hover content to plugin
+                    if let Some(hover) = hover_info {
+                        if let Some((line, col)) = self.current_hover_position {
+                            self.plugin.set_hover_content(hover.contents, line, col);
+                        }
+                    }
+                }
+                LspResult::DocumentSymbols(symbols) => {
+                    // Convert LSP symbols to plugin symbols
+                    let mut plugin_symbols = Vec::new();
+                    for symbol in symbols {
+                        // Convert line/character positions to our format
+                        plugin_symbols.push(diagnostics_plugin::Symbol {
+                            name: symbol.name,
+                            line: symbol.range.start.line as usize,
+                            column_range: (
+                                symbol.range.start.character as usize,
+                                symbol.range.end.character as usize,
+                            ),
+                            kind: format!("{:?}", symbol.kind),
+                        });
+                    }
+                    self.plugin.set_symbols(plugin_symbols);
+
+                    // Request symbols again if file changed
+                    // This ensures we always have up-to-date symbols
                 }
                 LspResult::GoToDefinition(_) => {
                     // TODO: Handle goto definition results
@@ -71,6 +115,32 @@ impl DiagnosticsManager {
                 }
             }
         }
+    }
+
+    /// Handle mouse movement (requests hover info from LSP with debouncing)
+    pub fn on_mouse_move(&mut self, line: usize, column: usize) {
+        let now = Instant::now();
+        self.current_hover_position = Some((line, column));
+
+        // Debounce hover requests - only send if position changed and enough time passed
+        let should_request = if let Some((last_line, last_col, last_time)) = self.last_hover_request {
+            // Different position or enough time has passed
+            (line != last_line || column != last_col) && now.duration_since(last_time).as_millis() > 100
+        } else {
+            true // First request
+        };
+
+        if should_request && self.lsp_service.is_ready() {
+            self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
+            self.last_hover_request = Some((line, column, now));
+        }
+    }
+
+    /// Clear hover info when mouse leaves text area
+    pub fn on_mouse_leave(&mut self) {
+        self.plugin.clear_symbols();
+        self.last_hover_request = None;
+        self.current_hover_position = None;
     }
 
     /// Request hover information at cursor position (for future use)
@@ -95,6 +165,7 @@ impl DiagnosticsManager {
 
     /// Apply diagnostics to the plugin (internal helper)
     fn apply_diagnostics(&mut self, diagnostics: &[ParsedDiagnostic], content: &str) {
+        eprintln!("DIAG: Clearing old diagnostics and applying {} new ones", diagnostics.len());
         self.plugin.clear_diagnostics();
 
         let lines: Vec<&str> = content.lines().collect();

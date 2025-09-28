@@ -3,7 +3,8 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tiny_font::{create_glyph_instances, measure_text_width, SharedFontSystem};
+use std::time::Instant;
+use tiny_font::{create_glyph_instances, SharedFontSystem};
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
@@ -38,6 +39,19 @@ pub struct Diagnostic {
     pub message: String,
     /// Severity level
     pub severity: DiagnosticSeverity,
+}
+
+/// Represents a symbol with its position
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    /// Symbol name
+    pub name: String,
+    /// Line number (0-indexed)
+    pub line: usize,
+    /// Column range (start, end) - 0-indexed character positions
+    pub column_range: (usize, usize),
+    /// Symbol kind (function, struct, etc)
+    pub kind: String,
 }
 
 /// Configuration for diagnostics appearance
@@ -79,15 +93,28 @@ pub struct DiagnosticsPlugin {
     // Diagnostics data
     diagnostics: Vec<Diagnostic>,
 
+    // Symbol positions from LSP
+    symbols: Vec<Symbol>,
+
+    // Hover state machine
+    hover_state: HoverState,
+    hover_start_time: Option<Instant>,
+    last_hover_request: Option<(usize, usize)>, // (line, col) of last hover request
+
     // Line text cache for accurate width calculation
     line_texts: HashMap<usize, String>,
 
-    // Hover state
-    hovered_diagnostic: Option<usize>,
+    // Current mouse position
     mouse_position: (f32, f32),
+    mouse_line: Option<usize>,
+    mouse_column: Option<usize>,
+
+    // Current popup content to show
+    current_popup: Option<PopupContent>,
 
     // Viewport info
     viewport: ViewportInfo,
+
 
     // GPU resources (RwLock for interior mutability in paint())
     vertex_buffer: RwLock<Option<Buffer>>,
@@ -99,6 +126,22 @@ pub struct DiagnosticsPlugin {
     queue: Option<Arc<wgpu::Queue>>,
 }
 
+/// Hover state machine
+#[derive(Debug, Clone)]
+enum HoverState {
+    None,
+    WaitingForDelay { over_symbol: bool, line: usize, column: usize },
+    RequestingHover { line: usize, column: usize },
+    ShowingHover { content: String, line: usize, column: usize },
+}
+
+/// Popup content to display
+#[derive(Debug, Clone)]
+enum PopupContent {
+    Diagnostic { message: String, line: usize, column: usize },
+    Hover { content: String, line: usize, column: usize },
+}
+
 impl DiagnosticsPlugin {
     /// Create a new diagnostics plugin
     pub fn new() -> Self {
@@ -106,10 +149,16 @@ impl DiagnosticsPlugin {
 
         Self {
             config: DiagnosticsConfig::default(),
-            diagnostics: Vec::new(),  // Start empty, LSP will provide real diagnostics
+            diagnostics: Vec::new(),
+            symbols: Vec::new(),
             line_texts: HashMap::new(),
-            hovered_diagnostic: None,
+            hover_state: HoverState::None,
+            hover_start_time: None,
+            last_hover_request: None,
             mouse_position: (0.0, 0.0),
+            mouse_line: None,
+            mouse_column: None,
+            current_popup: None,
             viewport: ViewportInfo {
                 scroll: LayoutPos::new(0.0, 0.0),
                 logical_size: LogicalSize::new(800.0, 600.0),
@@ -141,59 +190,119 @@ impl DiagnosticsPlugin {
     /// Update mouse position for hover detection (in editor-local coordinates)
     pub fn set_mouse_position(&mut self, x: f32, y: f32, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>, services: Option<&tiny_sdk::ServiceRegistry>) {
         self.mouse_position = (x, y);
-        self.update_hover_state(widget_viewport, services);
+
+        // Calculate document position from mouse coordinates
+        if let Some(widget_viewport) = widget_viewport {
+            let widget_offset_y = widget_viewport.bounds.y.0;
+            let widget_scroll_y = widget_viewport.scroll.y.0;
+            let widget_offset_x = widget_viewport.bounds.x.0;
+            let widget_scroll_x = widget_viewport.scroll.x.0;
+
+            // Convert mouse position to document coordinates
+            let local_mouse_x = x - widget_offset_x;
+            let local_mouse_y = y - widget_offset_y;
+
+            // Calculate line number
+            let doc_y = local_mouse_y + widget_scroll_y;
+            let line = (doc_y / self.viewport.line_height) as usize;
+
+            // Calculate column using font metrics
+            if let Some(services) = services {
+                if let Some(font_service) = services.get::<SharedFontSystem>() {
+                    let char_width = font_service.char_width_coef() * self.viewport.font_size;
+                    let doc_x = local_mouse_x + widget_scroll_x;
+                    let column = (doc_x / char_width) as usize;
+
+                    self.mouse_line = Some(line);
+                    self.mouse_column = Some(column);
+                }
+            }
+        }
+
+        // Update hover state
+        self.update_hover_state();
     }
 
-    /// Check which diagnostic (if any) the mouse is hovering over
-    fn update_hover_state(&mut self, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>, services: Option<&tiny_sdk::ServiceRegistry>) {
-        self.hovered_diagnostic = None;
+    /// Update hover state based on current mouse position
+    fn update_hover_state(&mut self) {
+        let (line, column) = match (self.mouse_line, self.mouse_column) {
+            (Some(l), Some(c)) => (l, c),
+            _ => {
+                // Mouse not over text
+                self.hover_state = HoverState::None;
+                self.current_popup = None;
+                return;
+            }
+        };
 
-        let (mouse_x, mouse_y) = self.mouse_position;
+        // Check if we're over a diagnostic (show immediately)
+        for diagnostic in &self.diagnostics {
+            if diagnostic.line == line
+                && column >= diagnostic.column_range.0
+                && column < diagnostic.column_range.1 {
+                self.current_popup = Some(PopupContent::Diagnostic {
+                    message: diagnostic.message.clone(),
+                    line: diagnostic.line,
+                    column: diagnostic.column_range.0,
+                });
+                return;
+            }
+        }
 
-        // Get widget bounds and scroll if available
-        let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
-        let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-        let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(self.viewport.scroll.y.0);
+        // Check if we're over a symbol
+        let over_symbol = self.symbols.iter().any(|symbol| {
+            symbol.line == line
+                && column >= symbol.column_range.0
+                && column < symbol.column_range.1
+        });
 
-        // Convert mouse position to editor-local coordinates (remove widget offset)
-        let local_mouse_x = mouse_x - widget_offset_x;
-        let local_mouse_y = mouse_y - widget_offset_y;
-
-        for (i, diagnostic) in self.diagnostics.iter().enumerate() {
-            // Calculate diagnostic position in view coordinates
-            let doc_y = diagnostic.line as f32 * self.viewport.line_height;
-            let view_y = doc_y - widget_scroll_y;
-
-            // Get font service - required for proper rendering
-            let font_service = services
-                .and_then(|s| s.get::<SharedFontSystem>())
-                .expect("Font service is required for diagnostics plugin");
-
-            // Get actual text width using font metrics
-            let (start_x, end_x) = if let Some(line_text) = self.line_texts.get(&diagnostic.line) {
-                // Measure actual text width up to the diagnostic positions
-                let start_str = &line_text[..line_text.len().min(diagnostic.column_range.0)];
-                let end_str = &line_text[..line_text.len().min(diagnostic.column_range.1)];
-
-                let start_width = measure_text_width(&font_service, start_str, self.viewport.font_size);
-                let end_width = measure_text_width(&font_service, end_str, self.viewport.font_size);
-                (start_width, end_width)
-            } else {
-                // Use actual monospace character width from font metrics
-                let char_width = font_service.char_width_coef() * self.viewport.font_size;
-                let start_x = diagnostic.column_range.0 as f32 * char_width;
-                let end_x = diagnostic.column_range.1 as f32 * char_width;
-                (start_x, end_x)
-            };
-
-            // Check if mouse is over the diagnostic area (with some vertical tolerance)
-            if local_mouse_x >= start_x
-                && local_mouse_x <= end_x
-                && local_mouse_y >= view_y
-                && local_mouse_y <= view_y + self.viewport.line_height
-            {
-                self.hovered_diagnostic = Some(i);
-                break;
+        // Update hover state machine
+        match &self.hover_state {
+            HoverState::None => {
+                if over_symbol {
+                    self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                    self.hover_start_time = Some(Instant::now());
+                } else {
+                    self.current_popup = None;
+                }
+            }
+            HoverState::WaitingForDelay { over_symbol: _, line: prev_line, column: prev_column } => {
+                if line != *prev_line || column != *prev_column {
+                    // Position changed, reset
+                    if over_symbol {
+                        self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                        self.hover_start_time = Some(Instant::now());
+                    } else {
+                        self.hover_state = HoverState::None;
+                        self.current_popup = None;
+                    }
+                } else if !over_symbol {
+                    // Moved off symbol
+                    self.hover_state = HoverState::None;
+                    self.current_popup = None;
+                }
+            }
+            HoverState::RequestingHover { line: prev_line, column: prev_column } => {
+                if line != *prev_line || column != *prev_column || !over_symbol {
+                    // Position changed or moved off symbol
+                    self.hover_state = HoverState::None;
+                    self.current_popup = None;
+                    if over_symbol {
+                        self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                        self.hover_start_time = Some(Instant::now());
+                    }
+                }
+            }
+            HoverState::ShowingHover { line: prev_line, column: prev_column, .. } => {
+                if line != *prev_line || column != *prev_column || !over_symbol {
+                    // Position changed or moved off symbol
+                    self.hover_state = HoverState::None;
+                    self.current_popup = None;
+                    if over_symbol {
+                        self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                        self.hover_start_time = Some(Instant::now());
+                    }
+                }
             }
         }
     }
@@ -336,15 +445,44 @@ impl DiagnosticsPlugin {
         let view_x = doc_x - widget_scroll_x;
         let view_y = doc_y - widget_scroll_y;
 
-        // Position popup above the line in view space
-        let popup_x_view = view_x;
-        let popup_y_view = view_y - popup_height_logical - 10.0; // 10px above the line
+        // Smart positioning within editor bounds
+        let widget_bounds = widget_viewport.map(|w| w.bounds).unwrap_or_else(|| {
+            tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0)
+        });
+
+        // Try above first, then below if not enough space
+        let mut popup_x_view = view_x;
+        let mut popup_y_view = view_y - popup_height_logical - 10.0; // 10px above the line
+
+        // Check if popup fits above
+        if popup_y_view < 0.0 {
+            // Not enough space above, position below
+            popup_y_view = view_y + self.viewport.line_height + 10.0;
+        }
+
+        // Check if popup fits within horizontal bounds
+        if popup_x_view + message_width_logical > widget_bounds.width.0 {
+            // Move left to fit
+            popup_x_view = widget_bounds.width.0 - message_width_logical - 10.0;
+        }
+        if popup_x_view < 0.0 {
+            popup_x_view = 10.0; // Min margin from left edge
+        }
+
+        // Constrain popup height to fit in editor
+        let max_popup_height = if popup_y_view > 0.0 {
+            widget_bounds.height.0 - popup_y_view - 10.0
+        } else {
+            widget_bounds.height.0 - 20.0
+        };
+
+        let constrained_popup_height = popup_height_logical.min(max_popup_height);
 
         // Transform to screen space: add widget offset, then scale to physical
         let popup_x = (popup_x_view + widget_offset_x) * scale;
         let popup_y = (popup_y_view + widget_offset_y) * scale;
         let message_width = message_width_logical * scale;
-        let popup_height = popup_height_logical * scale;
+        let popup_height = constrained_popup_height * scale;
 
         let color = self.config.popup_background_color;
         let line_info = [0.0, 0.0, 0.0, 0.0]; // Not used for popups
@@ -394,72 +532,123 @@ impl DiagnosticsPlugin {
 
     /// Collect glyphs for popup text
     pub fn collect_popup_glyphs(&self, services: &tiny_sdk::ServiceRegistry, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>) -> Vec<GlyphInstance> {
-        if let Some(diagnostic_idx) = self.hovered_diagnostic {
-            if let Some(diagnostic) = self.diagnostics.get(diagnostic_idx) {
-                // Get font service - required for text rendering
-                let font_service = services.get::<SharedFontSystem>()
-                    .expect("Font service is required for popup text rendering");
+        // Get popup content from current popup
+        let popup_content = match &self.current_popup {
+            Some(PopupContent::Diagnostic { message, .. }) => Some(message.clone()),
+            Some(PopupContent::Hover { content, .. }) => Some(content.clone()),
+            None => None,
+        };
 
-                let scale = self.viewport.scale_factor;
-                // Use actual font metrics for popup text positioning
-                let char_width = font_service.char_width_coef() * self.viewport.font_size;
+        if let Some(content) = popup_content {
+            // Get font service - required for text rendering
+            let font_service = services.get::<SharedFontSystem>()
+                .expect("Font service is required for popup text rendering");
 
-                // Get widget bounds offset and scroll
-                let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
-                let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-                let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(self.viewport.scroll.x.0);
-                let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(self.viewport.scroll.y.0);
+            let scale = self.viewport.scale_factor;
+            // Use actual font metrics for popup text positioning
+            let char_width = font_service.char_width_coef() * self.viewport.font_size;
 
-                // Calculate popup position consistently with popup background
-                // Position in document space
-                let doc_y = diagnostic.line as f32 * self.viewport.line_height;
-                let doc_x = diagnostic.column_range.0 as f32 * char_width;
+            // Get widget bounds offset and scroll
+            let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
+            let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
+            let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(self.viewport.scroll.x.0);
+            let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(self.viewport.scroll.y.0);
 
-                // Convert to view space (subtract scroll)
-                let view_x = doc_x - widget_scroll_x;
-                let view_y = doc_y - widget_scroll_y;
+            // Calculate popup position based on popup content
+            let (doc_x, doc_y) = match &self.current_popup {
+                Some(PopupContent::Diagnostic { line, column, .. }) |
+                Some(PopupContent::Hover { line, column, .. }) => {
+                    let doc_y = *line as f32 * self.viewport.line_height;
+                    let doc_x = *column as f32 * char_width;
+                    (doc_x, doc_y)
+                }
+                None => (0.0, 0.0),
+            };
 
-                // Get the actual text layout to know the exact height
-                let layout = font_service.layout_text(&diagnostic.message, self.viewport.font_size);
+            // Convert to view space (subtract scroll)
+            let view_x = doc_x - widget_scroll_x;
+            let view_y = doc_y - widget_scroll_y;
 
-                // Calculate popup background position (same as in create_popup_vertices)
-                // Use the actual text height from the layout
-                let popup_height_logical = layout.height + self.config.popup_padding * 2.0;
-                let popup_y_view = view_y - popup_height_logical - 10.0; // 10px above the line
+            // Get the actual text layout to know the exact height
+            let layout = font_service.layout_text(&content, self.viewport.font_size);
 
-                // Position text inside popup with padding from the top of the popup
-                let text_x = view_x + self.config.popup_padding;
-                let text_y = popup_y_view + self.config.popup_padding;
+            // Constrain content if it's too long for available space
+            let widget_bounds = widget_viewport.map(|w| w.bounds).unwrap_or_else(|| {
+                tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0)
+            });
 
-                // The position for create_glyph_instances should be in logical pixels
-                // relative to where the text will be rendered (already includes widget offset)
-                let pos = LayoutPos::new(text_x + widget_offset_x, text_y + widget_offset_y);
+            let max_popup_height = widget_bounds.height.0 * 0.6; // Max 60% of editor height
+            let max_lines = (max_popup_height / self.viewport.line_height) as usize;
 
-                let glyphs = create_glyph_instances(
-                    &font_service,
-                    &diagnostic.message,
-                    pos,
-                    self.viewport.font_size,
-                    scale,
-                    self.viewport.line_height,
-                    None,
-                    0,
-                );
-
-                // The glyphs are already in logical coordinates with the correct position
-                // We need to scale them to physical coordinates
-                glyphs
-                    .into_iter()
-                    .map(|mut g| {
-                        // Scale position from logical to physical
-                        g.pos = LayoutPos::new(g.pos.x.0 * scale, g.pos.y.0 * scale);
-                        g.token_id = 254; // Special token for popup text
-                        g
-                    })
-                    .collect()
+            let final_content = if layout.height > max_popup_height {
+                // Truncate content to fit
+                let lines: Vec<&str> = content.lines().collect();
+                if lines.len() > max_lines {
+                    let truncated_lines = &lines[0..max_lines.saturating_sub(1)];
+                    format!("{}\n... (content truncated)", truncated_lines.join("\n"))
+                } else {
+                    content
+                }
             } else {
-                Vec::new()
+                content
+            };
+
+            let final_layout = font_service.layout_text(&final_content, self.viewport.font_size);
+
+            // Smart positioning within editor bounds
+            let max_popup_height_view = widget_bounds.height.0 * 0.6; // Max 60% of editor height
+            let popup_height_logical = final_layout.height.min(max_popup_height_view) + self.config.popup_padding * 2.0;
+
+            // Try above first, then below if not enough space
+            let mut popup_x_view = view_x;
+            let mut popup_y_view = view_y - popup_height_logical - 10.0; // 10px above the line
+
+            // Check if popup fits above
+            if popup_y_view < 0.0 {
+                // Not enough space above, position below
+                popup_y_view = view_y + self.viewport.line_height + 10.0;
             }
+
+            // Check if popup fits within horizontal bounds
+            let message_width_logical = final_layout.width + self.config.popup_padding * 2.0;
+            if popup_x_view + message_width_logical > widget_bounds.width.0 {
+                // Move left to fit
+                popup_x_view = widget_bounds.width.0 - message_width_logical - 10.0;
+            }
+            if popup_x_view < 0.0 {
+                popup_x_view = 10.0; // Min margin from left edge
+            }
+
+            // Position text inside popup with padding from the top of the popup
+            let text_x = popup_x_view + self.config.popup_padding;
+            let text_y = popup_y_view + self.config.popup_padding;
+
+            // The position for create_glyph_instances should be in logical pixels
+            // relative to where the text will be rendered (already includes widget offset)
+            let pos = LayoutPos::new(text_x + widget_offset_x, text_y + widget_offset_y);
+
+            let glyphs = create_glyph_instances(
+                &font_service,
+                &final_content,
+                pos,
+                self.viewport.font_size,
+                scale,
+                self.viewport.line_height,
+                None,
+                0,
+            );
+
+            // The glyphs are already in logical coordinates with the correct position
+            // We need to scale them to physical coordinates
+            glyphs
+                .into_iter()
+                .map(|mut g| {
+                    // Scale position from logical to physical
+                    g.pos = LayoutPos::new(g.pos.x.0 * scale, g.pos.y.0 * scale);
+                    g.token_id = 254; // Special token for popup text
+                    g
+                })
+                .collect()
         } else {
             Vec::new()
         }
@@ -618,9 +807,9 @@ impl Library for DiagnosticsPlugin {
 
                 let x = f32::from_le_bytes(args[0..4].try_into().unwrap());
                 let y = f32::from_le_bytes(args[4..8].try_into().unwrap());
-                // For Library API calls, we don't have widget viewport or services info
-                // The caller should use the paint method with proper viewport
-                self.set_mouse_position(x, y, None, None);
+                // Store the mouse position directly since we need cached viewport/services from paint()
+                self.mouse_position = (x, y);
+                // Note: actual hover detection will happen in paint() when we have viewport/services
                 Ok(Vec::new())
             }
             "add_diagnostic" => {
@@ -657,7 +846,8 @@ impl Library for DiagnosticsPlugin {
             "clear_diagnostics" => {
                 self.diagnostics.clear();
                 self.line_texts.clear();
-                self.hovered_diagnostic = None;
+                self.current_popup = None;
+                self.hover_state = HoverState::None;
                 Ok(Vec::new())
             }
             "set_line_text" => {
@@ -675,6 +865,75 @@ impl Library for DiagnosticsPlugin {
 
                 let text = String::from_utf8_lossy(&args[8..8 + text_len]).to_string();
                 self.line_texts.insert(line_num, text);
+                Ok(Vec::new())
+            }
+            "set_symbols" => {
+                // Format: count (u32), then for each symbol: line (u32), col_start (u32), col_end (u32), kind_len (u32), kind, name_len (u32), name
+                if args.len() < 4 {
+                    return Err(PluginError::Other("Invalid symbols args".into()));
+                }
+
+                let count = u32::from_le_bytes(args[0..4].try_into().unwrap()) as usize;
+                self.symbols.clear();
+                self.symbols.reserve(count);
+
+                let mut offset = 4;
+                for _ in 0..count {
+                    if args.len() < offset + 16 {
+                        return Err(PluginError::Other("Invalid symbol data".into()));
+                    }
+
+                    let line = u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
+                    let col_start = u32::from_le_bytes(args[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                    let col_end = u32::from_le_bytes(args[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                    let kind_len = u32::from_le_bytes(args[offset + 12..offset + 16].try_into().unwrap()) as usize;
+
+                    offset += 16;
+                    if args.len() < offset + kind_len {
+                        return Err(PluginError::Other("Invalid symbol kind length".into()));
+                    }
+
+                    let kind = String::from_utf8_lossy(&args[offset..offset + kind_len]).to_string();
+                    offset += kind_len;
+
+                    if args.len() < offset + 4 {
+                        return Err(PluginError::Other("Invalid symbol name length header".into()));
+                    }
+                    let name_len = u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+
+                    if args.len() < offset + name_len {
+                        return Err(PluginError::Other("Invalid symbol name length".into()));
+                    }
+
+                    let name = String::from_utf8_lossy(&args[offset..offset + name_len]).to_string();
+                    offset += name_len;
+
+                    self.symbols.push(Symbol {
+                        name,
+                        line,
+                        column_range: (col_start, col_end),
+                        kind,
+                    });
+                }
+                Ok(Vec::new())
+            }
+            "set_hover_content" => {
+                // Format: line (u32), column (u32), content_len (u32), content (bytes)
+                if args.len() < 12 {
+                    return Err(PluginError::Other("Invalid hover content args".into()));
+                }
+
+                let line = u32::from_le_bytes(args[0..4].try_into().unwrap()) as usize;
+                let column = u32::from_le_bytes(args[4..8].try_into().unwrap()) as usize;
+                let content_len = u32::from_le_bytes(args[8..12].try_into().unwrap()) as usize;
+
+                if args.len() < 12 + content_len {
+                    return Err(PluginError::Other("Invalid hover content length".into()));
+                }
+
+                let content = String::from_utf8_lossy(&args[12..12 + content_len]).to_string();
+                self.set_hover_content(content, line, column);
                 Ok(Vec::new())
             }
             _ => Err(PluginError::Other("Unknown method".into())),
@@ -744,74 +1003,90 @@ impl Paintable for DiagnosticsPlugin {
             }
         }
 
-        // Draw popup if hovering
-        if let Some(diagnostic_idx) = self.hovered_diagnostic {
-            if let Some(diagnostic) = self.diagnostics.get(diagnostic_idx) {
-                // Draw popup background
-                let popup_vertices = self.create_popup_vertices(diagnostic, ctx.widget_viewport.as_ref(), services);
-                if !popup_vertices.is_empty() {
-                    let vertex_data = bytemuck::cast_slice(&popup_vertices);
-                    let vertex_count = popup_vertices.len() as u32;
-                    let required_size = vertex_data.len() as u64;
+        // Show popup if we have one
+        if let Some(ref popup_content) = self.current_popup {
+            let (popup_text, popup_line, popup_col) = match popup_content {
+                PopupContent::Diagnostic { message, line, column } => {
+                    (message.clone(), *line, *column)
+                }
+                PopupContent::Hover { content, line, column } => {
+                    (content.clone(), *line, *column)
+                }
+            };
 
-                    // Recreate popup buffer if needed
-                    if let Some(device) = &self.device {
-                        let needs_new_buffer = {
-                            let buffer = self.popup_vertex_buffer.read().unwrap();
-                            buffer.is_none() || buffer.as_ref().map(|b| b.size() < required_size).unwrap_or(true)
-                        };
+            // Create a temporary diagnostic for popup positioning
+            let temp_diagnostic = Diagnostic {
+                line: popup_line,
+                column_range: (popup_col, popup_col + 1),
+                byte_range: None,
+                message: popup_text.clone(),
+                severity: DiagnosticSeverity::Info,
+            };
 
-                        if needs_new_buffer {
-                            let buffer_size = (required_size + 512).max(required_size * 2);
-                            let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("Diagnostics Popup Buffer (Dynamic)"),
-                                size: buffer_size,
-                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                                mapped_at_creation: false,
-                            });
-                            *self.popup_vertex_buffer.write().unwrap() = Some(new_buffer);
+            // Draw popup background
+            let popup_vertices = self.create_popup_vertices(&temp_diagnostic, ctx.widget_viewport.as_ref(), services);
+            if !popup_vertices.is_empty() {
+                let vertex_data = bytemuck::cast_slice(&popup_vertices);
+                let vertex_count = popup_vertices.len() as u32;
+                let required_size = vertex_data.len() as u64;
 
-                            let new_buffer_id = BufferId::create(
-                                buffer_size,
-                                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                            );
-                            *self.popup_vertex_buffer_id.write().unwrap() = Some(new_buffer_id);
-                        }
-                    }
+                // Recreate popup buffer if needed
+                if let Some(device) = &self.device {
+                    let needs_new_buffer = {
+                        let buffer = self.popup_vertex_buffer.read().unwrap();
+                        buffer.is_none() || buffer.as_ref().map(|b| b.size() < required_size).unwrap_or(true)
+                    };
 
-                    if let Some(buffer_id) = self.popup_vertex_buffer_id.read().unwrap().as_ref() {
-                        buffer_id.write(0, vertex_data);
+                    if needs_new_buffer {
+                        let buffer_size = (required_size + 512).max(required_size * 2);
+                        let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("Diagnostics Popup Buffer (Dynamic)"),
+                            size: buffer_size,
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        *self.popup_vertex_buffer.write().unwrap() = Some(new_buffer);
 
-                        if let Some(ref gpu_ctx) = ctx.gpu_context {
-                            if let Some(pipeline_id) = self.custom_pipeline_id {
-                                gpu_ctx.set_pipeline(render_pass, pipeline_id);
-                                gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
-                                gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
-                                gpu_ctx.draw(render_pass, vertex_count, 1);
-                            }
-                        }
+                        let new_buffer_id = BufferId::create(
+                            buffer_size,
+                            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        );
+                        *self.popup_vertex_buffer_id.write().unwrap() = Some(new_buffer_id);
                     }
                 }
 
-                // Draw popup text using glyph rendering with a separate buffer offset
-                // to avoid interfering with main text rendering
-                unsafe {
-                    if let Some(services) = ctx.context_data.as_ref() {
-                        let services = &*(services as *const _ as *const tiny_sdk::ServiceRegistry);
-                        let glyphs = self.collect_popup_glyphs(services, ctx.widget_viewport.as_ref());
+                if let Some(buffer_id) = self.popup_vertex_buffer_id.read().unwrap().as_ref() {
+                    buffer_id.write(0, vertex_data);
 
-                        if !glyphs.is_empty() && ctx.gpu_renderer != std::ptr::null_mut() {
-                            let gpu_renderer = &*(ctx.gpu_renderer as *const tiny_core::GpuRenderer);
-                            // Use a large offset to avoid conflicts with main text buffer
-                            // Main text typically uses offsets 0-100KB, so we use 500KB offset
-                            let buffer_offset = 500_000;
-                            gpu_renderer.draw_glyphs_styled_with_offset(
-                                render_pass,
-                                &glyphs,
-                                false,
-                                buffer_offset
-                            );
+                    if let Some(ref gpu_ctx) = ctx.gpu_context {
+                        if let Some(pipeline_id) = self.custom_pipeline_id {
+                            gpu_ctx.set_pipeline(render_pass, pipeline_id);
+                            gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
+                            gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
+                            gpu_ctx.draw(render_pass, vertex_count, 1);
                         }
+                    }
+                }
+            }
+
+            // Draw popup text using glyph rendering with a separate buffer offset
+            // to avoid interfering with main text rendering
+            unsafe {
+                if let Some(services) = ctx.context_data.as_ref() {
+                    let services = &*(services as *const _ as *const tiny_sdk::ServiceRegistry);
+                    let glyphs = self.collect_popup_glyphs(services, ctx.widget_viewport.as_ref());
+
+                    if !glyphs.is_empty() && ctx.gpu_renderer != std::ptr::null_mut() {
+                        let gpu_renderer = &*(ctx.gpu_renderer as *const tiny_core::GpuRenderer);
+                        // Use a large offset to avoid conflicts with main text buffer
+                        // Main text typically uses offsets 0-100KB, so we use 500KB offset
+                        let buffer_offset = 500_000;
+                        gpu_renderer.draw_glyphs_styled_with_offset(
+                            render_pass,
+                            &glyphs,
+                            false,
+                            buffer_offset
+                        );
                     }
                 }
             }
@@ -890,11 +1165,63 @@ impl DiagnosticsPlugin {
         self.line_texts.insert(line, text);
     }
 
+    /// Update timing and check if we should request hover (call every frame)
+    pub fn update(&mut self) -> Option<(usize, usize)> {
+        // Check if we need to transition hover state based on timing
+        if let HoverState::WaitingForDelay { line, column, .. } = self.hover_state {
+            if let Some(start_time) = self.hover_start_time {
+                if start_time.elapsed().as_millis() >= 500 {
+                    // 500ms elapsed, request hover info
+                    self.hover_state = HoverState::RequestingHover { line, column };
+                    self.last_hover_request = Some((line, column));
+                    return Some((line, column));
+                }
+            }
+        }
+        None
+    }
+
+    /// Set hover content received from LSP
+    pub fn set_hover_content(&mut self, content: String, line: usize, column: usize) {
+        if let HoverState::RequestingHover { line: req_line, column: req_column } = self.hover_state {
+            if line == req_line && column == req_column {
+                self.hover_state = HoverState::ShowingHover {
+                    content: content.clone(),
+                    line,
+                    column,
+                };
+                self.current_popup = Some(PopupContent::Hover {
+                    content,
+                    line,
+                    column,
+                });
+            }
+        }
+    }
+
+    /// Set document symbols from LSP
+    pub fn set_symbols(&mut self, symbols: Vec<Symbol>) {
+        self.symbols = symbols;
+    }
+
+    /// Clear all symbols
+    pub fn clear_symbols(&mut self) {
+        self.symbols.clear();
+    }
+
+    /// Get current mouse position in document coordinates (line, column)
+    pub fn get_mouse_document_position(&self) -> Option<(usize, usize)> {
+        self.mouse_line.and_then(|line| {
+            self.mouse_column.map(|col| (line, col))
+        })
+    }
+
     /// Clear all diagnostics
     pub fn clear_diagnostics(&mut self) {
         self.diagnostics.clear();
         self.line_texts.clear();
-        self.hovered_diagnostic = None;
+        self.current_popup = None;
+        self.hover_state = HoverState::None;
     }
 
     /// Get diagnostics count

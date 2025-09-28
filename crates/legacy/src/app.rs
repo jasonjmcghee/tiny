@@ -641,18 +641,34 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                 if let Some(point) = logical_point {
                     if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                        // Update diagnostics hover state
+                        // Update diagnostics hover state and request LSP hover
                         if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                            if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
-                                let diagnostics = unsafe { &mut *diagnostics_ptr };
-                                // Create widget viewport for diagnostics
-                                let editor_viewport = tiny_sdk::types::WidgetViewport {
-                                    bounds: cpu_renderer.editor_bounds,
-                                    scroll: cpu_renderer.viewport.scroll,
-                                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                                    widget_id: 3,
-                                };
-                                diagnostics.set_mouse_position(point.x.0, point.y.0, Some(&editor_viewport), Some(&cpu_renderer.service_registry));
+                            // Check if mouse is within editor bounds
+                            let in_editor = point.x.0 >= cpu_renderer.editor_bounds.x.0 &&
+                                           point.x.0 <= cpu_renderer.editor_bounds.x.0 + cpu_renderer.editor_bounds.width.0 &&
+                                           point.y.0 >= cpu_renderer.editor_bounds.y.0 &&
+                                           point.y.0 <= cpu_renderer.editor_bounds.y.0 + cpu_renderer.editor_bounds.height.0;
+
+                            if in_editor {
+                                if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
+                                    let diagnostics_plugin = unsafe { &mut *diagnostics_ptr };
+                                    // Create widget viewport for diagnostics
+                                    let editor_viewport = tiny_sdk::types::WidgetViewport {
+                                        bounds: cpu_renderer.editor_bounds,
+                                        scroll: cpu_renderer.viewport.scroll,
+                                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                                        widget_id: 3,
+                                    };
+                                    diagnostics_plugin.set_mouse_position(point.x.0, point.y.0, Some(&editor_viewport), Some(&cpu_renderer.service_registry));
+
+                                    // Request hover info from LSP if mouse position changed
+                                    if let Some((line, column)) = diagnostics_plugin.get_mouse_document_position() {
+                                        editor.diagnostics.on_mouse_move(line, column);
+                                    }
+                                }
+                            } else {
+                                // Mouse left editor area - clear hover info
+                                editor.diagnostics.on_mouse_leave();
                             }
                         }
 
@@ -1363,10 +1379,16 @@ impl AppLogic for EditorLogic {
         );
         let result = self.handle_input_action(action);
 
-        // Notify diagnostics manager of document changes
+        // Notify diagnostics manager of document changes with incremental updates
         if result {
-            let text = self.plugin.doc.read().flatten_to_string();
-            self.diagnostics.document_changed(text.to_string());
+            let lsp_changes = self.plugin.input.take_lsp_changes();
+            if !lsp_changes.is_empty() {
+                self.diagnostics.document_changed_incremental(lsp_changes);
+            } else {
+                // Fallback to full text if no incremental changes
+                let text = self.plugin.doc.read().flatten_to_string();
+                self.diagnostics.document_changed(text.to_string());
+            }
         }
 
         result
@@ -1382,9 +1404,15 @@ impl AppLogic for EditorLogic {
         if result {
             self.widgets_dirty = true;
 
-            // Notify diagnostics manager of document changes
-            let text = self.plugin.doc.read().flatten_to_string();
-            self.diagnostics.document_changed(text.to_string());
+            // Notify diagnostics manager of document changes with incremental updates
+            let lsp_changes = self.plugin.input.take_lsp_changes();
+            if !lsp_changes.is_empty() {
+                self.diagnostics.document_changed_incremental(lsp_changes);
+            } else {
+                // Fallback to full text if no incremental changes
+                let text = self.plugin.doc.read().flatten_to_string();
+                self.diagnostics.document_changed(text.to_string());
+            }
         }
         result
     }

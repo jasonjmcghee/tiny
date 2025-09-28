@@ -5,6 +5,7 @@
 use crate::coordinates::Viewport;
 use crate::history::{DocumentHistory, DocumentSnapshot, SelectionHistory};
 use crate::input_types::{ElementState, Key, KeyEvent, Modifiers, MouseButton, NamedKey};
+use crate::lsp_manager::TextChange;
 use crate::syntax::SyntaxHighlighter;
 use arboard::Clipboard;
 use std::ops::Range;
@@ -142,6 +143,8 @@ pub struct InputHandler {
     pending_text_edits: Vec<crate::syntax::TextEdit>,
     /// Whether we have unflushed syntax updates
     has_pending_syntax_update: bool,
+    /// Accumulated LSP text changes for incremental updates
+    pending_lsp_changes: Vec<TextChange>,
     /// History for undo/redo (document + selections)
     history: DocumentHistory,
     /// Navigation history for cursor positions (Cmd+[/])
@@ -175,6 +178,7 @@ impl InputHandler {
             syntax_highlighter: None,
             pending_text_edits: Vec::new(),
             has_pending_syntax_update: false,
+            pending_lsp_changes: Vec::new(),
             history: DocumentHistory::new(),
             nav_history: SelectionHistory::with_max_size(50),
             drag_anchor: None,
@@ -558,6 +562,11 @@ impl InputHandler {
                 .map_or(false, |t| t.elapsed().as_millis() > 50)
     }
 
+    /// Get and clear pending LSP changes for incremental updates
+    pub fn take_lsp_changes(&mut self) -> Vec<TextChange> {
+        std::mem::take(&mut self.pending_lsp_changes)
+    }
+
     pub fn pending_edits_count(&self) -> usize {
         self.pending_edits.len()
     }
@@ -654,13 +663,17 @@ impl InputHandler {
         // Capture tree state BEFORE applying edits
         let tree_before = doc.read();
 
-        // Collect TextEdits for LATER syntax update
+        // Collect TextEdits for LATER syntax update and LSP changes
         for edit in &self.pending_edits {
             if self.syntax_highlighter.is_some() {
                 let text_edit = crate::syntax::create_text_edit(&tree_before, edit);
                 self.pending_text_edits.push(text_edit);
                 self.has_pending_syntax_update = true;
             }
+
+            // Track LSP changes for incremental updates
+            let lsp_change = self.create_lsp_change(&tree_before, edit);
+            self.pending_lsp_changes.push(lsp_change);
 
             // Apply incremental edit to renderer for stable typing
             if let Some(renderer) = renderer.as_deref_mut() {
@@ -1331,6 +1344,88 @@ impl InputHandler {
             return true;
         }
         false
+    }
+
+    /// Create an LSP TextChange from a document edit
+    fn create_lsp_change(&self, tree: &tiny_core::tree::Tree, edit: &Edit) -> TextChange {
+        use lsp_types::{Position, Range as LspRange};
+
+        match edit {
+            Edit::Insert { pos, content } => {
+                // For insert, the range is just the insertion point
+                let start_line = tree.byte_to_line(*pos);
+                let line_start_byte = tree.line_to_byte(start_line).unwrap_or(0);
+                let start_char = tree.get_text_slice(line_start_byte..*pos).chars().count() as u32;
+
+                TextChange {
+                    range: LspRange {
+                        start: Position {
+                            line: start_line,
+                            character: start_char,
+                        },
+                        end: Position {
+                            line: start_line,
+                            character: start_char,
+                        },
+                    },
+                    text: match content {
+                        Content::Text(s) => s.clone(),
+                        Content::Spatial(_) => String::new(), // Shouldn't happen for LSP
+                    },
+                }
+            }
+            Edit::Delete { range } => {
+                // For delete, provide the range being deleted
+                let start_line = tree.byte_to_line(range.start);
+                let start_line_byte = tree.line_to_byte(start_line).unwrap_or(0);
+                let start_char = tree.get_text_slice(start_line_byte..range.start).chars().count() as u32;
+
+                let end_line = tree.byte_to_line(range.end);
+                let end_line_byte = tree.line_to_byte(end_line).unwrap_or(0);
+                let end_char = tree.get_text_slice(end_line_byte..range.end).chars().count() as u32;
+
+                TextChange {
+                    range: LspRange {
+                        start: Position {
+                            line: start_line,
+                            character: start_char,
+                        },
+                        end: Position {
+                            line: end_line,
+                            character: end_char,
+                        },
+                    },
+                    text: String::new(), // Empty string for deletion
+                }
+            }
+            Edit::Replace { range, content } => {
+                // For replace, provide the range being replaced and the new text
+                let start_line = tree.byte_to_line(range.start);
+                let start_line_byte = tree.line_to_byte(start_line).unwrap_or(0);
+                let start_char = tree.get_text_slice(start_line_byte..range.start).chars().count() as u32;
+
+                let end_line = tree.byte_to_line(range.end);
+                let end_line_byte = tree.line_to_byte(end_line).unwrap_or(0);
+                let end_char = tree.get_text_slice(end_line_byte..range.end).chars().count() as u32;
+
+                TextChange {
+                    range: LspRange {
+                        start: Position {
+                            line: start_line,
+                            character: start_char,
+                        },
+                        end: Position {
+                            line: end_line,
+                            character: end_char,
+                        },
+                    },
+                    text: match content {
+                        Content::Text(s) => s.clone(),
+                        Content::Spatial(_) => String::new(), // Shouldn't happen for LSP
+                    },
+                }
+            }
+        }
     }
 
     /// Perform redo operation

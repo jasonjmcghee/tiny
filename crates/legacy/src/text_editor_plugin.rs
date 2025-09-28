@@ -66,7 +66,8 @@ impl TextEditorPlugin {
         viewport: &Viewport,
         modifiers: &crate::input_types::Modifiers,
     ) -> bool {
-        let action = self.input.on_key(&self.doc, viewport, event, modifiers);
+        // Use on_key_with_renderer to ensure LSP changes are collected properly
+        let action = self.input.on_key_with_renderer(&self.doc, viewport, event, modifiers, None);
         self.handle_input_action(action)
     }
 
