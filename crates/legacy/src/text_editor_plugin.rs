@@ -59,19 +59,6 @@ impl TextEditorPlugin {
         Ok(editor)
     }
 
-    /// Handle keyboard input
-    pub fn on_key(
-        &mut self,
-        event: &crate::input_types::KeyEvent,
-        viewport: &Viewport,
-        modifiers: &crate::input_types::Modifiers,
-    ) -> bool {
-        // Use on_key_with_renderer to ensure LSP changes are collected properly
-        // Create a temporary event bus for compatibility
-        let mut temp_bus = crate::input::EventBus::new();
-        let action = self.input.on_key_with_renderer(&self.doc, viewport, event, modifiers, None, &mut temp_bus);
-        self.handle_input_action(action)
-    }
 
     /// Handle mouse click
     pub fn on_click(

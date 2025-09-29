@@ -4,7 +4,7 @@
 
 use crate::{
     diagnostics_manager::DiagnosticsManager,
-    input::{EventBus, EventResult, InputAction, InputHandler},
+    input::{EventBus, InputAction, InputHandler},
     input_types, io,
     lsp_manager::LspManager,
     render::Renderer,
@@ -60,29 +60,6 @@ pub trait AppLogic: 'static {
         unreachable!("as_any_mut not implemented")
     }
 
-    /// Handle keyboard input with optional renderer for incremental updates
-    fn on_key_with_renderer(
-        &mut self,
-        _key: &input_types::KeyEvent,
-        _viewport: &crate::coordinates::Viewport,
-        _modifiers: &input_types::Modifiers,
-        _renderer: Option<&mut crate::render::Renderer>,
-        _bus: &mut EventBus,
-    ) -> bool {
-        // Default fallback to regular on_key
-        self.on_key(_key, _viewport, _modifiers)
-    }
-
-    /// Handle keyboard input
-    fn on_key(
-        &mut self,
-        _key: &input_types::KeyEvent,
-        _viewport: &crate::coordinates::Viewport,
-        _modifiers: &input_types::Modifiers,
-    ) -> bool {
-        // Default implementation with basic editor functionality
-        false
-    }
 
     /// Handle mouse click at logical position
     fn on_click(
@@ -321,6 +298,11 @@ impl<T: AppLogic> TinyApp<T> {
         });
         LspManager::prewarm_for_workspace(workspace_root);
 
+        let mut event_bus = EventBus::new();
+
+        // Register app-level event handlers from InputHandler
+        InputHandler::register_app_handlers(&mut event_bus);
+
         Self {
             window: None,
             gpu_renderer: None,
@@ -329,7 +311,7 @@ impl<T: AppLogic> TinyApp<T> {
             _shader_watcher: None,
             shader_reload_pending: Arc::new(AtomicBool::new(false)),
             logic,
-            event_bus: EventBus::new(),
+            event_bus,
             orchestrator: PluginOrchestrator::new(),
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
@@ -994,17 +976,14 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Process each event
             for event in events_to_process {
-                // Handle app-level events
+                // Handle app-level command events (from InputHandler's registered handlers)
                 match event.name.as_str() {
-                    "app.action.font_increase" => {
-                        self.adjust_font_size(true);
+                    "app.command.adjust_font_size" => {
+                        let increase = event.data.get("increase").and_then(|v| v.as_bool()).unwrap_or(false);
+                        self.adjust_font_size(increase);
                         continue;
                     }
-                    "app.action.font_decrease" => {
-                        self.adjust_font_size(false);
-                        continue;
-                    }
-                    "app.action.toggle_scroll_lock" => {
+                    "app.command.toggle_scroll_lock" => {
                         self.scroll_lock_enabled = !self.scroll_lock_enabled;
                         self.current_scroll_direction = None;
                         println!(
@@ -1064,7 +1043,6 @@ impl<T: AppLogic> TinyApp<T> {
                                 self.cursor_needs_scroll = true;
                             }
                         }
-
                     }
                 }
             }
@@ -1497,61 +1475,6 @@ impl AppLogic for EditorLogic {
         self
     }
 
-    fn on_key_with_renderer(
-        &mut self,
-        event: &input_types::KeyEvent,
-        viewport: &crate::coordinates::Viewport,
-        modifiers: &input_types::Modifiers,
-        renderer: Option<&mut crate::render::Renderer>,
-        bus: &mut EventBus,
-    ) -> bool {
-        let action = self.plugin.input.on_key_with_renderer(
-            &self.plugin.doc,
-            viewport,
-            event,
-            modifiers,
-            renderer,
-            bus,
-        );
-        let result = self.handle_input_action(action);
-
-        // Notify diagnostics manager of document changes with incremental updates
-        if result {
-            let lsp_changes = self.plugin.input.take_lsp_changes();
-            if !lsp_changes.is_empty() {
-                self.diagnostics.document_changed_incremental(lsp_changes);
-            } else {
-                // Fallback to full text if no incremental changes
-                let text = self.plugin.doc.read().flatten_to_string();
-                self.diagnostics.document_changed(text.to_string());
-            }
-        }
-
-        result
-    }
-
-    fn on_key(
-        &mut self,
-        event: &input_types::KeyEvent,
-        viewport: &crate::coordinates::Viewport,
-        modifiers: &input_types::Modifiers,
-    ) -> bool {
-        let result = self.plugin.on_key(event, viewport, modifiers);
-        if result {
-            self.widgets_dirty = true;
-
-            // Notify diagnostics manager of document changes with incremental updates
-            let lsp_changes = self.plugin.input.take_lsp_changes();
-            if !lsp_changes.is_empty() {
-                self.diagnostics.document_changed_incremental(lsp_changes);
-            } else {
-                // Fallback to full text if no incremental changes
-                let text = self.plugin.doc.read().flatten_to_string();
-                self.diagnostics.document_changed(text.to_string());
-            }
-        }
-        result
-    }
 
     fn on_click(
         &mut self,

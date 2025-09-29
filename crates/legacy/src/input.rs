@@ -352,118 +352,31 @@ impl InputHandler {
         }
     }
 
-    /// Convert key event to event bus event and emit it
-    pub fn emit_key_event(&self, event: &KeyEvent, modifiers: &Modifiers, bus: &mut EventBus) {
-        // Emit all key events, but include the state
+    /// Register app-level event handlers (font size, scroll lock, etc)
+    /// These are handlers that don't directly manipulate the document
+    pub fn register_app_handlers(bus: &mut EventBus) {
+        // Font size increase handler
+        bus.on("app.action.font_increase", Box::new(|_event, bus| {
+            // Re-emit as a command that app.rs will handle
+            bus.emit("app.command.adjust_font_size", json!({ "increase": true }), 5, "input_handler");
+            EventResult::Continue
+        }));
 
-        // Build proper JSON data for the key event
-        let key_data = match &event.logical_key {
-            Key::Character(ch) => json!({
-                "type": "character",
-                "value": ch.clone(),
-            }),
-            Key::Named(named) => {
-                let name = match named {
-                    NamedKey::Enter => "Enter",
-                    NamedKey::Tab => "Tab",
-                    NamedKey::Backspace => "Backspace",
-                    NamedKey::Delete => "Delete",
-                    NamedKey::ArrowLeft => "ArrowLeft",
-                    NamedKey::ArrowRight => "ArrowRight",
-                    NamedKey::ArrowUp => "ArrowUp",
-                    NamedKey::ArrowDown => "ArrowDown",
-                    NamedKey::Home => "Home",
-                    NamedKey::End => "End",
-                    NamedKey::PageUp => "PageUp",
-                    NamedKey::PageDown => "PageDown",
-                    NamedKey::Space => "Space",
-                    NamedKey::Shift => "Shift",
-                    NamedKey::Control => "Control",
-                    NamedKey::Alt => "Alt",
-                    NamedKey::Super => "Super",
-                    _ => "Unknown",
-                };
-                json!({
-                    "type": "named",
-                    "value": name,
-                })
-            }
-            _ => json!({
-                "type": "unknown",
-                "value": null,
-            }),
-        };
+        // Font size decrease handler
+        bus.on("app.action.font_decrease", Box::new(|_event, bus| {
+            // Re-emit as a command that app.rs will handle
+            bus.emit("app.command.adjust_font_size", json!({ "increase": false }), 5, "input_handler");
+            EventResult::Continue
+        }));
 
-        // Emit keyboard event with proper structure
-        bus.emit(
-            "app.keyboard.keypress",
-            json!({
-                "key": key_data,
-                "modifiers": {
-                    "shift": modifiers.state().shift_key(),
-                    "ctrl": modifiers.state().control_key(),
-                    "alt": modifiers.state().alt_key(),
-                    "cmd": modifiers.state().super_key(),
-                },
-                "state": if event.state == ElementState::Pressed { "pressed" } else { "released" },
-            }),
-            10, // Input priority
-            "input_handler",
-        );
+        // Scroll lock toggle handler
+        bus.on("app.action.toggle_scroll_lock", Box::new(|_event, bus| {
+            // Re-emit as a command that app.rs will handle
+            bus.emit("app.command.toggle_scroll_lock", json!({}), 5, "input_handler");
+            EventResult::Continue
+        }));
     }
 
-    /// Convert mouse click to event bus event and emit it
-    pub fn emit_mouse_click(
-        &self,
-        pos: Point,
-        button: MouseButton,
-        modifiers: &Modifiers,
-        bus: &mut EventBus,
-    ) {
-        bus.emit(
-            "app.mouse.click",
-            json!({
-                "x": pos.x.0,
-                "y": pos.y.0,
-                "button": format!("{:?}", button),
-                "modifiers": {
-                    "shift": modifiers.state().shift_key(),
-                    "ctrl": modifiers.state().control_key(),
-                    "alt": modifiers.state().alt_key(),
-                    "cmd": modifiers.state().super_key(),
-                },
-            }),
-            10,
-            "input_handler",
-        );
-    }
-
-    /// Convert mouse drag to event bus event and emit it
-    pub fn emit_mouse_drag(
-        &self,
-        from: Point,
-        to: Point,
-        modifiers: &Modifiers,
-        bus: &mut EventBus,
-    ) {
-        bus.emit(
-            "app.mouse.drag",
-            json!({
-                "from_x": from.x.0,
-                "from_y": from.y.0,
-                "to_x": to.x.0,
-                "to_y": to.y.0,
-                "modifiers": {
-                    "shift": modifiers.state().shift_key(),
-                    "ctrl": modifiers.state().control_key(),
-                    "alt": modifiers.state().alt_key(),
-                    "cmd": modifiers.state().super_key(),
-                },
-            }),
-            10,
-            "input_handler",
-        );
-    }
 
     /// Process events from the bus - handles keyboard, mouse, and action events
     pub fn process_event(
@@ -689,7 +602,7 @@ impl InputHandler {
             "app.action.nav_back" => self.navigate_history(doc, true),
             "app.action.nav_forward" => self.navigate_history(doc, false),
             "app.mouse.press" => {
-                // Handle mouse press/click
+                // Handle mouse press/click - coordinates are pre-converted by app.rs
                 if let (Some(x), Some(y)) = (
                     event.data.get("x").and_then(|v| v.as_f64()),
                     event.data.get("y").and_then(|v| v.as_f64())
@@ -709,7 +622,7 @@ impl InputHandler {
                         y: tiny_sdk::LogicalPixels(y as f32),
                     };
 
-                    // Store drag anchor for potential drag operation
+                    // Store drag anchor in document coordinates (already converted by app.rs)
                     self.drag_anchor = Some(viewport.layout_to_doc(
                         tiny_sdk::LayoutPos {
                             x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
@@ -788,45 +701,6 @@ impl InputHandler {
         }
     }
 
-    /// Handle character typing with optional renderer
-    fn handle_character_input(
-        &mut self,
-        doc: &Doc,
-        ch: &str,
-        renderer: Option<&mut crate::render::Renderer>,
-    ) -> InputAction {
-        self.goal_column = None;
-        self.save_snapshot_to_history(doc);
-
-        // Simply delete selections and insert text at cursor positions
-        for sel in &self.selections {
-            if !sel.is_cursor() {
-                self.pending_edits.push(Edit::Delete {
-                    range: sel.byte_range(doc),
-                });
-            }
-            let tree = doc.read();
-            let insert_pos = tree.doc_pos_to_byte(sel.min_pos());
-            self.pending_edits.push(Edit::Insert {
-                pos: insert_pos,
-                content: Content::Text(ch.to_string()),
-            });
-        }
-
-        self.flush_pending_edits_with_renderer(doc, renderer);
-
-        // Update cursor positions
-        let ch_len = ch.chars().count() as u32;
-        for sel in &mut self.selections {
-            if !sel.is_cursor() {
-                sel.cursor = sel.min_pos();
-            }
-            sel.cursor.column += ch_len;
-            sel.anchor = sel.cursor;
-        }
-
-        InputAction::Redraw
-    }
 
     /// Move cursor to a new position, handling selection based on current state
     fn move_cursor_to(&mut self, new_position: DocPos, extending_selection: bool) {
@@ -1097,33 +971,6 @@ impl InputHandler {
         InputAction::Redraw
     }
 
-    /// Handle command key combinations
-    fn handle_command_key(&mut self, doc: &Doc, ch: &str, shift_held: bool) -> InputAction {
-        match ch {
-            "z" if shift_held => InputAction::Redo,
-            "z" => InputAction::Undo,
-            "c" => {
-                self.copy(doc);
-                InputAction::None
-            }
-            "x" => {
-                self.cut(doc);
-                InputAction::Redraw
-            }
-            "v" => {
-                self.paste(doc);
-                InputAction::Redraw
-            }
-            "s" => InputAction::Save,
-            "a" => {
-                self.select_all(doc);
-                InputAction::Redraw
-            }
-            "[" => self.navigate_history(doc, true),
-            "]" => self.navigate_history(doc, false),
-            _ => InputAction::None,
-        }
-    }
 
     /// Navigate through cursor history
     fn navigate_history(&mut self, doc: &Doc, back: bool) -> InputAction {
@@ -1366,66 +1213,6 @@ impl InputHandler {
         edits
     }
 
-    /// Handle key input with optional renderer for incremental updates
-    pub fn on_key_with_renderer(
-        &mut self,
-        doc: &Doc,
-        viewport: &Viewport,
-        event: &KeyEvent,
-        modifiers: &Modifiers,
-        renderer: Option<&mut crate::render::Renderer>,
-        bus: &mut EventBus,
-    ) -> InputAction {
-        self.on_key_internal(doc, viewport, event, modifiers, renderer, bus)
-    }
-
-    /// Handle keyboard input
-    pub fn on_key(
-        &mut self,
-        doc: &Doc,
-        viewport: &Viewport,
-        event: &KeyEvent,
-        modifiers: &Modifiers,
-    ) -> InputAction {
-        // For backwards compatibility, create a temporary event bus
-        let mut bus = EventBus::new();
-        self.on_key_internal(doc, viewport, event, modifiers, None, &mut bus)
-    }
-
-    /// Internal key handling with optional renderer - NOW USES EVENT BUS
-    fn on_key_internal(
-        &mut self,
-        doc: &Doc,
-        viewport: &Viewport,
-        event: &KeyEvent,
-        modifiers: &Modifiers,
-        renderer: Option<&mut crate::render::Renderer>,
-        bus: &mut EventBus,
-    ) -> InputAction {
-        // Emit the key event to the bus
-        self.emit_key_event(event, modifiers, bus);
-
-        // Process all queued events immediately
-        // This maintains synchronous behavior while using the event bus
-        let mut action = InputAction::None;
-
-        // We need to handle events in a loop since processing one event might emit more
-        loop {
-            let events_to_process: Vec<Event> = bus.queued.drain(..).collect();
-            if events_to_process.is_empty() {
-                break;
-            }
-
-            for event in events_to_process {
-                let result = self.process_event(&event, doc, viewport, bus);
-                if result != InputAction::None {
-                    action = result;
-                }
-            }
-        }
-
-        action
-    }
 
     /// Handle mouse click
     pub fn on_mouse_click(
@@ -1457,7 +1244,7 @@ impl InputHandler {
         }
 
         // Detect double/triple click
-        const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(500);
+        const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(300);
         const CLICK_POS_TOLERANCE: u32 = 2; // Allow 2 character tolerance for position
 
         let now = Instant::now();
@@ -1532,6 +1319,7 @@ impl InputHandler {
         } else {
             // Regular click: start fresh selection at click point
             self.selection_anchor = None; // Clear any existing selection mode
+            self.drag_anchor = None; // Clear any leftover drag anchor
             self.selections = vec![Selection {
                 cursor: doc_pos,
                 anchor: doc_pos,
@@ -1556,7 +1344,7 @@ impl InputHandler {
             return (true, None);
         }
 
-        // Use the stored drag anchor, or calculate it if missing
+        // Use the stored drag anchor if available, otherwise fallback to current selection anchor
         let anchor_doc = self.drag_anchor.unwrap_or_else(|| {
             self.selections
                 .first()
