@@ -1220,8 +1220,28 @@ impl<T: AppLogic> TinyApp<T> {
             cpu_renderer.set_gpu_renderer(gpu_renderer);
 
             let doc_read = doc.read();
+
+            // Check if version changed without edits (undo/redo) BEFORE updating cache
+            let version_changed_without_edits = doc_read.version != cpu_renderer.cached_doc_version;
+
             cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
             cpu_renderer.cached_doc_version = doc_read.version;
+
+            // Apply pending renderer edits for syntax token adjustment
+            if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                let pending_edits = editor.plugin.input.take_renderer_edits();
+
+                // If version changed without edits, it's undo/redo
+                // Clear BOTH edit_deltas and stable_tokens - they're for the wrong state
+                if pending_edits.is_empty() && version_changed_without_edits {
+                    cpu_renderer.clear_edit_deltas();
+                    cpu_renderer.text_renderer.syntax_state.stable_tokens.clear();
+                }
+
+                for edit in pending_edits {
+                    cpu_renderer.apply_incremental_edit(&edit);
+                }
+            }
 
             // Just use the existing render pipeline - it was working!
             unsafe {
@@ -1453,8 +1473,22 @@ impl EditorLogic {
                 }
                 true
             }
-            InputAction::Undo => self.plugin.input.undo(&self.plugin.doc),
-            InputAction::Redo => self.plugin.input.redo(&self.plugin.doc),
+            InputAction::Undo => {
+                let changed = self.plugin.input.undo(&self.plugin.doc);
+                if changed {
+                    // Mark that renderer needs edit_deltas cleared
+                    self.widgets_dirty = true;
+                }
+                changed
+            }
+            InputAction::Redo => {
+                let changed = self.plugin.input.redo(&self.plugin.doc);
+                if changed {
+                    // Mark that renderer needs edit_deltas cleared
+                    self.widgets_dirty = true;
+                }
+                changed
+            }
             InputAction::Redraw => true,
             InputAction::None => false,
         };

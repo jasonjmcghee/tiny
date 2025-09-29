@@ -41,7 +41,7 @@ pub struct TokenRange {
     pub token_id: u8,
 }
 
-/// Syntax state with stable tokens and dirty range tracking
+/// Syntax state with stable tokens and edit tracking
 pub struct SyntaxState {
     /// Last completed tree-sitter parse
     pub stable_tokens: Vec<TokenRange>,
@@ -49,6 +49,9 @@ pub struct SyntaxState {
     pub dirty_range: Option<Range<usize>>,
     /// Version of stable tokens
     pub stable_version: u64,
+    /// Accumulated edit delta for adjusting token ranges
+    /// Tracks (position, delta) for each edit since last fresh parse
+    pub edit_deltas: Vec<(usize, isize)>,
 }
 
 /// Decoupled text renderer
@@ -92,6 +95,7 @@ impl TextRenderer {
                 stable_tokens: Vec::new(),
                 dirty_range: None,
                 stable_version: 0,
+                edit_deltas: Vec::new(),
             },
             visible_lines: 0..0,
             visible_chars: Vec::new(),
@@ -128,11 +132,21 @@ impl TextRenderer {
             return;
         }
 
-        // Save old glyphs to preserve token IDs
-        let old_styles: HashMap<usize, (u16, f32)> = self
+        // Build map of (line, pos_in_line, char) → (token_id, relative_pos) for preservation
+        // This keeps colors stable when layout rebuilds (e.g., after undo)
+        let old_tokens: ahash::HashMap<(u32, u32, char), (u16, f32)> = self
             .layout_cache
             .iter()
-            .map(|g| (g.char_byte_offset, (g.token_id, g.relative_pos)))
+            .enumerate()
+            .filter_map(|(glyph_idx, g)| {
+                if g.token_id == 0 {
+                    return None; // Skip unstyled glyphs
+                }
+                // Find which line this glyph is on
+                let line_info = self.line_cache.iter().find(|l| l.char_range.contains(&glyph_idx))?;
+                let pos_in_line = (glyph_idx - line_info.char_range.start) as u32;
+                Some(((line_info.line_number, pos_in_line, g.char), (g.token_id, g.relative_pos)))
+            })
             .collect();
 
         self.layout_cache.clear();
@@ -151,6 +165,8 @@ impl TextRenderer {
             (viewport.margin.x.0, viewport.global_margin.y.0 + viewport.margin.y.0)
         };
 
+        let text_len = text.len();
+
         for (line_idx, line_text) in lines.iter().enumerate() {
             let line_start_char = char_index;
             let line_start_byte = byte_offset;
@@ -162,30 +178,71 @@ impl TextRenderer {
                 viewport.scale_factor,
             );
 
+            // Build a mapping from source text chars to their byte positions
+            // This handles tabs which expand to multiple glyphs but occupy 1 byte
+            let mut source_byte_offsets = Vec::new();
+            let mut line_byte = line_start_byte;
+            for ch in line_text.chars() {
+                source_byte_offsets.push(line_byte);
+                line_byte += ch.len_utf8();
+            }
+
+            // Track position in source text (NOT glyph index!)
+            let mut source_char_idx = 0;
+
             // Add glyphs to cache
-            for glyph in layout.glyphs {
+            for (glyph_idx, glyph) in layout.glyphs.iter().enumerate() {
                 let layout_pos = LayoutPos::new(
                     x_offset + glyph.pos.x.0 / viewport.scale_factor,
                     y_pos + glyph.pos.y.0 / viewport.scale_factor,
                 );
 
-                // Preserve token_id from old layout if available
-                let (token_id, relative_pos) =
-                    old_styles.get(&byte_offset).copied().unwrap_or((0, 0.0));
+                // Get the byte offset from source text position
+                // Font system may expand tabs to multiple space glyphs - they all map to the tab's byte
+                let char_byte_offset = if source_char_idx < source_byte_offsets.len() {
+                    source_byte_offsets[source_char_idx]
+                } else {
+                    byte_offset
+                };
+
+                // Try to preserve token from old layout
+                let key = (line_idx as u32, (char_index - line_start_char) as u32, glyph.char);
+                let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
                     layout_pos,
                     physical_pos: glyph.pos,
                     tex_coords: glyph.tex_coords,
-                    char_byte_offset: byte_offset,
+                    char_byte_offset,
                     token_id,
                     relative_pos,
                 });
 
-                byte_offset += glyph.char.len_utf8();
                 char_index += 1;
+
+                // Advance source position only when we see a non-expanded glyph
+                // Tabs expand to 4 spaces - only advance after we've seen all 4
+                // Check if next source char is different from current glyph char
+                if source_char_idx < line_text.chars().count() {
+                    let source_char = line_text.chars().nth(source_char_idx).unwrap();
+                    // If source is tab but glyph is space, we're in an expansion
+                    if source_char == '\t' && glyph.char == ' ' {
+                        // Check if we're at the last space of the tab expansion (tab width = 4)
+                        let next_glyph_is_not_space = layout.glyphs.get(glyph_idx + 1)
+                            .map(|g| g.char != ' ')
+                            .unwrap_or(true);
+                        if next_glyph_is_not_space {
+                            source_char_idx += 1;
+                        }
+                    } else {
+                        source_char_idx += 1;
+                    }
+                }
             }
+
+            // Update byte_offset to end of line
+            byte_offset = line_byte;
 
             // Add line info
             self.line_cache.push(LineInfo {
@@ -198,11 +255,8 @@ impl TextRenderer {
 
             // Add newline as a glyph (invisible but maintains byte position)
             if line_idx < lines.len() - 1 {
-                // Newline between lines
-                // Preserve token_id for newline
-                let (token_id, relative_pos) =
-                    old_styles.get(&byte_offset).copied().unwrap_or((0, 0.0));
-
+                let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
+                let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -218,11 +272,8 @@ impl TextRenderer {
                 byte_offset += 1;
                 char_index += 1;
             } else if text.ends_with('\n') {
-                // Trailing newline
-                // Preserve token_id for newline
-                let (token_id, relative_pos) =
-                    old_styles.get(&byte_offset).copied().unwrap_or((0, 0.0));
-
+                let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
+                let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -247,22 +298,31 @@ impl TextRenderer {
 
     /// Update style buffer with legacy token ranges
     pub fn update_syntax(&mut self, tokens: &[TokenRange], fresh_parse: bool) {
-        // Early exit if no tokens - just clear styles and return
+        // Early exit if no tokens - preserve existing highlights (don't clear!)
+        // This prevents white text when waiting for fresh parse
         if tokens.is_empty() {
-            for glyph in &mut self.layout_cache {
-                glyph.token_id = 0;
-                glyph.relative_pos = 0.0;
-            }
             if fresh_parse {
+                // Fresh parse with no tokens means parse failed or doc is empty - clear
+                for glyph in &mut self.layout_cache {
+                    glyph.token_id = 0;
+                    glyph.relative_pos = 0.0;
+                }
                 self.syntax_state.dirty_range = None;
             }
+            // If not fresh_parse and no tokens, keep existing highlights
             return;
         }
 
-        // If this is a fresh parse, clear dirty range and update stable tokens
-        if fresh_parse {
+        // Strategy for stable syntax highlighting:
+        // - fresh_parse=true: Authoritative tokens, apply directly
+        // - fresh_parse=false: Adjust old tokens for accumulated edits, then apply
+
+        let adjusted_tokens: Vec<TokenRange>;
+        let tokens_to_apply = if fresh_parse {
             self.syntax_state.dirty_range = None;
-            // Convert legacy tokens to new format for stable storage
+            self.syntax_state.edit_deltas.clear();
+
+            // Store fresh tokens and increment version
             self.syntax_state.stable_tokens = tokens
                 .iter()
                 .map(|t| TokenRange {
@@ -271,66 +331,71 @@ impl TextRenderer {
                 })
                 .collect();
 
-            // Apply all tokens for fresh parse - O(n + m) single-pass merge
-            let mut glyph_idx = 0;
-            let mut token_idx = 0;
+            // Increment our version to match that we consumed a new parse
+            self.syntax_state.stable_version += 1;
 
-            // First, clear all glyph styles
-            for glyph in &mut self.layout_cache {
-                glyph.token_id = 0;
-                glyph.relative_pos = 0.0;
-            }
-
-            // Single-pass merge: both glyphs and tokens are sorted by byte position
-            while glyph_idx < self.layout_cache.len() && token_idx < tokens.len() {
-                let glyph_pos = self.layout_cache[glyph_idx].char_byte_offset;
-                let token = &tokens[token_idx];
-
-                if glyph_pos < token.byte_range.start {
-                    // Glyph is before current token - leave as default (0)
-                    glyph_idx += 1;
-                } else if glyph_pos >= token.byte_range.end {
-                    // Glyph is after current token - advance to next token
-                    token_idx += 1;
-                } else {
-                    // Glyph is within current token - apply styling
-                    self.layout_cache[glyph_idx].token_id = token.token_id as u16;
-
-                    // Calculate relative position within token
-                    let token_byte_length = token.byte_range.end - token.byte_range.start;
-                    let byte_offset_in_token = glyph_pos - token.byte_range.start;
-                    self.layout_cache[glyph_idx].relative_pos = if token_byte_length > 0 {
-                        (byte_offset_in_token as f32) / (token_byte_length as f32)
-                    } else {
-                        0.0
-                    };
-
-                    glyph_idx += 1;
-                }
-            }
+            tokens
         } else {
-            // Incremental update - only update dirty range
-            if let Some(dirty_range) = &self.syntax_state.dirty_range {
-                // Collect positions that need updating first to avoid borrow conflicts
-                let positions_to_update: Vec<usize> = self
-                    .layout_cache
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, glyph)| {
-                        if dirty_range.contains(&glyph.char_byte_offset) {
-                            Some(idx)
-                        } else {
-                            None
+            // Adjust stable tokens for accumulated edits
+            adjusted_tokens = self.syntax_state.stable_tokens
+                .iter()
+                .map(|t| {
+                    let mut range = t.byte_range.clone();
+                    // Apply each edit delta
+                    for &(edit_pos, delta) in &self.syntax_state.edit_deltas {
+                        if edit_pos <= range.start {
+                            // Edit before token, shift entire range
+                            range.start = ((range.start as isize) + delta).max(0) as usize;
+                            range.end = ((range.end as isize) + delta).max(0) as usize;
+                        } else if edit_pos < range.end {
+                            // Edit within token, only shift end
+                            range.end = ((range.end as isize) + delta).max(edit_pos as isize) as usize;
                         }
-                    })
-                    .collect();
+                    }
+                    TokenRange {
+                        byte_range: range,
+                        token_id: t.token_id,
+                    }
+                })
+                .collect();
+            &adjusted_tokens
+        };
 
-                // Now update the glyphs at those positions
-                for idx in positions_to_update {
-                    let new_token_id = self.infer_style_from_context(idx);
-                    self.layout_cache[idx].token_id = new_token_id;
-                    self.layout_cache[idx].relative_pos = 0.5; // Middle of token for dirty regions
-                }
+        // Clear all tokens before applying
+        for glyph in &mut self.layout_cache {
+            glyph.token_id = 0;
+            glyph.relative_pos = 0.0;
+        }
+
+        // Apply tokens - O(n + m) single-pass merge
+        let mut glyph_idx = 0;
+        let mut token_idx = 0;
+
+        // Single-pass merge: both glyphs and tokens are sorted by byte position
+        while glyph_idx < self.layout_cache.len() && token_idx < tokens_to_apply.len() {
+            let glyph_pos = self.layout_cache[glyph_idx].char_byte_offset;
+            let token = &tokens_to_apply[token_idx];
+
+            if glyph_pos < token.byte_range.start {
+                // Glyph is before current token - leave as default (0)
+                glyph_idx += 1;
+            } else if glyph_pos >= token.byte_range.end {
+                // Glyph is after current token - advance to next token
+                token_idx += 1;
+            } else {
+                // Glyph is within current token - apply styling
+                self.layout_cache[glyph_idx].token_id = token.token_id as u16;
+
+                // Calculate relative position within token
+                let token_byte_length = token.byte_range.end - token.byte_range.start;
+                let byte_offset_in_token = glyph_pos - token.byte_range.start;
+                self.layout_cache[glyph_idx].relative_pos = if token_byte_length > 0 {
+                    (byte_offset_in_token as f32) / (token_byte_length as f32)
+                } else {
+                    0.0
+                };
+
+                glyph_idx += 1;
             }
         }
     }
@@ -365,6 +430,31 @@ impl TextRenderer {
 
     /// Handle incremental syntax update (while tree-sitter is parsing)
     pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
+        // Track the edit delta for token range adjustment
+        let (pos, delta) = match edit {
+            tree::Edit::Insert { pos, content } => {
+                let len = match content {
+                    tree::Content::Text(text) => text.len(),
+                    tree::Content::Spatial(_) => 0,
+                };
+                (*pos, len as isize)
+            }
+            tree::Edit::Delete { range } => {
+                (range.start, -(range.len() as isize))
+            }
+            tree::Edit::Replace { range, content } => {
+                let old_len = range.len();
+                let new_len = match content {
+                    tree::Content::Text(text) => text.len(),
+                    tree::Content::Spatial(_) => 0,
+                };
+                (range.start, (new_len as isize) - (old_len as isize))
+            }
+        };
+
+        // Store the edit delta for later adjustment
+        self.syntax_state.edit_deltas.push((pos, delta));
+
         // Calculate the affected range for this edit
         let edit_range = match edit {
             tree::Edit::Insert { pos, content } => {
@@ -375,7 +465,6 @@ impl TextRenderer {
                 *pos..*pos + len
             }
             tree::Edit::Delete { range } => {
-                // After deletion, the range collapses to the start position
                 range.start..range.start
             }
             tree::Edit::Replace { range, content } => {
@@ -391,7 +480,6 @@ impl TextRenderer {
         self.syntax_state.dirty_range = match self.syntax_state.dirty_range.take() {
             None => Some(edit_range),
             Some(existing) => {
-                // Merge with existing dirty range
                 Some(existing.start.min(edit_range.start)..existing.end.max(edit_range.end))
             }
         };

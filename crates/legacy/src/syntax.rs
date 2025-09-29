@@ -119,6 +119,17 @@ impl Languages {
     // }
 }
 
+/// Syntax highlighting mode for debugging and validation
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SyntaxMode {
+    /// Use incremental parsing with InputEdit for efficiency
+    Incremental,
+    /// Always do full reparse from scratch (slower but more reliable for debugging)
+    FullReparse,
+    /// Validate: run both modes and compare results (very slow, debug only)
+    Validate,
+}
+
 /// Token types (universal across languages)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenType {
@@ -214,6 +225,8 @@ pub struct SyntaxHighlighter {
     language: Language,
     /// Highlight query string (compiled lazily in background thread)
     highlights_query: &'static str,
+    /// Syntax highlighting mode (for debugging/validation)
+    mode: Arc<ArcSwap<SyntaxMode>>,
 }
 
 /// Text edit information for tree-sitter incremental parsing
@@ -234,6 +247,8 @@ struct ParseRequest {
     version: u64,
     /// Edit information for incremental parsing
     edit: Option<TextEdit>,
+    /// Force fresh parse (discard old tree) - needed when multiple edits accumulate
+    reset_tree: bool,
 }
 
 /// Viewport query request
@@ -242,6 +257,16 @@ pub struct ViewportQuery {
 }
 
 impl SyntaxHighlighter {
+    /// Set syntax highlighting mode (for debugging/validation)
+    pub fn set_mode(&self, mode: SyntaxMode) {
+        self.mode.store(Arc::new(mode));
+    }
+
+    /// Get current syntax highlighting mode
+    pub fn get_mode(&self) -> SyntaxMode {
+        **self.mode.load()
+    }
+
     /// Apply an incremental edit for efficient reparsing
     pub fn apply_edit(&self, edit: TextEdit) {
         // Send edit to background thread
@@ -249,15 +274,24 @@ impl SyntaxHighlighter {
             text: String::new(), // Will be set by request_update_with_edit
             version: 0,          // Will be set by request_update_with_edit
             edit: Some(edit),
+            reset_tree: false,
         });
     }
 
     /// Request update with edit information
+    /// Note: For explicit reset (undo/redo), use request_update_with_reset directly
     pub fn request_update_with_edit(&self, text: &str, version: u64, edit: Option<TextEdit>) {
+        // Don't override reset_tree - just pass through
+        self.request_update_with_reset(text, version, edit, false);
+    }
+
+    /// Request update with optional tree reset
+    pub fn request_update_with_reset(&self, text: &str, version: u64, edit: Option<TextEdit>, reset_tree: bool) {
         let _ = self.tx.send(ParseRequest {
             text: text.to_string(),
             version,
             edit,
+            reset_tree,
         });
     }
 
@@ -323,22 +357,17 @@ impl SyntaxHighlighter {
                 let final_request = rx.try_iter().last().unwrap_or(request);
 
                 // Skip if text hasn't changed (avoid redundant parsing)
-                if final_request.text == last_text && final_request.edit.is_none() {
+                if final_request.text == last_text && final_request.edit.is_none() && !final_request.reset_tree {
                     continue;
                 }
                 last_text = final_request.text.clone();
 
-                // Apply edit to existing tree for incremental parsing
-                if let Some(edit) = &final_request.edit {
+                // Reset tree if requested (needed when multiple edits accumulate)
+                if final_request.reset_tree {
+                    tree = None;
+                } else if let Some(edit) = &final_request.edit {
+                    // Apply edit to existing tree for incremental parsing
                     if let Some(ref mut existing_tree) = tree {
-                        println!("SYNTAX: Applying incremental edit:");
-                        println!("  bytes: start={}, old_end={}, new_end={}",
-                                 edit.start_byte, edit.old_end_byte, edit.new_end_byte);
-                        println!("  positions: start=({},{}), old_end=({},{}), new_end=({},{})",
-                                 edit.start_position.row, edit.start_position.column,
-                                 edit.old_end_position.row, edit.old_end_position.column,
-                                 edit.new_end_position.row, edit.new_end_position.column);
-
                         let ts_edit = InputEdit {
                             start_byte: edit.start_byte,
                             old_end_byte: edit.old_end_byte,
@@ -347,17 +376,12 @@ impl SyntaxHighlighter {
                             old_end_position: edit.old_end_position,
                             new_end_position: edit.new_end_position,
                         };
-
                         existing_tree.edit(&ts_edit);
                     }
                 }
 
-                // Parse with tree-sitter (incremental if we have existing tree)
+                // Parse with tree-sitter (incremental if we have existing tree, fresh if reset)
                 tree = parser.parse(&final_request.text, tree.as_ref());
-
-                if tree.is_none() {
-                    println!("SYNTAX [{}]: WARNING - Failed to parse!", language_name);
-                }
 
                 if let Some(ref ts_tree) = tree {
                     // Compile query on first use (lazy initialization)
@@ -417,22 +441,16 @@ impl SyntaxHighlighter {
                     effects.sort_by_key(|e| (e.range.start, e.range.end));
                     let cleaned = Self::remove_overlaps(effects);
 
-                    println!(
-                        "SYNTAX: Generated {} effects for {} bytes of text",
-                        cleaned.len(),
-                        final_request.text.len()
-                    );
-                    if !cleaned.is_empty() {
-                        println!("  First effect: {:?}", cleaned.first());
-                    }
-
                     // Atomic swap - readers never block! Old highlighting stays until this completes
                     highlights_clone.store(Arc::new(cleaned));
 
                     // Store the tree and corresponding text for viewport queries
                     cached_tree_clone.store(Arc::new(Some(ts_tree.clone())));
                     cached_text_clone.store(Arc::new(Some(final_request.text.clone())));
-                    cached_version_clone.store(final_request.version, Ordering::Relaxed);
+                    // IMPORTANT: Always increment version, never go backwards
+                    // Version comparison doesn't work with undo/redo
+                    let current_v = cached_version_clone.load(Ordering::Relaxed);
+                    cached_version_clone.store(current_v + 1, Ordering::Relaxed);
 
                     // Mark first parse as complete
                     is_first_parse = false;
@@ -449,6 +467,7 @@ impl SyntaxHighlighter {
             cached_version,
             language: config.language,
             highlights_query: config.highlights_query,
+            mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)), // Default to incremental
         })
     }
 
@@ -819,30 +838,26 @@ impl TextStyleProvider for SyntaxHighlighter {
 }
 
 /// Convert byte position to tree-sitter Point using efficient tree navigation
+/// IMPORTANT: Tree-sitter expects actual character columns, NOT visual columns
+/// A tab character should count as 1 column, not expanded to tab width
 fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
-    const TAB_WIDTH: usize = 4;  // TODO: Get from ViewportMetrics
     let line = tree.byte_to_line(byte_pos);
     let line_start = tree.line_to_byte(line).unwrap_or(0);
     let byte_in_line = byte_pos - line_start;
 
-    // Get the line text to calculate visual column (accounting for tabs)
+    // Get the line text to count actual characters (not visual columns)
     let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
     let line_text = tree.get_text_slice(line_start..line_end);
 
+    // Count actual UTF-8 characters up to byte_in_line
+    // Each character (including tab) counts as 1 column for tree-sitter
     let mut column = 0;
     let mut byte_offset = 0;
     for ch in line_text.chars() {
         if byte_offset >= byte_in_line {
             break;
         }
-
-        if ch == '\t' {
-            // Tab advances to next tab stop
-            let spaces_to_add = TAB_WIDTH - (column % TAB_WIDTH);
-            column += spaces_to_add;
-        } else {
-            column += 1;
-        }
+        column += 1;  // Each character is 1 column (including tabs)
         byte_offset += ch.len_utf8();
     }
 
@@ -853,18 +868,17 @@ fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
 }
 
 /// Calculate new point position after inserting text
+/// IMPORTANT: Tree-sitter expects actual character positions, NOT visual columns
+/// A tab character should count as 1 column, not expanded to tab width
 fn calc_new_point(start: Point, text: &str) -> Point {
-    const TAB_WIDTH: usize = 4;  // TODO: Get from ViewportMetrics
     let mut line = start.row;
     let mut column = start.column;
     for ch in text.chars() {
         if ch == '\n' {
             line += 1;
             column = 0;
-        } else if ch == '\t' {
-            // Tab advances to next tab stop, matching byte_to_point
-            column += TAB_WIDTH - (column % TAB_WIDTH);
         } else {
+            // Each character (including tab) counts as 1 column for tree-sitter
             column += 1;
         }
     }
@@ -908,24 +922,6 @@ pub fn create_text_edit(tree: &tiny_core::tree::Tree, edit: &tiny_core::tree::Ed
         calc_new_point(start_position, content_text)
     };
 
-    // Debug tab handling
-    if content_text.contains('\t') {
-        eprintln!("Tab edit: start_byte={}, old_end_byte={}, new_end_byte={}",
-            start_byte, old_end_byte, new_end_byte);
-        eprintln!("  start_position=({},{}), old_end=({},{}), new_end=({},{})",
-            start_position.row, start_position.column,
-            old_end_position.row, old_end_position.column,
-            new_end_position.row, new_end_position.column);
-        eprintln!("  text={:?}", content_text);
-
-        // Verify the column calculation
-        let recalc_start = byte_to_point(tree, start_byte);
-        eprintln!("  recalc_start=({},{})", recalc_start.row, recalc_start.column);
-        if recalc_start.column != start_position.column {
-            eprintln!("  WARNING: Column mismatch! Expected {}, got {}",
-                start_position.column, recalc_start.column);
-        }
-    }
 
     TextEdit {
         start_byte,

@@ -427,6 +427,11 @@ impl Renderer {
         self.text_renderer.apply_incremental_edit(edit);
     }
 
+    /// Clear edit deltas (called after undo/redo when tree is replaced)
+    pub fn clear_edit_deltas(&mut self) {
+        self.text_renderer.syntax_state.edit_deltas.clear();
+    }
+
     pub fn update_viewport(&mut self, width: f32, height: f32, scale_factor: f32) {
         self.viewport.resize(width, height, scale_factor);
         self.layout_dirty = true;
@@ -608,20 +613,38 @@ impl Renderer {
         }
 
         if let Some(ref highlighter) = self.syntax_highlighter {
-            let text = tree.flatten_to_string();
-            let effects = highlighter.get_visible_effects(&text, 0..text.len());
-            let tokens: Vec<_> = effects
-                .into_iter()
-                .filter_map(|e| match e.effect {
-                    text_effects::EffectType::Token(id) => Some(text_renderer::TokenRange {
-                        byte_range: e.range,
-                        token_id: id,
-                    }),
-                    _ => None,
-                })
-                .collect();
-            self.text_renderer
-                .update_syntax(&tokens, highlighter.cached_version() == tree.version);
+            // Check if tree-sitter completed a parse since last update
+            let fresh_parse = highlighter.cached_version() > self.text_renderer.syntax_state.stable_version;
+            let has_stable = !self.text_renderer.syntax_state.stable_tokens.is_empty();
+
+            let tokens: Vec<_> = if fresh_parse {
+                // Tree-sitter has caught up - query it for fresh tokens
+                let text = tree.flatten_to_string();
+                let effects = highlighter.get_visible_effects(&text, 0..text.len());
+                effects
+                    .into_iter()
+                    .filter_map(|e| match e.effect {
+                        text_effects::EffectType::Token(id) => Some(text_renderer::TokenRange {
+                            byte_range: e.range,
+                            token_id: id,
+                        }),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                // Use stable tokens from last parse with edit adjustment
+                self.text_renderer
+                    .syntax_state
+                    .stable_tokens
+                    .iter()
+                    .map(|t| text_renderer::TokenRange {
+                        byte_range: t.byte_range.clone(),
+                        token_id: t.token_id,
+                    })
+                    .collect()
+            };
+
+            self.text_renderer.update_syntax(&tokens, fresh_parse);
         }
 
         self.text_renderer

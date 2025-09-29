@@ -307,6 +307,8 @@ pub struct InputHandler {
     has_pending_syntax_update: bool,
     /// Accumulated LSP text changes for incremental updates
     pending_lsp_changes: Vec<TextChange>,
+    /// Accumulated edits for syntax token adjustment
+    pending_renderer_edits: Vec<tiny_core::tree::Edit>,
     /// History for undo/redo (document + selections)
     history: DocumentHistory,
     /// Navigation history for cursor positions (Cmd+[/])
@@ -341,6 +343,7 @@ impl InputHandler {
             pending_text_edits: Vec::new(),
             has_pending_syntax_update: false,
             pending_lsp_changes: Vec::new(),
+            pending_renderer_edits: Vec::new(),
             history: DocumentHistory::new(),
             nav_history: SelectionHistory::with_max_size(50),
             drag_anchor: None,
@@ -1012,6 +1015,11 @@ impl InputHandler {
         std::mem::take(&mut self.pending_lsp_changes)
     }
 
+    /// Get and clear pending renderer edits for syntax token adjustment
+    pub fn take_renderer_edits(&mut self) -> Vec<tiny_core::tree::Edit> {
+        std::mem::take(&mut self.pending_renderer_edits)
+    }
+
     pub fn pending_edits_count(&self) -> usize {
         self.pending_edits.len()
     }
@@ -1046,35 +1054,19 @@ impl InputHandler {
             return;
         }
 
-        println!(
-            "SYNTAX_FLUSH: Sending {} accumulated TextEdits to tree-sitter",
-            self.pending_text_edits.len()
-        );
 
         if let Some(ref syntax_hl) = self.syntax_highlighter {
             let text_after = doc.read().flatten_to_string();
 
             // If we have multiple edits, we can't send them all to tree-sitter
-            // (it only accepts one InputEdit at a time), so request a full reparse
+            // (it only accepts one InputEdit at a time), so reset the tree and do a fresh parse
             if self.pending_text_edits.len() == 1 {
                 // Single edit - use incremental parsing
                 let edit = &self.pending_text_edits[0];
-                println!(
-                    "SYNTAX_FLUSH: Sending single InputEdit - start_byte={}, old_end={}, new_end={}",
-                    edit.start_byte, edit.old_end_byte, edit.new_end_byte
-                );
                 syntax_hl.request_update_with_edit(&text_after, doc.version(), Some(edit.clone()));
             } else {
-                // Multiple edits - request full reparse
-                println!(
-                    "SYNTAX_FLUSH: {} edits accumulated, requesting full reparse",
-                    self.pending_text_edits.len()
-                );
-                syntax_hl.request_update_with_edit(
-                    &text_after,
-                    doc.version(),
-                    None, // No edit = full reparse
-                );
+                // Multiple edits - reset tree and do fresh parse
+                syntax_hl.request_update_with_reset(&text_after, doc.version(), None, true);
             }
         }
 
@@ -1100,10 +1092,6 @@ impl InputHandler {
             return false;
         }
 
-        println!(
-            "FLUSH: Applying {} pending edits to document",
-            self.pending_edits.len()
-        );
 
         // Capture tree state BEFORE applying edits
         let tree_before = doc.read();
@@ -1119,6 +1107,9 @@ impl InputHandler {
             // Track LSP changes for incremental updates
             let lsp_change = self.create_lsp_change(&tree_before, edit);
             self.pending_lsp_changes.push(lsp_change);
+
+            // Track edits for renderer (syntax token adjustment)
+            self.pending_renderer_edits.push(edit.clone());
 
             // Apply incremental edit to renderer for stable typing
             if let Some(renderer) = renderer.as_deref_mut() {
@@ -1709,10 +1700,16 @@ impl InputHandler {
             doc.replace_tree(prev.tree.clone());
             self.selections = prev.selections;
             self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-            if self.syntax_highlighter.is_some() {
-                self.has_pending_syntax_update = true;
-                self.last_edit_time = Some(Instant::now());
+
+            // Clear accumulated renderer edits - they're invalid for the undone tree
+            self.pending_renderer_edits.clear();
+
+            // Request syntax update after undo (tree has changed significantly)
+            if let Some(ref syntax_hl) = self.syntax_highlighter {
+                let text = doc.read().flatten_to_string();
+                syntax_hl.request_update_with_reset(&text, doc.version(), None, true);
             }
+
             return true;
         }
         false
@@ -1812,10 +1809,16 @@ impl InputHandler {
             doc.replace_tree(next.tree.clone());
             self.selections = next.selections;
             self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-            if self.syntax_highlighter.is_some() {
-                self.has_pending_syntax_update = true;
-                self.last_edit_time = Some(Instant::now());
+
+            // Clear accumulated renderer edits - they're invalid for the redone tree
+            self.pending_renderer_edits.clear();
+
+            // Request syntax update after redo (tree has changed significantly)
+            if let Some(ref syntax_hl) = self.syntax_highlighter {
+                let text = doc.read().flatten_to_string();
+                syntax_hl.request_update_with_reset(&text, doc.version(), None, true);
             }
+
             return true;
         }
         false
