@@ -838,7 +838,13 @@ impl InputHandler {
                     let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
                     if cursor_byte > 0 {
                         let deleted = tree.get_text_slice(cursor_byte - 1..cursor_byte);
-                        deleted_info.push(Some(deleted.clone()));
+                        // When at column 0, we're deleting a newline - capture the previous line's length NOW
+                        let target_column = if sel.cursor.column == 0 && deleted == "\n" && sel.cursor.line > 0 {
+                            Some(tree.line_char_count(sel.cursor.line - 1) as u32)
+                        } else {
+                            None
+                        };
+                        deleted_info.push(Some((deleted.clone(), target_column)));
                         self.pending_edits.push(Edit::Delete {
                             range: cursor_byte - 1..cursor_byte,
                         });
@@ -853,7 +859,7 @@ impl InputHandler {
             self.flush_pending_edits(doc);
 
             // Update cursors after backspace
-            for (sel, deleted) in self.selections.iter_mut().zip(deleted_info.iter()) {
+            for (sel, deleted_info) in self.selections.iter_mut().zip(deleted_info.iter()) {
                 if !sel.is_cursor() {
                     sel.cursor = sel.min_pos();
                 } else if sel.cursor.column > 0 {
@@ -861,8 +867,13 @@ impl InputHandler {
                     sel.cursor.column -= 1;
                 } else if sel.cursor.line > 0 {
                     sel.cursor.line -= 1;
-                    sel.cursor.column = if deleted.as_deref() == Some("\n") {
-                        doc.read().line_char_count(sel.cursor.line) as u32
+                    sel.cursor.column = if let Some((deleted, target_column)) = deleted_info {
+                        if deleted == "\n" {
+                            // Use the pre-captured column position
+                            target_column.unwrap_or(0)
+                        } else {
+                            0
+                        }
                     } else {
                         0
                     };
