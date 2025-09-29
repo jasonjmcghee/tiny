@@ -1242,10 +1242,11 @@ impl<T: AppLogic> TinyApp<T> {
                 let pending_edits = editor.plugin.input.take_renderer_edits();
 
                 // If version changed without edits, it's undo/redo
-                // Clear BOTH edit_deltas and stable_tokens - they're for the wrong state
+                // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
+                // This prevents white flash while keeping old (close enough) syntax visible
                 if pending_edits.is_empty() && version_changed_without_edits {
                     cpu_renderer.clear_edit_deltas();
-                    cpu_renderer.text_renderer.syntax_state.stable_tokens.clear();
+                    // Don't clear stable_tokens - causes white flash. Let background parse update them.
                 }
 
                 for edit in pending_edits {
