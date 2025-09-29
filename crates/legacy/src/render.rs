@@ -446,11 +446,11 @@ impl Renderer {
             offset_x += FILE_EXPLORER_WIDTH;
         }
 
-        // Update editor bounds based on new viewport size
+        // Update editor bounds with padding baked in
         self.editor_bounds = tiny_sdk::types::LayoutRect::new(
-            offset_x, // Start after line numbers
+            offset_x,
             offset_y,
-            width - offset_x, // Rest of the width
+            width - offset_x,
             height - offset_y,
         );
     }
@@ -537,13 +537,29 @@ impl Renderer {
             self.collect_line_number_glyphs();
 
             // === DRAW EDITOR CONTENT FIRST ===
-            // Set scissor rect for text editor region
-            pass.set_scissor_rect(
-                (self.editor_bounds.x.0 * scale) as u32,
-                (self.editor_bounds.y.0 * scale) as u32,
-                (self.editor_bounds.width.0 * scale) as u32,
-                (self.editor_bounds.height.0 * scale) as u32,
+            // Set scissor rect slightly outside the content area to avoid edge clipping
+            // Content is at editor_bounds (which includes padding), scissor needs to be larger
+            let scissor_margin = 2.0; // Extra margin to prevent edge clipping
+            let scissor_x = ((self.editor_bounds.x.0 - scissor_margin) * scale)
+                .floor()
+                .max(0.0) as u32;
+            let scissor_y = ((self.editor_bounds.y.0 - scissor_margin) * scale)
+                .floor()
+                .max(0.0) as u32;
+            let scissor_w =
+                ((self.editor_bounds.width.0 + scissor_margin * 2.0) * scale).ceil() as u32;
+            let scissor_h =
+                ((self.editor_bounds.height.0 + scissor_margin * 2.0) * scale).ceil() as u32;
+
+            // Clamp to render target bounds
+            let (target_w, target_h) = (
+                self.viewport.physical_size.width,
+                self.viewport.physical_size.height,
             );
+            let scissor_w = scissor_w.min(target_w.saturating_sub(scissor_x));
+            let scissor_h = scissor_h.min(target_h.saturating_sub(scissor_y));
+
+            pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
 
             // Paint background layers (selection)
             self.paint_layers(pass, true);
@@ -561,11 +577,12 @@ impl Renderer {
 
                 // === DRAW LINE NUMBERS LAST (with separate buffer) ===
                 // Set scissor rect for line numbers (left panel)
+                // Floor position and ceil size to avoid sub-pixel clipping
                 pass.set_scissor_rect(
-                    (FILE_EXPLORER_WIDTH * scale) as u32,
-                    (offset_y * scale) as u32,
-                    ((plugin.width) * scale) as u32,
-                    ((self.viewport.logical_size.height.0 - offset_y) * scale) as u32,
+                    (FILE_EXPLORER_WIDTH * scale).floor() as u32,
+                    (offset_y * scale).floor() as u32,
+                    ((plugin.width) * scale).ceil() as u32,
+                    ((self.viewport.logical_size.height.0 - offset_y) * scale).ceil() as u32,
                 );
 
                 // Draw line numbers using dedicated buffer (won't conflict with main text)
@@ -614,7 +631,8 @@ impl Renderer {
 
         if let Some(ref highlighter) = self.syntax_highlighter {
             // Check if tree-sitter completed a parse since last update
-            let fresh_parse = highlighter.cached_version() > self.text_renderer.syntax_state.stable_version;
+            let fresh_parse =
+                highlighter.cached_version() > self.text_renderer.syntax_state.stable_version;
             let has_stable = !self.text_renderer.syntax_state.stable_tokens.is_empty();
 
             let tokens: Vec<_> = if fresh_parse {
@@ -671,7 +689,7 @@ impl Renderer {
 
                     // Create editor-specific viewport for text-related plugins
                     let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
+                        bounds: self.editor_bounds,   // Bounds already include padding
                         scroll: self.viewport.scroll, // Use main viewport scroll
                         content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
                         widget_id: 2, // Editor widget ID
@@ -717,7 +735,8 @@ impl Renderer {
         self.paint_plugins(pass, background);
 
         // Paint diagnostics plugin if present
-        if !background {  // Diagnostics renders on foreground (z-index 50)
+        if !background {
+            // Diagnostics renders on foreground (z-index 50)
             if let Some(diagnostics_ptr) = self.diagnostics_plugin {
                 let diagnostics = unsafe { &*diagnostics_ptr };
 
@@ -726,7 +745,7 @@ impl Renderer {
 
                     // Create editor-specific viewport for diagnostics
                     let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
+                        bounds: self.editor_bounds, // Bounds already include padding
                         scroll: self.viewport.scroll,
                         content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
                         widget_id: 3, // Diagnostics widget ID
@@ -865,7 +884,7 @@ impl Renderer {
                 let view_x = g.layout_pos.x.0 - self.viewport.scroll.x.0;
                 let view_y = g.layout_pos.y.0 - self.viewport.scroll.y.0;
 
-                // Then add editor bounds offset and scale to physical
+                // Then add editor bounds offset (already includes padding) and scale to physical
                 let physical_x = (view_x + self.editor_bounds.x.0) * self.viewport.scale_factor;
                 let physical_y = (view_y + self.editor_bounds.y.0) * self.viewport.scale_factor;
 

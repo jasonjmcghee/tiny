@@ -389,8 +389,7 @@ impl Paintable for CursorPlugin {
         // Get cursor position from our API (in editor-local coordinates)
         let mut pos = self.api.get_position();
 
-        // Transform to screen coordinates by adding widget viewport bounds
-        // This matches how text glyphs are transformed
+        // Transform to screen coordinates by adding widget viewport bounds (already includes padding)
         if let Some(ref widget_viewport) = ctx.widget_viewport {
             pos = LayoutPos::new(
                 pos.x.0 + widget_viewport.bounds.x.0,
