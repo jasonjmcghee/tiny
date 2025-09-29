@@ -7,6 +7,7 @@ use crate::history::{DocumentHistory, DocumentSnapshot, SelectionHistory};
 use crate::input_types::{ElementState, Key, KeyEvent, Modifiers, MouseButton, NamedKey};
 use crate::lsp_manager::TextChange;
 use crate::syntax::SyntaxHighlighter;
+use crate::text_editor_plugin::TextEditorPlugin;
 use arboard::Clipboard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -324,6 +325,8 @@ pub struct InputHandler {
     click_count: u32,
     /// Ignore drag events after multi-click to prevent selection loss
     ignore_next_drag: bool,
+    /// Time of last undo checkpoint for grouping edits
+    last_checkpoint_time: Option<Instant>,
 }
 
 impl InputHandler {
@@ -352,6 +355,7 @@ impl InputHandler {
             last_click_pos: None,
             click_count: 0,
             ignore_next_drag: false,
+            last_checkpoint_time: None,
         }
     }
 
@@ -1686,16 +1690,17 @@ impl InputHandler {
     }
 
     /// Save current document state to history before making an edit
+    /// Uses a 1 second debounce to group rapid edits together for undo/redo
     fn save_snapshot_to_history(&mut self, doc: &Doc) {
-        if self.pending_edits.is_empty()
-            || self
-                .last_edit_time
-                .map_or(true, |t| t.elapsed().as_millis() > 500)
-        {
+        // Only save checkpoint if this is the first edit OR enough time has passed since last checkpoint
+        // This groups rapid edits (typing) into a single undo/redo group
+        if self.last_checkpoint_time.map_or(true, |t| t.elapsed().as_millis() > 1000) {
             self.history.checkpoint(DocumentSnapshot {
                 tree: doc.read(),
                 selections: self.selections.clone(),
             });
+            // Update checkpoint time (not edit time - we want to measure time since last checkpoint)
+            self.last_checkpoint_time = Some(Instant::now());
         }
     }
 
@@ -1714,6 +1719,9 @@ impl InputHandler {
 
             // Clear accumulated renderer edits - they're invalid for the undone tree
             self.pending_renderer_edits.clear();
+
+            // Reset checkpoint time so next edit starts a new undo group
+            self.last_checkpoint_time = None;
 
             // Request syntax update after undo (tree has changed significantly)
             if let Some(ref syntax_hl) = self.syntax_highlighter {
@@ -1824,6 +1832,9 @@ impl InputHandler {
             // Clear accumulated renderer edits - they're invalid for the redone tree
             self.pending_renderer_edits.clear();
 
+            // Reset checkpoint time so next edit starts a new undo group
+            self.last_checkpoint_time = None;
+
             // Request syntax update after redo (tree has changed significantly)
             if let Some(ref syntax_hl) = self.syntax_highlighter {
                 let text = doc.read().flatten_to_string();
@@ -1833,5 +1844,29 @@ impl InputHandler {
             return true;
         }
         false
+    }
+}
+
+/// Handle input actions at the plugin level
+/// Returns true if the action was handled and requires a redraw
+/// Note: InputAction::Save should be handled by the caller since it needs EditorLogic
+pub fn handle_input_action(
+    action: InputAction,
+    plugin: &mut TextEditorPlugin,
+) -> bool {
+    match action {
+        InputAction::Save => {
+            // Save should be handled by caller (needs EditorLogic)
+            eprintln!("Warning: Save action should be handled by caller");
+            false
+        }
+        InputAction::Undo => {
+            plugin.input.undo(&plugin.doc)
+        }
+        InputAction::Redo => {
+            plugin.input.redo(&plugin.doc)
+        }
+        InputAction::Redraw => true,
+        InputAction::None => false,
     }
 }

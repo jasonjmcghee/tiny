@@ -4,7 +4,7 @@
 
 use crate::{
     diagnostics_manager::DiagnosticsManager,
-    input::{EventBus, InputAction, InputHandler},
+    input::{self, EventBus, InputAction, InputHandler},
     input_types, io,
     lsp_manager::LspManager,
     render::Renderer,
@@ -1036,8 +1036,18 @@ impl<T: AppLogic> TinyApp<T> {
                         let action = input_handler.process_event(&event, doc, &viewport, &mut self.event_bus);
 
                         if action != InputAction::None {
-                            let handled = editor.handle_input_action(action);
+                            // Handle Save separately since it needs EditorLogic
+                            let handled = if action == InputAction::Save {
+                                if let Err(e) = editor.save() {
+                                    eprintln!("Failed to save: {}", e);
+                                }
+                                true
+                            } else {
+                                input::handle_input_action(action, &mut editor.plugin)
+                            };
+
                             if handled {
+                                editor.widgets_dirty = true;
                                 self.request_redraw();
                                 self.update_window_title();
                                 self.cursor_needs_scroll = true;
@@ -1464,41 +1474,6 @@ impl EditorLogic {
     }
 }
 
-impl EditorLogic {
-    fn handle_input_action(&mut self, action: InputAction) -> bool {
-        let result = match action {
-            InputAction::Save => {
-                if let Err(e) = self.save() {
-                    eprintln!("Failed to save: {}", e);
-                }
-                true
-            }
-            InputAction::Undo => {
-                let changed = self.plugin.input.undo(&self.plugin.doc);
-                if changed {
-                    // Mark that renderer needs edit_deltas cleared
-                    self.widgets_dirty = true;
-                }
-                changed
-            }
-            InputAction::Redo => {
-                let changed = self.plugin.input.redo(&self.plugin.doc);
-                if changed {
-                    // Mark that renderer needs edit_deltas cleared
-                    self.widgets_dirty = true;
-                }
-                changed
-            }
-            InputAction::Redraw => true,
-            InputAction::None => false,
-        };
-
-        if result {
-            self.widgets_dirty = true;
-        }
-        result
-    }
-}
 
 impl AppLogic for EditorLogic {
     fn as_any(&self) -> &dyn std::any::Any {
