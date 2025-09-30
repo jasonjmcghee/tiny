@@ -45,15 +45,47 @@ impl TextEditorPlugin {
         }
     }
 
+    /// Check if document has unsaved changes
+    pub fn is_modified(&self) -> bool {
+        use std::hash::{Hash, Hasher};
+        use ahash::AHasher;
+        let current_text = self.doc.read().flatten_to_string();
+        let mut hasher = AHasher::default();
+        current_text.hash(&mut hasher);
+        let current_hash = hasher.finish();
+        current_hash != self.last_saved_content_hash
+    }
+
     pub fn from_file(path: PathBuf) -> Result<Self, std::io::Error> {
         let content = std::fs::read_to_string(&path)?;
         let doc = Doc::from_str(&content);
         let mut editor = Self::new(doc);
         editor.file_path = Some(path.clone());
 
+        // Calculate saved content hash (file was just loaded)
+        use std::hash::{Hash, Hasher};
+        use ahash::AHasher;
+        let mut hasher = AHasher::default();
+        content.hash(&mut hasher);
+        editor.last_saved_content_hash = hasher.finish();
+
         // Setup syntax highlighter based on file extension
         if let Some(highlighter) = SyntaxHighlighter::from_file_path(path.to_str().unwrap_or("")) {
-            editor.syntax_highlighter = Some(Box::new(highlighter) as Box<dyn TextStyleProvider>);
+            let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(highlighter);
+
+            // Set up shared highlighter for InputHandler
+            if let Some(syntax_hl) = syntax_highlighter
+                .as_any()
+                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+            {
+                let shared_highlighter = Arc::new(syntax_hl.clone());
+                editor.input.set_syntax_highlighter(shared_highlighter);
+
+                // Request initial syntax highlighting
+                syntax_hl.request_update_with_edit(&content, editor.doc.version(), None);
+            }
+
+            editor.syntax_highlighter = Some(syntax_highlighter);
         }
 
         Ok(editor)

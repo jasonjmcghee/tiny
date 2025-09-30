@@ -327,6 +327,9 @@ pub struct InputHandler {
     ignore_next_drag: bool,
     /// Time of last undo checkpoint for grouping edits
     last_checkpoint_time: Option<Instant>,
+    /// Double-shift detection for file picker
+    last_shift_press: Option<Instant>,
+    shift_currently_pressed: bool,
 }
 
 impl InputHandler {
@@ -356,6 +359,8 @@ impl InputHandler {
             click_count: 0,
             ignore_next_drag: false,
             last_checkpoint_time: None,
+            last_shift_press: None,
+            shift_currently_pressed: false,
         }
     }
 
@@ -395,8 +400,41 @@ impl InputHandler {
     ) -> InputAction {
         match event.name.as_str() {
             "app.keyboard.keypress" => {
-                // Check if this is a key press (not release)
                 let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
+
+                // Track Shift key specifically for double-shift detection
+                if let Some(key_obj) = event.data.get("key") {
+                    let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Check if this is the Shift key itself (named key "Shift")
+                    if key_type == "named" && key_value == "Shift" {
+                        if state == "pressed" && !self.shift_currently_pressed {
+                            self.shift_currently_pressed = true;
+
+                            // Check if this is a double-shift (within 300ms of last release)
+                            const DOUBLE_SHIFT_TIMEOUT: Duration = Duration::from_millis(300);
+                            if let Some(last_press) = self.last_shift_press {
+                                if last_press.elapsed() < DOUBLE_SHIFT_TIMEOUT {
+                                    // Double-shift detected! Emit file picker event
+                                    bus.emit("app.action.open_file_picker", json!({}), 5, "input_handler");
+                                    self.last_shift_press = None; // Reset to avoid triple-shift
+                                    return InputAction::None;
+                                }
+                            }
+
+                            // Record this press for double-shift detection
+                            self.last_shift_press = Some(Instant::now());
+                        } else if state == "released" {
+                            self.shift_currently_pressed = false;
+                        }
+
+                        // Don't process shift key itself further
+                        return InputAction::None;
+                    }
+                }
+
+                // Check if this is a key press (not release) for normal key handling
                 if state != "pressed" {
                     return InputAction::None;
                 }

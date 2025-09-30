@@ -3129,6 +3129,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "pollster",
+ "regex",
  "serde",
  "serde_json",
  "swash",

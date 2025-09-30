@@ -18,6 +18,8 @@ use tiny_sdk::{PaintContext, Paintable};
 
 const FILE_EXPLORER_WIDTH: f32 = 0.0;
 const STATUS_BAR_HEIGHT: f32 = 0.0;
+const TAB_BAR_HEIGHT: f32 = 30.0;
+const FILE_PICKER_HEIGHT: f32 = 300.0; // Height when file picker is visible
 
 // Plugin state synchronization
 #[derive(Clone, Debug)]
@@ -111,12 +113,20 @@ pub struct Renderer {
     pub service_registry: ServiceRegistry,
     pub line_numbers_plugin: Option<*mut crate::line_numbers_plugin::LineNumbersPlugin>,
     pub diagnostics_plugin: Option<*mut diagnostics_plugin::DiagnosticsPlugin>,
+    pub tab_bar_plugin: Option<*mut crate::tab_bar_plugin::TabBarPlugin>,
+    pub file_picker_plugin: Option<*mut crate::file_picker_plugin::FilePickerPlugin>,
     /// Editor widget bounds (where main text renders)
     pub editor_bounds: tiny_sdk::types::LayoutRect,
     /// Accumulated glyphs for batched rendering
     accumulated_glyphs: Vec<GlyphInstance>,
     /// Line number glyphs (rendered separately)
     line_number_glyphs: Vec<GlyphInstance>,
+    /// Tab bar glyphs (rendered separately)
+    tab_bar_glyphs: Vec<GlyphInstance>,
+    /// Tab bar background rectangles
+    tab_bar_rects: Vec<tiny_sdk::types::RectInstance>,
+    /// File picker glyphs (rendered separately)
+    file_picker_glyphs: Vec<GlyphInstance>,
 }
 
 unsafe impl Send for Renderer {}
@@ -148,10 +158,15 @@ impl Renderer {
             service_registry: ServiceRegistry::new(),
             line_numbers_plugin: None,
             diagnostics_plugin: None,
+            tab_bar_plugin: None,
+            file_picker_plugin: None,
             // Default editor bounds - will be updated based on layout
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
             line_number_glyphs: Vec::new(),
+            tab_bar_glyphs: Vec::new(),
+            tab_bar_rects: Vec::new(),
+            file_picker_glyphs: Vec::new(),
         }
     }
 
@@ -419,6 +434,20 @@ impl Renderer {
         self.diagnostics_plugin = Some(plugin as *mut _);
     }
 
+    pub fn set_tab_bar_plugin(&mut self, plugin: &mut crate::tab_bar_plugin::TabBarPlugin) {
+        self.tab_bar_plugin = Some(plugin as *mut _);
+    }
+
+    pub fn set_file_picker_plugin(&mut self, plugin: &mut crate::file_picker_plugin::FilePickerPlugin) {
+        self.file_picker_plugin = Some(plugin as *mut _);
+    }
+
+    /// Swap the text renderer with the active tab's renderer
+    /// This preserves per-tab rendering state (syntax highlighting, layout, etc.)
+    pub fn swap_text_renderer(&mut self, tab_renderer: &mut crate::text_renderer::TextRenderer) {
+        std::mem::swap(&mut self.text_renderer, tab_renderer);
+    }
+
     pub fn get_gpu_renderer(&self) -> Option<*const GpuRenderer> {
         self.gpu_renderer
     }
@@ -437,7 +466,16 @@ impl Renderer {
         self.layout_dirty = true;
 
         let mut offset_x = 0.0;
-        let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT;
+        let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
+
+        // Check if file picker is visible and add its height
+        if let Some(plugin_ptr) = self.file_picker_plugin {
+            let plugin = unsafe { &*plugin_ptr };
+            if plugin.visible {
+                offset_y += FILE_PICKER_HEIGHT;
+            }
+        }
+
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
             offset_x = plugin.width;
@@ -515,6 +553,7 @@ impl Renderer {
         &mut self,
         tree: &Tree,
         mut render_pass: Option<&mut wgpu::RenderPass>,
+        tab_manager: Option<&crate::tab_manager::TabManager>,
     ) {
         if tree.version == self.last_rendered_version && !self.layout_dirty && !self.syntax_dirty {
             return;
@@ -532,9 +571,18 @@ impl Renderer {
             let scale = self.viewport.scale_factor;
 
             // === COLLECT GLYPHS ===
-            // Collect line number glyphs first
+            // Collect UI glyphs first
             self.line_number_glyphs.clear();
             self.collect_line_number_glyphs();
+
+            self.tab_bar_glyphs.clear();
+            self.tab_bar_rects.clear();
+            if let Some(tab_mgr) = tab_manager {
+                self.collect_tab_bar_glyphs(tab_mgr);
+            }
+
+            self.file_picker_glyphs.clear();
+            self.collect_file_picker_glyphs();
 
             // === DRAW EDITOR CONTENT FIRST ===
             // Set scissor rect slightly outside the content area to avoid edge clipping
@@ -570,28 +618,37 @@ impl Renderer {
             // Paint foreground layers (cursor)
             self.paint_layers(pass, false);
 
-            if let Some(plugin_ptr) = self.line_numbers_plugin {
-                let plugin = unsafe { &*plugin_ptr };
+            // === DRAW TAB BAR BACKGROUNDS FIRST ===
+            if !self.tab_bar_rects.is_empty() {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        gpu_renderer.draw_rects(pass, &self.tab_bar_rects, scale);
+                    }
+                }
+            }
 
-                let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT;
+            // === DRAW ALL UI TEXT ELEMENTS (combine into one buffer to avoid conflicts) ===
+            let mut all_ui_glyphs = Vec::new();
+            all_ui_glyphs.extend_from_slice(&self.line_number_glyphs);
+            all_ui_glyphs.extend_from_slice(&self.tab_bar_glyphs);
+            all_ui_glyphs.extend_from_slice(&self.file_picker_glyphs);
 
-                // === DRAW LINE NUMBERS LAST (with separate buffer) ===
-                // Set scissor rect for line numbers (left panel)
-                // Floor position and ceil size to avoid sub-pixel clipping
+            if !all_ui_glyphs.is_empty() {
+                // Disable scissor rect for UI elements (each is positioned correctly already)
                 pass.set_scissor_rect(
-                    (FILE_EXPLORER_WIDTH * scale).floor() as u32,
-                    (offset_y * scale).floor() as u32,
-                    ((plugin.width) * scale).ceil() as u32,
-                    ((self.viewport.logical_size.height.0 - offset_y) * scale).ceil() as u32,
+                    0,
+                    0,
+                    target_w,
+                    target_h,
                 );
 
-                // Draw line numbers using dedicated buffer (won't conflict with main text)
-                if !self.line_number_glyphs.is_empty() {
-                    if let Some(gpu) = self.gpu_renderer {
-                        unsafe {
-                            let gpu_renderer = &*gpu;
-                            gpu_renderer.draw_line_number_glyphs(pass, &self.line_number_glyphs);
-                        }
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        // Use line number buffer for all UI (separate from main text)
+                        gpu_renderer.draw_line_number_glyphs(pass, &all_ui_glyphs);
                     }
                 }
             }
@@ -847,12 +904,23 @@ impl Renderer {
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
 
+            // Line numbers start after title bar + tab bar + file picker (if visible)
+            let mut line_numbers_y = self.viewport.global_margin.y.0 + TAB_BAR_HEIGHT;
+
+            // Add file picker height if visible
+            if let Some(fp_ptr) = self.file_picker_plugin {
+                let fp = unsafe { &*fp_ptr };
+                if fp.visible {
+                    line_numbers_y += FILE_PICKER_HEIGHT;
+                }
+            }
+
             // Use the collect_glyphs method to get glyphs
             let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
                 self.viewport.global_margin.x.0 + FILE_EXPLORER_WIDTH,
-                self.viewport.global_margin.y.0,
+                line_numbers_y,
                 plugin.width,
-                self.viewport.logical_size.height.0 - self.viewport.global_margin.y.0,
+                self.viewport.logical_size.height.0 - line_numbers_y,
             );
 
             let widget_viewport = tiny_sdk::types::WidgetViewport {
@@ -870,6 +938,78 @@ impl Renderer {
 
             plugin.collect_glyphs(&mut collector);
             self.line_number_glyphs = collector.glyphs;
+        }
+    }
+
+    fn collect_tab_bar_glyphs(&mut self, tab_manager: &crate::tab_manager::TabManager) {
+        if let Some(plugin_ptr) = self.tab_bar_plugin {
+            let plugin = unsafe { &*plugin_ptr };
+
+            let tab_bar_bounds = tiny_sdk::types::LayoutRect::new(
+                0.0,
+                self.viewport.global_margin.y.0,
+                self.viewport.logical_size.width.0,
+                TAB_BAR_HEIGHT,
+            );
+
+            let widget_viewport = tiny_sdk::types::WidgetViewport {
+                bounds: tab_bar_bounds,
+                scroll: tiny_sdk::types::LayoutPos::new(0.0, 0.0), // No scroll for tab bar
+                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                widget_id: 10,
+            };
+
+            let mut collector = GlyphCollector::new(
+                self.viewport.to_viewport_info(),
+                &self.service_registry,
+                widget_viewport,
+            );
+
+            plugin.collect_glyphs(&mut collector, tab_manager);
+            self.tab_bar_glyphs = collector.glyphs;
+
+            // Collect background rectangles
+            let mut rects = plugin.collect_rects(tab_manager);
+            // Transform rects to screen coordinates
+            for rect in &mut rects {
+                rect.rect.x.0 += tab_bar_bounds.x.0;
+                rect.rect.y.0 += tab_bar_bounds.y.0;
+            }
+            self.tab_bar_rects = rects;
+        }
+    }
+
+    fn collect_file_picker_glyphs(&mut self) {
+        if let Some(plugin_ptr) = self.file_picker_plugin {
+            let plugin = unsafe { &*plugin_ptr };
+
+            if !plugin.visible {
+                self.file_picker_glyphs.clear();
+                return;
+            }
+
+            let file_picker_bounds = tiny_sdk::types::LayoutRect::new(
+                0.0,
+                self.viewport.global_margin.y.0 + TAB_BAR_HEIGHT,
+                self.viewport.logical_size.width.0,
+                FILE_PICKER_HEIGHT,
+            );
+
+            let widget_viewport = tiny_sdk::types::WidgetViewport {
+                bounds: file_picker_bounds,
+                scroll: tiny_sdk::types::LayoutPos::new(0.0, 0.0), // No scroll for file picker
+                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                widget_id: 11,
+            };
+
+            let mut collector = GlyphCollector::new(
+                self.viewport.to_viewport_info(),
+                &self.service_registry,
+                widget_viewport,
+            );
+
+            plugin.collect_glyphs(&mut collector);
+            self.file_picker_glyphs = collector.glyphs;
         }
     }
 

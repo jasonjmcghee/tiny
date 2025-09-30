@@ -44,6 +44,7 @@ url = "2.5"  # URL parsing for LSP
 arboard = "3.4"  # Clipboard support
 pollster = "0.3"  # Async executor for main
 notify = "6"  # File watching for shader hot-reload
+regex = "1"  # Regex for file picker search
 
 # Async runtime for LSP
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

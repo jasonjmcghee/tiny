@@ -3,12 +3,10 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
-    diagnostics_manager::DiagnosticsManager,
     input::{self, EventBus, InputAction, InputHandler},
     input_types, io,
     lsp_manager::LspManager,
     render::Renderer,
-    syntax::SyntaxHighlighter,
     text_editor_plugin::TextEditorPlugin,
     text_effects::TextStyleProvider,
 };
@@ -570,6 +568,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                             NamedKey::PageUp => "PageUp",
                             NamedKey::PageDown => "PageDown",
                             NamedKey::Space => "Space",
+                            NamedKey::Shift => "Shift",
                             NamedKey::F12 => "F12",
                             _ => "Unknown",
                         };
@@ -665,12 +664,12 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                                     // Request hover info from LSP if mouse position changed
                                     if let Some((line, column)) = diagnostics_plugin.get_mouse_document_position() {
-                                        editor.diagnostics.on_mouse_move(line, column);
+                                        editor.tab_manager.active_tab_mut().diagnostics.on_mouse_move(line, column);
                                     }
                                 }
                             } else {
                                 // Mouse left editor area - clear hover info
-                                editor.diagnostics.on_mouse_leave();
+                                editor.tab_manager.active_tab_mut().diagnostics.on_mouse_leave();
                             }
                         }
 
@@ -732,9 +731,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                 match state {
                     ElementState::Pressed => {
                         if let Some(position) = self.cursor_position {
-                            self.mouse_pressed = true;
-                            self.drag_start = Some(position);
-
                             // Emit press event with editor-local coordinates
                             if let Some(point) = self.physical_to_logical_point(position) {
                                 // Check if click is in titlebar area
@@ -744,30 +740,95 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                 let is_in_titlebar = false;
 
                                 if !is_in_titlebar {
-                                    // Convert to editor-local coordinates if we have a renderer
-                                    let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
-                                        cpu_renderer.screen_to_editor_local(point)
-                                    } else {
-                                        point
-                                    };
+                                    // Check if click is in tab bar area (before converting coordinates)
+                                    let tab_bar_start = self.title_bar_height;
+                                    let tab_bar_end = tab_bar_start + 30.0; // TAB_BAR_HEIGHT
+                                    let in_tab_bar = point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
 
-                                    self.event_bus.emit(
-                                        "app.mouse.press",
-                                        json!({
-                                            "x": editor_local.x.0,
-                                            "y": editor_local.y.0,
-                                            "button": "Left",
-                                            "state": "pressed",
-                                            "modifiers": {
-                                                "shift": self.modifiers.state().shift_key(),
-                                                "ctrl": self.modifiers.state().control_key(),
-                                                "alt": self.modifiers.state().alt_key(),
-                                                "cmd": self.modifiers.state().super_key(),
+                                    let mut handled_by_tab_bar = false;
+                                    if in_tab_bar {
+                                        // Any click in tab bar region should be blocked from reaching editor
+                                        // Don't set drag_start for tab bar clicks
+                                        handled_by_tab_bar = true;
+
+                                        // Handle tab bar clicks
+                                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                                            let click_x = point.x.0;
+                                            let click_y = point.y.0 - tab_bar_start;
+
+                                            if let Some(cpu_renderer) = &self.cpu_renderer {
+                                                let viewport_width = cpu_renderer.viewport.logical_size.width.0;
+
+                                                // Check dropdown first
+                                                if editor.tab_bar.hit_test_dropdown(click_x, click_y, viewport_width) {
+                                                    editor.tab_bar.toggle_dropdown();
+                                                }
+                                                // Check close button
+                                                else if let Some(tab_idx) = editor.tab_bar.hit_test_close_button(click_x, click_y, &editor.tab_manager) {
+                                                    let was_last = editor.tab_manager.close_tab(tab_idx);
+                                                    if was_last {
+                                                        // TODO: Handle closing last tab (maybe exit app or create new tab)
+                                                        eprintln!("Closed last tab");
+                                                    }
+                                                }
+                                                // Check tab click
+                                                else if let Some(tab_idx) = editor.tab_bar.hit_test_tab(click_x, click_y, &editor.tab_manager) {
+                                                    editor.tab_manager.switch_to(tab_idx);
+                                                    editor.tab_bar.close_dropdown();
+
+                                                    // Trigger syntax highlighting for newly active tab
+                                                    let plugin = &editor.tab_manager.active_tab().unwrap().plugin;
+                                                    if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
+                                                        let text = plugin.doc.read().flatten_to_string();
+                                                        if let Some(syntax_hl) = syntax_highlighter
+                                                            .as_any()
+                                                            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+                                                        {
+                                                            syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
+                                                        }
+                                                    }
+                                                }
+                                                // Else: clicked in empty tab bar space - do nothing
                                             }
-                                        }),
-                                        10, // Input priority
-                                        "winit",
-                                    );
+                                        }
+                                    }
+
+                                    // Request redraw after handling tab bar (outside the mutable borrow)
+                                    if handled_by_tab_bar {
+                                        self.request_redraw();
+                                    }
+
+                                    // Only emit mouse press event and set drag state if not handled by tab bar
+                                    if !handled_by_tab_bar {
+                                        // Set drag state for editor clicks only
+                                        self.mouse_pressed = true;
+                                        self.drag_start = Some(position);
+
+                                        // Convert to editor-local coordinates if we have a renderer
+                                        let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
+                                            cpu_renderer.screen_to_editor_local(point)
+                                        } else {
+                                            point
+                                        };
+
+                                        self.event_bus.emit(
+                                            "app.mouse.press",
+                                            json!({
+                                                "x": editor_local.x.0,
+                                                "y": editor_local.y.0,
+                                                "button": "Left",
+                                                "state": "pressed",
+                                                "modifiers": {
+                                                    "shift": self.modifiers.state().shift_key(),
+                                                    "ctrl": self.modifiers.state().control_key(),
+                                                    "alt": self.modifiers.state().alt_key(),
+                                                    "cmd": self.modifiers.state().super_key(),
+                                                }
+                                            }),
+                                            10, // Input priority
+                                            "winit",
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1012,7 +1073,7 @@ impl<T: AppLogic> TinyApp<T> {
 
                                 // Clamp scroll to bounds
                                 if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
-                                    let tree = editor.plugin.doc.read();
+                                    let tree = editor.active_plugin().doc.read();
                                     cpu_renderer.viewport.clamp_scroll_to_bounds(
                                         &tree, cpu_renderer.editor_bounds
                                     );
@@ -1023,17 +1084,84 @@ impl<T: AppLogic> TinyApp<T> {
                         }
                         continue;
                     }
+                    "app.action.open_file_picker" => {
+                        // Open file picker (triggered by double-shift)
+                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                            editor.file_picker.show();
+                            self.request_redraw();
+                        }
+                        continue;
+                    }
                     _ => {}
                 }
 
                 // Process with InputHandler for document events
                 if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                    let input_handler = &mut editor.plugin.input;
-                    let doc = &editor.plugin.doc;
+                    // Check if file picker is open and handle its events first
+                    if editor.file_picker.visible && event.name == "app.keyboard.keypress" {
+                        let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                        if state == "pressed" {
+                            if let Some(key_obj) = event.data.get("key") {
+                                let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+                                let mut handled = false;
+
+                                if key_type == "named" {
+                                    match key_value {
+                                        "Escape" => {
+                                            editor.file_picker.hide();
+                                            handled = true;
+                                        }
+                                        "ArrowUp" => {
+                                            editor.file_picker.move_up();
+                                            handled = true;
+                                        }
+                                        "ArrowDown" => {
+                                            editor.file_picker.move_down();
+                                            handled = true;
+                                        }
+                                        "Enter" => {
+                                            // Open selected file
+                                            if let Some(path) = editor.file_picker.selected_file() {
+                                                let path_buf = path.to_path_buf();
+                                                editor.file_picker.hide();
+                                                if let Err(e) = editor.tab_manager.open_file(path_buf) {
+                                                    eprintln!("Failed to open file: {}", e);
+                                                }
+                                                // Active tab is automatically updated by TabManager
+                                            }
+                                            handled = true;
+                                        }
+                                        "Backspace" => {
+                                            editor.file_picker.backspace();
+                                            handled = true;
+                                        }
+                                        _ => {}
+                                    }
+                                } else if key_type == "character" {
+                                    // Add character to query
+                                    if let Some(ch) = key_value.chars().next() {
+                                        if !ch.is_control() {
+                                            editor.file_picker.add_char(ch);
+                                            handled = true;
+                                        }
+                                    }
+                                }
+
+                                if handled {
+                                    self.request_redraw();
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    let plugin = editor.active_plugin_mut();
                     let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
 
                     if let Some(viewport) = viewport {
-                        let action = input_handler.process_event(&event, doc, &viewport, &mut self.event_bus);
+                        let action = plugin.input.process_event(&event, &plugin.doc, &viewport, &mut self.event_bus);
 
                         if action != InputAction::None {
                             // Handle Save separately since it needs EditorLogic
@@ -1043,7 +1171,7 @@ impl<T: AppLogic> TinyApp<T> {
                                 }
                                 true
                             } else {
-                                input::handle_input_action(action, &mut editor.plugin)
+                                input::handle_input_action(action, plugin)
                             };
 
                             if handled {
@@ -1151,17 +1279,26 @@ impl<T: AppLogic> TinyApp<T> {
 
             // Update plugins if EditorLogic
             if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                let tab = editor.tab_manager.active_tab_mut();
+
+                // Swap in the active tab's text_renderer to preserve per-tab state
+                cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+
                 // Always update selection widgets
-                cpu_renderer.set_selection_plugin(&editor.plugin.input, &editor.plugin.doc);
+                cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
 
                 // Set line numbers plugin with fresh document reference
-                cpu_renderer.set_line_numbers_plugin(&mut editor.line_numbers, &editor.plugin.doc);
+                cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
+
+                // Set tab bar and file picker plugins (global UI)
+                cpu_renderer.set_tab_bar_plugin(&mut editor.tab_bar);
+                cpu_renderer.set_file_picker_plugin(&mut editor.file_picker);
 
                 // Update diagnostics manager (handles LSP polling, caching, plugin updates)
-                editor.diagnostics.update(&editor.plugin.doc);
+                tab.diagnostics.update(&tab.plugin.doc);
 
                 // Set diagnostics plugin for rendering
-                cpu_renderer.set_diagnostics_plugin(editor.diagnostics.plugin_mut(), &editor.plugin.doc);
+                cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
 
                 // Initialize diagnostics plugin with GPU resources (first time only)
                 static mut DIAGNOSTICS_INITIALIZED: bool = false;
@@ -1238,8 +1375,9 @@ impl<T: AppLogic> TinyApp<T> {
             cpu_renderer.cached_doc_version = doc_read.version;
 
             // Apply pending renderer edits for syntax token adjustment
+            // Note: text_renderer has already been swapped in from the active tab
             if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                let pending_edits = editor.plugin.input.take_renderer_edits();
+                let pending_edits = editor.active_plugin_mut().input.take_renderer_edits();
 
                 // If version changed without edits, it's undo/redo
                 // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
@@ -1254,11 +1392,24 @@ impl<T: AppLogic> TinyApp<T> {
                 }
             }
 
+            // Get tab_manager reference if we have EditorLogic
+            let tab_manager = if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+                Some(&editor.tab_manager)
+            } else {
+                None
+            };
+
             // Just use the existing render pipeline - it was working!
             unsafe {
                 gpu_renderer.render_with_callback(uniforms, |render_pass| {
-                    cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass));
+                    cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass), tab_manager);
                 });
+            }
+
+            // Swap the text_renderer back to the tab to preserve state
+            if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                let tab = editor.tab_manager.active_tab_mut();
+                cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
             }
         }
     }
@@ -1266,11 +1417,12 @@ impl<T: AppLogic> TinyApp<T> {
 
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {
-    pub plugin: TextEditorPlugin,
-    /// Line numbers plugin
-    pub line_numbers: crate::line_numbers_plugin::LineNumbersPlugin,
-    /// Diagnostics manager (encapsulates plugin + LSP + caching)
-    pub diagnostics: DiagnosticsManager,
+    /// Tab manager for handling multiple open files (each tab owns its own plugin + line numbers + diagnostics)
+    pub tab_manager: crate::tab_manager::TabManager,
+    /// Tab bar plugin for rendering tabs (global UI)
+    pub tab_bar: crate::tab_bar_plugin::TabBarPlugin,
+    /// File picker plugin for opening files (global UI)
+    pub file_picker: crate::file_picker_plugin::FilePickerPlugin,
     /// Flag to indicate widgets need updating
     widgets_dirty: bool,
     /// Extra text style providers (e.g., for effects)
@@ -1280,10 +1432,23 @@ pub struct EditorLogic {
 }
 
 impl EditorLogic {
+    /// Get the active tab's plugin
+    fn active_plugin(&self) -> &TextEditorPlugin {
+        &self.tab_manager.active_tab().expect("No active tab").plugin
+    }
+
+    /// Get the active tab's plugin mutably
+    fn active_plugin_mut(&mut self) -> &mut TextEditorPlugin {
+        &mut self.tab_manager.active_tab_mut().plugin
+    }
+}
+
+impl EditorLogic {
     fn needs_syntax_highlighter_update(&self, path: &str) -> bool {
         let desired_language = crate::syntax::SyntaxHighlighter::file_extension_to_language(path);
+        let plugin = self.active_plugin();
 
-        if let Some(ref current_highlighter) = self.plugin.syntax_highlighter {
+        if let Some(ref current_highlighter) = plugin.syntax_highlighter {
             if let Some(syntax_hl) = current_highlighter
                 .as_any()
                 .downcast_ref::<crate::syntax::SyntaxHighlighter>()
@@ -1304,16 +1469,17 @@ impl EditorLogic {
                 new_highlighter.name(),
                 path
             );
+            let plugin = self.active_plugin_mut();
             let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
-            self.plugin.syntax_highlighter = Some(syntax_highlighter);
+            plugin.syntax_highlighter = Some(syntax_highlighter);
 
-            if let Some(ref syntax_highlighter) = self.plugin.syntax_highlighter {
+            if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
                 if let Some(syntax_hl) = syntax_highlighter
                     .as_any()
                     .downcast_ref::<crate::syntax::SyntaxHighlighter>()
                 {
                     let shared_highlighter = Arc::new(syntax_hl.clone());
-                    self.plugin.input.set_syntax_highlighter(shared_highlighter);
+                    plugin.input.set_syntax_highlighter(shared_highlighter);
                 }
             }
         } else {
@@ -1325,13 +1491,14 @@ impl EditorLogic {
     }
 
     fn request_syntax_update(&self) {
-        if let Some(ref syntax_highlighter) = self.plugin.syntax_highlighter {
-            let text = self.plugin.doc.read().flatten_to_string();
+        let plugin = self.active_plugin();
+        if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
+            let text = plugin.doc.read().flatten_to_string();
             if let Some(syntax_hl) = syntax_highlighter
                 .as_any()
                 .downcast_ref::<crate::syntax::SyntaxHighlighter>()
             {
-                syntax_hl.request_update_with_edit(&text, self.plugin.doc.version(), None);
+                syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
             }
         }
     }
@@ -1342,56 +1509,43 @@ impl EditorLogic {
     }
 
     pub fn with_file(mut self, path: PathBuf) -> Self {
-        if let Some(path_str) = path.to_str() {
-            if self.needs_syntax_highlighter_update(path_str) {
-                self.setup_syntax_highlighter(path_str);
-            } else {
-                println!(
-                    "EditorLogic: Keeping existing {} syntax highlighter for {}",
-                    self.plugin
-                        .syntax_highlighter
-                        .as_ref()
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                        .unwrap()
-                        .name(),
-                    path_str
-                );
+        // Replace the initial tab with a tab for this file
+        if let Err(e) = self.tab_manager.open_file(path.clone()) {
+            eprintln!("Failed to open initial file: {}", e);
+        } else {
+            // Remove the empty initial tab if it exists
+            if self.tab_manager.len() > 1 {
+                // Find and remove the first tab if it's untitled and empty
+                if let Some(first_tab) = self.tab_manager.tabs().get(0) {
+                    if first_tab.path().is_none() {
+                        // Close the empty tab (index 0)
+                        self.tab_manager.close_tab(0);
+                    }
+                }
             }
-            self.request_syntax_update();
-
-            // Open file in diagnostics manager (handles LSP + caching)
-            let content = self.plugin.doc.read().flatten_to_string();
-            self.diagnostics.open_file(PathBuf::from(path_str), content.to_string());
         }
-
-        self.plugin.file_path = Some(path);
         self
     }
 
     /// Check if document has unsaved changes by comparing content hash
     pub fn is_modified(&self) -> bool {
-        let current_text = self.plugin.doc.read().flatten_to_string();
-        let mut hasher = AHasher::default();
-        current_text.hash(&mut hasher);
-        let current_hash = hasher.finish();
-
-        current_hash != self.plugin.last_saved_content_hash
+        self.active_plugin().is_modified()
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
-        if let Some(ref path) = self.plugin.file_path {
-            io::autosave(&self.plugin.doc, path)?;
+        let tab = self.tab_manager.active_tab_mut();
+        let plugin = &mut tab.plugin;
+        if let Some(ref path) = plugin.file_path {
+            io::autosave(&plugin.doc, path)?;
 
             // Update saved content hash
-            let current_text = self.plugin.doc.read().flatten_to_string();
+            let current_text = plugin.doc.read().flatten_to_string();
             let mut hasher = AHasher::default();
             current_text.hash(&mut hasher);
-            self.plugin.last_saved_content_hash = hasher.finish();
+            plugin.last_saved_content_hash = hasher.finish();
 
             // Notify diagnostics manager of save
-            self.diagnostics.document_saved(current_text.to_string());
+            tab.diagnostics.document_saved(current_text.to_string());
 
             Ok(())
         } else {
@@ -1403,7 +1557,8 @@ impl EditorLogic {
     }
 
     pub fn title(&self) -> String {
-        let filename = if let Some(ref path) = self.plugin.file_path {
+        let plugin = self.active_plugin();
+        let filename = if let Some(ref path) = plugin.file_path {
             path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("Untitled")
@@ -1423,51 +1578,25 @@ impl EditorLogic {
     pub fn new(doc: Doc) -> Self {
         let mut plugin = TextEditorPlugin::new(doc);
 
-        // Setup default Rust syntax highlighter
-        let syntax_highlighter: Box<dyn TextStyleProvider> =
-            Box::new(SyntaxHighlighter::new_rust());
-
-        let text = plugin.doc.read().flatten_to_string();
-        println!(
-            "EditorLogic: Requesting initial syntax highlighting for {} bytes of text",
-            text.len()
-        );
-
-        if let Some(syntax_hl) = syntax_highlighter
-            .as_any()
-            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-        {
-            syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
-        } else {
-            panic!("Syntax highlighter could not be used to update")
-        }
-
-        if let Some(syntax_hl) = syntax_highlighter
-            .as_any()
-            .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-        {
-            let shared_highlighter = Arc::new(syntax_hl.clone());
-            plugin.input.set_syntax_highlighter(shared_highlighter);
-        }
-
+        // No default syntax highlighter - will be set based on file extension when file is opened
         // Calculate initial content hash
         let initial_text = plugin.doc.read().flatten_to_string();
         let mut hasher = AHasher::default();
         initial_text.hash(&mut hasher);
         plugin.last_saved_content_hash = hasher.finish();
 
-        plugin.syntax_highlighter = Some(syntax_highlighter);
+        // Create initial tab with the plugin (tab owns line numbers + diagnostics)
+        let initial_tab = crate::tab_manager::Tab::new(plugin);
+        let tab_manager = crate::tab_manager::TabManager::with_initial_tab(initial_tab);
 
-        // Create line numbers plugin (document will be set each frame)
-        let line_numbers = crate::line_numbers_plugin::LineNumbersPlugin::new();
-
-        // Create diagnostics manager
-        let diagnostics = DiagnosticsManager::new();
+        // Create global UI plugins
+        let tab_bar = crate::tab_bar_plugin::TabBarPlugin::new();
+        let file_picker = crate::file_picker_plugin::FilePickerPlugin::new();
 
         Self {
-            plugin,
-            line_numbers,
-            diagnostics,
+            tab_manager,
+            tab_bar,
+            file_picker,
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
             pending_scroll: None,
@@ -1492,11 +1621,12 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &input_types::Modifiers,
     ) -> bool {
+        let plugin = self.active_plugin_mut();
         // Convert to mouse click for InputHandler
         let alt_held = modifiers.state().alt_key();
         let shift_held = modifiers.state().shift_key();
-        self.plugin.input.on_mouse_click(
-            &self.plugin.doc,
+        plugin.input.on_mouse_click(
+            &plugin.doc,
             viewport,
             pos,
             input_types::MouseButton::Left,
@@ -1514,12 +1644,13 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &input_types::Modifiers,
     ) -> bool {
+        let plugin = self.active_plugin_mut();
         // Convert to mouse drag for InputHandler
         let alt_held = modifiers.state().alt_key();
         let (_redraw, scroll_delta) =
-            self.plugin
+            plugin
                 .input
-                .on_mouse_drag(&self.plugin.doc, viewport, from, to, alt_held);
+                .on_mouse_drag(&plugin.doc, viewport, from, to, alt_held);
 
         // Store scroll delta to be applied in render loop
         if scroll_delta.is_some() {
@@ -1531,21 +1662,22 @@ impl AppLogic for EditorLogic {
     }
 
     fn on_mouse_release(&mut self) {
-        self.plugin.input.clear_drag_anchor();
+        self.active_plugin_mut().input.clear_drag_anchor();
         self.pending_scroll = None;
     }
 
     fn doc(&self) -> &Doc {
-        &self.plugin.doc
+        &self.active_plugin().doc
     }
 
     fn doc_mut(&mut self) -> &mut Doc {
-        &mut self.plugin.doc
+        &mut self.active_plugin_mut().doc
     }
 
     fn cursor_pos(&self) -> usize {
+        let plugin = self.active_plugin();
         // Return first selection's cursor byte position for compatibility
-        self.plugin
+        plugin
             .input
             .selections()
             .first()
@@ -1554,22 +1686,23 @@ impl AppLogic for EditorLogic {
     }
 
     fn get_cursor_doc_pos(&self) -> Option<DocPos> {
-        self.plugin.get_cursor_doc_pos()
+        self.active_plugin().get_cursor_doc_pos()
     }
 
     fn selections(&self) -> &[crate::input::Selection] {
-        self.plugin.selections()
+        self.active_plugin().selections()
     }
 
     fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
-        self.plugin.syntax_highlighter.as_deref()
+        self.active_plugin().syntax_highlighter.as_deref()
     }
 
     fn on_update(&mut self) {
+        let plugin = self.active_plugin_mut();
         // Check if we should send pending syntax updates (debounce timer expired)
-        if self.plugin.input.should_flush() {
+        if plugin.input.should_flush() {
             println!("DEBOUNCE: Sending pending syntax updates after idle timeout");
-            self.plugin.input.flush_syntax_updates(&self.plugin.doc);
+            plugin.input.flush_syntax_updates(&plugin.doc);
         }
     }
 }

@@ -107,6 +107,18 @@ impl Languages {
         }
     }
 
+    /// TOML language configuration (WASM)
+    pub fn toml() -> LanguageConfig {
+        const WASM: &[u8] = include_bytes!("../assets/grammars/toml/tree-sitter-toml.wasm");
+        const HIGHLIGHTS: &str = include_str!("../assets/grammars/toml/highlights.scm");
+
+        LanguageConfig {
+            language: WASM_LOADER.load("toml", WASM),
+            highlights_query: HIGHLIGHTS,
+            name: "toml",
+        }
+    }
+
     // Adding new WASM languages is now trivial:
     // pub fn javascript() -> LanguageConfig {
     //     const WASM: &[u8] = include_bytes!("../assets/grammars/js/tree-sitter-javascript.wasm");
@@ -300,7 +312,7 @@ impl SyntaxHighlighter {
         // Create the parser with proper setup here, then move to thread
         let mut parser = Parser::new();
 
-        // For WGSL, we need special handling
+        // For WASM languages, we need special handling
         if config.name == "wgsl" {
             // Create engine and store here
             let engine = Box::leak(Box::new(tree_sitter::wasmtime::Engine::default()));
@@ -312,6 +324,23 @@ impl SyntaxHighlighter {
             let language = store
                 .load_language("wgsl", WGSL_WASM)
                 .expect("Failed to load WGSL language");
+
+            // Set up the parser
+            parser
+                .set_wasm_store(store)
+                .expect("Failed to set WasmStore");
+            parser.set_language(&language)?;
+        } else if config.name == "toml" {
+            // Create engine and store here
+            let engine = Box::leak(Box::new(tree_sitter::wasmtime::Engine::default()));
+            let mut store = WasmStore::new(engine).expect("Failed to create WasmStore");
+
+            // Load the language into the store
+            const TOML_WASM: &[u8] =
+                include_bytes!("../assets/grammars/toml/tree-sitter-toml.wasm");
+            let language = store
+                .load_language("toml", TOML_WASM)
+                .expect("Failed to load TOML language");
 
             // Set up the parser
             parser
@@ -481,11 +510,17 @@ impl SyntaxHighlighter {
         Self::new(Languages::wgsl()).expect("Failed to create WGSL highlighter")
     }
 
+    /// Create highlighter for TOML (convenience method)
+    pub fn new_toml() -> Self {
+        Self::new(Languages::toml()).expect("Failed to create TOML highlighter")
+    }
+
     /// Create highlighter based on file extension
     pub fn from_file_extension(extension: &str) -> Option<Self> {
         match extension.to_lowercase().as_str() {
             "rs" => Some(Self::new_rust()),
             "wgsl" => Some(Self::new_wgsl()),
+            "toml" => Some(Self::new_toml()),
             _ => None,
         }
     }
@@ -500,7 +535,8 @@ impl SyntaxHighlighter {
         match extension.to_lowercase().as_str() {
             "rs" => "rust",
             "wgsl" => "wgsl",
-            _ => "rust", // Default to rust
+            "toml" => "toml",
+            _ => "none", // Default to no highlighting
         }
     }
 

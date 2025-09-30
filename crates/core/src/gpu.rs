@@ -928,7 +928,8 @@ impl GpuRenderer {
         let surface = instance.create_surface(window).unwrap();
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
-                power_preference: PowerPreference::HighPerformance,
+                // power_preference: PowerPreference::HighPerformance,
+                power_preference: PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
@@ -1075,7 +1076,8 @@ impl GpuRenderer {
 
         let rect_vertex_buffer = create_vertex_buffer("Rect Vertex Buffer", RECT_BUFFER_SIZE);
         let glyph_vertex_buffer = create_vertex_buffer("Glyph Vertex Buffer", GLYPH_BUFFER_SIZE);
-        let line_number_vertex_buffer = create_vertex_buffer("Line Number Vertex Buffer", 256 * 1024); // 256KB for line numbers
+        let line_number_vertex_buffer =
+            create_vertex_buffer("Line Number Vertex Buffer", 256 * 1024); // 256KB for line numbers
 
         let builder = PipelineBuilder {
             device: &device,
