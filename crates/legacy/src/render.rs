@@ -127,6 +127,13 @@ pub struct Renderer {
     tab_bar_rects: Vec<tiny_sdk::types::RectInstance>,
     /// File picker glyphs (rendered separately)
     file_picker_glyphs: Vec<GlyphInstance>,
+
+    /// Dirty flags to track what needs regeneration
+    glyphs_dirty: bool,
+    line_numbers_dirty: bool,
+    ui_dirty: bool,
+    last_scroll: (f32, f32),
+    last_viewport_size: (f32, f32),
 }
 
 unsafe impl Send for Renderer {}
@@ -167,12 +174,20 @@ impl Renderer {
             tab_bar_glyphs: Vec::new(),
             tab_bar_rects: Vec::new(),
             file_picker_glyphs: Vec::new(),
+            glyphs_dirty: true,
+            line_numbers_dirty: true,
+            ui_dirty: true,
+            last_scroll: (0.0, 0.0),
+            last_viewport_size: (0.0, 0.0),
         }
     }
 
     pub fn set_font_size(&mut self, font_size: f32) {
         self.viewport.set_font_size(font_size);
         self.layout_dirty = true;
+        self.glyphs_dirty = true;
+        self.line_numbers_dirty = true;
+        self.ui_dirty = true;
 
         // Notify plugins about the viewport change
         let mut state = self.plugin_state.lock().unwrap();
@@ -442,10 +457,25 @@ impl Renderer {
         self.file_picker_plugin = Some(plugin as *mut _);
     }
 
+    /// Mark UI as dirty (call when tabs change, file picker opens, etc.)
+    pub fn mark_ui_dirty(&mut self) {
+        self.ui_dirty = true;
+    }
+
+    /// Mark everything dirty (call when swapping tabs or major changes)
+    pub fn mark_all_dirty(&mut self) {
+        self.glyphs_dirty = true;
+        self.line_numbers_dirty = true;
+        self.ui_dirty = true;
+    }
+
     /// Swap the text renderer with the active tab's renderer
     /// This preserves per-tab rendering state (syntax highlighting, layout, etc.)
     pub fn swap_text_renderer(&mut self, tab_renderer: &mut crate::text_renderer::TextRenderer) {
         std::mem::swap(&mut self.text_renderer, tab_renderer);
+        // Mark glyphs dirty since we switched to different content
+        self.glyphs_dirty = true;
+        self.line_numbers_dirty = true;
     }
 
     pub fn get_gpu_renderer(&self) -> Option<*const GpuRenderer> {
@@ -454,6 +484,8 @@ impl Renderer {
 
     pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
         self.text_renderer.apply_incremental_edit(edit);
+        self.glyphs_dirty = true;
+        self.line_numbers_dirty = true;
     }
 
     /// Clear edit deltas (called after undo/redo when tree is replaced)
@@ -462,9 +494,20 @@ impl Renderer {
     }
 
     pub fn update_viewport(&mut self, width: f32, height: f32, scale_factor: f32) {
-        self.viewport.resize(width, height, scale_factor);
-        self.layout_dirty = true;
+        let size_changed = self.last_viewport_size != (width, height);
+        let scale_changed = self.viewport.scale_factor != scale_factor;
 
+        // Only do expensive resize/relayout if something actually changed
+        if size_changed || scale_changed {
+            self.viewport.resize(width, height, scale_factor);
+            self.layout_dirty = true;
+            self.glyphs_dirty = true;
+            self.line_numbers_dirty = true;
+            self.ui_dirty = true;
+            self.last_viewport_size = (width, height);
+        }
+
+        // Always recalculate editor bounds (cheap) - plugins may have changed
         let mut offset_x = 0.0;
         let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
 
@@ -555,34 +598,58 @@ impl Renderer {
         mut render_pass: Option<&mut wgpu::RenderPass>,
         tab_manager: Option<&crate::tab_manager::TabManager>,
     ) {
-        if tree.version == self.last_rendered_version && !self.layout_dirty && !self.syntax_dirty {
+        // Check if scroll changed
+        let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
+        let scroll_changed = current_scroll != self.last_scroll;
+        if scroll_changed {
+            self.glyphs_dirty = true;
+            self.line_numbers_dirty = true;
+            self.last_scroll = current_scroll;
+        }
+
+        let content_changed = tree.version != self.last_rendered_version || self.layout_dirty || self.syntax_dirty;
+
+        // Early exit if nothing changed at all
+        if !content_changed && !scroll_changed && !self.glyphs_dirty && !self.line_numbers_dirty && !self.ui_dirty {
             return;
         }
 
-        self.prepare_render(tree);
+        // Only prepare render if content actually changed
+        if content_changed {
+            self.prepare_render(tree);
+        }
 
-        // Clear accumulated glyphs from previous frame
-        self.accumulated_glyphs.clear();
-
+        // Only regenerate glyphs if something actually changed
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
-        self.collect_main_text_glyphs(tree, visible_range.clone());
+        if self.glyphs_dirty || content_changed {
+            self.accumulated_glyphs.clear();
+            self.collect_main_text_glyphs(tree, visible_range.clone());
+            self.glyphs_dirty = false;
+        }
 
         if let Some(pass) = render_pass.as_deref_mut() {
             let scale = self.viewport.scale_factor;
 
             // === COLLECT GLYPHS ===
-            // Collect UI glyphs first
-            self.line_number_glyphs.clear();
-            self.collect_line_number_glyphs();
-
-            self.tab_bar_glyphs.clear();
-            self.tab_bar_rects.clear();
-            if let Some(tab_mgr) = tab_manager {
-                self.collect_tab_bar_glyphs(tab_mgr);
+            // Only regenerate line numbers if dirty
+            if self.line_numbers_dirty {
+                self.line_number_glyphs.clear();
+                self.collect_line_number_glyphs();
+                self.line_numbers_dirty = false;
             }
 
-            self.file_picker_glyphs.clear();
-            self.collect_file_picker_glyphs();
+            // Only regenerate UI if dirty
+            if self.ui_dirty {
+                self.tab_bar_glyphs.clear();
+                self.tab_bar_rects.clear();
+                if let Some(tab_mgr) = tab_manager {
+                    self.collect_tab_bar_glyphs(tab_mgr);
+                }
+
+                self.file_picker_glyphs.clear();
+                self.collect_file_picker_glyphs();
+                self.ui_dirty = false;
+            }
 
             // === DRAW EDITOR CONTENT FIRST ===
             // Set scissor rect slightly outside the content area to avoid edge clipping

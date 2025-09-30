@@ -6,6 +6,7 @@ use tiny_core::DocTree;
 use tiny_sdk::DocPos;
 
 use crate::input::Selection;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Generic history tracker for undo/redo operations
@@ -106,6 +107,16 @@ pub type TreeHistory = History<Arc<DocTree>>;
 
 /// Type alias for cursor navigation history (Cmd+[/])
 pub type SelectionHistory = History<DocPos>;
+
+/// File location for cross-file navigation
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileLocation {
+    pub path: Option<PathBuf>,
+    pub position: DocPos,
+}
+
+/// Type alias for cross-file navigation history (global Cmd+[/])
+pub type FileNavigationHistory = History<FileLocation>;
 
 impl<T: Clone> History<T> {
     /// Peek at the next undo item without removing it

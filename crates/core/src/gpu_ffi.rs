@@ -3,7 +3,7 @@
 //! Instead of passing wgpu objects across FFI (which corrupts them),
 //! we pass integer IDs and maintain a registry on the host side.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use wgpu::*;

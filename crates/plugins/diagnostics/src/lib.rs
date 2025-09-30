@@ -1,7 +1,7 @@
 //! Diagnostics Plugin - Renders squiggly lines under text and shows popups on hover
 
+use ahash::AHashMap as HashMap;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tiny_font::{create_glyph_instances, SharedFontSystem};
@@ -14,8 +14,8 @@ use tiny_sdk::{
         BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId, VertexAttributeDescriptor,
         VertexFormat,
     },
-    Capability, Configurable, GlyphInstance, Initializable, LayoutPos, Library,
-    PaintContext, Paintable, Plugin, PluginError, SetupContext, ViewportInfo,
+    Capability, Configurable, GlyphInstance, Initializable, LayoutPos, Library, PaintContext,
+    Paintable, Plugin, PluginError, SetupContext, ViewportInfo,
 };
 
 /// Diagnostic severity levels
@@ -115,7 +115,6 @@ pub struct DiagnosticsPlugin {
     // Viewport info
     viewport: ViewportInfo,
 
-
     // GPU resources (RwLock for interior mutability in paint())
     vertex_buffer: RwLock<Option<Buffer>>,
     vertex_buffer_id: RwLock<Option<BufferId>>,
@@ -130,16 +129,35 @@ pub struct DiagnosticsPlugin {
 #[derive(Debug, Clone)]
 enum HoverState {
     None,
-    WaitingForDelay { over_symbol: bool, line: usize, column: usize },
-    RequestingHover { line: usize, column: usize },
-    ShowingHover { content: String, line: usize, column: usize },
+    WaitingForDelay {
+        over_symbol: bool,
+        line: usize,
+        column: usize,
+    },
+    RequestingHover {
+        line: usize,
+        column: usize,
+    },
+    ShowingHover {
+        content: String,
+        line: usize,
+        column: usize,
+    },
 }
 
 /// Popup content to display
 #[derive(Debug, Clone)]
 enum PopupContent {
-    Diagnostic { message: String, line: usize, column: usize },
-    Hover { content: String, line: usize, column: usize },
+    Diagnostic {
+        message: String,
+        line: usize,
+        column: usize,
+    },
+    Hover {
+        content: String,
+        line: usize,
+        column: usize,
+    },
 }
 
 impl DiagnosticsPlugin {
@@ -188,7 +206,13 @@ impl DiagnosticsPlugin {
     }
 
     /// Update mouse position for hover detection (in editor-local coordinates)
-    pub fn set_mouse_position(&mut self, x: f32, y: f32, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>, services: Option<&tiny_sdk::ServiceRegistry>) {
+    pub fn set_mouse_position(
+        &mut self,
+        x: f32,
+        y: f32,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+        services: Option<&tiny_sdk::ServiceRegistry>,
+    ) {
         self.mouse_position = (x, y);
 
         // Calculate document position from mouse coordinates
@@ -239,7 +263,8 @@ impl DiagnosticsPlugin {
         for diagnostic in &self.diagnostics {
             if diagnostic.line == line
                 && column >= diagnostic.column_range.0
-                && column < diagnostic.column_range.1 {
+                && column < diagnostic.column_range.1
+            {
                 self.current_popup = Some(PopupContent::Diagnostic {
                     message: diagnostic.message.clone(),
                     line: diagnostic.line,
@@ -251,26 +276,36 @@ impl DiagnosticsPlugin {
 
         // Check if we're over a symbol
         let over_symbol = self.symbols.iter().any(|symbol| {
-            symbol.line == line
-                && column >= symbol.column_range.0
-                && column < symbol.column_range.1
+            symbol.line == line && column >= symbol.column_range.0 && column < symbol.column_range.1
         });
 
         // Update hover state machine
         match &self.hover_state {
             HoverState::None => {
                 if over_symbol {
-                    self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                    self.hover_state = HoverState::WaitingForDelay {
+                        over_symbol: true,
+                        line,
+                        column,
+                    };
                     self.hover_start_time = Some(Instant::now());
                 } else {
                     self.current_popup = None;
                 }
             }
-            HoverState::WaitingForDelay { over_symbol: _, line: prev_line, column: prev_column } => {
+            HoverState::WaitingForDelay {
+                over_symbol: _,
+                line: prev_line,
+                column: prev_column,
+            } => {
                 if line != *prev_line || column != *prev_column {
                     // Position changed, reset
                     if over_symbol {
-                        self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                        self.hover_state = HoverState::WaitingForDelay {
+                            over_symbol: true,
+                            line,
+                            column,
+                        };
                         self.hover_start_time = Some(Instant::now());
                     } else {
                         self.hover_state = HoverState::None;
@@ -282,24 +317,39 @@ impl DiagnosticsPlugin {
                     self.current_popup = None;
                 }
             }
-            HoverState::RequestingHover { line: prev_line, column: prev_column } => {
+            HoverState::RequestingHover {
+                line: prev_line,
+                column: prev_column,
+            } => {
                 if line != *prev_line || column != *prev_column || !over_symbol {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
                     if over_symbol {
-                        self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                        self.hover_state = HoverState::WaitingForDelay {
+                            over_symbol: true,
+                            line,
+                            column,
+                        };
                         self.hover_start_time = Some(Instant::now());
                     }
                 }
             }
-            HoverState::ShowingHover { line: prev_line, column: prev_column, .. } => {
+            HoverState::ShowingHover {
+                line: prev_line,
+                column: prev_column,
+                ..
+            } => {
                 if line != *prev_line || column != *prev_column || !over_symbol {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
                     if over_symbol {
-                        self.hover_state = HoverState::WaitingForDelay { over_symbol: true, line, column };
+                        self.hover_state = HoverState::WaitingForDelay {
+                            over_symbol: true,
+                            line,
+                            column,
+                        };
                         self.hover_start_time = Some(Instant::now());
                     }
                 }
@@ -308,7 +358,11 @@ impl DiagnosticsPlugin {
     }
 
     /// Create vertices for squiggly lines
-    fn create_squiggly_vertices(&self, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>, services: Option<&tiny_sdk::ServiceRegistry>) -> Vec<DiagnosticVertex> {
+    fn create_squiggly_vertices(
+        &self,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+        services: Option<&tiny_sdk::ServiceRegistry>,
+    ) -> Vec<DiagnosticVertex> {
         let mut vertices = Vec::new();
         let scale = self.viewport.scale_factor;
 
@@ -324,15 +378,18 @@ impl DiagnosticsPlugin {
         // Get widget bounds offset and scroll
         let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
         let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-        let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(self.viewport.scroll.x.0);
-        let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(self.viewport.scroll.y.0);
+        let widget_scroll_x = widget_viewport
+            .map(|w| w.scroll.x.0)
+            .unwrap_or(self.viewport.scroll.x.0);
+        let widget_scroll_y = widget_viewport
+            .map(|w| w.scroll.y.0)
+            .unwrap_or(self.viewport.scroll.y.0);
 
         for diagnostic in &self.diagnostics {
             // Calculate line position in document space (absolute position in the document)
             let doc_y = diagnostic.line as f32 * self.viewport.line_height;
             // Position at bottom of line for squiggly effect
             let line_y_doc = doc_y + self.viewport.line_height - 2.0;
-
 
             // Calculate X positions in document space
             let start_x_doc = diagnostic.column_range.0 as f32 * char_width;
@@ -349,7 +406,6 @@ impl DiagnosticsPlugin {
             let start_x = screen_x * scale;
             let line_y = screen_y * scale;
             let width_scaled = width * scale;
-
 
             // Create a quad that covers the area where the squiggly line will be drawn
             let padding = 4.0 * scale; // Extra height for the wave amplitude
@@ -408,7 +464,12 @@ impl DiagnosticsPlugin {
     }
 
     /// Create vertices for popup background
-    fn create_popup_vertices(&self, diagnostic: &Diagnostic, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>, services: Option<&tiny_sdk::ServiceRegistry>) -> Vec<DiagnosticVertex> {
+    fn create_popup_vertices(
+        &self,
+        diagnostic: &Diagnostic,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+        services: Option<&tiny_sdk::ServiceRegistry>,
+    ) -> Vec<DiagnosticVertex> {
         let mut vertices = Vec::new();
         let scale = self.viewport.scale_factor;
         // Get font service for accurate character width
@@ -423,8 +484,12 @@ impl DiagnosticsPlugin {
         // Get widget bounds offset and scroll
         let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
         let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-        let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(self.viewport.scroll.x.0);
-        let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(self.viewport.scroll.y.0);
+        let widget_scroll_x = widget_viewport
+            .map(|w| w.scroll.x.0)
+            .unwrap_or(self.viewport.scroll.x.0);
+        let widget_scroll_y = widget_viewport
+            .map(|w| w.scroll.y.0)
+            .unwrap_or(self.viewport.scroll.y.0);
 
         // Calculate popup size using font system's layout for accurate multi-line text dimensions
         let font_service = services
@@ -446,9 +511,9 @@ impl DiagnosticsPlugin {
         let view_y = doc_y - widget_scroll_y;
 
         // Smart positioning within editor bounds
-        let widget_bounds = widget_viewport.map(|w| w.bounds).unwrap_or_else(|| {
-            tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0)
-        });
+        let widget_bounds = widget_viewport
+            .map(|w| w.bounds)
+            .unwrap_or_else(|| tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0));
 
         // Try above first, then below if not enough space
         let mut popup_x_view = view_x;
@@ -531,7 +596,11 @@ impl DiagnosticsPlugin {
     }
 
     /// Collect glyphs for popup text
-    pub fn collect_popup_glyphs(&self, services: &tiny_sdk::ServiceRegistry, widget_viewport: Option<&tiny_sdk::types::WidgetViewport>) -> Vec<GlyphInstance> {
+    pub fn collect_popup_glyphs(
+        &self,
+        services: &tiny_sdk::ServiceRegistry,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+    ) -> Vec<GlyphInstance> {
         // Get popup content from current popup
         let popup_content = match &self.current_popup {
             Some(PopupContent::Diagnostic { message, .. }) => Some(message.clone()),
@@ -541,7 +610,8 @@ impl DiagnosticsPlugin {
 
         if let Some(content) = popup_content {
             // Get font service - required for text rendering
-            let font_service = services.get::<SharedFontSystem>()
+            let font_service = services
+                .get::<SharedFontSystem>()
                 .expect("Font service is required for popup text rendering");
 
             let scale = self.viewport.scale_factor;
@@ -551,13 +621,17 @@ impl DiagnosticsPlugin {
             // Get widget bounds offset and scroll
             let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
             let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-            let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(self.viewport.scroll.x.0);
-            let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(self.viewport.scroll.y.0);
+            let widget_scroll_x = widget_viewport
+                .map(|w| w.scroll.x.0)
+                .unwrap_or(self.viewport.scroll.x.0);
+            let widget_scroll_y = widget_viewport
+                .map(|w| w.scroll.y.0)
+                .unwrap_or(self.viewport.scroll.y.0);
 
             // Calculate popup position based on popup content
             let (doc_x, doc_y) = match &self.current_popup {
-                Some(PopupContent::Diagnostic { line, column, .. }) |
-                Some(PopupContent::Hover { line, column, .. }) => {
+                Some(PopupContent::Diagnostic { line, column, .. })
+                | Some(PopupContent::Hover { line, column, .. }) => {
                     let doc_y = *line as f32 * self.viewport.line_height;
                     let doc_x = *column as f32 * char_width;
                     (doc_x, doc_y)
@@ -573,9 +647,9 @@ impl DiagnosticsPlugin {
             let layout = font_service.layout_text(&content, self.viewport.font_size);
 
             // Constrain content if it's too long for available space
-            let widget_bounds = widget_viewport.map(|w| w.bounds).unwrap_or_else(|| {
-                tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0)
-            });
+            let widget_bounds = widget_viewport
+                .map(|w| w.bounds)
+                .unwrap_or_else(|| tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0));
 
             let max_popup_height = widget_bounds.height.0 * 0.6; // Max 60% of editor height
             let max_lines = (max_popup_height / self.viewport.line_height) as usize;
@@ -597,7 +671,8 @@ impl DiagnosticsPlugin {
 
             // Smart positioning within editor bounds
             let max_popup_height_view = widget_bounds.height.0 * 0.6; // Max 60% of editor height
-            let popup_height_logical = final_layout.height.min(max_popup_height_view) + self.config.popup_padding * 2.0;
+            let popup_height_logical =
+                final_layout.height.min(max_popup_height_view) + self.config.popup_padding * 2.0;
 
             // Try above first, then below if not enough space
             let mut popup_x_view = view_x;
@@ -883,30 +958,42 @@ impl Library for DiagnosticsPlugin {
                         return Err(PluginError::Other("Invalid symbol data".into()));
                     }
 
-                    let line = u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
-                    let col_start = u32::from_le_bytes(args[offset + 4..offset + 8].try_into().unwrap()) as usize;
-                    let col_end = u32::from_le_bytes(args[offset + 8..offset + 12].try_into().unwrap()) as usize;
-                    let kind_len = u32::from_le_bytes(args[offset + 12..offset + 16].try_into().unwrap()) as usize;
+                    let line =
+                        u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
+                    let col_start =
+                        u32::from_le_bytes(args[offset + 4..offset + 8].try_into().unwrap())
+                            as usize;
+                    let col_end =
+                        u32::from_le_bytes(args[offset + 8..offset + 12].try_into().unwrap())
+                            as usize;
+                    let kind_len =
+                        u32::from_le_bytes(args[offset + 12..offset + 16].try_into().unwrap())
+                            as usize;
 
                     offset += 16;
                     if args.len() < offset + kind_len {
                         return Err(PluginError::Other("Invalid symbol kind length".into()));
                     }
 
-                    let kind = String::from_utf8_lossy(&args[offset..offset + kind_len]).to_string();
+                    let kind =
+                        String::from_utf8_lossy(&args[offset..offset + kind_len]).to_string();
                     offset += kind_len;
 
                     if args.len() < offset + 4 {
-                        return Err(PluginError::Other("Invalid symbol name length header".into()));
+                        return Err(PluginError::Other(
+                            "Invalid symbol name length header".into(),
+                        ));
                     }
-                    let name_len = u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
+                    let name_len =
+                        u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
 
                     if args.len() < offset + name_len {
                         return Err(PluginError::Other("Invalid symbol name length".into()));
                     }
 
-                    let name = String::from_utf8_lossy(&args[offset..offset + name_len]).to_string();
+                    let name =
+                        String::from_utf8_lossy(&args[offset..offset + name_len]).to_string();
                     offset += name_len;
 
                     self.symbols.push(Symbol {
@@ -951,9 +1038,9 @@ impl Paintable for DiagnosticsPlugin {
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
         // Get services from context
         let services = unsafe {
-            ctx.context_data.as_ref().map(|data| {
-                &*(data as *const _ as *const tiny_sdk::ServiceRegistry)
-            })
+            ctx.context_data
+                .as_ref()
+                .map(|data| &*(data as *const _ as *const tiny_sdk::ServiceRegistry))
         };
 
         // Draw squiggly lines
@@ -967,7 +1054,11 @@ impl Paintable for DiagnosticsPlugin {
             if let Some(device) = &self.device {
                 let needs_new_buffer = {
                     let buffer = self.vertex_buffer.read().unwrap();
-                    buffer.is_none() || buffer.as_ref().map(|b| b.size() < required_size).unwrap_or(true)
+                    buffer.is_none()
+                        || buffer
+                            .as_ref()
+                            .map(|b| b.size() < required_size)
+                            .unwrap_or(true)
                 };
 
                 if needs_new_buffer {
@@ -1006,12 +1097,16 @@ impl Paintable for DiagnosticsPlugin {
         // Show popup if we have one
         if let Some(ref popup_content) = self.current_popup {
             let (popup_text, popup_line, popup_col) = match popup_content {
-                PopupContent::Diagnostic { message, line, column } => {
-                    (message.clone(), *line, *column)
-                }
-                PopupContent::Hover { content, line, column } => {
-                    (content.clone(), *line, *column)
-                }
+                PopupContent::Diagnostic {
+                    message,
+                    line,
+                    column,
+                } => (message.clone(), *line, *column),
+                PopupContent::Hover {
+                    content,
+                    line,
+                    column,
+                } => (content.clone(), *line, *column),
             };
 
             // Create a temporary diagnostic for popup positioning
@@ -1024,7 +1119,11 @@ impl Paintable for DiagnosticsPlugin {
             };
 
             // Draw popup background
-            let popup_vertices = self.create_popup_vertices(&temp_diagnostic, ctx.widget_viewport.as_ref(), services);
+            let popup_vertices = self.create_popup_vertices(
+                &temp_diagnostic,
+                ctx.widget_viewport.as_ref(),
+                services,
+            );
             if !popup_vertices.is_empty() {
                 let vertex_data = bytemuck::cast_slice(&popup_vertices);
                 let vertex_count = popup_vertices.len() as u32;
@@ -1034,7 +1133,11 @@ impl Paintable for DiagnosticsPlugin {
                 if let Some(device) = &self.device {
                     let needs_new_buffer = {
                         let buffer = self.popup_vertex_buffer.read().unwrap();
-                        buffer.is_none() || buffer.as_ref().map(|b| b.size() < required_size).unwrap_or(true)
+                        buffer.is_none()
+                            || buffer
+                                .as_ref()
+                                .map(|b| b.size() < required_size)
+                                .unwrap_or(true)
                     };
 
                     if needs_new_buffer {
@@ -1085,7 +1188,7 @@ impl Paintable for DiagnosticsPlugin {
                             render_pass,
                             &glyphs,
                             false,
-                            buffer_offset
+                            buffer_offset,
                         );
                     }
                 }
@@ -1115,10 +1218,18 @@ impl Configurable for DiagnosticsPlugin {
             popup_padding: f32,
         }
 
-        fn default_popup_bg() -> u32 { 0x2D2D30FF }
-        fn default_popup_text() -> u32 { 0xCCCCCCFF }
-        fn default_popup_border() -> u32 { 0x464647FF }
-        fn default_popup_padding() -> f32 { 8.0 }
+        fn default_popup_bg() -> u32 {
+            0x2D2D30FF
+        }
+        fn default_popup_text() -> u32 {
+            0xCCCCCCFF
+        }
+        fn default_popup_border() -> u32 {
+            0x464647FF
+        }
+        fn default_popup_padding() -> f32 {
+            8.0
+        }
 
         match toml::from_str::<PluginToml>(config_data) {
             Ok(plugin_toml) => {
@@ -1132,7 +1243,9 @@ impl Configurable for DiagnosticsPlugin {
             }
             Err(e) => {
                 eprintln!("Failed to parse diagnostics config: {}", e);
-                Err(PluginError::Other(format!("Config parse error: {}", e).into()))
+                Err(PluginError::Other(
+                    format!("Config parse error: {}", e).into(),
+                ))
             }
         }
     }
@@ -1183,7 +1296,11 @@ impl DiagnosticsPlugin {
 
     /// Set hover content received from LSP
     pub fn set_hover_content(&mut self, content: String, line: usize, column: usize) {
-        if let HoverState::RequestingHover { line: req_line, column: req_column } = self.hover_state {
+        if let HoverState::RequestingHover {
+            line: req_line,
+            column: req_column,
+        } = self.hover_state
+        {
             if line == req_line && column == req_column {
                 self.hover_state = HoverState::ShowingHover {
                     content: content.clone(),
@@ -1211,9 +1328,8 @@ impl DiagnosticsPlugin {
 
     /// Get current mouse position in document coordinates (line, column)
     pub fn get_mouse_document_position(&self) -> Option<(usize, usize)> {
-        self.mouse_line.and_then(|line| {
-            self.mouse_column.map(|col| (line, col))
-        })
+        self.mouse_line
+            .and_then(|line| self.mouse_column.map(|col| (line, col)))
     }
 
     /// Clear all diagnostics

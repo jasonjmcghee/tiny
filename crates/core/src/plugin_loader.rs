@@ -2,7 +2,7 @@
 //!
 //! Handles discovery, loading, and lifecycle of plugins from dynamic libraries
 
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiny_sdk::{GlyphInstances, Hook, Library, Paintable, Plugin, PluginError, Updatable};
@@ -67,16 +67,16 @@ impl PluginLoader {
         &self,
         plugin_configs: &HashMap<String, PluginConfig>,
     ) -> Result<Vec<String>, PluginError> {
-        let mut loaded = std::collections::HashSet::new();
+        let mut loaded = HashSet::new();
         let mut order = Vec::new();
 
         // Helper function to recursively load dependencies
         fn visit(
             name: &str,
             configs: &HashMap<String, PluginConfig>,
-            loaded: &mut std::collections::HashSet<String>,
+            loaded: &mut HashSet<String>,
             order: &mut Vec<String>,
-            visiting: &mut std::collections::HashSet<String>,
+            visiting: &mut HashSet<String>,
         ) -> Result<(), PluginError> {
             if loaded.contains(name) {
                 return Ok(());
@@ -107,7 +107,7 @@ impl PluginLoader {
             Ok(())
         }
 
-        let mut visiting = std::collections::HashSet::new();
+        let mut visiting = HashSet::new();
         for name in plugin_configs.keys() {
             visit(name, plugin_configs, &mut loaded, &mut order, &mut visiting)?;
         }

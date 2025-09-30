@@ -83,6 +83,7 @@ pub struct GpuRenderer {
     rect_uniform_bind_group_layout: BindGroupLayout, // Rect-specific uniforms
     themed_uniform_bind_group_layout: Option<BindGroupLayout>, // Themed shader uniforms
     theme_bind_group_layout: Option<BindGroupLayout>, // Theme texture/sampler
+    style_bind_group_layout: Option<BindGroupLayout>, // Style buffer layout (cached)
 
     // Pipelines
     rect_pipeline: RenderPipeline,
@@ -128,6 +129,10 @@ pub struct GpuRenderer {
     // Store registered IDs for plugin context
     rect_pipeline_id: gpu_ffi::PipelineId,
     uniform_bind_group_id: gpu_ffi::BindGroupId,
+
+    // Dirty flags to avoid redundant updates
+    uniforms_dirty: bool,
+    themed_uniforms_dirty: bool,
 }
 
 /// Create 6 vertices (2 triangles) for a quad
@@ -462,12 +467,7 @@ impl GpuRenderer {
         vertex_data: &[u8],
         vertex_count: u32,
     ) {
-        // eprintln!("GPU renderer drawing {} vertices for plugin", vertex_count);
-        // eprintln!("rect_vertex_buffer at {:p}", &self.rect_vertex_buffer);
-        // eprintln!("vertex_data size: {} bytes", vertex_data.len());
-
-        // CRITICAL: Update uniforms with current viewport size!
-        self.update_uniforms(self.config.width as f32, self.config.height as f32);
+        // Uniforms are now updated once per frame in render_with_callback
 
         // Write data to our rect buffer (reusing it)
         self.queue
@@ -478,8 +478,6 @@ impl GpuRenderer {
         render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.rect_vertex_buffer.slice(..));
         render_pass.draw(0..vertex_count, 0..1);
-
-        eprintln!("Drew plugin vertices");
     }
 
     /// FFI-safe extern function for drawing vertices
@@ -565,13 +563,15 @@ impl GpuRenderer {
         // Buffer size is already aligned since u32 is 4 bytes
         let buffer_size = (style_data.len() * 4) as u64;
 
-        // Create or recreate buffer if size changed
-        if self
+        // Track if buffer was recreated
+        let buffer_recreated = self
             .style_buffer
             .as_ref()
             .map(|b| b.size() != buffer_size)
-            .unwrap_or(true)
-        {
+            .unwrap_or(true);
+
+        // Create or recreate buffer if size changed
+        if buffer_recreated {
             self.style_buffer = Some(self.create_buffer(
                 "Style Buffer",
                 buffer_size,
@@ -579,70 +579,79 @@ impl GpuRenderer {
             ));
         }
 
+        // Write data to buffer (always, even if not recreated)
         if let Some(buffer) = &self.style_buffer {
             self.queue
                 .write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
         }
 
-        // Always recreate bind group when buffer changes
-        if let (Some(style_buffer), Some(palette_view), Some(palette_sampler)) = (
-            &self.style_buffer,
-            &self.palette_texture_view,
-            &self.palette_sampler,
-        ) {
-            // Create bind group layout
-            let style_bind_group_layout =
-                self.device
-                    .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                        label: Some("Style Buffer Layout"),
+        // Only recreate bind group when buffer was recreated or it doesn't exist
+        if buffer_recreated || self.styled_bind_group.is_none() {
+            if let (Some(style_buffer), Some(palette_view), Some(palette_sampler)) = (
+                &self.style_buffer,
+                &self.palette_texture_view,
+                &self.palette_sampler,
+            ) {
+                // Create bind group layout if not cached
+                if self.style_bind_group_layout.is_none() {
+                    let style_bind_group_layout =
+                        self.device
+                            .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                                label: Some("Style Buffer Layout"),
+                                entries: &[
+                                    BindGroupLayoutEntry {
+                                        binding: 0,
+                                        visibility: ShaderStages::VERTEX,
+                                        ty: BindingType::Buffer {
+                                            ty: BufferBindingType::Storage { read_only: true },
+                                            has_dynamic_offset: false,
+                                            min_binding_size: None,
+                                        },
+                                        count: None,
+                                    },
+                                    BindGroupLayoutEntry {
+                                        binding: 1,
+                                        visibility: ShaderStages::FRAGMENT,
+                                        ty: BindingType::Texture {
+                                            multisampled: false,
+                                            view_dimension: TextureViewDimension::D1,
+                                            sample_type: TextureSampleType::Float { filterable: true },
+                                        },
+                                        count: None,
+                                    },
+                                    BindGroupLayoutEntry {
+                                        binding: 2,
+                                        visibility: ShaderStages::FRAGMENT,
+                                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                                        count: None,
+                                    },
+                                ],
+                            });
+                    self.style_bind_group_layout = Some(style_bind_group_layout);
+                }
+
+                // Create bind group using cached layout
+                if let Some(layout) = &self.style_bind_group_layout {
+                    self.styled_bind_group = Some(self.device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("Style Bind Group"),
+                        layout,
                         entries: &[
-                            BindGroupLayoutEntry {
+                            BindGroupEntry {
                                 binding: 0,
-                                visibility: ShaderStages::VERTEX,
-                                ty: BindingType::Buffer {
-                                    ty: BufferBindingType::Storage { read_only: true },
-                                    has_dynamic_offset: false,
-                                    min_binding_size: None,
-                                },
-                                count: None,
+                                resource: style_buffer.as_entire_binding(),
                             },
-                            BindGroupLayoutEntry {
+                            BindGroupEntry {
                                 binding: 1,
-                                visibility: ShaderStages::FRAGMENT,
-                                ty: BindingType::Texture {
-                                    multisampled: false,
-                                    view_dimension: TextureViewDimension::D1,
-                                    sample_type: TextureSampleType::Float { filterable: true },
-                                },
-                                count: None,
+                                resource: BindingResource::TextureView(palette_view),
                             },
-                            BindGroupLayoutEntry {
+                            BindGroupEntry {
                                 binding: 2,
-                                visibility: ShaderStages::FRAGMENT,
-                                ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                                count: None,
+                                resource: BindingResource::Sampler(palette_sampler),
                             },
                         ],
-                    });
-
-            self.styled_bind_group = Some(self.device.create_bind_group(&BindGroupDescriptor {
-                label: Some("Style Bind Group"),
-                layout: &style_bind_group_layout,
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: style_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::TextureView(palette_view),
-                    },
-                    BindGroupEntry {
-                        binding: 2,
-                        resource: BindingResource::Sampler(palette_sampler),
-                    },
-                ],
-            }));
+                    }));
+                }
+            }
         }
     }
 
@@ -834,11 +843,13 @@ impl GpuRenderer {
     /// Update time for animations
     pub fn update_time(&mut self, delta_time: f32) {
         self.current_time += delta_time;
+        self.themed_uniforms_dirty = true;
     }
 
     /// Set the current theme mode
     pub fn set_theme_mode(&mut self, mode: u32) {
         self.current_theme_mode = mode;
+        self.themed_uniforms_dirty = true;
     }
 
     /// Check if styled pipeline is available
@@ -958,6 +969,8 @@ impl GpuRenderer {
             TextureFormat::Rgba8UnormSrgb => TextureFormat::Rgba8Unorm,
             other => other,
         };
+        // Enable vsync for proper frame rate limiting
+        config.present_mode = wgpu::PresentMode::Fifo;
         surface.configure(&device, &config);
 
         let shader_base_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1136,6 +1149,7 @@ impl GpuRenderer {
             line_number_vertex_buffer,
             themed_uniform_bind_group_layout: None,
             theme_bind_group_layout: None,
+            style_bind_group_layout: None,
             themed_uniform_buffer: None,
             themed_uniform_bind_group: None,
             effect_pipelines: HashMap::default(),
@@ -1154,6 +1168,8 @@ impl GpuRenderer {
             current_theme_mode: 0,
             rect_pipeline_id,
             uniform_bind_group_id,
+            uniforms_dirty: true,
+            themed_uniforms_dirty: true,
         }
     }
 
@@ -1165,6 +1181,38 @@ impl GpuRenderer {
     where
         F: FnOnce(&mut RenderPass),
     {
+        // Update uniforms once per frame (only if dirty)
+        if self.uniforms_dirty {
+            let basic_uniforms = BasicUniforms {
+                viewport_size: [self.config.width as f32, self.config.height as f32],
+            };
+            self.queue.write_buffer(
+                &self.rect_uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[basic_uniforms]),
+            );
+            self.uniforms_dirty = false;
+        }
+
+        if self.themed_uniforms_dirty {
+            if let Some(themed_uniform_buffer) = &self.themed_uniform_buffer {
+                let themed_uniforms = Uniforms {
+                    viewport_size: [self.config.width as f32, self.config.height as f32],
+                    scale_factor: 1.0,
+                    time: self.current_time,
+                    theme_mode: self.current_theme_mode,
+                    _padding: [0.0, 0.0, 0.0],
+                };
+                self.queue.write_buffer(
+                    themed_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[themed_uniforms]),
+                );
+            }
+            self.themed_uniforms_dirty = false;
+        }
+
+        // Legacy uniform buffer update
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
@@ -1221,7 +1269,7 @@ impl GpuRenderer {
             return;
         }
 
-        self.update_uniforms(self.config.width as f32, self.config.height as f32);
+        // Uniforms are now updated once per frame in render_with_callback
 
         let vertices: Vec<RectVertex> = instances
             .iter()
@@ -1269,21 +1317,7 @@ impl GpuRenderer {
                 bytemuck::cast_slice(&vertices),
             );
 
-            // Update themed uniforms
-            if let Some(themed_uniform_buffer) = &self.themed_uniform_buffer {
-                let uniforms = Uniforms {
-                    viewport_size: [self.config.width as f32, self.config.height as f32],
-                    scale_factor: 1.0,
-                    time: self.current_time,
-                    theme_mode: self.current_theme_mode,
-                    _padding: [0.0, 0.0, 0.0],
-                };
-                self.queue.write_buffer(
-                    themed_uniform_buffer,
-                    0,
-                    bytemuck::cast_slice(&[uniforms]),
-                );
-            }
+            // Uniforms are now updated once per frame in render_with_callback
 
             // Draw with themed pipeline
             render_pass.set_pipeline(themed_pipeline);
@@ -1319,7 +1353,7 @@ impl GpuRenderer {
             return;
         }
 
-        self.update_uniforms(self.config.width as f32, self.config.height as f32);
+        // Uniforms are now updated once per frame in render_with_callback
 
         let vertices = self.generate_glyph_vertices(instances);
         self.queue.write_buffer(
@@ -1334,22 +1368,6 @@ impl GpuRenderer {
             &self.theme_bind_group,
             &self.themed_uniform_bind_group,
         ) {
-            // Update themed uniforms
-            if let Some(themed_uniform_buffer) = &self.themed_uniform_buffer {
-                let uniforms = Uniforms {
-                    viewport_size: [self.config.width as f32, self.config.height as f32],
-                    scale_factor: 1.0,
-                    time: self.current_time,
-                    theme_mode: self.current_theme_mode,
-                    _padding: [0.0, 0.0, 0.0],
-                };
-                self.queue.write_buffer(
-                    themed_uniform_buffer,
-                    0,
-                    bytemuck::cast_slice(&[uniforms]),
-                );
-            }
-
             // Draw with themed pipeline
             render_pass.set_pipeline(themed_pipeline);
             render_pass.set_bind_group(0, themed_bind_group, &[]);
@@ -1415,7 +1433,7 @@ impl GpuRenderer {
             return;
         }
 
-        self.update_uniforms(self.config.width as f32, self.config.height as f32);
+        // Uniforms are now updated once per frame in render_with_callback
 
         let (pipeline, extra_bind_group) = shader_id
             .and_then(|id| {
@@ -1452,6 +1470,10 @@ impl GpuRenderer {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+
+            // Mark uniforms as dirty since viewport size changed
+            self.uniforms_dirty = true;
+            self.themed_uniforms_dirty = true;
         }
     }
 }

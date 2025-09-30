@@ -31,6 +31,9 @@ pub struct TextEditorPlugin {
     // File management
     pub file_path: Option<PathBuf>,
     pub last_saved_content_hash: u64,
+
+    // Cmd+hover for go-to-definition preview (line, start_col, end_col)
+    pub cmd_hover_range: Option<(u32, u32, u32)>,
 }
 
 impl TextEditorPlugin {
@@ -42,6 +45,7 @@ impl TextEditorPlugin {
             show_line_numbers: true,
             file_path: None,
             last_saved_content_hash: 0,
+            cmd_hover_range: None,
         }
     }
 

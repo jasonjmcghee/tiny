@@ -664,7 +664,8 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
                                     // Request hover info from LSP if mouse position changed
                                     if let Some((line, column)) = diagnostics_plugin.get_mouse_document_position() {
-                                        editor.tab_manager.active_tab_mut().diagnostics.on_mouse_move(line, column);
+                                        let cmd_held = self.modifiers.state().super_key();
+                                        editor.tab_manager.active_tab_mut().diagnostics.on_mouse_move(line, column, cmd_held);
                                     }
                                 }
                             } else {
@@ -762,6 +763,7 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                                 // Check dropdown first
                                                 if editor.tab_bar.hit_test_dropdown(click_x, click_y, viewport_width) {
                                                     editor.tab_bar.toggle_dropdown();
+                                                    editor.ui_changed = true;
                                                 }
                                                 // Check close button
                                                 else if let Some(tab_idx) = editor.tab_bar.hit_test_close_button(click_x, click_y, &editor.tab_manager) {
@@ -770,11 +772,13 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                                         // TODO: Handle closing last tab (maybe exit app or create new tab)
                                                         eprintln!("Closed last tab");
                                                     }
+                                                    editor.ui_changed = true;
                                                 }
                                                 // Check tab click
                                                 else if let Some(tab_idx) = editor.tab_bar.hit_test_tab(click_x, click_y, &editor.tab_manager) {
                                                     editor.tab_manager.switch_to(tab_idx);
                                                     editor.tab_bar.close_dropdown();
+                                                    editor.ui_changed = true;
 
                                                     // Trigger syntax highlighting for newly active tab
                                                     let plugin = &editor.tab_manager.active_tab().unwrap().plugin;
@@ -1088,7 +1092,36 @@ impl<T: AppLogic> TinyApp<T> {
                         // Open file picker (triggered by double-shift)
                         if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
                             editor.file_picker.show();
+                            editor.ui_changed = true;
                             self.request_redraw();
+                        }
+                        continue;
+                    }
+                    "app.action.nav_back" => {
+                        // Navigate back across files
+                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                            if editor.navigate_back() {
+                                self.request_redraw();
+                                self.cursor_needs_scroll = true;
+                            }
+                        }
+                        continue;
+                    }
+                    "app.action.nav_forward" => {
+                        // Navigate forward across files
+                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                            if editor.navigate_forward() {
+                                self.request_redraw();
+                                self.cursor_needs_scroll = true;
+                            }
+                        }
+                        continue;
+                    }
+                    "app.action.goto_definition" => {
+                        eprintln!("DEBUG: app.action.goto_definition event received");
+                        // Go to definition at cursor
+                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                            editor.goto_definition();
                         }
                         continue;
                     }
@@ -1111,14 +1144,17 @@ impl<T: AppLogic> TinyApp<T> {
                                     match key_value {
                                         "Escape" => {
                                             editor.file_picker.hide();
+                                            editor.ui_changed = true;
                                             handled = true;
                                         }
                                         "ArrowUp" => {
                                             editor.file_picker.move_up();
+                                            editor.ui_changed = true;
                                             handled = true;
                                         }
                                         "ArrowDown" => {
                                             editor.file_picker.move_down();
+                                            editor.ui_changed = true;
                                             handled = true;
                                         }
                                         "Enter" => {
@@ -1126,15 +1162,24 @@ impl<T: AppLogic> TinyApp<T> {
                                             if let Some(path) = editor.file_picker.selected_file() {
                                                 let path_buf = path.to_path_buf();
                                                 editor.file_picker.hide();
-                                                if let Err(e) = editor.tab_manager.open_file(path_buf) {
-                                                    eprintln!("Failed to open file: {}", e);
+
+                                                // Record current location before opening new file
+                                                editor.record_navigation();
+
+                                                match editor.tab_manager.open_file(path_buf) {
+                                                    Ok(_) => {
+                                                        editor.ui_changed = true;
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("Failed to open file: {}", e);
+                                                    }
                                                 }
-                                                // Active tab is automatically updated by TabManager
                                             }
                                             handled = true;
                                         }
                                         "Backspace" => {
                                             editor.file_picker.backspace();
+                                            editor.ui_changed = true;
                                             handled = true;
                                         }
                                         _ => {}
@@ -1144,6 +1189,7 @@ impl<T: AppLogic> TinyApp<T> {
                                     if let Some(ch) = key_value.chars().next() {
                                         if !ch.is_control() {
                                             editor.file_picker.add_char(ch);
+                                            editor.ui_changed = true;
                                             handled = true;
                                         }
                                     }
@@ -1294,6 +1340,12 @@ impl<T: AppLogic> TinyApp<T> {
                 cpu_renderer.set_tab_bar_plugin(&mut editor.tab_bar);
                 cpu_renderer.set_file_picker_plugin(&mut editor.file_picker);
 
+                // Mark renderer UI dirty if UI changed
+                if editor.ui_changed {
+                    cpu_renderer.mark_ui_dirty();
+                    editor.ui_changed = false;
+                }
+
                 // Update diagnostics manager (handles LSP polling, caching, plugin updates)
                 tab.diagnostics.update(&tab.plugin.doc);
 
@@ -1415,6 +1467,35 @@ impl<T: AppLogic> TinyApp<T> {
     }
 }
 
+/// Find word boundaries at a given column position in a line
+/// Returns (start_col, end_col) if a word is found, None otherwise
+fn find_word_at_position(line_text: &str, column: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line_text.chars().collect();
+    if column >= chars.len() {
+        return None;
+    }
+
+    // Check if current character is part of an identifier
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    if !is_word_char(chars[column]) {
+        return None;
+    }
+
+    // Find start of word
+    let mut start = column;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+
+    // Find end of word
+    let mut end = column;
+    while end < chars.len() && is_word_char(chars[end]) {
+        end += 1;
+    }
+
+    Some((start, end))
+}
+
 /// Basic editor with cursor and text editing
 pub struct EditorLogic {
     /// Tab manager for handling multiple open files (each tab owns its own plugin + line numbers + diagnostics)
@@ -1429,6 +1510,10 @@ pub struct EditorLogic {
     pub extra_text_styles: Vec<Box<dyn TextStyleProvider>>,
     /// Pending scroll delta from drag operations
     pub pending_scroll: Option<(f32, f32)>,
+    /// Flag to indicate UI needs re-rendering (tabs, file picker, etc)
+    pub ui_changed: bool,
+    /// Global navigation history for cross-file navigation (Cmd+[/])
+    pub global_nav_history: crate::history::FileNavigationHistory,
 }
 
 impl EditorLogic {
@@ -1440,6 +1525,91 @@ impl EditorLogic {
     /// Get the active tab's plugin mutably
     fn active_plugin_mut(&mut self) -> &mut TextEditorPlugin {
         &mut self.tab_manager.active_tab_mut().plugin
+    }
+
+    /// Record current location in global navigation history
+    pub fn record_navigation(&mut self) {
+        let plugin = self.active_plugin();
+        let location = crate::history::FileLocation {
+            path: plugin.file_path.clone(),
+            position: plugin.input.primary_cursor_doc_pos(&plugin.doc),
+        };
+        self.global_nav_history.checkpoint_if_changed(location);
+    }
+
+    /// Navigate back in global history (across files)
+    pub fn navigate_back(&mut self) -> bool {
+        let current_location = crate::history::FileLocation {
+            path: self.active_plugin().file_path.clone(),
+            position: self.active_plugin().input.primary_cursor_doc_pos(&self.active_plugin().doc),
+        };
+
+        if let Some(target) = self.global_nav_history.undo(current_location) {
+            self.navigate_to_location(target)
+        } else {
+            false
+        }
+    }
+
+    /// Navigate forward in global history (across files)
+    pub fn navigate_forward(&mut self) -> bool {
+        let current_location = crate::history::FileLocation {
+            path: self.active_plugin().file_path.clone(),
+            position: self.active_plugin().input.primary_cursor_doc_pos(&self.active_plugin().doc),
+        };
+
+        if let Some(target) = self.global_nav_history.redo(current_location) {
+            self.navigate_to_location(target)
+        } else {
+            false
+        }
+    }
+
+    /// Navigate to a specific file and position
+    fn navigate_to_location(&mut self, location: crate::history::FileLocation) -> bool {
+        // Open file if needed (without recording - we're already in a navigation)
+        if let Some(ref path) = location.path {
+            match self.tab_manager.open_file(path.clone()) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("Failed to open file for navigation: {}", e);
+                    return false;
+                }
+            }
+        }
+
+        // Set cursor position in active tab
+        let plugin = self.active_plugin_mut();
+        plugin.input.set_cursor(location.position);
+        self.ui_changed = true;
+        true
+    }
+
+    /// Go to definition at current cursor position
+    pub fn goto_definition(&mut self) {
+        eprintln!("DEBUG: goto_definition() called");
+        // Record current location before jumping
+        self.record_navigation();
+
+        let tab = self.tab_manager.active_tab_mut();
+        let plugin = &tab.plugin;
+        let cursor_pos = plugin.input.primary_cursor_doc_pos(&plugin.doc);
+
+        // Debug: show what's at the cursor
+        let tree = plugin.doc.read();
+        let line_text = tree.line_text(cursor_pos.line);
+        eprintln!("DEBUG: Line text: {:?}", line_text);
+        eprintln!("DEBUG: Cursor at line {}, col {} (visual column)", cursor_pos.line, cursor_pos.column);
+        if cursor_pos.column < line_text.len() as u32 {
+            let chars: Vec<char> = line_text.chars().collect();
+            if (cursor_pos.column as usize) < chars.len() {
+                eprintln!("DEBUG: Character at cursor: {:?}", chars[cursor_pos.column as usize]);
+            }
+        }
+
+        // Request go-to-definition from diagnostics manager
+        // Note: cursor_pos is already in document coordinates (0-indexed)
+        tab.diagnostics.request_goto_definition(cursor_pos.line as usize, cursor_pos.column as usize);
     }
 }
 
@@ -1510,18 +1680,21 @@ impl EditorLogic {
 
     pub fn with_file(mut self, path: PathBuf) -> Self {
         // Replace the initial tab with a tab for this file
-        if let Err(e) = self.tab_manager.open_file(path.clone()) {
-            eprintln!("Failed to open initial file: {}", e);
-        } else {
-            // Remove the empty initial tab if it exists
-            if self.tab_manager.len() > 1 {
-                // Find and remove the first tab if it's untitled and empty
-                if let Some(first_tab) = self.tab_manager.tabs().get(0) {
-                    if first_tab.path().is_none() {
-                        // Close the empty tab (index 0)
-                        self.tab_manager.close_tab(0);
+        match self.tab_manager.open_file(path.clone()) {
+            Ok(_) => {
+                // Remove the empty initial tab if it exists
+                if self.tab_manager.len() > 1 {
+                    // Find and remove the first tab if it's untitled and empty
+                    if let Some(first_tab) = self.tab_manager.tabs().get(0) {
+                        if first_tab.path().is_none() {
+                            // Close the empty tab (index 0)
+                            self.tab_manager.close_tab(0);
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                eprintln!("Failed to open initial file: {}", e);
             }
         }
         self
@@ -1600,6 +1773,8 @@ impl EditorLogic {
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
             pending_scroll: None,
+            ui_changed: true,
+            global_nav_history: crate::history::FileNavigationHistory::with_max_size(50),
         }
     }
 }
@@ -1621,8 +1796,26 @@ impl AppLogic for EditorLogic {
         viewport: &crate::coordinates::Viewport,
         modifiers: &input_types::Modifiers,
     ) -> bool {
+        let cmd_held = modifiers.state().super_key();
+
+        // Cmd+Click triggers go-to-definition
+        if cmd_held {
+            eprintln!("DEBUG: Cmd+Click detected at {:?}", pos);
+            // Get document position at click location
+            let tab = self.tab_manager.active_tab();
+            if let Some(tab) = tab {
+                let doc_pos = viewport.layout_to_doc(pos);
+                eprintln!("DEBUG: Cmd+Click at doc pos: {:?}", doc_pos);
+
+                // Request go-to-definition at click location
+                self.goto_definition();
+                self.widgets_dirty = true;
+                return true;
+            }
+        }
+
+        // Normal click handling
         let plugin = self.active_plugin_mut();
-        // Convert to mouse click for InputHandler
         let alt_held = modifiers.state().alt_key();
         let shift_held = modifiers.state().shift_key();
         plugin.input.on_mouse_click(
@@ -1703,6 +1896,57 @@ impl AppLogic for EditorLogic {
         if plugin.input.should_flush() {
             println!("DEBOUNCE: Sending pending syntax updates after idle timeout");
             plugin.input.flush_syntax_updates(&plugin.doc);
+        }
+
+        // Check for LSP go-to-definition results
+        let tab = self.tab_manager.active_tab_mut();
+        tab.diagnostics.poll_lsp_results();
+
+        if let Some(locations) = tab.diagnostics.take_goto_definition() {
+            eprintln!("DEBUG: on_update got {} goto_definition location(s)", locations.len());
+            if let Some(location) = locations.first() {
+                eprintln!("DEBUG: Navigating to {:?} at line {}, col {}",
+                    location.file_path, location.position.line, location.position.column);
+                // Convert LSP position to our format
+                let target_location = crate::history::FileLocation {
+                    path: Some(location.file_path.clone()),
+                    position: tiny_sdk::DocPos {
+                        line: location.position.line as u32,
+                        column: location.position.column as u32,
+                        byte_offset: 0,
+                    },
+                };
+
+                // Navigate to the definition
+                if self.navigate_to_location(target_location) {
+                    eprintln!("DEBUG: Navigation successful!");
+                    self.ui_changed = true;
+                } else {
+                    eprintln!("DEBUG: Navigation failed!");
+                }
+            }
+        }
+
+        // Update cmd_hover_range for underline rendering
+        let tab = self.tab_manager.active_tab_mut();
+        if let Some((line, column)) = tab.diagnostics.cmd_hover_position() {
+            // Find word boundaries at hover position
+            let doc = &tab.plugin.doc;
+            let tree = doc.read();
+            let line_text = tree.line_text(line as u32);
+            let word_range = find_word_at_position(&line_text, column);
+            if let Some((start, end)) = word_range {
+                tab.plugin.cmd_hover_range = Some((line as u32, start as u32, end as u32));
+                self.ui_changed = true;
+            } else {
+                tab.plugin.cmd_hover_range = None;
+            }
+        } else {
+            let tab = self.tab_manager.active_tab_mut();
+            if tab.plugin.cmd_hover_range.is_some() {
+                tab.plugin.cmd_hover_range = None;
+                self.ui_changed = true;
+            }
         }
     }
 }

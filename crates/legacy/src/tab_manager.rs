@@ -103,9 +103,13 @@ impl TabManager {
     }
 
     /// Switch to a tab by index
-    pub fn switch_to(&mut self, index: usize) {
-        if index < self.tabs.len() {
+    /// Returns true if the tab actually changed
+    pub fn switch_to(&mut self, index: usize) -> bool {
+        if index < self.tabs.len() && index != self.active_index {
             self.active_index = index;
+            true
+        } else {
+            false
         }
     }
 
@@ -145,17 +149,18 @@ impl TabManager {
     }
 
     /// Open a file (or switch to it if already open)
-    pub fn open_file(&mut self, path: PathBuf) -> Result<(), std::io::Error> {
+    /// Returns Ok(true) if a tab switch/open occurred, Ok(false) if no change
+    pub fn open_file(&mut self, path: PathBuf) -> Result<bool, std::io::Error> {
         // Check if already open
         if let Some(index) = self.find_tab_by_path(&path) {
-            self.switch_to(index);
-            return Ok(());
+            let switched = self.switch_to(index);
+            return Ok(switched);
         }
 
         // Open new tab
         let tab = Tab::from_file(path)?;
         self.add_tab(tab);
-        Ok(())
+        Ok(true)
     }
 
     /// Get the number of tabs

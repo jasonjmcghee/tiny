@@ -1,7 +1,7 @@
 //! Configuration management for Tiny Editor
 
+use ahash::AHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -105,15 +105,21 @@ impl PluginConfig {
 
     /// Get the config path (with defaults)
     pub fn config_path(&self, plugin_name: &str, plugin_dir: &str) -> String {
-        self.config.clone().unwrap_or_else(|| {
-            format!("{}/{}.toml", plugin_dir, plugin_name)
-        })
+        self.config
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}.toml", plugin_dir, plugin_name))
     }
 }
 
-fn default_font_size() -> f32 { 14.0 }
-fn default_theme() -> String { "dark".to_string() }
-fn default_plugin_dir() -> String { "target/plugins/release".to_string() }
+fn default_font_size() -> f32 {
+    14.0
+}
+fn default_theme() -> String {
+    "dark".to_string()
+}
+fn default_plugin_dir() -> String {
+    "target/plugins/release".to_string()
+}
 
 impl AppConfig {
     /// Load configuration from init.toml
@@ -142,7 +148,10 @@ impl AppConfig {
                 }
             }
 
-            eprintln!("Loaded configuration from init.toml with {} plugins", config.plugins.plugins.len());
+            eprintln!(
+                "Loaded configuration from init.toml with {} plugins",
+                config.plugins.plugins.len()
+            );
             Ok(config)
         } else {
             eprintln!("No init.toml found, using defaults");

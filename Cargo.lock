@@ -857,6 +857,7 @@ name = "diagnostics-plugin"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "ahash",
  "serde",
  "tiny-core",
  "tiny-font",

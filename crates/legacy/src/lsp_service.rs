@@ -96,6 +96,8 @@ impl LspService {
                 found_cargo_toml
             });
 
+        eprintln!("DEBUG: Opening file {:?} with workspace root {:?}", abs_path, workspace_root);
+
         // Get or create LSP manager
         match LspManager::get_or_create_global(workspace_root) {
             Ok(manager) => {
@@ -151,6 +153,33 @@ impl LspService {
             if let Some(symbols_update) = lsp.poll_symbols() {
                 results.push(LspResult::DocumentSymbols(symbols_update.symbols));
             }
+
+            // Poll go-to-definition
+            if let Some(goto_def_update) = lsp.poll_goto_definition() {
+                let location_refs: Vec<LocationRef> = goto_def_update
+                    .locations
+                    .into_iter()
+                    .filter_map(|loc| {
+                        // Convert URI path to PathBuf
+                        let uri_str = loc.uri.as_str();
+                        let file_path = if uri_str.starts_with("file://") {
+                            PathBuf::from(&uri_str[7..])
+                        } else {
+                            return None;
+                        };
+
+                        Some(LocationRef {
+                            file_path,
+                            position: DocPosition {
+                                line: loc.range.start.line as usize,
+                                column: loc.range.start.character as usize,
+                            },
+                            text: String::new(), // We don't have the text yet
+                        })
+                    })
+                    .collect();
+                results.push(LspResult::GoToDefinition(location_refs));
+            }
         }
 
         // Poll other LSP results from the channel
@@ -170,7 +199,13 @@ impl LspService {
 
     /// Request go-to-definition at position
     pub fn request_goto_definition(&self, position: DocPosition) {
-        // TODO: Send goto definition request to LSP
+        eprintln!("DEBUG: LspService requesting goto_definition at line {}, col {}", position.line, position.column);
+        if let Some(ref lsp) = self.lsp_manager {
+            eprintln!("DEBUG: LSP manager exists, sending request");
+            lsp.request_goto_definition(position.line as u32, position.column as u32);
+        } else {
+            eprintln!("DEBUG: No LSP manager available!");
+        }
     }
 
     /// Request document symbols

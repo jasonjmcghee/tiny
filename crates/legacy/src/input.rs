@@ -8,9 +8,9 @@ use crate::input_types::{ElementState, Key, KeyEvent, Modifiers, MouseButton, Na
 use crate::lsp_manager::TextChange;
 use crate::syntax::SyntaxHighlighter;
 use crate::text_editor_plugin::TextEditorPlugin;
+use ahash::AHashMap as HashMap;
 use arboard::Clipboard;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -167,7 +167,13 @@ impl EventBus {
     }
 
     /// Emit an event to the queue
-    pub fn emit(&mut self, name: impl Into<String>, data: Value, priority: i32, source: impl Into<String>) {
+    pub fn emit(
+        &mut self,
+        name: impl Into<String>,
+        data: Value,
+        priority: i32,
+        source: impl Into<String>,
+    ) {
         self.queued.push(Event {
             name: name.into(),
             data,
@@ -269,8 +275,17 @@ impl SharedEventBus {
         }
     }
 
-    pub fn emit(&self, name: impl Into<String>, data: Value, priority: i32, source: impl Into<String>) {
-        self.inner.lock().unwrap().emit(name, data, priority, source);
+    pub fn emit(
+        &self,
+        name: impl Into<String>,
+        data: Value,
+        priority: i32,
+        source: impl Into<String>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .emit(name, data, priority, source);
     }
 
     pub fn on(&self, pattern: impl Into<String>, handler: EventHandler) {
@@ -368,27 +383,50 @@ impl InputHandler {
     /// These are handlers that don't directly manipulate the document
     pub fn register_app_handlers(bus: &mut EventBus) {
         // Font size increase handler
-        bus.on("app.action.font_increase", Box::new(|_event, bus| {
-            // Re-emit as a command that app.rs will handle
-            bus.emit("app.command.adjust_font_size", json!({ "increase": true }), 5, "input_handler");
-            EventResult::Continue
-        }));
+        bus.on(
+            "app.action.font_increase",
+            Box::new(|_event, bus| {
+                // Re-emit as a command that app.rs will handle
+                bus.emit(
+                    "app.command.adjust_font_size",
+                    json!({ "increase": true }),
+                    5,
+                    "input_handler",
+                );
+                EventResult::Continue
+            }),
+        );
 
         // Font size decrease handler
-        bus.on("app.action.font_decrease", Box::new(|_event, bus| {
-            // Re-emit as a command that app.rs will handle
-            bus.emit("app.command.adjust_font_size", json!({ "increase": false }), 5, "input_handler");
-            EventResult::Continue
-        }));
+        bus.on(
+            "app.action.font_decrease",
+            Box::new(|_event, bus| {
+                // Re-emit as a command that app.rs will handle
+                bus.emit(
+                    "app.command.adjust_font_size",
+                    json!({ "increase": false }),
+                    5,
+                    "input_handler",
+                );
+                EventResult::Continue
+            }),
+        );
 
         // Scroll lock toggle handler
-        bus.on("app.action.toggle_scroll_lock", Box::new(|_event, bus| {
-            // Re-emit as a command that app.rs will handle
-            bus.emit("app.command.toggle_scroll_lock", json!({}), 5, "input_handler");
-            EventResult::Continue
-        }));
+        bus.on(
+            "app.action.toggle_scroll_lock",
+            Box::new(|_event, bus| {
+                // Re-emit as a command that app.rs will handle
+                bus.emit(
+                    "app.command.toggle_scroll_lock",
+                    json!({}),
+                    5,
+                    "input_handler",
+                );
+                EventResult::Continue
+            }),
+        );
     }
-
 
     /// Process events from the bus - handles keyboard, mouse, and action events
     pub fn process_event(
@@ -400,7 +438,11 @@ impl InputHandler {
     ) -> InputAction {
         match event.name.as_str() {
             "app.keyboard.keypress" => {
-                let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                let state = event
+                    .data
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
 
                 // Track Shift key specifically for double-shift detection
                 if let Some(key_obj) = event.data.get("key") {
@@ -417,7 +459,12 @@ impl InputHandler {
                             if let Some(last_press) = self.last_shift_press {
                                 if last_press.elapsed() < DOUBLE_SHIFT_TIMEOUT {
                                     // Double-shift detected! Emit file picker event
-                                    bus.emit("app.action.open_file_picker", json!({}), 5, "input_handler");
+                                    bus.emit(
+                                        "app.action.open_file_picker",
+                                        json!({}),
+                                        5,
+                                        "input_handler",
+                                    );
                                     self.last_shift_press = None; // Reset to avoid triple-shift
                                     return InputAction::None;
                                 }
@@ -442,8 +489,14 @@ impl InputHandler {
                 // Extract key data from proper JSON structure
                 if let Some(key_obj) = event.data.get("key") {
                     if let Some(modifiers) = event.data.get("modifiers") {
-                        let shift = modifiers.get("shift").and_then(|s| s.as_bool()).unwrap_or(false);
-                        let cmd = modifiers.get("cmd").and_then(|c| c.as_bool()).unwrap_or(false);
+                        let shift = modifiers
+                            .get("shift")
+                            .and_then(|s| s.as_bool())
+                            .unwrap_or(false);
+                        let cmd = modifiers
+                            .get("cmd")
+                            .and_then(|c| c.as_bool())
+                            .unwrap_or(false);
 
                         let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
@@ -451,15 +504,29 @@ impl InputHandler {
                         // Handle command key combinations
                         if cmd && key_type == "character" {
                             match key_value {
-                                "z" if shift => bus.emit("app.action.redo", json!({}), 5, "input_handler"),
+                                "z" if shift => {
+                                    bus.emit("app.action.redo", json!({}), 5, "input_handler")
+                                }
                                 "z" => bus.emit("app.action.undo", json!({}), 5, "input_handler"),
                                 "s" => bus.emit("app.action.save", json!({}), 5, "input_handler"),
                                 "c" => bus.emit("app.action.copy", json!({}), 5, "input_handler"),
                                 "x" => bus.emit("app.action.cut", json!({}), 5, "input_handler"),
                                 "v" => bus.emit("app.action.paste", json!({}), 5, "input_handler"),
-                                "a" => bus.emit("app.action.select_all", json!({}), 5, "input_handler"),
-                                "[" => bus.emit("app.action.nav_back", json!({}), 5, "input_handler"),
-                                "]" => bus.emit("app.action.nav_forward", json!({}), 5, "input_handler"),
+                                "a" => {
+                                    bus.emit("app.action.select_all", json!({}), 5, "input_handler")
+                                }
+                                "b" => {
+                                    bus.emit("app.action.goto_definition", json!({}), 5, "input_handler")
+                                }
+                                "[" => {
+                                    bus.emit("app.action.nav_back", json!({}), 5, "input_handler")
+                                }
+                                "]" => bus.emit(
+                                    "app.action.nav_forward",
+                                    json!({}),
+                                    5,
+                                    "input_handler",
+                                ),
                                 _ => {}
                             }
                         } else if !cmd {
@@ -482,105 +549,113 @@ impl InputHandler {
                                         );
                                     }
                                 }
-                                "named" => {
-                                    match key_value {
-                                        "Enter" => {
-                                            let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                            bus.emit(
-                                                "app.document.insert",
-                                                json!({
-                                                    "text": "\n",
-                                                    "position": {
-                                                        "line": cursor_pos.line,
-                                                        "column": cursor_pos.column,
-                                                    }
-                                                }),
-                                                20,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "Tab" => {
-                                            let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                            bus.emit(
-                                                "app.document.insert",
-                                                json!({
-                                                    "text": "\t",
-                                                    "position": {
-                                                        "line": cursor_pos.line,
-                                                        "column": cursor_pos.column,
-                                                    }
-                                                }),
-                                                20,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "Space" => {
-                                            let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                            bus.emit(
-                                                "app.document.insert",
-                                                json!({
-                                                    "text": " ",
-                                                    "position": {
-                                                        "line": cursor_pos.line,
-                                                        "column": cursor_pos.column,
-                                                    }
-                                                }),
-                                                20,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "Backspace" => {
-                                            bus.emit("app.document.delete_backward", json!({}), 20, "input_handler");
-                                        }
-                                        "Delete" => {
-                                            bus.emit("app.document.delete_forward", json!({}), 20, "input_handler");
-                                        }
-                                        "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" => {
-                                            bus.emit(
-                                                "app.cursor.move",
-                                                json!({
-                                                    "direction": key_value,
-                                                    "extending": shift,
-                                                }),
-                                                15,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "Home" => {
-                                            bus.emit(
-                                                "app.cursor.move_line_edge",
-                                                json!({ "to_end": false, "extending": shift }),
-                                                15,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "End" => {
-                                            bus.emit(
-                                                "app.cursor.move_line_edge",
-                                                json!({ "to_end": true, "extending": shift }),
-                                                15,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "PageUp" => {
-                                            bus.emit(
-                                                "app.cursor.page_jump",
-                                                json!({ "up": true, "extending": shift }),
-                                                15,
-                                                "input_handler",
-                                            );
-                                        }
-                                        "PageDown" => {
-                                            bus.emit(
-                                                "app.cursor.page_jump",
-                                                json!({ "up": false, "extending": shift }),
-                                                15,
-                                                "input_handler",
-                                            );
-                                        }
-                                        _ => {}
+                                "named" => match key_value {
+                                    "Enter" => {
+                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                        bus.emit(
+                                            "app.document.insert",
+                                            json!({
+                                                "text": "\n",
+                                                "position": {
+                                                    "line": cursor_pos.line,
+                                                    "column": cursor_pos.column,
+                                                }
+                                            }),
+                                            20,
+                                            "input_handler",
+                                        );
                                     }
-                                }
+                                    "Tab" => {
+                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                        bus.emit(
+                                            "app.document.insert",
+                                            json!({
+                                                "text": "\t",
+                                                "position": {
+                                                    "line": cursor_pos.line,
+                                                    "column": cursor_pos.column,
+                                                }
+                                            }),
+                                            20,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "Space" => {
+                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
+                                        bus.emit(
+                                            "app.document.insert",
+                                            json!({
+                                                "text": " ",
+                                                "position": {
+                                                    "line": cursor_pos.line,
+                                                    "column": cursor_pos.column,
+                                                }
+                                            }),
+                                            20,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "Backspace" => {
+                                        bus.emit(
+                                            "app.document.delete_backward",
+                                            json!({}),
+                                            20,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "Delete" => {
+                                        bus.emit(
+                                            "app.document.delete_forward",
+                                            json!({}),
+                                            20,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" => {
+                                        bus.emit(
+                                            "app.cursor.move",
+                                            json!({
+                                                "direction": key_value,
+                                                "extending": shift,
+                                            }),
+                                            15,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "Home" => {
+                                        bus.emit(
+                                            "app.cursor.move_line_edge",
+                                            json!({ "to_end": false, "extending": shift }),
+                                            15,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "End" => {
+                                        bus.emit(
+                                            "app.cursor.move_line_edge",
+                                            json!({ "to_end": true, "extending": shift }),
+                                            15,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "PageUp" => {
+                                        bus.emit(
+                                            "app.cursor.page_jump",
+                                            json!({ "up": true, "extending": shift }),
+                                            15,
+                                            "input_handler",
+                                        );
+                                    }
+                                    "PageDown" => {
+                                        bus.emit(
+                                            "app.cursor.page_jump",
+                                            json!({ "up": false, "extending": shift }),
+                                            15,
+                                            "input_handler",
+                                        );
+                                    }
+                                    _ => {}
+                                },
                                 _ => {}
                             }
                         }
@@ -620,7 +695,11 @@ impl InputHandler {
             "app.cursor.move" => {
                 // Handle cursor movement
                 if let Some(direction) = event.data.get("direction").and_then(|d| d.as_str()) {
-                    let extending = event.data.get("extending").and_then(|e| e.as_bool()).unwrap_or(false);
+                    let extending = event
+                        .data
+                        .get("extending")
+                        .and_then(|e| e.as_bool())
+                        .unwrap_or(false);
                     match direction {
                         "ArrowLeft" => self.move_cursor(doc, -1, 0, extending),
                         "ArrowRight" => self.move_cursor(doc, 1, 0, extending),
@@ -634,23 +713,39 @@ impl InputHandler {
             }
             "app.cursor.move_line_edge" => {
                 // Handle Home/End keys
-                let to_end = event.data.get("to_end").and_then(|e| e.as_bool()).unwrap_or(false);
-                let extending = event.data.get("extending").and_then(|e| e.as_bool()).unwrap_or(false);
+                let to_end = event
+                    .data
+                    .get("to_end")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
+                let extending = event
+                    .data
+                    .get("extending")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
                 self.move_to_line_edge(doc, to_end, extending)
             }
             "app.cursor.page_jump" => {
                 // Handle PageUp/PageDown
-                let up = event.data.get("up").and_then(|u| u.as_bool()).unwrap_or(false);
-                let extending = event.data.get("extending").and_then(|e| e.as_bool()).unwrap_or(false);
+                let up = event
+                    .data
+                    .get("up")
+                    .and_then(|u| u.as_bool())
+                    .unwrap_or(false);
+                let extending = event
+                    .data
+                    .get("extending")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
                 self.page_jump(doc, up, extending)
             }
-            "app.action.nav_back" => self.navigate_history(doc, true),
-            "app.action.nav_forward" => self.navigate_history(doc, false),
+            // Navigation events are handled at app level (EditorLogic) for cross-file navigation
+            "app.action.nav_back" | "app.action.nav_forward" => InputAction::None,
             "app.mouse.press" => {
                 // Handle mouse press/click - coordinates are pre-converted by app.rs
                 if let (Some(x), Some(y)) = (
                     event.data.get("x").and_then(|v| v.as_f64()),
-                    event.data.get("y").and_then(|v| v.as_f64())
+                    event.data.get("y").and_then(|v| v.as_f64()),
                 ) {
                     let modifiers = event.data.get("modifiers");
                     let shift_held = modifiers
@@ -668,12 +763,10 @@ impl InputHandler {
                     };
 
                     // Store drag anchor in document coordinates (already converted by app.rs)
-                    self.drag_anchor = Some(viewport.layout_to_doc(
-                        tiny_sdk::LayoutPos {
-                            x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
-                            y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
-                        }
-                    ));
+                    self.drag_anchor = Some(viewport.layout_to_doc(tiny_sdk::LayoutPos {
+                        x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
+                        y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
+                    }));
 
                     // Handle the click
                     self.on_mouse_click(
@@ -696,7 +789,7 @@ impl InputHandler {
                     event.data.get("from_x").and_then(|v| v.as_f64()),
                     event.data.get("from_y").and_then(|v| v.as_f64()),
                     event.data.get("to_x").and_then(|v| v.as_f64()),
-                    event.data.get("to_y").and_then(|v| v.as_f64())
+                    event.data.get("to_y").and_then(|v| v.as_f64()),
                 ) {
                     let modifiers = event.data.get("modifiers");
                     let alt_held = modifiers
@@ -713,7 +806,8 @@ impl InputHandler {
                         y: tiny_sdk::LogicalPixels(to_y as f32),
                     };
 
-                    let (redraw, scroll_delta) = self.on_mouse_drag(doc, viewport, from, to, alt_held);
+                    let (redraw, scroll_delta) =
+                        self.on_mouse_drag(doc, viewport, from, to, alt_held);
 
                     // If there's a scroll delta, emit a scroll event
                     if let Some((dx, dy)) = scroll_delta {
@@ -724,7 +818,7 @@ impl InputHandler {
                                 "delta_y": dy
                             }),
                             15,
-                            "input_handler"
+                            "input_handler",
                         );
                     }
 
@@ -745,7 +839,6 @@ impl InputHandler {
             _ => InputAction::None,
         }
     }
-
 
     /// Move cursor to a new position, handling selection based on current state
     fn move_cursor_to(&mut self, new_position: DocPos, extending_selection: bool) {
@@ -881,11 +974,12 @@ impl InputHandler {
                     if cursor_byte > 0 {
                         let deleted = tree.get_text_slice(cursor_byte - 1..cursor_byte);
                         // When at column 0, we're deleting a newline - capture the previous line's length NOW
-                        let target_column = if sel.cursor.column == 0 && deleted == "\n" && sel.cursor.line > 0 {
-                            Some(tree.line_char_count(sel.cursor.line - 1) as u32)
-                        } else {
-                            None
-                        };
+                        let target_column =
+                            if sel.cursor.column == 0 && deleted == "\n" && sel.cursor.line > 0 {
+                                Some(tree.line_char_count(sel.cursor.line - 1) as u32)
+                            } else {
+                                None
+                            };
                         deleted_info.push(Some((deleted.clone(), target_column)));
                         self.pending_edits.push(Edit::Delete {
                             range: cursor_byte - 1..cursor_byte,
@@ -1027,7 +1121,6 @@ impl InputHandler {
         InputAction::Redraw
     }
 
-
     /// Navigate through cursor history
     fn navigate_history(&mut self, doc: &Doc, back: bool) -> InputAction {
         let current_pos = self.primary_cursor_doc_pos(doc);
@@ -1107,7 +1200,6 @@ impl InputHandler {
             return;
         }
 
-
         if let Some(ref syntax_hl) = self.syntax_highlighter {
             let text_after = doc.read().flatten_to_string();
 
@@ -1144,7 +1236,6 @@ impl InputHandler {
         if self.pending_edits.is_empty() {
             return false;
         }
-
 
         // Capture tree state BEFORE applying edits
         let tree_before = doc.read();
@@ -1257,7 +1348,6 @@ impl InputHandler {
         edits
     }
 
-
     /// Handle mouse click
     pub fn on_mouse_click(
         &mut self,
@@ -1292,7 +1382,9 @@ impl InputHandler {
         const CLICK_POS_TOLERANCE: u32 = 2; // Allow 2 character tolerance for position
 
         let now = Instant::now();
-        let is_multi_click = if let (Some(last_time), Some(last_pos)) = (self.last_click_time, self.last_click_pos) {
+        let is_multi_click = if let (Some(last_time), Some(last_pos)) =
+            (self.last_click_time, self.last_click_pos)
+        {
             now.duration_since(last_time) < DOUBLE_CLICK_TIME
                 && last_pos.line == doc_pos.line
                 && last_pos.column.abs_diff(doc_pos.column) <= CLICK_POS_TOLERANCE
@@ -1590,7 +1682,10 @@ impl InputHandler {
         // Convert byte positions back to DocPos
         let word_start_line = tree.byte_to_line(word_start_byte);
         let word_start_line_byte = tree.line_to_byte(word_start_line).unwrap_or(0);
-        let word_start_column = tree.get_text_slice(word_start_line_byte..word_start_byte).chars().count() as u32;
+        let word_start_column = tree
+            .get_text_slice(word_start_line_byte..word_start_byte)
+            .chars()
+            .count() as u32;
         let word_start = DocPos {
             line: word_start_line,
             column: word_start_column,
@@ -1599,7 +1694,10 @@ impl InputHandler {
 
         let word_end_line = tree.byte_to_line(word_end_byte);
         let word_end_line_byte = tree.line_to_byte(word_end_line).unwrap_or(0);
-        let word_end_column = tree.get_text_slice(word_end_line_byte..word_end_byte).chars().count() as u32;
+        let word_end_column = tree
+            .get_text_slice(word_end_line_byte..word_end_byte)
+            .chars()
+            .count() as u32;
         let word_end = DocPos {
             line: word_end_line,
             column: word_end_column,
@@ -1681,6 +1779,17 @@ impl InputHandler {
         })
     }
 
+    /// Set cursor position (for navigation)
+    pub fn set_cursor(&mut self, pos: DocPos) {
+        self.selections = vec![Selection {
+            cursor: pos,
+            anchor: pos,
+            id: self.next_id,
+        }];
+        self.next_id += 1;
+        self.goal_column = None;
+    }
+
     /// Get selection data for plugins: cursor position and selection positions
     pub fn get_selection_data(
         &self,
@@ -1732,7 +1841,10 @@ impl InputHandler {
     fn save_snapshot_to_history(&mut self, doc: &Doc) {
         // Only save checkpoint if this is the first edit OR enough time has passed since last checkpoint
         // This groups rapid edits (typing) into a single undo/redo group
-        if self.last_checkpoint_time.map_or(true, |t| t.elapsed().as_millis() > 1000) {
+        if self
+            .last_checkpoint_time
+            .map_or(true, |t| t.elapsed().as_millis() > 1000)
+        {
             self.history.checkpoint(DocumentSnapshot {
                 tree: doc.read(),
                 selections: self.selections.clone(),
@@ -1804,11 +1916,17 @@ impl InputHandler {
                 // For delete, provide the range being deleted
                 let start_line = tree.byte_to_line(range.start);
                 let start_line_byte = tree.line_to_byte(start_line).unwrap_or(0);
-                let start_char = tree.get_text_slice(start_line_byte..range.start).chars().count() as u32;
+                let start_char = tree
+                    .get_text_slice(start_line_byte..range.start)
+                    .chars()
+                    .count() as u32;
 
                 let end_line = tree.byte_to_line(range.end);
                 let end_line_byte = tree.line_to_byte(end_line).unwrap_or(0);
-                let end_char = tree.get_text_slice(end_line_byte..range.end).chars().count() as u32;
+                let end_char = tree
+                    .get_text_slice(end_line_byte..range.end)
+                    .chars()
+                    .count() as u32;
 
                 TextChange {
                     range: LspRange {
@@ -1828,11 +1946,17 @@ impl InputHandler {
                 // For replace, provide the range being replaced and the new text
                 let start_line = tree.byte_to_line(range.start);
                 let start_line_byte = tree.line_to_byte(start_line).unwrap_or(0);
-                let start_char = tree.get_text_slice(start_line_byte..range.start).chars().count() as u32;
+                let start_char = tree
+                    .get_text_slice(start_line_byte..range.start)
+                    .chars()
+                    .count() as u32;
 
                 let end_line = tree.byte_to_line(range.end);
                 let end_line_byte = tree.line_to_byte(end_line).unwrap_or(0);
-                let end_char = tree.get_text_slice(end_line_byte..range.end).chars().count() as u32;
+                let end_char = tree
+                    .get_text_slice(end_line_byte..range.end)
+                    .chars()
+                    .count() as u32;
 
                 TextChange {
                     range: LspRange {
@@ -1888,22 +2012,15 @@ impl InputHandler {
 /// Handle input actions at the plugin level
 /// Returns true if the action was handled and requires a redraw
 /// Note: InputAction::Save should be handled by the caller since it needs EditorLogic
-pub fn handle_input_action(
-    action: InputAction,
-    plugin: &mut TextEditorPlugin,
-) -> bool {
+pub fn handle_input_action(action: InputAction, plugin: &mut TextEditorPlugin) -> bool {
     match action {
         InputAction::Save => {
             // Save should be handled by caller (needs EditorLogic)
             eprintln!("Warning: Save action should be handled by caller");
             false
         }
-        InputAction::Undo => {
-            plugin.input.undo(&plugin.doc)
-        }
-        InputAction::Redo => {
-            plugin.input.redo(&plugin.doc)
-        }
+        InputAction::Undo => plugin.input.undo(&plugin.doc),
+        InputAction::Redo => plugin.input.redo(&plugin.doc),
         InputAction::Redraw => true,
         InputAction::None => false,
     }

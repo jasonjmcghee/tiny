@@ -13,6 +13,10 @@ pub struct DiagnosticsManager {
     lsp_service: LspService,
     last_hover_request: Option<(usize, usize, Instant)>, // (line, col, time) for debouncing
     current_hover_position: Option<(usize, usize)>, // Current hover position for tracking
+    /// Pending go-to-definition result
+    pending_goto_definition: Option<Vec<crate::lsp_service::LocationRef>>,
+    /// Current hover position with Cmd held (for go-to-definition preview)
+    cmd_hover_position: Option<(usize, usize)>,
 }
 
 impl DiagnosticsManager {
@@ -23,6 +27,8 @@ impl DiagnosticsManager {
             lsp_service: LspService::new(),
             last_hover_request: None,
             current_hover_position: None,
+            pending_goto_definition: None,
+            cmd_hover_position: None,
         }
     }
 
@@ -107,8 +113,9 @@ impl DiagnosticsManager {
                     // Request symbols again if file changed
                     // This ensures we always have up-to-date symbols
                 }
-                LspResult::GoToDefinition(_) => {
-                    // TODO: Handle goto definition results
+                LspResult::GoToDefinition(locations) => {
+                    // Store for app.rs to consume
+                    self.pending_goto_definition = Some(locations);
                 }
                 LspResult::FindReferences(_) => {
                     // TODO: Handle find references results
@@ -118,9 +125,16 @@ impl DiagnosticsManager {
     }
 
     /// Handle mouse movement (requests hover info from LSP with debouncing)
-    pub fn on_mouse_move(&mut self, line: usize, column: usize) {
+    pub fn on_mouse_move(&mut self, line: usize, column: usize, cmd_held: bool) {
         let now = Instant::now();
         self.current_hover_position = Some((line, column));
+
+        // Track Cmd+hover for go-to-definition preview
+        if cmd_held {
+            self.cmd_hover_position = Some((line, column));
+        } else {
+            self.cmd_hover_position = None;
+        }
 
         // Debounce hover requests - only send if position changed and enough time passed
         let should_request = if let Some((last_line, last_col, last_time)) = self.last_hover_request {
@@ -141,6 +155,12 @@ impl DiagnosticsManager {
         self.plugin.clear_symbols();
         self.last_hover_request = None;
         self.current_hover_position = None;
+        self.cmd_hover_position = None;
+    }
+
+    /// Get Cmd+hover position for go-to-definition preview
+    pub fn cmd_hover_position(&self) -> Option<(usize, usize)> {
+        self.cmd_hover_position
     }
 
     /// Request hover information at cursor position (for future use)
@@ -148,9 +168,20 @@ impl DiagnosticsManager {
         self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
     }
 
-    /// Request go-to-definition at cursor position (for future use)
+    /// Request go-to-definition at cursor position
     pub fn request_goto_definition(&self, line: usize, column: usize) {
+        eprintln!("DEBUG: DiagnosticsManager requesting goto_definition at line {}, col {}", line, column);
         self.lsp_service.request_goto_definition(crate::lsp_service::DocPosition { line, column });
+    }
+
+    /// Take pending go-to-definition result (consumes it)
+    pub fn take_goto_definition(&mut self) -> Option<Vec<crate::lsp_service::LocationRef>> {
+        self.pending_goto_definition.take()
+    }
+
+    /// Poll for LSP results and update plugin state
+    pub fn poll_lsp_results(&mut self) {
+        self.lsp_service.poll_results();
     }
 
     /// Get mutable access to the plugin for rendering setup

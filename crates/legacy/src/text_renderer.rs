@@ -83,6 +83,11 @@ pub struct TextRenderer {
     // === WIDGET BOUNDS ===
     /// Editor widget bounds (where text should render)
     pub editor_bounds: Option<tiny_sdk::types::LayoutRect>,
+
+    // === CACHE ===
+    /// Cached flattened text to avoid re-flattening on every layout update
+    cached_text: Option<std::sync::Arc<String>>,
+    cached_text_version: u64,
 }
 
 impl TextRenderer {
@@ -102,6 +107,8 @@ impl TextRenderer {
             gpu_style_buffer: None,
             palette_texture: None,
             editor_bounds: None,
+            cached_text: None,
+            cached_text_version: 0,
         }
     }
 
@@ -142,8 +149,17 @@ impl TextRenderer {
                 if g.token_id == 0 {
                     return None; // Skip unstyled glyphs
                 }
-                // Find which line this glyph is on
-                let line_info = self.line_cache.iter().find(|l| l.char_range.contains(&glyph_idx))?;
+                // Find which line this glyph is on using binary search
+                let line_idx = self.line_cache.binary_search_by(|l| {
+                    if glyph_idx < l.char_range.start {
+                        std::cmp::Ordering::Greater
+                    } else if glyph_idx >= l.char_range.end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }).ok()?;
+                let line_info = self.line_cache.get(line_idx)?;
                 let pos_in_line = (glyph_idx - line_info.char_range.start) as u32;
                 Some(((line_info.line_number, pos_in_line, g.char), (g.token_id, g.relative_pos)))
             })
@@ -152,7 +168,17 @@ impl TextRenderer {
         self.layout_cache.clear();
         self.line_cache.clear();
 
-        let text = tree.flatten_to_string();
+        // Use cached text if available and version matches
+        let text_arc = if self.cached_text_version == tree.version && self.cached_text.is_some() {
+            self.cached_text.clone().unwrap()
+        } else {
+            let new_text = tree.flatten_to_string();
+            self.cached_text = Some(new_text.clone());
+            self.cached_text_version = tree.version;
+            new_text
+        };
+
+        let text = text_arc.as_str();
         let lines: Vec<&str> = text.lines().collect();
 
         let mut char_index = 0;
