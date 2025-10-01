@@ -16,10 +16,22 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EditorConfig {
+    #[serde(default = "default_window_title")]
+    pub window_title: String,
+    #[serde(default = "default_window_width")]
+    pub window_width: f32,
+    #[serde(default = "default_window_height")]
+    pub window_height: f32,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default = "default_title_bar_height")]
+    pub title_bar_height: f32,
+    #[serde(default = "default_scroll_lock_enabled")]
+    pub scroll_lock_enabled: bool,
+    #[serde(default)]
+    pub continuous_rendering: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,8 +75,14 @@ pub struct DevelopmentConfig {
 impl Default for EditorConfig {
     fn default() -> Self {
         Self {
+            window_title: default_window_title(),
+            window_width: default_window_width(),
+            window_height: default_window_height(),
             font_size: default_font_size(),
             theme: default_theme(),
+            title_bar_height: default_title_bar_height(),
+            scroll_lock_enabled: default_scroll_lock_enabled(),
+            continuous_rendering: false,
         }
     }
 }
@@ -111,11 +129,26 @@ impl PluginConfig {
     }
 }
 
+fn default_window_title() -> String {
+    "Tiny Editor".to_string()
+}
+fn default_window_width() -> f32 {
+    1200.0
+}
+fn default_window_height() -> f32 {
+    1024.0
+}
 fn default_font_size() -> f32 {
     14.0
 }
 fn default_theme() -> String {
     "dark".to_string()
+}
+fn default_title_bar_height() -> f32 {
+    28.0
+}
+fn default_scroll_lock_enabled() -> bool {
+    true
 }
 fn default_plugin_dir() -> String {
     "target/plugins/release".to_string()

@@ -1,12 +1,16 @@
 use std::env;
 use std::path::PathBuf;
 use tiny_editor::app::{EditorLogic, TinyApp};
-use tiny_editor::{io, Doc};
+use tiny_editor::config::AppConfig;
 use tiny_editor::gpu_ffi_host;
+use tiny_editor::{io, Doc};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize GPU FFI for plugins
     gpu_ffi_host::init_ffi();
+
+    // Load configuration
+    let config = AppConfig::load()?;
 
     let args: Vec<String> = env::args().collect();
 
@@ -28,9 +32,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EditorLogic::new(doc)
     };
 
-    TinyApp::new(editor_logic)
-        .with_size(1200.0, 1024.0)
-        .with_font_size(13.0)
-        .with_continuous_rendering(false)
-        .run()
+    TinyApp::new(editor_logic).with_config(&config).run()
 }

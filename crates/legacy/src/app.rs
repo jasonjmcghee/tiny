@@ -331,6 +331,16 @@ impl<T: AppLogic> TinyApp<T> {
         }
     }
 
+    pub fn with_config(mut self, config: &crate::config::AppConfig) -> Self {
+        self.window_title = config.editor.window_title.clone();
+        self.window_size = (config.editor.window_width, config.editor.window_height);
+        self.font_size = config.editor.font_size;
+        self.title_bar_height = config.editor.title_bar_height;
+        self.scroll_lock_enabled = config.editor.scroll_lock_enabled;
+        self.continuous_rendering = config.editor.continuous_rendering;
+        self
+    }
+
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.window_title = title.into();
         self
