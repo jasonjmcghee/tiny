@@ -2,7 +2,8 @@
 
 use crate::{
     coordinates::Viewport,
-    input, syntax, text_effects,
+    input, syntax,
+    text_effects::{self, TextStyleProvider},
     text_renderer::{self, TextRenderer},
 };
 use bytemuck;
@@ -453,7 +454,10 @@ impl Renderer {
         self.tab_bar_plugin = Some(plugin as *mut _);
     }
 
-    pub fn set_file_picker_plugin(&mut self, plugin: &mut crate::file_picker_plugin::FilePickerPlugin) {
+    pub fn set_file_picker_plugin(
+        &mut self,
+        plugin: &mut crate::file_picker_plugin::FilePickerPlugin,
+    ) {
         self.file_picker_plugin = Some(plugin as *mut _);
     }
 
@@ -607,10 +611,16 @@ impl Renderer {
             self.last_scroll = current_scroll;
         }
 
-        let content_changed = tree.version != self.last_rendered_version || self.layout_dirty || self.syntax_dirty;
+        let content_changed =
+            tree.version != self.last_rendered_version || self.layout_dirty || self.syntax_dirty;
 
         // Early exit if nothing changed at all
-        if !content_changed && !scroll_changed && !self.glyphs_dirty && !self.line_numbers_dirty && !self.ui_dirty {
+        if !content_changed
+            && !scroll_changed
+            && !self.glyphs_dirty
+            && !self.line_numbers_dirty
+            && !self.ui_dirty
+        {
             return;
         }
 
@@ -704,12 +714,7 @@ impl Renderer {
 
             if !all_ui_glyphs.is_empty() {
                 // Disable scissor rect for UI elements (each is positioned correctly already)
-                pass.set_scissor_rect(
-                    0,
-                    0,
-                    target_w,
-                    target_h,
-                );
+                pass.set_scissor_rect(0, 0, target_w, target_h);
 
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
@@ -761,20 +766,22 @@ impl Renderer {
             // Only update syntax if there's something new to apply:
             // - Fresh parse has new tokens from tree-sitter
             // - OR there are accumulated edits to adjust stable tokens with
-            let needs_update = fresh_parse || !self.text_renderer.syntax_state.edit_deltas.is_empty();
+            let needs_update =
+                fresh_parse || !self.text_renderer.syntax_state.edit_deltas.is_empty();
 
             if needs_update {
                 let tokens: Vec<_> = if fresh_parse {
                     // Tree-sitter has caught up - query it for fresh tokens
-                    let text = tree.flatten_to_string();
-                    let effects = highlighter.get_visible_effects(&text, 0..text.len());
+                    let effects = highlighter.get_effects_in_range(0..tree.char_count());
                     effects
                         .into_iter()
                         .filter_map(|e| match e.effect {
-                            text_effects::EffectType::Token(id) => Some(text_renderer::TokenRange {
-                                byte_range: e.range,
-                                token_id: id,
-                            }),
+                            text_effects::EffectType::Token(id) => {
+                                Some(text_renderer::TokenRange {
+                                    byte_range: e.range,
+                                    token_id: id,
+                                })
+                            }
                             _ => None,
                         })
                         .collect()

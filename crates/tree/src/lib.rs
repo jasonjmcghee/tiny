@@ -238,11 +238,14 @@ impl Tree {
             };
         }
 
-        // Build leaves, each with up to MAX_SPANS spans
-        let mut all_leaves = Vec::new();
-        let mut current_leaf_spans = Vec::<Span>::new();
-
         const CHUNK_SIZE: usize = 1024;
+
+        // Pre-allocate all_leaves based on estimated count
+        let estimated_chunks = (bytes.len() / CHUNK_SIZE) + 1;
+        let estimated_leaves = (estimated_chunks / MAX_SPANS) + 1;
+        let mut all_leaves = Vec::with_capacity(estimated_leaves);
+        let mut current_leaf_spans = Vec::<Span>::with_capacity(MAX_SPANS);
+
         let mut pos = 0;
 
         while pos < bytes.len() {
@@ -270,8 +273,8 @@ impl Tree {
 
             // If leaf is full, create it and start a new one
             if current_leaf_spans.len() >= MAX_SPANS {
-                all_leaves.push(Node::leaf(current_leaf_spans.clone()));
-                current_leaf_spans = Vec::new();
+                all_leaves.push(Node::leaf(std::mem::take(&mut current_leaf_spans)));
+                current_leaf_spans = Vec::with_capacity(MAX_SPANS);
             }
 
             pos = e;
@@ -282,26 +285,30 @@ impl Tree {
             all_leaves.push(Node::leaf(current_leaf_spans));
         }
 
+        // Cache the text as Arc to avoid copies
+        let cached_text = Arc::new(text.to_string());
+
         // If only one leaf, use it as root
         if all_leaves.len() == 1 {
             return Self {
                 root: all_leaves.into_iter().next().unwrap(),
                 version: 0,
-                cached_flattened_text: Some(Arc::new(text.to_string())),
+                cached_flattened_text: Some(cached_text),
             };
         }
 
         // Build internal nodes bottom-up
         let mut nodes = all_leaves;
         while nodes.len() > 1 {
-            let mut next_level = Vec::new();
-            let mut current_children = Vec::new();
+            let estimated_next = (nodes.len() / MAX_SPANS) + 1;
+            let mut next_level = Vec::with_capacity(estimated_next);
+            let mut current_children = Vec::with_capacity(MAX_SPANS);
 
             for node in nodes {
                 current_children.push(node);
                 if current_children.len() >= MAX_SPANS {
-                    next_level.push(Node::internal(current_children.clone()));
-                    current_children = Vec::new();
+                    next_level.push(Node::internal(std::mem::take(&mut current_children)));
+                    current_children = Vec::with_capacity(MAX_SPANS);
                 }
             }
 
@@ -315,7 +322,7 @@ impl Tree {
         Self {
             root: nodes.into_iter().next().unwrap(),
             version: 0,
-            cached_flattened_text: Some(Arc::new(text.to_string())),
+            cached_flattened_text: Some(cached_text),
         }
     }
 
@@ -976,41 +983,52 @@ impl<'a> TreeCursor<'a> {
             return None;
         }
 
-        self.reset();
-        let mut current_line = 0;
+        // Navigate down the tree using cached line sums (O(log n) instead of O(n))
+        self.stack.clear();
+        self.current_spans.clear();
+        self.span_idx = 0;
+        self.byte_pos = 0;
+        self.line_pos = 0;
+        self.stack.push(CursorFrame::new(&self.tree.root, 0, 0));
 
-        loop {
-            if self.current_spans.is_empty() {
-                self.descend_to_leaf();
-                if self.current_spans.is_empty() {
-                    break;
-                }
-            }
+        while let Some(frame) = self.stack.pop() {
+            match frame.node {
+                Node::Leaf { spans, .. } => {
+                    let mut curr_line = frame.line_offset;
+                    let mut curr_byte = frame.byte_offset;
 
-            for (span, offset) in self.current_spans.iter() {
-                if let Span::Text { bytes, lines } = span {
-                    if current_line + lines >= target_line {
-                        let skip = target_line - current_line;
-                        if skip == 0 {
-                            return Some(*offset);
-                        }
+                    for span in spans {
+                        if let Span::Text { bytes, lines } = span {
+                            if curr_line + lines >= target_line {
+                                let skip = target_line - curr_line;
+                                if skip == 0 {
+                                    return Some(curr_byte);
+                                }
 
-                        let mut n = 0;
-                        for (i, &b) in bytes.iter().enumerate() {
-                            if b == b'\n' {
-                                n += 1;
-                                if n == skip {
-                                    return Some(*offset + i + 1);
+                                // Use SIMD-optimized memchr to find the skip'th newline
+                                let mut count = 0u32;
+                                for pos in memchr::memchr_iter(b'\n', bytes) {
+                                    count += 1;
+                                    if count == skip {
+                                        return Some(curr_byte + pos + 1);
+                                    }
                                 }
                             }
+                            curr_line += lines;
+                            curr_byte += bytes.len();
                         }
                     }
-                    current_line += lines;
                 }
-            }
-
-            if !self.advance_leaf() {
-                break;
+                Node::Internal { children, .. } => {
+                    // Use pre-computed offsets to navigate to correct child
+                    for (i, &(byte_off, line_off)) in frame.children_offsets.iter().enumerate() {
+                        let child_lines = node_metrics(&children[i]).1;
+                        if line_off + child_lines > target_line {
+                            self.stack.push(CursorFrame::new(&children[i], byte_off, line_off));
+                            break;
+                        }
+                    }
+                }
             }
         }
         None

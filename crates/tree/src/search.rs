@@ -2,9 +2,13 @@
 
 use super::*;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use ahash::AHashMap;
+use ahash::{AHashMap, AHasher};
+use bytecount::count as bytecount_count;
+use memchr::memchr_iter;
 use regex::Regex;
+use simdutf8::basic::from_utf8;
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -53,34 +57,44 @@ thread_local! {
 
 /// Cache for compiled search patterns to avoid recompilation
 struct SearcherCache {
-    // Cache key is (pattern, case_sensitive, whole_word, is_regex)
-    cache: AHashMap<(String, bool, bool, bool), Arc<SearchEngine>>,
+    // Use hash as key for O(1) lookup without allocation
+    // Store (pattern, engine) to verify no hash collisions
+    cache: AHashMap<u64, (String, bool, bool, bool, Arc<SearchEngine>)>,
     max_size: usize,
-    // Simple LRU: track access order
-    access_order: Vec<(String, bool, bool, bool)>,
 }
 
 impl SearcherCache {
     fn new() -> Self {
         Self {
-            cache: AHashMap::new(),
-            max_size: 32, // Keep last 32 patterns
-            access_order: Vec::new(),
+            cache: AHashMap::with_capacity(64),
+            max_size: 128, // Larger cache since lookup is now O(1)
         }
     }
 
-    fn get_or_create(&mut self, pattern: &str, options: &SearchOptions) -> Arc<SearchEngine> {
-        let key = (pattern.to_string(), options.case_sensitive, options.whole_word, options.regex);
+    #[inline]
+    fn compute_hash(pattern: &str, case_sensitive: bool, whole_word: bool, regex: bool) -> u64 {
+        let mut hasher = AHasher::default();
+        pattern.hash(&mut hasher);
+        case_sensitive.hash(&mut hasher);
+        whole_word.hash(&mut hasher);
+        regex.hash(&mut hasher);
+        hasher.finish()
+    }
 
-        // Check if we have it cached
-        if let Some(engine) = self.cache.get(&key) {
-            // Move to end of access order (most recently used)
-            self.access_order.retain(|k| k != &key);
-            self.access_order.push(key.clone());
-            return Arc::clone(engine);
+    fn get_or_create(&mut self, pattern: &str, options: &SearchOptions) -> Arc<SearchEngine> {
+        // Compute hash once (no allocation)
+        let hash = Self::compute_hash(pattern, options.case_sensitive, options.whole_word, options.regex);
+
+        // O(1) lookup with hash
+        if let Some((cached_pattern, cs, ww, rx, engine)) = self.cache.get(&hash) {
+            // Verify no collision (extremely rare)
+            if cached_pattern == pattern && *cs == options.case_sensitive
+                && *ww == options.whole_word && *rx == options.regex {
+                return Arc::clone(engine);
+            }
         }
 
-        // Create new searcher
+        // Create new searcher (cache miss)
         let engine = Arc::new(if options.regex {
             SearchEngine::Regex(RegexSearcher::new(pattern, options))
         } else {
@@ -88,15 +102,19 @@ impl SearcherCache {
         });
 
         // Add to cache
-        self.cache.insert(key.clone(), Arc::clone(&engine));
-        self.access_order.push(key);
+        self.cache.insert(
+            hash,
+            (pattern.to_string(), options.case_sensitive, options.whole_word, options.regex, Arc::clone(&engine))
+        );
 
-        // Evict oldest if cache is too large
+        // Simple eviction: if cache gets too big, clear it entirely
         if self.cache.len() > self.max_size {
-            if let Some(oldest) = self.access_order.first().cloned() {
-                self.access_order.remove(0);
-                self.cache.remove(&oldest);
-            }
+            self.cache.clear();
+            // Re-insert current pattern
+            self.cache.insert(
+                hash,
+                (pattern.to_string(), options.case_sensitive, options.whole_word, options.regex, Arc::clone(&engine))
+            );
         }
 
         engine
@@ -106,8 +124,338 @@ impl SearcherCache {
     #[allow(dead_code)]
     fn clear(&mut self) {
         self.cache.clear();
-        self.access_order.clear();
     }
+}
+
+// === Helper: Fast search in flat buffer ===
+
+fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -> Option<SearchMatch> {
+    match engine {
+        SearchEngine::Plain(searcher) => {
+            let mut pos = start_pos;
+
+            // Count lines up to start_pos using SIMD
+            let current_line = bytecount_count(&bytes[..start_pos.min(bytes.len())], b'\n') as u32;
+            let line_start_byte = memchr_iter(b'\n', &bytes[..start_pos.min(bytes.len())])
+                .last()
+                .map(|p| p + 1)
+                .unwrap_or(0);
+
+            while pos < bytes.len() {
+                if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
+                    if match_start > start_pos && searcher.is_word_boundary(bytes, match_start, match_end) {
+                        // Count lines from line_start_byte to match_start using SIMD
+                        let lines_to_match = bytecount_count(&bytes[line_start_byte..match_start], b'\n') as u32;
+                        let final_line = current_line + lines_to_match;
+
+                        let final_line_start = memchr_iter(b'\n', &bytes[..match_start])
+                            .last()
+                            .map(|p| p + 1)
+                            .unwrap_or(0);
+
+                        // Use simdutf8 for faster UTF-8 validation
+                        let column = if let Ok(text) = from_utf8(&bytes[final_line_start..match_start]) {
+                            text.chars().count() as u32
+                        } else {
+                            (match_start - final_line_start) as u32
+                        };
+
+                        return Some(SearchMatch {
+                            byte_range: match_start..match_end,
+                            line: final_line,
+                            column,
+                        });
+                    }
+                    pos = match_start + 1;
+                } else {
+                    break;
+                }
+            }
+            None
+        }
+        SearchEngine::Regex(searcher) => {
+            // Use simdutf8 for faster UTF-8 validation
+            if let Ok(text) = from_utf8(bytes) {
+                let search_text = &text[start_pos..];
+
+                if let Some(m) = searcher.regex.find(search_text) {
+                    let match_start = start_pos + m.start();
+                    let match_end = start_pos + m.end();
+
+                    // Count lines up to match using SIMD
+                    let current_line = bytecount_count(&bytes[..match_start], b'\n') as u32;
+
+                    // Find line start using SIMD
+                    let line_start = memchr_iter(b'\n', &bytes[..match_start])
+                        .last()
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+
+                    let column = text[line_start..match_start].chars().count() as u32;
+
+                    return Some(SearchMatch {
+                        byte_range: match_start..match_end,
+                        line: current_line,
+                        column,
+                    });
+                }
+            }
+            None
+        }
+    }
+}
+
+fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> Option<SearchMatch> {
+    let search_bytes = &bytes[..end_pos.min(bytes.len())];
+
+    match engine {
+        SearchEngine::Plain(searcher) => {
+            let mut pos = 0;
+            let mut last_match: Option<SearchMatch> = None;
+            let mut current_line = 0u32;
+            let mut line_start_byte = 0;
+
+            while pos < search_bytes.len() {
+                if let Some((match_start, match_end)) = searcher.find_in_bytes(search_bytes, pos) {
+                    if match_end <= end_pos && searcher.is_word_boundary(search_bytes, match_start, match_end) {
+                        // Incrementally count lines from last position using SIMD
+                        let lines_between = bytecount_count(&search_bytes[line_start_byte..match_start], b'\n') as u32;
+                        current_line += lines_between;
+
+                        // Find line start for this match using memchr (SIMD)
+                        if lines_between > 0 {
+                            line_start_byte = memchr_iter(b'\n', &search_bytes[line_start_byte..match_start])
+                                .last()
+                                .map(|p| line_start_byte + p + 1)
+                                .unwrap_or(line_start_byte);
+                        }
+
+                        // Use simdutf8 for faster UTF-8 validation
+                        let column = if let Ok(text) = from_utf8(&search_bytes[line_start_byte..match_start]) {
+                            text.chars().count() as u32
+                        } else {
+                            (match_start - line_start_byte) as u32
+                        };
+
+                        last_match = Some(SearchMatch {
+                            byte_range: match_start..match_end,
+                            line: current_line,
+                            column,
+                        });
+                    }
+                    pos = match_start + 1;
+                } else {
+                    break;
+                }
+            }
+            last_match
+        }
+        SearchEngine::Regex(searcher) => {
+            // Use simdutf8 for faster UTF-8 validation
+            if let Ok(text) = from_utf8(search_bytes) {
+                let mut last_match: Option<SearchMatch> = None;
+                let mut current_line = 0u32;
+                let mut line_start_byte = 0;
+
+                for m in searcher.regex.find_iter(text) {
+                    if m.end() > end_pos {
+                        break;
+                    }
+
+                    let match_start = m.start();
+                    let match_end = m.end();
+
+                    // Incrementally count lines from last position using SIMD
+                    let lines_between = bytecount_count(&search_bytes[line_start_byte..match_start], b'\n') as u32;
+                    current_line += lines_between;
+
+                    // Find line start for this match using memchr (SIMD)
+                    if lines_between > 0 {
+                        line_start_byte = memchr_iter(b'\n', &search_bytes[line_start_byte..match_start])
+                            .last()
+                            .map(|p| line_start_byte + p + 1)
+                            .unwrap_or(line_start_byte);
+                    }
+
+                    let column = text[line_start_byte..match_start].chars().count() as u32;
+
+                    last_match = Some(SearchMatch {
+                        byte_range: match_start..match_end,
+                        line: current_line,
+                        column,
+                    });
+                }
+
+                return last_match;
+            }
+            None
+        }
+    }
+}
+
+/// Fast search that only returns byte ranges (no line/column calculation)
+fn search_byte_ranges_only(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+
+    match engine {
+        SearchEngine::Plain(searcher) => {
+            let mut pos = 0;
+
+            while pos < bytes.len() {
+                if let Some(lim) = limit {
+                    if matches.len() >= lim {
+                        break;
+                    }
+                }
+
+                if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
+                    if searcher.is_word_boundary(bytes, match_start, match_end) {
+                        // No line/column calculation - just byte ranges
+                        matches.push(SearchMatch {
+                            byte_range: match_start..match_end,
+                            line: 0,
+                            column: 0,
+                        });
+                    }
+                    pos = match_start + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        SearchEngine::Regex(searcher) => {
+            if let Ok(text) = from_utf8(bytes) {
+                for m in searcher.regex.find_iter(text) {
+                    if let Some(lim) = limit {
+                        if matches.len() >= lim {
+                            break;
+                        }
+                    }
+
+                    matches.push(SearchMatch {
+                        byte_range: m.start()..m.end(),
+                        line: 0,
+                        column: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    matches
+}
+
+fn search_in_bytes(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+
+    match engine {
+        SearchEngine::Plain(searcher) => {
+            let mut pos = 0;
+            let mut current_line = 0u32;
+            let mut line_start_byte = 0;
+            let mut last_checked_byte = 0;
+            let mut current_column = 0u32;
+
+            while pos < bytes.len() {
+                if let Some(lim) = limit {
+                    if matches.len() >= lim {
+                        break;
+                    }
+                }
+
+                if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
+                    if searcher.is_word_boundary(bytes, match_start, match_end) {
+                        // Use SIMD for incremental counting (faster than single-pass scalar loop)
+                        let slice = &bytes[last_checked_byte..match_start];
+                        let newline_count = bytecount_count(slice, b'\n') as u32;
+
+                        if newline_count > 0 {
+                            // We crossed newline(s) - update line and reset column tracking
+                            current_line += newline_count;
+                            line_start_byte = memchr_iter(b'\n', slice)
+                                .last()
+                                .map(|p| last_checked_byte + p + 1)
+                                .unwrap_or(line_start_byte);
+                            last_checked_byte = line_start_byte;
+                            current_column = 0;
+
+                            // Count chars from new line_start_byte to match_start
+                            let remaining_slice = &bytes[line_start_byte..match_start];
+                            current_column = remaining_slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
+                        } else {
+                            // No newlines - count UTF-8 chars incrementally
+                            current_column += slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
+                        }
+
+                        matches.push(SearchMatch {
+                            byte_range: match_start..match_end,
+                            line: current_line,
+                            column: current_column,
+                        });
+
+                        // Update last_checked to match_start for next iteration
+                        last_checked_byte = match_start;
+                    }
+                    pos = match_start + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        SearchEngine::Regex(searcher) => {
+            // Use simdutf8 for faster UTF-8 validation
+            if let Ok(text) = from_utf8(bytes) {
+                let mut current_line = 0u32;
+                let mut line_start_byte = 0;
+                let mut last_checked_byte = 0;
+                let mut current_column = 0u32;
+
+                for m in searcher.regex.find_iter(text) {
+                    if let Some(lim) = limit {
+                        if matches.len() >= lim {
+                            break;
+                        }
+                    }
+
+                    let match_start = m.start();
+                    let match_end = m.end();
+
+                    // Use SIMD for incremental counting (faster than single-pass scalar loop)
+                    let slice = &bytes[last_checked_byte..match_start];
+                    let newline_count = bytecount_count(slice, b'\n') as u32;
+
+                    if newline_count > 0 {
+                        // We crossed newline(s) - update line and reset column tracking
+                        current_line += newline_count;
+                        line_start_byte = memchr_iter(b'\n', slice)
+                            .last()
+                            .map(|p| last_checked_byte + p + 1)
+                            .unwrap_or(line_start_byte);
+                        last_checked_byte = line_start_byte;
+                        current_column = 0;
+
+                        // Count chars from new line_start_byte to match_start
+                        let remaining_slice = &bytes[line_start_byte..match_start];
+                        current_column = remaining_slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
+                    } else {
+                        // No newlines - count UTF-8 chars incrementally
+                        current_column += slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
+                    }
+
+                    matches.push(SearchMatch {
+                        byte_range: match_start..match_end,
+                        line: current_line,
+                        column: current_column,
+                    });
+
+                    // Update last_checked to match_start for next iteration
+                    last_checked_byte = match_start;
+                }
+            }
+        }
+    }
+
+    matches
 }
 
 // === Tree Search Implementation ===
@@ -119,43 +467,115 @@ impl Tree {
             return Vec::new();
         }
 
-        let mut matches = Vec::new();
+        // Use flattened text for search (much faster than tree traversal!)
+        let text = self.flatten_to_string();
+        let bytes = text.as_bytes();
 
         // Get cached searcher or create new one
         let searcher = SEARCHER_CACHE.with(|cache| {
             cache.borrow_mut().get_or_create(pattern, &options)
         });
 
-        let mut cursor = self.cursor();
-        cursor.search_with_engine_arc(searcher, &mut matches, options.limit);
-        matches
+        // Search in flat buffer (like ripgrep does)
+        search_in_bytes(&searcher, bytes, options.limit)
     }
 
     /// Find next occurrence after given position
     pub fn search_next(&self, pattern: &str, start_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
-        // Search for all matches and return the first one after start_pos
-        let matches = self.search(pattern, options);
+        if pattern.is_empty() {
+            return None;
+        }
 
-        matches.into_iter().find(|m| m.byte_range.start > start_pos)
+        // Use flattened text for fast search
+        let text = self.flatten_to_string();
+        let bytes = text.as_bytes();
+
+        if start_pos >= bytes.len() {
+            return None;
+        }
+
+        // Get cached searcher
+        let searcher = SEARCHER_CACHE.with(|cache| {
+            cache.borrow_mut().get_or_create(pattern, &options)
+        });
+
+        // Search from start_pos to end
+        search_next_in_bytes(&searcher, bytes, start_pos)
     }
 
     /// Find previous occurrence before given position
     pub fn search_prev(&self, pattern: &str, end_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
-        // Search for all matches and return the last one before end_pos
-        let matches = self.search(pattern, options);
+        if pattern.is_empty() {
+            return None;
+        }
 
-        matches.into_iter()
-            .filter(|m| m.byte_range.end <= end_pos)
-            .last()
+        // Use flattened text for fast search
+        let text = self.flatten_to_string();
+        let bytes = text.as_bytes();
+
+        // Get cached searcher
+        let searcher = SEARCHER_CACHE.with(|cache| {
+            cache.borrow_mut().get_or_create(pattern, &options)
+        });
+
+        // Search from beginning to end_pos
+        search_prev_in_bytes(&searcher, bytes, end_pos)
     }
 
     /// Replace all occurrences - returns new tree
     pub fn replace_all(&self, pattern: &str, replacement: &str, options: SearchOptions) -> Self {
-        let matches = self.search(pattern, options);
+        // For large numbers of replacements, flatten → replace → rebuild is faster
+        // than applying individual tree edits
+        const BATCH_THRESHOLD: usize = 100;
+
+        // Get flattened text once (cached if available)
+        let text = self.flatten_to_string();
+        let bytes = text.as_bytes();
+
+        // Get cached searcher
+        let searcher = SEARCHER_CACHE.with(|cache| {
+            cache.borrow_mut().get_or_create(pattern, &options)
+        });
+
+        // Use fast search that skips line/column calculation (replace_all doesn't need it)
+        let matches = search_byte_ranges_only(&searcher, bytes, options.limit);
+
         if matches.is_empty() {
             return self.clone();
         }
 
+        if matches.len() >= BATCH_THRESHOLD {
+            // Fast path: use the already-flattened text (no second flatten!)
+
+            // Better capacity estimation to avoid reallocation
+            let pattern_len = match &*searcher {
+                SearchEngine::Plain(p) => p.pattern.len(),
+                SearchEngine::Regex(_) => {
+                    // For regex, estimate from first match if available
+                    matches.first().map(|m| m.byte_range.len()).unwrap_or(pattern.len())
+                }
+            };
+            let size_diff = replacement.len().saturating_sub(pattern_len);
+            let estimated_capacity = text.len() + (matches.len() * size_diff);
+            let mut result = String::with_capacity(estimated_capacity);
+            let mut last_end = 0;
+
+            // Filter out overlapping matches (e.g., "aa" in "aaa" finds matches at 0-2 and 1-3)
+            // We only replace non-overlapping matches
+            for m in &matches {
+                if m.byte_range.start >= last_end {
+                    result.push_str(&text[last_end..m.byte_range.start]);
+                    result.push_str(replacement);
+                    last_end = m.byte_range.end;
+                }
+                // Skip overlapping matches
+            }
+            result.push_str(&text[last_end..]);
+
+            return Self::from_str(&result);
+        }
+
+        // Slow path: individual tree edits for small numbers of replacements
         // Build edits from matches (in reverse order to preserve positions)
         let mut edits = Vec::new();
         for m in matches.iter().rev() {
@@ -179,7 +599,7 @@ impl Tree {
         }
 
         // Call replacer in forward order but collect replacements with matches
-        let mut replacements = Vec::new();
+        let mut replacements = Vec::with_capacity(matches.len()); // Pre-allocate worst case
         for m in matches.iter() {
             if let Some(replacement) = replacer(m) {
                 replacements.push((m.byte_range.clone(), replacement));
@@ -190,8 +610,32 @@ impl Tree {
             return self.clone();
         }
 
-        // Build edits in reverse order to preserve positions
-        let mut edits = Vec::new();
+        // Fast path for many replacements: use string building instead of tree edits
+        const BATCH_THRESHOLD: usize = 100;
+        if replacements.len() >= BATCH_THRESHOLD {
+            let text = self.flatten_to_string();
+
+            // Estimate capacity
+            let avg_match_len = replacements.iter().map(|(r, _)| r.len()).sum::<usize>() / replacements.len();
+            let avg_replacement_len = replacements.iter().map(|(_, s)| s.len()).sum::<usize>() / replacements.len();
+            let size_diff = avg_replacement_len.saturating_sub(avg_match_len);
+            let estimated_capacity = text.len() + (replacements.len() * size_diff);
+
+            let mut result = String::with_capacity(estimated_capacity);
+            let mut last_end = 0;
+
+            for (range, replacement) in &replacements {
+                result.push_str(&text[last_end..range.start]);
+                result.push_str(replacement);
+                last_end = range.end;
+            }
+            result.push_str(&text[last_end..]);
+
+            return Self::from_str(&result);
+        }
+
+        // Slow path: Build edits in reverse order to preserve positions
+        let mut edits = Vec::with_capacity(replacements.len());
         for (range, replacement) in replacements.iter().rev() {
             edits.push(Edit::Replace {
                 range: range.clone(),
@@ -351,6 +795,144 @@ impl<'a> TreeCursor<'a> {
         self.search_with_engine(&*engine, matches, limit)
     }
 
+    /// Search from a specific position, return first match (forward) or last match before pos (backward)
+    pub(super) fn search_from_position(
+        &mut self,
+        engine: Arc<SearchEngine>,
+        pos: usize,
+        forward: bool,
+    ) -> Option<SearchMatch> {
+        let mut matches = Vec::new();
+
+        if forward {
+            // Forward search: seek to position and find first match after it
+            self.seek_byte(pos);
+
+            loop {
+                if self.current_spans.is_empty() {
+                    break;
+                }
+
+                let current_line_offset = self.line_pos;
+
+                for (span, offset) in self.current_spans.iter() {
+                    if let Span::Text { bytes, .. } = span {
+                        // Only search in the part after pos
+                        let search_start = if *offset < pos {
+                            pos - offset
+                        } else {
+                            0
+                        };
+
+                        if search_start < bytes.len() {
+                            self.search_in_span_partial(
+                                bytes,
+                                *offset,
+                                current_line_offset,
+                                &*engine,
+                                &mut matches,
+                                search_start,
+                            );
+
+                            if !matches.is_empty() {
+                                // Return first match immediately
+                                return matches.into_iter().next();
+                            }
+                        }
+                    }
+                }
+
+                if !self.advance_leaf() {
+                    break;
+                }
+            }
+            None
+        } else {
+            // Backward search: search from beginning up to pos, return last match
+            self.reset();
+
+            let max_pattern_len = match &*engine {
+                SearchEngine::Plain(p) => p.pattern.len(),
+                SearchEngine::Regex(_) => 100,
+            };
+
+            let mut overlap_buffer = Vec::with_capacity(max_pattern_len * 2);
+            let mut prev_span_tail = Vec::new();
+            let mut prev_offset = 0;
+            let mut prev_line = 0;
+
+            loop {
+                if self.current_spans.is_empty() {
+                    break;
+                }
+
+                let current_line_offset = self.line_pos;
+
+                for (i, (span, offset)) in self.current_spans.iter().enumerate() {
+                    if let Span::Text { bytes, lines: _ } = span {
+                        // Stop if we've gone past the end position
+                        if *offset >= pos {
+                            return matches.into_iter().last();
+                        }
+
+                        // For spans after the first, check for patterns spanning the boundary
+                        if i > 0 && !prev_span_tail.is_empty() && max_pattern_len > 1 {
+                            overlap_buffer.clear();
+                            overlap_buffer.extend_from_slice(&prev_span_tail);
+                            let take_from_current = max_pattern_len.min(bytes.len());
+                            overlap_buffer.extend_from_slice(&bytes[..take_from_current]);
+
+                            let overlap_start = prev_offset + prev_span_tail.len().saturating_sub(max_pattern_len);
+                            self.search_in_span(
+                                &overlap_buffer,
+                                overlap_start,
+                                prev_line,
+                                &*engine,
+                                &mut matches,
+                                None,
+                            );
+                        }
+
+                        // Search in span, but only up to pos
+                        let search_end = if offset + bytes.len() > pos {
+                            pos - offset
+                        } else {
+                            bytes.len()
+                        };
+
+                        if search_end > 0 {
+                            let search_bytes = &bytes[..search_end];
+                            self.search_in_span(
+                                search_bytes,
+                                *offset,
+                                current_line_offset,
+                                &*engine,
+                                &mut matches,
+                                None,
+                            );
+                        }
+
+                        // Save tail for next boundary check
+                        prev_span_tail.clear();
+                        if bytes.len() > max_pattern_len {
+                            prev_span_tail.extend_from_slice(&bytes[bytes.len() - max_pattern_len..]);
+                        } else {
+                            prev_span_tail.extend_from_slice(bytes);
+                        }
+                        prev_offset = *offset;
+                        prev_line = current_line_offset;
+                    }
+                }
+
+                if !self.advance_leaf() {
+                    break;
+                }
+            }
+
+            matches.into_iter().last()
+        }
+    }
+
     pub(super) fn search_with_engine(
         &mut self,
         engine: &SearchEngine,
@@ -437,6 +1019,112 @@ impl<'a> TreeCursor<'a> {
 
             if !self.advance_leaf() {
                 break;
+            }
+        }
+    }
+
+    fn search_in_span_partial(
+        &self,
+        bytes: &[u8],
+        byte_offset: usize,
+        base_line: u32,
+        engine: &SearchEngine,
+        matches: &mut Vec<SearchMatch>,
+        start_offset: usize,
+    ) {
+        // Like search_in_span but starts from start_offset within the span
+        match engine {
+            SearchEngine::Plain(searcher) => {
+                let mut pos = start_offset;
+                let mut current_line = base_line;
+                let mut line_start_pos = 0;
+
+                // Count lines up to start_offset
+                for i in 0..start_offset {
+                    if bytes[i] == b'\n' {
+                        current_line += 1;
+                        line_start_pos = i + 1;
+                    }
+                }
+
+                while pos < bytes.len() {
+                    if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
+                        if searcher.is_word_boundary(bytes, match_start, match_end) {
+                            // Update line count up to match position
+                            for i in line_start_pos..match_start {
+                                if bytes[i] == b'\n' {
+                                    current_line += 1;
+                                    line_start_pos = i + 1;
+                                }
+                            }
+
+                            let column = if let Ok(text) = std::str::from_utf8(&bytes[line_start_pos..match_start]) {
+                                text.chars().count() as u32
+                            } else {
+                                (match_start - line_start_pos) as u32
+                            };
+
+                            let new_match = SearchMatch {
+                                byte_range: (byte_offset + match_start)..(byte_offset + match_end),
+                                line: current_line,
+                                column,
+                            };
+
+                            if matches.last() != Some(&new_match) {
+                                matches.push(new_match);
+                                return; // Early exit for forward search
+                            }
+                        }
+                        pos = match_start + 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            SearchEngine::Regex(searcher) => {
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    let search_text = &text[start_offset..];
+                    let mut current_line = base_line;
+                    let mut byte_pos = 0;
+
+                    // Count lines up to start_offset
+                    for i in 0..start_offset {
+                        if bytes[i] == b'\n' {
+                            current_line += 1;
+                        }
+                    }
+
+                    for m in searcher.regex.find_iter(search_text) {
+                        let match_start_bytes = start_offset + m.start();
+                        let match_end_bytes = start_offset + m.end();
+
+                        // Count newlines from start_offset to match
+                        while byte_pos < m.start() {
+                            if search_text.as_bytes()[byte_pos] == b'\n' {
+                                current_line += 1;
+                            }
+                            byte_pos += 1;
+                        }
+
+                        let line_start = text[..match_start_bytes]
+                            .rfind('\n')
+                            .map(|p| p + 1)
+                            .unwrap_or(0);
+
+                        let column = text[line_start..match_start_bytes].chars().count() as u32;
+
+                        let new_match = SearchMatch {
+                            byte_range: (byte_offset + match_start_bytes)..(byte_offset + match_end_bytes),
+                            line: current_line,
+                            column,
+                        };
+
+                        if matches.last() != Some(&new_match) {
+                            matches.push(new_match);
+                            return; // Early exit for forward search
+                        }
+                    }
+                }
             }
         }
     }

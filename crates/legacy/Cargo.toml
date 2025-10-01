@@ -45,6 +45,7 @@ arboard = "3.4"  # Clipboard support
 pollster = "0.3"  # Async executor for main
 notify = "6"  # File watching for shader hot-reload
 regex = "1"  # Regex for file picker search
+ignore = "0.4"  # Fast directory traversal with gitignore support
 
 # Async runtime for LSP
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -1,6 +1,8 @@
 //! File picker plugin - shows a searchable list of files
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tiny_font::{create_glyph_instances, SharedFontSystem};
 use tiny_sdk::{
     Capability, GlyphInstance, Initializable, LayoutPos, PaintContext, Paintable, Plugin,
@@ -13,8 +15,8 @@ pub struct FilePickerPlugin {
     pub visible: bool,
     /// Current search query
     pub query: String,
-    /// All files in the working directory
-    all_files: Vec<PathBuf>,
+    /// All files in the working directory (thread-safe)
+    all_files: Arc<RwLock<Vec<PathBuf>>>,
     /// Filtered files based on query
     filtered_files: Vec<PathBuf>,
     /// Selected index in filtered list
@@ -26,45 +28,44 @@ pub struct FilePickerPlugin {
 impl FilePickerPlugin {
     pub fn new() -> Self {
         let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let all_files = Self::scan_directory(&working_dir);
+        let all_files = Arc::new(RwLock::new(Vec::new()));
+
+        // Spawn background thread to scan directory
+        let all_files_clone = all_files.clone();
+        let working_dir_clone = working_dir.clone();
+        std::thread::spawn(move || {
+            let scanned = Self::scan_directory(&working_dir_clone);
+            *all_files_clone.write() = scanned;
+        });
 
         Self {
             visible: false,
             query: String::new(),
-            all_files: all_files.clone(),
-            filtered_files: all_files,
+            all_files,
+            filtered_files: Vec::new(),
             selected_index: 0,
             working_dir,
         }
     }
 
-    /// Scan directory for files (recursively, but limited depth)
+    /// Scan directory for files using ignore crate (respects .gitignore)
     fn scan_directory(dir: &Path) -> Vec<PathBuf> {
-        let mut files = Vec::new();
+        use ignore::WalkBuilder;
 
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-
-                // Skip hidden files and directories
-                if path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.starts_with('.'))
+        let mut files: Vec<PathBuf> = WalkBuilder::new(dir)
+            .hidden(true) // Skip hidden files/directories
+            .git_ignore(true) // Respect .gitignore
+            .git_exclude(true) // Respect .git/info/exclude
+            .build()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|ft| ft.is_file())
                     .unwrap_or(false)
-                {
-                    continue;
-                }
-
-                if path.is_file() {
-                    files.push(path);
-                } else if path.is_dir() {
-                    // Recursively scan subdirectories (limit depth to avoid performance issues)
-                    let subfiles = Self::scan_directory(&path);
-                    files.extend(subfiles);
-                }
-            }
-        }
+            })
+            .map(|entry| entry.into_path())
+            .collect();
 
         // Sort files for consistent ordering
         files.sort();
@@ -104,14 +105,15 @@ impl FilePickerPlugin {
 
     /// Update filtered files based on current query
     fn update_filtered_files(&mut self) {
+        let all_files = self.all_files.read();
+
         if self.query.is_empty() {
-            self.filtered_files = self.all_files.clone();
+            self.filtered_files = all_files.clone();
         } else {
             // Simple regex-based filtering with .* appended
             let pattern = format!("{}.*", regex::escape(&self.query));
             if let Ok(re) = regex::Regex::new(&pattern) {
-                self.filtered_files = self
-                    .all_files
+                self.filtered_files = all_files
                     .iter()
                     .filter(|path| {
                         path.to_str()
@@ -122,7 +124,7 @@ impl FilePickerPlugin {
                     .collect();
             } else {
                 // If regex is invalid, show all files
-                self.filtered_files = self.all_files.clone();
+                self.filtered_files = all_files.clone();
             }
         }
 

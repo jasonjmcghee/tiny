@@ -174,6 +174,7 @@ fn bench_text_extraction(c: &mut Criterion) {
 /// Benchmark RCU reader/writer concurrency
 fn bench_rcu_concurrency(c: &mut Criterion) {
     let mut group = c.benchmark_group("rcu_concurrency");
+    group.sample_size(10);
 
     let text = generate_document(10000);
 
@@ -266,11 +267,11 @@ fn bench_tree_traversal(c: &mut Criterion) {
 
     for size in [1000, 10000, 100000].iter() {
         let text = generate_document(*size);
-        let doc = Doc::from_str(&text);
 
         // Full document conversion (save operation) - original method
         group.bench_with_input(BenchmarkId::new("to_string", size), size, |b, _| {
             b.iter(|| {
+                let doc = Doc::from_str(&text);
                 let tree = doc.read();
                 std::hint::black_box(tree.flatten_to_string());
             });
@@ -524,7 +525,9 @@ fn bench_searcher_cache(c: &mut Criterion) {
     group.bench_function("repeated_same_pattern", |b| {
         b.iter(|| {
             // Simulate incremental search as user types
-            let patterns = ["f", "fu", "fun", "func", "funct", "functi", "functio", "function"];
+            let patterns = [
+                "f", "fu", "fun", "func", "funct", "functi", "functio", "function",
+            ];
             let mut results = Vec::new();
 
             for pattern in &patterns {
@@ -539,7 +542,9 @@ fn bench_searcher_cache(c: &mut Criterion) {
     // Benchmark searches with different patterns (cache misses)
     group.bench_function("different_patterns", |b| {
         b.iter(|| {
-            let patterns = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+            let patterns = [
+                "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+            ];
             let mut results = Vec::new();
 
             for pattern in &patterns {
@@ -569,9 +574,18 @@ fn bench_searcher_cache(c: &mut Criterion) {
             let mut results = Vec::new();
 
             // Same pattern, different options
-            let options1 = SearchOptions { case_sensitive: true, ..Default::default() };
-            let options2 = SearchOptions { case_sensitive: false, ..Default::default() };
-            let options3 = SearchOptions { whole_word: true, ..Default::default() };
+            let options1 = SearchOptions {
+                case_sensitive: true,
+                ..Default::default()
+            };
+            let options2 = SearchOptions {
+                case_sensitive: false,
+                ..Default::default()
+            };
+            let options3 = SearchOptions {
+                whole_word: true,
+                ..Default::default()
+            };
 
             results.push(tree.search("test", options1).len());
             results.push(tree.search("test", options2).len());
