@@ -31,12 +31,21 @@ const ATLAS_SIZE: f32 = 2048.0;
 const RECT_BUFFER_SIZE: u64 = 65536; // 64KB
 const GLYPH_BUFFER_SIZE: u64 = 4 * 1024 * 1024; // 4MB
 
-/// Vertex data for rectangles
+/// Vertex data for rectangles (unit quad)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct RectVertex {
     pub position: [f32; 2],
+}
+
+/// Instance data for rectangles (per-rect data)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct RectInstanceData {
+    pub rect_pos: [f32; 2],
+    pub rect_size: [f32; 2],
     pub color: u32,
+    pub _padding: u32, // Align to 16 bytes
 }
 
 /// Vertex data for glyphs
@@ -122,7 +131,8 @@ pub struct GpuRenderer {
     glyph_bind_group: BindGroup,
 
     // Vertex buffers
-    rect_vertex_buffer: Buffer,
+    rect_vertex_buffer: Buffer,      // Unit quad (6 vertices, static)
+    rect_instance_buffer: Buffer,    // Per-rect data (dynamic)
     glyph_vertex_buffer: Buffer,
     line_number_vertex_buffer: Buffer,
 
@@ -133,6 +143,15 @@ pub struct GpuRenderer {
     // Dirty flags to avoid redundant updates
     uniforms_dirty: bool,
     themed_uniforms_dirty: bool,
+
+    // Vertex cache: (buffer_ptr, offset) -> (instances_hash, cached_vertices)
+    vertex_cache: HashMap<(usize, u64), (u64, Vec<GlyphVertex>)>,
+
+    // Style buffer cache to avoid redundant writes (0 = uninitialized)
+    last_style_hash: std::sync::atomic::AtomicU64,
+
+    // Rect instance cache to avoid redundant writes (0 = uninitialized)
+    last_rect_instances_hash: std::sync::atomic::AtomicU64,
 }
 
 /// Create 6 vertices (2 triangles) for a quad
@@ -149,11 +168,16 @@ where
     [tl, tr, bl, tr, br, bl]
 }
 
-pub fn create_rect_vertices(x: f32, y: f32, w: f32, h: f32, color: u32) -> [RectVertex; 6] {
-    quad_vertices(x, y, w, h, |pos, _| RectVertex {
-        position: pos,
-        color,
-    })
+/// Create a unit quad (0,0 to 1,1) for instanced rendering
+pub fn create_unit_quad() -> [RectVertex; 6] {
+    [
+        RectVertex { position: [0.0, 0.0] }, // TL
+        RectVertex { position: [1.0, 0.0] }, // TR
+        RectVertex { position: [0.0, 1.0] }, // BL
+        RectVertex { position: [1.0, 0.0] }, // TR
+        RectVertex { position: [1.0, 1.0] }, // BR
+        RectVertex { position: [0.0, 1.0] }, // BL
+    ]
 }
 
 fn create_glyph_vertices(
@@ -196,10 +220,17 @@ fn glyph_vertex_attributes() -> [VertexAttribute; 4] {
     ]
 }
 
-fn rect_vertex_attributes() -> [VertexAttribute; 2] {
+fn rect_vertex_attributes() -> [VertexAttribute; 1] {
     [
-        vertex_attr(0, 0, VertexFormat::Float32x2),
-        vertex_attr(8, 1, VertexFormat::Uint32),
+        vertex_attr(0, 0, VertexFormat::Float32x2), // vertex_pos
+    ]
+}
+
+fn rect_instance_attributes() -> [VertexAttribute; 3] {
+    [
+        vertex_attr(0, 1, VertexFormat::Float32x2),  // rect_pos
+        vertex_attr(8, 2, VertexFormat::Float32x2),  // rect_size
+        vertex_attr(16, 3, VertexFormat::Uint32),    // color
     ]
 }
 
@@ -238,6 +269,71 @@ impl<'a> PipelineBuilder<'a> {
                         step_mode: VertexStepMode::Vertex,
                         attributes: vertex_attributes,
                     }],
+                    compilation_options: PipelineCompilationOptions::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(ColorTargetState {
+                        format: self.format,
+                        blend: Some(BlendState::ALPHA_BLENDING),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: PipelineCompilationOptions::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+    }
+
+    fn create_instanced_pipeline(
+        &self,
+        label: &str,
+        shader: &ShaderModule,
+        bind_group_layouts: &[&BindGroupLayout],
+        vertex_attributes: &[VertexAttribute],
+        vertex_stride: BufferAddress,
+        instance_attributes: &[VertexAttribute],
+        instance_stride: BufferAddress,
+    ) -> RenderPipeline {
+        let layout = self
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some(&format!("{} Layout", label)),
+                bind_group_layouts,
+                push_constant_ranges: &[],
+            });
+
+        self.device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[
+                        VertexBufferLayout {
+                            array_stride: vertex_stride,
+                            step_mode: VertexStepMode::Vertex,
+                            attributes: vertex_attributes,
+                        },
+                        VertexBufferLayout {
+                            array_stride: instance_stride,
+                            step_mode: VertexStepMode::Instance,
+                            attributes: instance_attributes,
+                        },
+                    ],
                     compilation_options: PipelineCompilationOptions::default(),
                 },
                 fragment: Some(FragmentState {
@@ -372,14 +468,20 @@ impl GpuRenderer {
         )
     }
 
-    /// Create rect pipeline with given shader module
+    /// Create rect pipeline with given shader module (instanced rendering)
     fn create_rect_pipeline(&self, shader: &ShaderModule) -> RenderPipeline {
-        self.create_pipeline(
-            "Rect Pipeline",
+        let builder = PipelineBuilder {
+            device: &self.device,
+            format: self.config.format,
+        };
+        builder.create_instanced_pipeline(
+            "Rect Pipeline (Instanced)",
             shader,
             &[&self.rect_uniform_bind_group_layout],
             &rect_vertex_attributes(),
             std::mem::size_of::<RectVertex>() as BufferAddress,
+            &rect_instance_attributes(),
+            std::mem::size_of::<RectInstanceData>() as BufferAddress,
         )
     }
 
@@ -560,6 +662,18 @@ impl GpuRenderer {
 
     /// Upload style buffer as u32 (for shader compatibility)
     pub fn upload_style_buffer_u32(&mut self, style_data: &[u32]) {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
+
+        // Hash the style data to check if it changed
+        let mut hasher = ahash::AHasher::default();
+        style_data.hash(&mut hasher);
+        let style_hash = hasher.finish();
+
+        // Check if data actually changed
+        let cached_hash = self.last_style_hash.load(Ordering::Relaxed);
+        let data_changed = cached_hash != style_hash;
+
         // Buffer size is already aligned since u32 is 4 bytes
         let buffer_size = (style_data.len() * 4) as u64;
 
@@ -579,10 +693,13 @@ impl GpuRenderer {
             ));
         }
 
-        // Write data to buffer (always, even if not recreated)
-        if let Some(buffer) = &self.style_buffer {
-            self.queue
-                .write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
+        // Only write data if it changed or buffer was recreated
+        if data_changed || buffer_recreated {
+            if let Some(buffer) = &self.style_buffer {
+                self.queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
+                self.last_style_hash.store(style_hash, Ordering::Relaxed);
+            }
         }
 
         // Only recreate bind group when buffer was recreated or it doesn't exist
@@ -1087,7 +1204,21 @@ impl GpuRenderer {
             })
         };
 
-        let rect_vertex_buffer = create_vertex_buffer("Rect Vertex Buffer", RECT_BUFFER_SIZE);
+        // Create unit quad vertex buffer (static - never changes)
+        let unit_quad = create_unit_quad();
+        let rect_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Rect Vertex Buffer (Unit Quad)"),
+            size: std::mem::size_of_val(&unit_quad) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        // Upload unit quad data immediately
+        rect_vertex_buffer.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&unit_quad));
+        rect_vertex_buffer.unmap();
+
+        // Create instance buffer for per-rect data (dynamic)
+        let rect_instance_buffer = create_vertex_buffer("Rect Instance Buffer", RECT_BUFFER_SIZE);
+
         let glyph_vertex_buffer = create_vertex_buffer("Glyph Vertex Buffer", GLYPH_BUFFER_SIZE);
         let line_number_vertex_buffer =
             create_vertex_buffer("Line Number Vertex Buffer", 256 * 1024); // 256KB for line numbers
@@ -1096,12 +1227,14 @@ impl GpuRenderer {
             device: &device,
             format: config.format,
         };
-        let rect_pipeline = builder.create_pipeline(
-            "Rect Pipeline",
+        let rect_pipeline = builder.create_instanced_pipeline(
+            "Rect Pipeline (Instanced)",
             &rect_shader,
             &[&rect_uniform_bind_group_layout],
             &rect_vertex_attributes(),
             std::mem::size_of::<RectVertex>() as BufferAddress,
+            &rect_instance_attributes(),
+            std::mem::size_of::<RectInstanceData>() as BufferAddress,
         );
         let glyph_pipeline = builder.create_pipeline(
             "Glyph Pipeline",
@@ -1145,6 +1278,7 @@ impl GpuRenderer {
             glyph_texture,
             glyph_bind_group,
             rect_vertex_buffer,
+            rect_instance_buffer,
             glyph_vertex_buffer,
             line_number_vertex_buffer,
             themed_uniform_bind_group_layout: None,
@@ -1170,6 +1304,9 @@ impl GpuRenderer {
             uniform_bind_group_id,
             uniforms_dirty: true,
             themed_uniforms_dirty: true,
+            vertex_cache: HashMap::default(),
+            last_style_hash: std::sync::atomic::AtomicU64::new(0),
+            last_rect_instances_hash: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1269,33 +1406,69 @@ impl GpuRenderer {
             return;
         }
 
-        // Uniforms are now updated once per frame in render_with_callback
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
 
-        let vertices: Vec<RectVertex> = instances
-            .iter()
-            .flat_map(|rect| {
-                create_rect_vertices(
-                    rect.rect.x.0 * scale_factor,
-                    rect.rect.y.0 * scale_factor,
-                    rect.rect.width.0 * scale_factor,
-                    rect.rect.height.0 * scale_factor,
-                    rect.color,
-                )
-            })
-            .collect();
+        // Hash the instances and scale factor to check if anything changed
+        let mut hasher = ahash::AHasher::default();
+        scale_factor.to_bits().hash(&mut hasher);
+        for instance in instances {
+            instance.rect.x.0.to_bits().hash(&mut hasher);
+            instance.rect.y.0.to_bits().hash(&mut hasher);
+            instance.rect.width.0.to_bits().hash(&mut hasher);
+            instance.rect.height.0.to_bits().hash(&mut hasher);
+            instance.color.hash(&mut hasher);
+        }
+        let instances_hash = hasher.finish();
 
-        self.queue
-            .write_buffer(&self.rect_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        // Check if instance data changed
+        let cached_hash = self.last_rect_instances_hash.load(Ordering::Relaxed);
+        let needs_update = cached_hash != instances_hash;
 
+        if needs_update {
+            // Convert RectInstance to RectInstanceData
+            let instance_data: Vec<RectInstanceData> = instances
+                .iter()
+                .map(|rect| {
+                    RectInstanceData {
+                        rect_pos: [
+                            rect.rect.x.0 * scale_factor,
+                            rect.rect.y.0 * scale_factor,
+                        ],
+                        rect_size: [
+                            rect.rect.width.0 * scale_factor,
+                            rect.rect.height.0 * scale_factor,
+                        ],
+                        color: rect.color,
+                        _padding: 0,
+                    }
+                })
+                .collect();
+
+            // Write instance data to instance buffer
+            self.queue.write_buffer(
+                &self.rect_instance_buffer,
+                0,
+                bytemuck::cast_slice(&instance_data),
+            );
+
+            self.last_rect_instances_hash.store(instances_hash, Ordering::Relaxed);
+        }
+
+        // Always draw (even if buffer didn't change)
         render_pass.set_pipeline(&self.rect_pipeline);
         render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
+        // Slot 0: vertex buffer (unit quad - 6 vertices)
         render_pass.set_vertex_buffer(0, self.rect_vertex_buffer.slice(..));
-        render_pass.draw(0..vertices.len() as u32, 0..1);
+        // Slot 1: instance buffer (per-rect data)
+        render_pass.set_vertex_buffer(1, self.rect_instance_buffer.slice(..));
+        // Draw 6 vertices per instance
+        render_pass.draw(0..6, 0..instances.len() as u32);
     }
 
     /// Draw glyphs with styled rendering at a specific buffer offset
     pub fn draw_glyphs_styled_with_offset(
-        &self,
+        &mut self,
         render_pass: &mut RenderPass,
         instances: &[GlyphInstance],
         use_styled_pipeline: bool,
@@ -1305,27 +1478,23 @@ impl GpuRenderer {
             return;
         }
 
-        if let (Some(themed_pipeline), Some(theme_bind_group), Some(themed_bind_group)) = (
-            &self.themed_glyph_pipeline,
-            &self.theme_bind_group,
-            &self.themed_uniform_bind_group,
-        ) {
-            let vertices = self.generate_glyph_vertices(instances);
-            self.queue.write_buffer(
-                &self.glyph_vertex_buffer,
-                buffer_offset,
-                bytemuck::cast_slice(&vertices),
-            );
+        // Check if themed pipeline is available
+        let has_themed_pipeline = self.themed_glyph_pipeline.is_some()
+            && self.theme_bind_group.is_some()
+            && self.themed_uniform_bind_group.is_some();
 
-            // Uniforms are now updated once per frame in render_with_callback
+        if has_themed_pipeline {
+            // Write vertices (uses cache - only writes if instances changed)
+            let buffer_ptr = &self.glyph_vertex_buffer as *const Buffer;
+            let vertex_count = self.write_cached_vertices(buffer_ptr, buffer_offset, instances);
 
             // Draw with themed pipeline
-            render_pass.set_pipeline(themed_pipeline);
-            render_pass.set_bind_group(0, themed_bind_group, &[]);
+            render_pass.set_pipeline(self.themed_glyph_pipeline.as_ref().unwrap());
+            render_pass.set_bind_group(0, self.themed_uniform_bind_group.as_ref().unwrap(), &[]);
             render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
-            render_pass.set_bind_group(2, theme_bind_group, &[]);
+            render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
             render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(buffer_offset..));
-            render_pass.draw(0..vertices.len() as u32, 0..1);
+            render_pass.draw(0..vertex_count, 0..1);
         } else if use_styled_pipeline {
             panic!("Styled rendering requested but themed pipeline not available! Make sure to call upload_theme_for_interpolation() or upload_theme() first.");
         } else {
@@ -1335,7 +1504,7 @@ impl GpuRenderer {
 
     /// Draw glyphs with styled rendering (token-based or color-based)
     pub fn draw_glyphs_styled(
-        &self,
+        &mut self,
         render_pass: &mut RenderPass,
         instances: &[GlyphInstance],
         use_styled_pipeline: bool,
@@ -1345,7 +1514,7 @@ impl GpuRenderer {
 
     /// Draw line number glyphs using a separate buffer to avoid conflicts
     pub fn draw_line_number_glyphs(
-        &self,
+        &mut self,
         render_pass: &mut RenderPass,
         instances: &[GlyphInstance],
     ) {
@@ -1353,35 +1522,30 @@ impl GpuRenderer {
             return;
         }
 
-        // Uniforms are now updated once per frame in render_with_callback
+        // Write vertices (uses cache - only writes if instances changed)
+        let buffer_ptr = &self.line_number_vertex_buffer as *const Buffer;
+        let vertex_count = self.write_cached_vertices(buffer_ptr, 0, instances);
 
-        let vertices = self.generate_glyph_vertices(instances);
-        self.queue.write_buffer(
-            &self.line_number_vertex_buffer,
-            0,
-            bytemuck::cast_slice(&vertices),
-        );
+        // Check if themed pipeline is available
+        let has_themed_pipeline = self.themed_glyph_pipeline.is_some()
+            && self.theme_bind_group.is_some()
+            && self.themed_uniform_bind_group.is_some();
 
-        // Use themed pipeline if available for proper coloring
-        if let (Some(themed_pipeline), Some(theme_bind_group), Some(themed_bind_group)) = (
-            &self.themed_glyph_pipeline,
-            &self.theme_bind_group,
-            &self.themed_uniform_bind_group,
-        ) {
+        if has_themed_pipeline {
             // Draw with themed pipeline
-            render_pass.set_pipeline(themed_pipeline);
-            render_pass.set_bind_group(0, themed_bind_group, &[]);
+            render_pass.set_pipeline(self.themed_glyph_pipeline.as_ref().unwrap());
+            render_pass.set_bind_group(0, self.themed_uniform_bind_group.as_ref().unwrap(), &[]);
             render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
-            render_pass.set_bind_group(2, theme_bind_group, &[]);
+            render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
             render_pass.set_vertex_buffer(0, self.line_number_vertex_buffer.slice(..));
-            render_pass.draw(0..vertices.len() as u32, 0..1);
+            render_pass.draw(0..vertex_count, 0..1);
         } else {
             // Fall back to basic pipeline
             render_pass.set_pipeline(&self.glyph_pipeline);
             render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
             render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.line_number_vertex_buffer.slice(..));
-            render_pass.draw(0..vertices.len() as u32, 0..1);
+            render_pass.draw(0..vertex_count, 0..1);
         }
     }
 
@@ -1405,6 +1569,58 @@ impl GpuRenderer {
             .collect()
     }
 
+    /// Write vertices to buffer, using cache to avoid regeneration
+    /// Returns vertex count for drawing
+    /// buffer_ptr is the raw pointer to the buffer to write to
+    fn write_cached_vertices(
+        &mut self,
+        buffer_ptr: *const Buffer,
+        offset: u64,
+        instances: &[GlyphInstance],
+    ) -> u32 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let buffer_id = buffer_ptr as usize;
+        let cache_key = (buffer_id, offset);
+
+        // Hash the instances
+        let mut hasher = DefaultHasher::new();
+        for instance in instances {
+            instance.pos.x.0.to_bits().hash(&mut hasher);
+            instance.pos.y.0.to_bits().hash(&mut hasher);
+            // Hash tex_coords as bits (f32 doesn't impl Hash)
+            for &coord in &instance.tex_coords {
+                coord.to_bits().hash(&mut hasher);
+            }
+            instance.token_id.hash(&mut hasher);
+            instance.relative_pos.to_bits().hash(&mut hasher);
+        }
+        let instances_hash = hasher.finish();
+
+        // Check cache
+        let needs_update = self.vertex_cache
+            .get(&cache_key)
+            .map(|(cached_hash, _)| *cached_hash != instances_hash)
+            .unwrap_or(true);
+
+        if needs_update {
+            // Cache miss or stale - generate and write vertices
+            let vertices = self.generate_glyph_vertices(instances);
+            let vertex_count = vertices.len() as u32;
+
+            // Safe to dereference because we know the pointer is valid (it comes from &self.buffer)
+            let buffer = unsafe { &*buffer_ptr };
+            self.queue.write_buffer(buffer, offset, bytemuck::cast_slice(&vertices));
+            self.vertex_cache.insert(cache_key, (instances_hash, vertices));
+
+            vertex_count
+        } else {
+            // Cache hit - skip write, just return count
+            self.vertex_cache.get(&cache_key).unwrap().1.len() as u32
+        }
+    }
+
     /// Get current viewport size
     pub fn viewport_size(&self) -> (f32, f32) {
         (self.config.width as f32, self.config.height as f32)
@@ -1424,7 +1640,7 @@ impl GpuRenderer {
 
     /// Draw glyphs with optional shader effects
     pub fn draw_glyphs(
-        &self,
+        &mut self,
         render_pass: &mut RenderPass,
         instances: &[GlyphInstance],
         shader_id: Option<u32>,
@@ -1433,32 +1649,29 @@ impl GpuRenderer {
             return;
         }
 
-        // Uniforms are now updated once per frame in render_with_callback
+        // Check if we have an effect pipeline
+        let has_effect = shader_id.is_some()
+            && self.effect_pipelines.contains_key(&shader_id.unwrap())
+            && self.effect_bind_groups.contains_key(&shader_id.unwrap());
 
-        let (pipeline, extra_bind_group) = shader_id
-            .and_then(|id| {
-                Some((
-                    self.effect_pipelines.get(&id)?,
-                    Some(self.effect_bind_groups.get(&id)?),
-                ))
-            })
-            .unwrap_or((&self.glyph_pipeline, None));
+        // Write vertices (uses cache - only writes if instances changed)
+        let buffer_ptr = &self.glyph_vertex_buffer as *const Buffer;
+        let vertex_count = self.write_cached_vertices(buffer_ptr, 0, instances);
 
-        let vertices = self.generate_glyph_vertices(instances);
-        self.queue.write_buffer(
-            &self.glyph_vertex_buffer,
-            0,
-            bytemuck::cast_slice(&vertices),
-        );
-
-        render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
-        if let Some(effect_bind_group) = extra_bind_group {
-            render_pass.set_bind_group(2, effect_bind_group, &[]);
+        if has_effect {
+            let id = shader_id.unwrap();
+            render_pass.set_pipeline(self.effect_pipelines.get(&id).unwrap());
+            render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+            render_pass.set_bind_group(2, self.effect_bind_groups.get(&id).unwrap(), &[]);
+        } else {
+            render_pass.set_pipeline(&self.glyph_pipeline);
+            render_pass.set_bind_group(0, &self.rect_uniform_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
         }
+
         render_pass.set_vertex_buffer(0, self.glyph_vertex_buffer.slice(..));
-        render_pass.draw(0..vertices.len() as u32, 0..1);
+        render_pass.draw(0..vertex_count, 0..1);
     }
 
     /// Resize surface when window changes

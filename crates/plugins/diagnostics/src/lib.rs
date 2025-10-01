@@ -1180,7 +1180,7 @@ impl Paintable for DiagnosticsPlugin {
                     let glyphs = self.collect_popup_glyphs(services, ctx.widget_viewport.as_ref());
 
                     if !glyphs.is_empty() && ctx.gpu_renderer != std::ptr::null_mut() {
-                        let gpu_renderer = &*(ctx.gpu_renderer as *const tiny_core::GpuRenderer);
+                        let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
                         // Use a large offset to avoid conflicts with main text buffer
                         // Main text typically uses offsets 0-100KB, so we use 500KB offset
                         let buffer_offset = 500_000;

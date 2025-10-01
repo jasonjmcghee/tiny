@@ -75,6 +75,91 @@ pub struct SetupContext {
     pub registry: PluginRegistry,
 }
 
+/// Helper for vertex buffer caching in Paintable implementations
+///
+/// ## Usage Pattern
+///
+/// Plugins should avoid redundant GPU buffer writes by caching vertex data:
+///
+/// ```rust,ignore
+/// use std::sync::atomic::{AtomicU64, Ordering};
+/// use tiny_sdk::paint_cache;
+/// use ahash::AHasher;
+/// use std::hash::{Hash, Hasher};
+///
+/// struct MyPlugin {
+///     last_vertex_hash: AtomicU64,  // 0 = uninitialized
+///     // ... other fields
+/// }
+///
+/// impl Paintable for MyPlugin {
+///     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
+///         // Hash viewport + plugin-specific state
+///         let mut hasher = AHasher::default();
+///         paint_cache::hash_viewport_base(&mut hasher, &ctx.viewport);
+///         paint_cache::hash_widget_viewport(&mut hasher, &ctx.widget_viewport);
+///
+///         // Add plugin-specific state
+///         my_position.to_bits().hash(&mut hasher);
+///         my_color.hash(&mut hasher);
+///
+///         let state_hash = hasher.finish();
+///
+///         // Check if update needed
+///         let cached = self.last_vertex_hash.load(Ordering::Relaxed);
+///         if cached != state_hash {
+///             // Generate and write vertices
+///             buffer.write(vertex_data);
+///             self.last_vertex_hash.store(state_hash, Ordering::Relaxed);
+///         }
+///
+///         // Always draw (even if buffer unchanged)
+///         render_pass.draw(...);
+///     }
+/// }
+/// ```
+pub mod paint_cache {
+    use std::hash::{Hash, Hasher};
+
+    /// Hash common viewport properties that affect rendering
+    /// Returns a hasher that can be extended with plugin-specific state
+    pub fn hash_viewport_base<H: Hasher>(
+        hasher: &mut H,
+        viewport: &crate::types::ViewportInfo,
+    ) {
+        viewport.scale_factor.to_bits().hash(hasher);
+        viewport.line_height.to_bits().hash(hasher);
+        viewport.font_size.to_bits().hash(hasher);
+        viewport.margin.x.0.to_bits().hash(hasher);
+        viewport.margin.y.0.to_bits().hash(hasher);
+        viewport.logical_size.width.0.to_bits().hash(hasher);
+        viewport.logical_size.height.0.to_bits().hash(hasher);
+    }
+
+    /// Hash widget viewport if present
+    pub fn hash_widget_viewport<H: Hasher>(
+        hasher: &mut H,
+        widget_viewport: &Option<crate::types::WidgetViewport>,
+    ) {
+        if let Some(ref wv) = widget_viewport {
+            wv.bounds.x.0.to_bits().hash(hasher);
+            wv.bounds.y.0.to_bits().hash(hasher);
+            wv.bounds.width.0.to_bits().hash(hasher);
+            wv.bounds.height.0.to_bits().hash(hasher);
+        }
+    }
+
+    /// Complete hash computation for paint context
+    /// Returns a u64 hash suitable for comparison with cached values
+    pub fn hash_paint_context(ctx: &crate::PaintContext) -> u64 {
+        use ahash::AHasher;
+        let mut hasher = AHasher::default();
+        hash_viewport_base(&mut hasher, &ctx.viewport);
+        hash_widget_viewport(&mut hasher, &ctx.widget_viewport);
+        hasher.finish()
+    }
+}
+
 /// Context provided during update
 pub struct UpdateContext {
     /// Access to other plugins' libraries

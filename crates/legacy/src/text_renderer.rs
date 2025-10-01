@@ -362,29 +362,65 @@ impl TextRenderer {
 
             tokens
         } else {
-            // Adjust stable tokens for accumulated edits
-            adjusted_tokens = self.syntax_state.stable_tokens
-                .iter()
-                .map(|t| {
-                    let mut range = t.byte_range.clone();
-                    // Apply each edit delta
-                    for &(edit_pos, delta) in &self.syntax_state.edit_deltas {
-                        if edit_pos <= range.start {
-                            // Edit before token, shift entire range
-                            range.start = ((range.start as isize) + delta).max(0) as usize;
-                            range.end = ((range.end as isize) + delta).max(0) as usize;
-                        } else if edit_pos < range.end {
-                            // Edit within token, only shift end
-                            range.end = ((range.end as isize) + delta).max(edit_pos as isize) as usize;
+            // Early exit: if no edits have accumulated, use stable tokens as-is
+            if self.syntax_state.edit_deltas.is_empty() {
+                &self.syntax_state.stable_tokens
+            } else {
+                // Optimize: sort edit_deltas once and compute cumulative shifts
+                // This reduces from O(tokens * edits) to O(edits log edits + tokens log edits)
+                let mut sorted_edits = self.syntax_state.edit_deltas.clone();
+                sorted_edits.sort_by_key(|&(pos, _)| pos);
+
+                // Build cumulative delta array for efficient binary search
+                // cumulative[i] = sum of all deltas for edits at position <= sorted_edits[i].0
+                let mut cumulative_deltas: Vec<(usize, isize)> = Vec::with_capacity(sorted_edits.len());
+                let mut sum = 0;
+                for &(pos, delta) in &sorted_edits {
+                    sum += delta;
+                    cumulative_deltas.push((pos, sum));
+                }
+
+                // Helper to find cumulative delta at a position using binary search
+                let get_cumulative_at = |pos: usize| -> isize {
+                    match cumulative_deltas.binary_search_by(|&(p, _)| p.cmp(&pos)) {
+                        Ok(idx) => cumulative_deltas[idx].1,
+                        Err(0) => 0, // No edits before this position
+                        Err(idx) => cumulative_deltas[idx - 1].1,
+                    }
+                };
+
+                // Adjust stable tokens using binary search
+                adjusted_tokens = self.syntax_state.stable_tokens
+                    .iter()
+                    .map(|t| {
+                        let original_start = t.byte_range.start;
+                        let original_end = t.byte_range.end;
+
+                        // Find cumulative delta for all edits <= start
+                        // These shift the entire token
+                        let shift_before_start = get_cumulative_at(original_start);
+
+                        // Find cumulative delta for all edits < end
+                        // The difference gives us edits within (start, end) that only shift the end
+                        let shift_before_end = if original_end > 0 {
+                            get_cumulative_at(original_end - 1)
+                        } else {
+                            0
+                        };
+                        let shift_within = shift_before_end - shift_before_start;
+
+                        let new_start = ((original_start as isize) + shift_before_start).max(0) as usize;
+                        let new_end = ((original_end as isize) + shift_before_start + shift_within)
+                            .max(new_start as isize) as usize;
+
+                        TokenRange {
+                            byte_range: new_start..new_end,
+                            token_id: t.token_id,
                         }
-                    }
-                    TokenRange {
-                        byte_range: range,
-                        token_id: t.token_id,
-                    }
-                })
-                .collect();
-            &adjusted_tokens
+                    })
+                    .collect();
+                &adjusted_tokens
+            }
         };
 
         // Clear all tokens before applying

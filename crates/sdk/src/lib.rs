@@ -12,8 +12,8 @@
 
 // Re-export all traits
 pub use crate::traits::{
-    Capability, Configurable, Hook, Initializable, Library, PaintContext, Paintable, Plugin,
-    PluginError, PluginRegistry, SetupContext, Spatial, Updatable, UpdateContext,
+    paint_cache, Capability, Configurable, Hook, Initializable, Library, PaintContext, Paintable,
+    Plugin, PluginError, PluginRegistry, SetupContext, Spatial, Updatable, UpdateContext,
 };
 
 // Re-export all types

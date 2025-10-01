@@ -14,15 +14,15 @@ use tiny_sdk::types::{GlyphInstance, LayoutPos, PhysicalPos, PhysicalSizeF};
 /// Helper to expand tabs to spaces
 fn expand_tabs(text: &str) -> String {
     const TAB_WIDTH: usize = 4;
-    let mut result = String::new();
+    const SPACES: &str = "    "; // Pre-allocated 4 spaces
+
+    let mut result = String::with_capacity(text.len() + (text.len() / 8)); // Estimate extra space for tabs
     let mut column = 0;
 
     for ch in text.chars() {
         if ch == '\t' {
             let spaces_needed = TAB_WIDTH - (column % TAB_WIDTH);
-            for _ in 0..spaces_needed {
-                result.push(' ');
-            }
+            result.push_str(&SPACES[..spaces_needed]);
             column += spaces_needed;
         } else if ch == '\n' {
             result.push(ch);
@@ -32,7 +32,6 @@ fn expand_tabs(text: &str) -> String {
             column += 1;
         }
     }
-
     result
 }
 
@@ -76,6 +75,8 @@ pub struct FontSystem {
     row_height: u32,
     /// Approx character width coefficient to multiply by the font for fast calculations
     char_width_coef: f32,
+    /// Dirty flag - set when atlas changes and needs GPU upload
+    dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -111,6 +112,7 @@ impl FontSystem {
             next_y: 0,
             row_height: 0,
             char_width_coef: 0.0,
+            dirty: true, // Initially dirty - needs upload
         };
 
         // Get the monospace advance width by measuring a single character
@@ -313,6 +315,9 @@ impl FontSystem {
         self.next_x += metrics.width as u32 + 1; // 1px padding
         self.row_height = self.row_height.max(metrics.height as u32 + 1);
 
+        // Mark atlas as dirty - needs GPU upload
+        self.dirty = true;
+
         // Cache and return
         self.glyph_cache.insert(key, entry);
         entry
@@ -361,6 +366,18 @@ impl FontSystem {
         self.row_height = 0;
         // Clear atlas data
         self.atlas_data.fill(0);
+        // Mark as dirty - needs GPU upload
+        self.dirty = true;
+    }
+
+    /// Check if atlas needs GPU upload
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Clear dirty flag after GPU upload
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 }
 
@@ -462,6 +479,16 @@ impl SharedFontSystem {
     /// Get atlas size
     pub fn atlas_size(&self) -> (u32, u32) {
         self.inner.lock().atlas_size()
+    }
+
+    /// Check if atlas needs GPU upload
+    pub fn is_dirty(&self) -> bool {
+        self.inner.lock().is_dirty()
+    }
+
+    /// Clear dirty flag after GPU upload
+    pub fn clear_dirty(&self) {
+        self.inner.lock().clear_dirty()
     }
 
     /// Hit test: find character position at x coordinate using binary search

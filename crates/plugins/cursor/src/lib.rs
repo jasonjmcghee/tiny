@@ -12,6 +12,8 @@ use tiny_sdk::{
     Capability, Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext, Updatable, UpdateContext, ViewportInfo,
 };
+use ahash::AHasher;
+use std::hash::{Hash, Hasher};
 
 /// API exposed by cursor plugin
 pub struct CursorAPI {
@@ -90,9 +92,19 @@ pub struct CursorPlugin {
     // GPU resources (created during setup)
     vertex_buffer: Option<Buffer>,
     vertex_buffer_id: Option<tiny_sdk::ffi::BufferId>,
+    uniform_buffer_id: Option<tiny_sdk::ffi::BufferId>,
+    bind_group_id: Option<tiny_sdk::ffi::BindGroupId>,
     custom_pipeline_id: Option<PipelineId>,
     device: Option<std::sync::Arc<wgpu::Device>>,
     queue: Option<std::sync::Arc<wgpu::Queue>>,
+
+    // Vertex cache to avoid redundant writes (0 = uninitialized)
+    last_vertex_hash: AtomicU64,
+
+    // Uniform cache to avoid redundant writes
+    last_visibility: std::sync::atomic::AtomicBool,
+    last_viewport_size: std::sync::atomic::AtomicU64, // packed width|height as u32s
+    last_color: std::sync::atomic::AtomicU32,
 }
 
 impl CursorPlugin {
@@ -122,9 +134,15 @@ impl CursorPlugin {
             },
             vertex_buffer: None,
             vertex_buffer_id: None,
+            uniform_buffer_id: None,
+            bind_group_id: None,
             custom_pipeline_id: None,
             device: None,
             queue: None,
+            last_vertex_hash: AtomicU64::new(0),
+            last_visibility: std::sync::atomic::AtomicBool::new(false),
+            last_viewport_size: std::sync::atomic::AtomicU64::new(0),
+            last_color: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -173,13 +191,6 @@ impl CursorPlugin {
         viewport: &tiny_sdk::ViewportInfo,
         position: tiny_sdk::LayoutPos,
     ) -> Vec<CursorVertex> {
-        let visible = self.calculate_visibility();
-        let color = if visible {
-            self.config.style.color
-        } else {
-            0x00000000
-        };
-
         // Use viewport's line height (in logical pixels)
         let line_height = viewport.line_height * self.config.style.height_scale;
 
@@ -192,43 +203,34 @@ impl CursorPlugin {
         let w = self.config.style.width * scale;
         let h = line_height * scale;
 
-        // Create two triangles for a quad
+        // Create two triangles for a quad (no color - it's in uniforms)
         vec![
-            CursorVertex {
-                position: [x, y],
-                color,
-            },
-            CursorVertex {
-                position: [x + w, y],
-                color,
-            },
-            CursorVertex {
-                position: [x, y + h],
-                color,
-            },
-            CursorVertex {
-                position: [x + w, y],
-                color,
-            },
-            CursorVertex {
-                position: [x + w, y + h],
-                color,
-            },
-            CursorVertex {
-                position: [x, y + h],
-                color,
-            },
+            CursorVertex { position: [x, y] },
+            CursorVertex { position: [x + w, y] },
+            CursorVertex { position: [x, y + h] },
+            CursorVertex { position: [x + w, y] },
+            CursorVertex { position: [x + w, y + h] },
+            CursorVertex { position: [x, y + h] },
         ]
     }
 }
 
-/// Vertex data for cursor rendering
+/// Vertex data for cursor rendering (position only - color is uniform)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "self::bytemuck")]
 struct CursorVertex {
     position: [f32; 2],
+}
+
+/// Cursor uniforms for shader
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[bytemuck(crate = "self::bytemuck")]
+struct CursorUniforms {
+    viewport_size: [f32; 2],
     color: u32,
+    alpha: f32,
 }
 
 // === Plugin Trait Implementation ===
@@ -300,16 +302,28 @@ impl Initializable for CursorPlugin {
 
         // Also create an FFI buffer ID for reuse
         use tiny_sdk::ffi::BufferId;
-        eprintln!(
-            "CursorPlugin: About to create FFI buffer with size {}",
-            buffer_size
-        );
         let buffer_id = BufferId::create(
             buffer_size,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
-        eprintln!("CursorPlugin: Created FFI buffer ID: {:?}", buffer_id);
         self.vertex_buffer_id = Some(buffer_id);
+
+        // Create uniform buffer for color and alpha
+        let uniform_size = std::mem::size_of::<CursorUniforms>() as u64;
+        let uniform_buffer_id = BufferId::create(
+            uniform_size,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        self.uniform_buffer_id = Some(uniform_buffer_id);
+
+        // Create bind group layout for uniforms
+        use tiny_sdk::ffi::BindGroupLayoutId;
+        let bind_group_layout = BindGroupLayoutId::create_uniform();
+
+        // Create bind group with our uniform buffer
+        use tiny_sdk::ffi::BindGroupId;
+        let bind_group = BindGroupId::create_with_buffer(bind_group_layout, uniform_buffer_id);
+        self.bind_group_id = Some(bind_group);
 
         // Create custom shader for cursor rendering
         let shader_source = include_str!("shader.wgsl");
@@ -317,11 +331,24 @@ impl Initializable for CursorPlugin {
         // Create shader modules
         let shader_id = ShaderModuleId::create_from_wgsl(shader_source);
 
-        // Create pipeline with the same shader for vertex and fragment
-        let pipeline_id = PipelineId::create_simple(shader_id, shader_id);
+        // Create pipeline with custom vertex layout (position only, no color)
+        use tiny_sdk::ffi::{VertexAttributeDescriptor, VertexFormat};
+        let attributes = vec![VertexAttributeDescriptor {
+            offset: 0,
+            location: 0,
+            format: VertexFormat::Float32x2, // position
+        }];
+
+        let pipeline_id = PipelineId::create_with_layout(
+            shader_id,
+            shader_id,
+            bind_group_layout,
+            8, // stride: just position (8 bytes)
+            &attributes,
+        );
         self.custom_pipeline_id = Some(pipeline_id);
 
-        eprintln!("Cursor plugin created custom pipeline");
+        eprintln!("Cursor plugin created custom pipeline with uniform-based color/alpha");
 
         Ok(())
     }
@@ -397,45 +424,100 @@ impl Paintable for CursorPlugin {
             );
         }
 
-        // Create vertices for current frame
-        let vertices = self.create_vertices_at_position(&ctx.viewport, pos);
-        if vertices.is_empty() {
-            return;
+        // Compute hash of all relevant state (geometry only - not visibility)
+        // Visibility is now a uniform, so blinking doesn't trigger vertex buffer writes
+        let mut hasher = AHasher::default();
+        tiny_sdk::paint_cache::hash_viewport_base(&mut hasher, &ctx.viewport);
+        tiny_sdk::paint_cache::hash_widget_viewport(&mut hasher, &ctx.widget_viewport);
+
+        // Hash cursor-specific geometry state only
+        pos.x.0.to_bits().hash(&mut hasher);
+        pos.y.0.to_bits().hash(&mut hasher);
+        // Note: color is NOT hashed - it's a uniform and can change without regenerating vertices
+        self.config.style.width.to_bits().hash(&mut hasher);
+        self.config.style.height_scale.to_bits().hash(&mut hasher);
+        self.config.style.x_offset.to_bits().hash(&mut hasher);
+        let state_hash = hasher.finish();
+
+        // Check if we need to update the vertex buffer (geometry changed)
+        let cached_hash = self.last_vertex_hash.load(Ordering::Relaxed);
+        let needs_update = cached_hash != state_hash;
+
+        if needs_update {
+            // Create vertices for current frame (position only)
+            let vertices = self.create_vertices_at_position(&ctx.viewport, pos);
+            if vertices.is_empty() {
+                return;
+            }
+
+            let vertex_data = bytemuck::cast_slice(&vertices);
+
+            // Write updated vertex data to the buffer
+            if let Some(buffer_id) = self.vertex_buffer_id {
+                buffer_id.write(0, vertex_data);
+                self.last_vertex_hash.store(state_hash, Ordering::Relaxed);
+            } else {
+                eprintln!("No FFI buffer ID available - cursor not properly initialized");
+                return;
+            }
         }
 
-        // eprintln!("Rendering {} vertices with color {:#010x}", vertices.len(), vertices[0].color);
+        // Update uniforms only when they change (viewport, color, visibility alpha)
+        let visible = self.calculate_visibility();
+        let viewport_width = ctx.viewport.physical_size.width;
+        let viewport_height = ctx.viewport.physical_size.height;
+        let color = self.config.style.color;
 
-        let vertex_data = bytemuck::cast_slice(&vertices);
-        let vertex_count = vertices.len() as u32;
+        // Pack viewport size for atomic comparison
+        let packed_viewport = ((viewport_width as u64) << 32) | (viewport_height as u64);
 
-        // Reuse the existing FFI buffer created during setup
+        // Check if any uniform values changed
+        let visibility_changed = self.last_visibility.load(Ordering::Relaxed) != visible;
+        let viewport_changed = self.last_viewport_size.load(Ordering::Relaxed) != packed_viewport;
+        let color_changed = self.last_color.load(Ordering::Relaxed) != color;
+
+        if visibility_changed || viewport_changed || color_changed {
+            let alpha = if visible { 1.0 } else { 0.0 };
+
+            let uniforms = CursorUniforms {
+                viewport_size: [viewport_width as f32, viewport_height as f32],
+                color,
+                alpha,
+            };
+
+            if let Some(uniform_buffer_id) = self.uniform_buffer_id {
+                uniform_buffer_id.write(0, bytemuck::cast_slice(&[uniforms]));
+            }
+
+            // Update cached values
+            self.last_visibility.store(visible, Ordering::Relaxed);
+            self.last_viewport_size.store(packed_viewport, Ordering::Relaxed);
+            self.last_color.store(color, Ordering::Relaxed);
+        }
+
+        // Always draw, even if we didn't update the vertex buffer
+        let vertex_count = 6; // 2 triangles = 6 vertices
+
+        // Draw with our custom pipeline and bind group
         if let Some(buffer_id) = self.vertex_buffer_id {
-            // Write updated vertex data to the existing buffer
-            buffer_id.write(0, vertex_data);
-            // eprintln!("Updated reusable buffer via FFI");
-
-            // Use atomic render operations with our custom pipeline
             if let Some(ref gpu_ctx) = ctx.gpu_context {
-                if let Some(pipeline_id) = self.custom_pipeline_id {
+                if let (Some(pipeline_id), Some(bind_group_id)) =
+                    (self.custom_pipeline_id, self.bind_group_id)
+                {
                     // Use our custom pipeline
                     gpu_ctx.set_pipeline(render_pass, pipeline_id);
-                    // Use the host's uniform bind group for viewport transforms
-                    gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
+                    // Use our own uniform bind group (with color/alpha)
+                    gpu_ctx.set_bind_group(render_pass, 0, bind_group_id);
                     // Set our vertex buffer
                     gpu_ctx.set_vertex_buffer(render_pass, 0, buffer_id);
                     // Draw!
                     gpu_ctx.draw(render_pass, vertex_count, 1);
-                    // eprintln!("Drew cursor with custom pipeline");
                 } else {
-                    // Fallback to old method if custom pipeline not available
-                    gpu_ctx.draw_vertices(render_pass, buffer_id, vertex_count);
-                    // eprintln!("Drew vertices via FFI (fallback)");
+                    eprintln!("Cursor pipeline or bind group not available");
                 }
             } else {
                 eprintln!("No GPU context - cannot use FFI draw");
             }
-        } else {
-            eprintln!("No FFI buffer ID available - cursor not properly initialized");
         }
     }
 }

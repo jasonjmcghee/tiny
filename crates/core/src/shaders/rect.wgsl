@@ -1,4 +1,5 @@
-// Rectangle shader for drawing filled rectangles
+// Rectangle shader using instanced rendering
+// Each instance is a rect with its own position, size, and color
 
 struct Uniforms {
     viewport_size: vec2<f32>,
@@ -14,16 +15,22 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(
-    @location(0) position: vec2<f32>,
-    @location(1) color: u32,
+    // Vertex data: unit quad corner (0-1 range)
+    @location(0) vertex_pos: vec2<f32>,
+    // Instance data: per-rect position, size, and color
+    @location(1) rect_pos: vec2<f32>,
+    @location(2) rect_size: vec2<f32>,
+    @location(3) color: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
 
+    // Scale unit quad to rect size and translate to rect position
+    let pixel_pos = rect_pos + vertex_pos * rect_size;
+
     // Convert position from pixel coords to clip space
-    // Map [0, viewport_width] to [-1, 1] and [0, viewport_height] to [1, -1]
     out.clip_position = vec4<f32>(
-        (position.x / uniforms.viewport_size.x) * 2.0 - 1.0,
-        1.0 - (position.y / uniforms.viewport_size.y) * 2.0,
+        (pixel_pos.x / uniforms.viewport_size.x) * 2.0 - 1.0,
+        1.0 - (pixel_pos.y / uniforms.viewport_size.y) * 2.0,
         0.0,
         1.0
     );

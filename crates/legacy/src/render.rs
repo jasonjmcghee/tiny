@@ -603,7 +603,7 @@ impl Renderer {
         let scroll_changed = current_scroll != self.last_scroll;
         if scroll_changed {
             self.glyphs_dirty = true;
-            self.line_numbers_dirty = true;
+            // Don't mark line_numbers_dirty - they cache scroll internally
             self.last_scroll = current_scroll;
         }
 
@@ -713,7 +713,7 @@ impl Renderer {
 
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
-                        let gpu_renderer = &*gpu;
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         // Use line number buffer for all UI (separate from main text)
                         gpu_renderer.draw_line_number_glyphs(pass, &all_ui_glyphs);
                     }
@@ -757,36 +757,42 @@ impl Renderer {
             // Check if tree-sitter completed a parse since last update
             let fresh_parse =
                 highlighter.cached_version() > self.text_renderer.syntax_state.stable_version;
-            let has_stable = !self.text_renderer.syntax_state.stable_tokens.is_empty();
 
-            let tokens: Vec<_> = if fresh_parse {
-                // Tree-sitter has caught up - query it for fresh tokens
-                let text = tree.flatten_to_string();
-                let effects = highlighter.get_visible_effects(&text, 0..text.len());
-                effects
-                    .into_iter()
-                    .filter_map(|e| match e.effect {
-                        text_effects::EffectType::Token(id) => Some(text_renderer::TokenRange {
-                            byte_range: e.range,
-                            token_id: id,
-                        }),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                // Use stable tokens from last parse with edit adjustment
-                self.text_renderer
-                    .syntax_state
-                    .stable_tokens
-                    .iter()
-                    .map(|t| text_renderer::TokenRange {
-                        byte_range: t.byte_range.clone(),
-                        token_id: t.token_id,
-                    })
-                    .collect()
-            };
+            // Only update syntax if there's something new to apply:
+            // - Fresh parse has new tokens from tree-sitter
+            // - OR there are accumulated edits to adjust stable tokens with
+            let needs_update = fresh_parse || !self.text_renderer.syntax_state.edit_deltas.is_empty();
 
-            self.text_renderer.update_syntax(&tokens, fresh_parse);
+            if needs_update {
+                let tokens: Vec<_> = if fresh_parse {
+                    // Tree-sitter has caught up - query it for fresh tokens
+                    let text = tree.flatten_to_string();
+                    let effects = highlighter.get_visible_effects(&text, 0..text.len());
+                    effects
+                        .into_iter()
+                        .filter_map(|e| match e.effect {
+                            text_effects::EffectType::Token(id) => Some(text_renderer::TokenRange {
+                                byte_range: e.range,
+                                token_id: id,
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    // Use stable tokens from last parse with edit adjustment
+                    self.text_renderer
+                        .syntax_state
+                        .stable_tokens
+                        .iter()
+                        .map(|t| text_renderer::TokenRange {
+                            byte_range: t.byte_range.clone(),
+                            token_id: t.token_id,
+                        })
+                        .collect()
+                };
+
+                self.text_renderer.update_syntax(&tokens, fresh_parse);
+            }
         }
 
         self.text_renderer
@@ -900,6 +906,7 @@ impl Renderer {
         if let Some(pass) = render_pass.as_mut() {
             if let Some(gpu_ptr) = self.gpu_renderer {
                 let gpu_renderer = unsafe { &*gpu_ptr };
+                let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
 
                 // Always use text_renderer for main document rendering
                 let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
@@ -907,7 +914,6 @@ impl Renderer {
                 if gpu_renderer.has_styled_pipeline() && !visible_glyphs.is_empty() {
                     let style_buffer: Vec<u32> =
                         visible_glyphs.iter().map(|g| g.token_id as u32).collect();
-                    let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
                     gpu_mut.upload_style_buffer_u32(&style_buffer);
                 }
 
@@ -944,7 +950,7 @@ impl Renderer {
                         glyph_instances.len(),
                         use_styled
                     );
-                    gpu_renderer.draw_glyphs_styled(pass, &glyph_instances, use_styled);
+                    gpu_mut.draw_glyphs_styled(pass, &glyph_instances, use_styled);
                 }
 
                 // Still handle inline spatial widgets
@@ -1139,7 +1145,7 @@ impl Renderer {
                 // println!("Drawing ALL {} glyphs in one batch (styled={})",
                 // self.accumulated_glyphs.len(), use_styled);
 
-                gpu_renderer.draw_glyphs_styled(pass, &self.accumulated_glyphs, use_styled);
+                gpu_mut.draw_glyphs_styled(pass, &self.accumulated_glyphs, use_styled);
             }
         }
     }

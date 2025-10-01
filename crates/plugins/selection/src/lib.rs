@@ -1,6 +1,7 @@
 //! Selection Plugin - Visual highlight for selected text
 
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
@@ -14,6 +15,8 @@ use tiny_sdk::{
     Capability, Configurable, Initializable, LayoutRect, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext, ViewPos, ViewportInfo,
 };
+use ahash::AHasher;
+use std::hash::{Hash, Hasher};
 
 /// Single selection with start and end positions
 #[derive(Debug, Clone)]
@@ -63,6 +66,9 @@ pub struct SelectionPlugin {
     custom_pipeline_id: Option<PipelineId>,
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
+
+    // Vertex cache to avoid redundant writes (0 = uninitialized)
+    last_vertex_hash: AtomicU64,
 }
 
 impl SelectionPlugin {
@@ -91,6 +97,7 @@ impl SelectionPlugin {
             custom_pipeline_id: None,
             device: None,
             queue: None,
+            last_vertex_hash: AtomicU64::new(0),
         }
     }
 
@@ -468,44 +475,78 @@ impl Paintable for SelectionPlugin {
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Transform selections to screen coordinates if we have widget viewport
-        let transformed_selections = if let Some(ref widget_viewport) = ctx.widget_viewport {
-            let offset_x = widget_viewport.bounds.x.0;
-            let offset_y = widget_viewport.bounds.y.0;
+        // Compute hash of all relevant state (viewport + plugin-specific state)
+        let mut hasher = AHasher::default();
+        tiny_sdk::paint_cache::hash_viewport_base(&mut hasher, &ctx.viewport);
+        tiny_sdk::paint_cache::hash_widget_viewport(&mut hasher, &ctx.widget_viewport);
 
-            self.selections.iter().map(|sel| {
-                Selection {
-                    start: ViewPos::new(
-                        sel.start.x.0 + offset_x,
-                        sel.start.y.0 + offset_y,
-                    ),
-                    end: ViewPos::new(
-                        sel.end.x.0 + offset_x,
-                        sel.end.y.0 + offset_y,
-                    ),
-                }
-            }).collect()
+        // Hash selection-specific state
+        for sel in &self.selections {
+            sel.start.x.0.to_bits().hash(&mut hasher);
+            sel.start.y.0.to_bits().hash(&mut hasher);
+            sel.end.x.0.to_bits().hash(&mut hasher);
+            sel.end.y.0.to_bits().hash(&mut hasher);
+        }
+        self.config.style.color.hash(&mut hasher);
+
+        let state_hash = hasher.finish();
+
+        // Check if we need to update the vertex buffer
+        let cached_hash = self.last_vertex_hash.load(Ordering::Relaxed);
+        let needs_update = cached_hash != state_hash;
+
+        let vertex_count = if needs_update {
+            // Transform selections to screen coordinates if we have widget viewport
+            let transformed_selections = if let Some(ref widget_viewport) = ctx.widget_viewport {
+                let offset_x = widget_viewport.bounds.x.0;
+                let offset_y = widget_viewport.bounds.y.0;
+
+                self.selections.iter().map(|sel| {
+                    Selection {
+                        start: ViewPos::new(
+                            sel.start.x.0 + offset_x,
+                            sel.start.y.0 + offset_y,
+                        ),
+                        end: ViewPos::new(
+                            sel.end.x.0 + offset_x,
+                            sel.end.y.0 + offset_y,
+                        ),
+                    }
+                }).collect()
+            } else {
+                self.selections.clone()
+            };
+
+            // Create vertices for current frame with transformed selections
+            let vertices = self.create_vertices_for_selections(&ctx.viewport, &transformed_selections);
+            if vertices.is_empty() {
+                return;
+            }
+
+            let vertex_data = bytemuck::cast_slice(&vertices);
+            let vertex_count = vertices.len() as u32;
+
+            // Write to buffer
+            if let Some(buffer_id) = self.vertex_buffer_id {
+                buffer_id.write(0, vertex_data);
+                self.last_vertex_hash.store(state_hash, Ordering::Relaxed);
+            } else {
+                eprintln!("  ERROR: No vertex buffer ID!");
+                return;
+            }
+
+            vertex_count
         } else {
-            self.selections.clone()
+            // Use cached vertex count (selections.len() * 6 vertices per selection)
+            (self.selections.len() * 6) as u32
         };
 
-        // Create vertices for current frame with transformed selections
-        let vertices = self.create_vertices_for_selections(&ctx.viewport, &transformed_selections);
-        if vertices.is_empty() {
+        if vertex_count == 0 {
             return;
         }
 
-        let vertex_data = bytemuck::cast_slice(&vertices);
-        let vertex_count = vertices.len() as u32;
-
-        // Check if we need a larger buffer
-        let _required_size = vertex_data.len() as u64;
-
-        // Recreate buffer if needed
+        // Always draw, even if we didn't update the buffer
         if let Some(buffer_id) = self.vertex_buffer_id {
-            // For now, just write to existing buffer - could check size first
-            buffer_id.write(0, vertex_data);
-
             // Use atomic render operations with our custom pipeline
             if let Some(ref gpu_ctx) = ctx.gpu_context {
                 if let Some(pipeline_id) = self.custom_pipeline_id {
@@ -525,8 +566,6 @@ impl Paintable for SelectionPlugin {
             } else {
                 eprintln!("  ERROR: No GPU context available!");
             }
-        } else {
-            eprintln!("  ERROR: No vertex buffer ID!");
         }
     }
 }

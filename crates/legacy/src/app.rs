@@ -1393,11 +1393,14 @@ impl<T: AppLogic> TinyApp<T> {
                 // No longer need margin - editor bounds are handled properly in renderer
             }
 
-            // Upload font atlas
+            // Upload font atlas only if dirty (atlas changed)
             if let Some(font_system) = &self.font_system {
-                let atlas_data = font_system.atlas_data();
-                let (atlas_width, atlas_height) = font_system.atlas_size();
-                gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+                if font_system.is_dirty() {
+                    let atlas_data = font_system.atlas_data();
+                    let (atlas_width, atlas_height) = font_system.atlas_size();
+                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+                    font_system.clear_dirty();
+                }
             }
 
             let doc = self.logic.doc();
