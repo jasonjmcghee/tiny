@@ -27,6 +27,201 @@ pub enum InputAction {
     Redo,
 }
 
+/// Input mode (for vim-like modal editing support)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputMode {
+    /// Default mode - all standard editor shortcuts work
+    Insert,
+    /// Vim-like normal mode - navigation and commands
+    Normal,
+    /// Vim-like visual mode - text selection
+    Visual,
+    /// Custom modes for extensions
+    Custom(&'static str),
+}
+
+impl Default for InputMode {
+    fn default() -> Self {
+        Self::Insert
+    }
+}
+
+/// Editor actions that can be bound to keys
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditorAction {
+    // Text insertion
+    InsertCharacter(String),
+    InsertNewline,
+    InsertTab,
+    InsertSpace,
+
+    // Deletion
+    DeleteBackward,
+    DeleteForward,
+
+    // Clipboard
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+
+    // Cursor movement
+    MoveLeft { extending: bool },
+    MoveRight { extending: bool },
+    MoveUp { extending: bool },
+    MoveDown { extending: bool },
+    MoveToLineStart { extending: bool },
+    MoveToLineEnd { extending: bool },
+    PageUp { extending: bool },
+    PageDown { extending: bool },
+
+    // History
+    Undo,
+    Redo,
+
+    // File operations
+    Save,
+
+    // Navigation
+    GoToDefinition,
+    NavigateBack,
+    NavigateForward,
+
+    // App-level
+    OpenFilePicker,
+
+    // Mode switching
+    EnterMode(InputMode),
+
+    // No action
+    None,
+}
+
+/// A key pattern for matching keyboard input
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyPattern {
+    key_type: String,  // "character" or "named"
+    key_value: String, // the actual key
+    cmd: bool,
+    shift: bool,
+    alt: bool,
+    mode: InputMode,  // Which mode this binding applies to
+}
+
+impl KeyPattern {
+    pub fn character(ch: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> Self {
+        Self {
+            key_type: "character".to_string(),
+            key_value: ch.to_string(),
+            cmd,
+            shift,
+            alt,
+            mode,
+        }
+    }
+
+    pub fn named(key: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> Self {
+        Self {
+            key_type: "named".to_string(),
+            key_value: key.to_string(),
+            cmd,
+            shift,
+            alt,
+            mode,
+        }
+    }
+
+    fn matches(&self, key_type: &str, key_value: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> bool {
+        self.key_type == key_type
+            && self.key_value == key_value
+            && self.cmd == cmd
+            && self.shift == shift
+            && self.alt == alt
+            && self.mode == mode
+    }
+}
+
+/// Centralized key bindings configuration
+pub struct KeyBindings {
+    bindings: Vec<(KeyPattern, EditorAction)>,
+}
+
+impl KeyBindings {
+    pub fn default() -> Self {
+        let mut bindings = Vec::new();
+        let insert = InputMode::Insert;
+
+        // Cmd+Key combinations (order matters for shift variants)
+        bindings.push((KeyPattern::character("z", true, true, false, insert), EditorAction::Redo));
+        bindings.push((KeyPattern::character("z", true, false, false, insert), EditorAction::Undo));
+        bindings.push((KeyPattern::character("s", true, false, false, insert), EditorAction::Save));
+        bindings.push((KeyPattern::character("c", true, false, false, insert), EditorAction::Copy));
+        bindings.push((KeyPattern::character("x", true, false, false, insert), EditorAction::Cut));
+        bindings.push((KeyPattern::character("v", true, false, false, insert), EditorAction::Paste));
+        bindings.push((KeyPattern::character("a", true, false, false, insert), EditorAction::SelectAll));
+        bindings.push((KeyPattern::character("b", true, false, false, insert), EditorAction::GoToDefinition));
+        bindings.push((KeyPattern::character("[", true, false, false, insert), EditorAction::NavigateBack));
+        bindings.push((KeyPattern::character("]", true, false, false, insert), EditorAction::NavigateForward));
+
+        // Named keys without modifiers
+        bindings.push((KeyPattern::named("Enter", false, false, false, insert), EditorAction::InsertNewline));
+        bindings.push((KeyPattern::named("Tab", false, false, false, insert), EditorAction::InsertTab));
+        bindings.push((KeyPattern::named("Space", false, false, false, insert), EditorAction::InsertSpace));
+        bindings.push((KeyPattern::named("Backspace", false, false, false, insert), EditorAction::DeleteBackward));
+        bindings.push((KeyPattern::named("Delete", false, false, false, insert), EditorAction::DeleteForward));
+
+        // Arrow keys with optional shift (extending selection)
+        for shift in [false, true] {
+            bindings.push((KeyPattern::named("ArrowLeft", false, shift, false, insert), EditorAction::MoveLeft { extending: shift }));
+            bindings.push((KeyPattern::named("ArrowRight", false, shift, false, insert), EditorAction::MoveRight { extending: shift }));
+            bindings.push((KeyPattern::named("ArrowUp", false, shift, false, insert), EditorAction::MoveUp { extending: shift }));
+            bindings.push((KeyPattern::named("ArrowDown", false, shift, false, insert), EditorAction::MoveDown { extending: shift }));
+            bindings.push((KeyPattern::named("Home", false, shift, false, insert), EditorAction::MoveToLineStart { extending: shift }));
+            bindings.push((KeyPattern::named("End", false, shift, false, insert), EditorAction::MoveToLineEnd { extending: shift }));
+            bindings.push((KeyPattern::named("PageUp", false, shift, false, insert), EditorAction::PageUp { extending: shift }));
+            bindings.push((KeyPattern::named("PageDown", false, shift, false, insert), EditorAction::PageDown { extending: shift }));
+        }
+
+        Self { bindings }
+    }
+
+    pub fn lookup(&self, key_type: &str, key_value: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> EditorAction {
+        // First try to find a mode-specific binding
+        for (pattern, action) in &self.bindings {
+            if pattern.matches(key_type, key_value, cmd, shift, alt, mode) {
+                return action.clone();
+            }
+        }
+
+        // Fallback: regular character insertion in Insert mode only (no modifiers, not control chars)
+        if mode == InputMode::Insert && key_type == "character" && !cmd && !alt && !key_value.chars().any(|c| c.is_control()) {
+            return EditorAction::InsertCharacter(key_value.to_string());
+        }
+
+        EditorAction::None
+    }
+
+    /// Add a new binding (for runtime customization)
+    pub fn add_binding(&mut self, pattern: KeyPattern, action: EditorAction) {
+        self.bindings.push((pattern, action));
+    }
+
+    /// Create a vim-like binding set (example of how to extend)
+    pub fn with_vim_bindings(mut self) -> Self {
+        let normal = InputMode::Normal;
+
+        // Example vim normal mode bindings - users can extend this
+        self.bindings.push((KeyPattern::character("h", false, false, false, normal), EditorAction::MoveLeft { extending: false }));
+        self.bindings.push((KeyPattern::character("j", false, false, false, normal), EditorAction::MoveDown { extending: false }));
+        self.bindings.push((KeyPattern::character("k", false, false, false, normal), EditorAction::MoveUp { extending: false }));
+        self.bindings.push((KeyPattern::character("l", false, false, false, normal), EditorAction::MoveRight { extending: false }));
+        self.bindings.push((KeyPattern::character("i", false, false, false, normal), EditorAction::EnterMode(InputMode::Insert)));
+        self.bindings.push((KeyPattern::named("Escape", false, false, false, InputMode::Insert), EditorAction::EnterMode(InputMode::Normal)));
+
+        self
+    }
+}
+
 /// Selection with cursor and anchor in document coordinates
 #[derive(Clone)]
 pub struct Selection {
@@ -368,6 +563,10 @@ pub struct InputHandler {
     /// Double-shift detection for file picker
     last_shift_press: Option<Instant>,
     shift_currently_pressed: bool,
+    /// Current input mode (for vim-like modal editing)
+    current_mode: InputMode,
+    /// Key bindings configuration
+    key_bindings: KeyBindings,
 }
 
 impl InputHandler {
@@ -399,6 +598,30 @@ impl InputHandler {
             last_checkpoint_time: None,
             last_shift_press: None,
             shift_currently_pressed: false,
+            current_mode: InputMode::default(),
+            key_bindings: KeyBindings::default(),
+        }
+    }
+
+    /// Get current input mode
+    pub fn current_mode(&self) -> InputMode {
+        self.current_mode
+    }
+
+    /// Set input mode (for external mode switching)
+    pub fn set_mode(&mut self, mode: InputMode) {
+        self.current_mode = mode;
+    }
+
+    /// Helper to convert byte offset to DocPos
+    fn byte_to_doc_pos(&self, tree: &tiny_core::tree::Tree, byte_offset: usize) -> DocPos {
+        let line = tree.byte_to_line(byte_offset);
+        let line_start_byte = tree.line_to_byte(line).unwrap_or(0);
+        let column = tree.get_text_slice(line_start_byte..byte_offset).chars().count() as u32;
+        DocPos {
+            line,
+            column,
+            byte_offset: 0,
         }
     }
 
@@ -460,409 +683,233 @@ impl InputHandler {
         bus: &mut EventBus,
     ) -> InputAction {
         match event.name.as_str() {
-            "app.keyboard.keypress" => {
-                let state = event
-                    .data
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-
-                // Track Shift key specifically for double-shift detection
-                if let Some(key_obj) = event.data.get("key") {
-                    let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
-
-                    // Check if this is the Shift key itself (named key "Shift")
-                    if key_type == "named" && key_value == "Shift" {
-                        if state == "pressed" && !self.shift_currently_pressed {
-                            self.shift_currently_pressed = true;
-
-                            // Check if this is a double-shift (within 300ms of last release)
-                            const DOUBLE_SHIFT_TIMEOUT: Duration = Duration::from_millis(300);
-                            if let Some(last_press) = self.last_shift_press {
-                                if last_press.elapsed() < DOUBLE_SHIFT_TIMEOUT {
-                                    // Double-shift detected! Emit file picker event
-                                    bus.emit(
-                                        "app.action.open_file_picker",
-                                        json!({}),
-                                        5,
-                                        "input_handler",
-                                    );
-                                    self.last_shift_press = None; // Reset to avoid triple-shift
-                                    return InputAction::None;
-                                }
-                            }
-
-                            // Record this press for double-shift detection
-                            self.last_shift_press = Some(Instant::now());
-                        } else if state == "released" {
-                            self.shift_currently_pressed = false;
-                        }
-
-                        // Don't process shift key itself further
-                        return InputAction::None;
-                    }
-                }
-
-                // Check if this is a key press (not release) for normal key handling
-                if state != "pressed" {
-                    return InputAction::None;
-                }
-
-                // Extract key data from proper JSON structure
-                if let Some(key_obj) = event.data.get("key") {
-                    if let Some(modifiers) = event.data.get("modifiers") {
-                        let shift = modifiers
-                            .get("shift")
-                            .and_then(|s| s.as_bool())
-                            .unwrap_or(false);
-                        let cmd = modifiers
-                            .get("cmd")
-                            .and_then(|c| c.as_bool())
-                            .unwrap_or(false);
-
-                        let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
-
-                        // Handle command key combinations
-                        if cmd && key_type == "character" {
-                            match key_value {
-                                "z" if shift => {
-                                    bus.emit("app.action.redo", json!({}), 5, "input_handler")
-                                }
-                                "z" => bus.emit("app.action.undo", json!({}), 5, "input_handler"),
-                                "s" => bus.emit("app.action.save", json!({}), 5, "input_handler"),
-                                "c" => bus.emit("app.action.copy", json!({}), 5, "input_handler"),
-                                "x" => bus.emit("app.action.cut", json!({}), 5, "input_handler"),
-                                "v" => bus.emit("app.action.paste", json!({}), 5, "input_handler"),
-                                "a" => {
-                                    bus.emit("app.action.select_all", json!({}), 5, "input_handler")
-                                }
-                                "b" => bus.emit(
-                                    "app.action.goto_definition",
-                                    json!({}),
-                                    5,
-                                    "input_handler",
-                                ),
-                                "[" => {
-                                    bus.emit("app.action.nav_back", json!({}), 5, "input_handler")
-                                }
-                                "]" => bus.emit(
-                                    "app.action.nav_forward",
-                                    json!({}),
-                                    5,
-                                    "input_handler",
-                                ),
-                                _ => {}
-                            }
-                        } else if !cmd {
-                            match key_type {
-                                "character" => {
-                                    if !key_value.chars().any(|c| c.is_control()) {
-                                        // Emit document insert event for regular characters
-                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                        bus.emit(
-                                            "app.document.insert",
-                                            json!({
-                                                "text": key_value,
-                                                "position": {
-                                                    "line": cursor_pos.line,
-                                                    "column": cursor_pos.column,
-                                                }
-                                            }),
-                                            20,
-                                            "input_handler",
-                                        );
-                                    }
-                                }
-                                "named" => match key_value {
-                                    "Enter" => {
-                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                        bus.emit(
-                                            "app.document.insert",
-                                            json!({
-                                                "text": "\n",
-                                                "position": {
-                                                    "line": cursor_pos.line,
-                                                    "column": cursor_pos.column,
-                                                }
-                                            }),
-                                            20,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "Tab" => {
-                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                        bus.emit(
-                                            "app.document.insert",
-                                            json!({
-                                                "text": "\t",
-                                                "position": {
-                                                    "line": cursor_pos.line,
-                                                    "column": cursor_pos.column,
-                                                }
-                                            }),
-                                            20,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "Space" => {
-                                        let cursor_pos = self.primary_cursor_doc_pos(doc);
-                                        bus.emit(
-                                            "app.document.insert",
-                                            json!({
-                                                "text": " ",
-                                                "position": {
-                                                    "line": cursor_pos.line,
-                                                    "column": cursor_pos.column,
-                                                }
-                                            }),
-                                            20,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "Backspace" => {
-                                        bus.emit(
-                                            "app.document.delete_backward",
-                                            json!({}),
-                                            20,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "Delete" => {
-                                        bus.emit(
-                                            "app.document.delete_forward",
-                                            json!({}),
-                                            20,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" => {
-                                        bus.emit(
-                                            "app.cursor.move",
-                                            json!({
-                                                "direction": key_value,
-                                                "extending": shift,
-                                            }),
-                                            15,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "Home" => {
-                                        bus.emit(
-                                            "app.cursor.move_line_edge",
-                                            json!({ "to_end": false, "extending": shift }),
-                                            15,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "End" => {
-                                        bus.emit(
-                                            "app.cursor.move_line_edge",
-                                            json!({ "to_end": true, "extending": shift }),
-                                            15,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "PageUp" => {
-                                        bus.emit(
-                                            "app.cursor.page_jump",
-                                            json!({ "up": true, "extending": shift }),
-                                            15,
-                                            "input_handler",
-                                        );
-                                    }
-                                    "PageDown" => {
-                                        bus.emit(
-                                            "app.cursor.page_jump",
-                                            json!({ "up": false, "extending": shift }),
-                                            15,
-                                            "input_handler",
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                InputAction::None
-            }
-            "app.document.insert" => {
-                // Handle actual text insertion
-                if let Some(text) = event.data.get("text").and_then(|t| t.as_str()) {
-                    self.insert_text(doc, text)
-                } else {
-                    InputAction::None
-                }
-            }
-            "app.document.delete_backward" => self.delete_at_cursor(doc, false),
-            "app.document.delete_forward" => self.delete_at_cursor(doc, true),
-            "app.action.undo" => InputAction::Undo,
-            "app.action.redo" => InputAction::Redo,
-            "app.action.save" => InputAction::Save,
-            "app.action.copy" => {
-                self.copy(doc);
-                InputAction::None
-            }
-            "app.action.cut" => {
-                self.cut(doc);
-                InputAction::Redraw
-            }
-            "app.action.paste" => {
-                self.paste(doc);
-                InputAction::Redraw
-            }
-            "app.action.select_all" => {
-                self.select_all(doc);
-                InputAction::Redraw
-            }
-            "app.cursor.move" => {
-                // Handle cursor movement
-                if let Some(direction) = event.data.get("direction").and_then(|d| d.as_str()) {
-                    let extending = event
-                        .data
-                        .get("extending")
-                        .and_then(|e| e.as_bool())
-                        .unwrap_or(false);
-                    match direction {
-                        "ArrowLeft" => self.move_cursor(doc, -1, 0, extending),
-                        "ArrowRight" => self.move_cursor(doc, 1, 0, extending),
-                        "ArrowUp" => self.move_cursor(doc, 0, -1, extending),
-                        "ArrowDown" => self.move_cursor(doc, 0, 1, extending),
-                        _ => InputAction::None,
-                    }
-                } else {
-                    InputAction::None
-                }
-            }
-            "app.cursor.move_line_edge" => {
-                // Handle Home/End keys
-                let to_end = event
-                    .data
-                    .get("to_end")
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(false);
-                let extending = event
-                    .data
-                    .get("extending")
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(false);
-                self.move_to_line_edge(doc, to_end, extending)
-            }
-            "app.cursor.page_jump" => {
-                // Handle PageUp/PageDown
-                let up = event
-                    .data
-                    .get("up")
-                    .and_then(|u| u.as_bool())
-                    .unwrap_or(false);
-                let extending = event
-                    .data
-                    .get("extending")
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(false);
-                self.page_jump(doc, up, extending)
-            }
-            // Navigation events are handled at app level (EditorLogic) for cross-file navigation
-            "app.action.nav_back" | "app.action.nav_forward" => InputAction::None,
-            "app.mouse.press" => {
-                // Handle mouse press/click - coordinates are pre-converted by app.rs
-                if let (Some(x), Some(y)) = (
-                    event.data.get("x").and_then(|v| v.as_f64()),
-                    event.data.get("y").and_then(|v| v.as_f64()),
-                ) {
-                    let modifiers = event.data.get("modifiers");
-                    let shift_held = modifiers
-                        .and_then(|m| m.get("shift"))
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-                    let alt_held = modifiers
-                        .and_then(|m| m.get("alt"))
-                        .and_then(|a| a.as_bool())
-                        .unwrap_or(false);
-
-                    let pos = Point {
-                        x: tiny_sdk::LogicalPixels(x as f32),
-                        y: tiny_sdk::LogicalPixels(y as f32),
-                    };
-
-                    // Store drag anchor in document coordinates (already converted by app.rs)
-                    self.drag_anchor = Some(viewport.layout_to_doc(tiny_sdk::LayoutPos {
-                        x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
-                        y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
-                    }));
-
-                    // Handle the click
-                    self.on_mouse_click(
-                        doc,
-                        viewport,
-                        pos,
-                        MouseButton::Left,
-                        alt_held,
-                        shift_held,
-                    );
-
-                    InputAction::Redraw
-                } else {
-                    InputAction::None
-                }
-            }
-            "app.mouse.drag" => {
-                // Handle mouse drag
-                if let (Some(from_x), Some(from_y), Some(to_x), Some(to_y)) = (
-                    event.data.get("from_x").and_then(|v| v.as_f64()),
-                    event.data.get("from_y").and_then(|v| v.as_f64()),
-                    event.data.get("to_x").and_then(|v| v.as_f64()),
-                    event.data.get("to_y").and_then(|v| v.as_f64()),
-                ) {
-                    let modifiers = event.data.get("modifiers");
-                    let alt_held = modifiers
-                        .and_then(|m| m.get("alt"))
-                        .and_then(|a| a.as_bool())
-                        .unwrap_or(false);
-
-                    let from = Point {
-                        x: tiny_sdk::LogicalPixels(from_x as f32),
-                        y: tiny_sdk::LogicalPixels(from_y as f32),
-                    };
-                    let to = Point {
-                        x: tiny_sdk::LogicalPixels(to_x as f32),
-                        y: tiny_sdk::LogicalPixels(to_y as f32),
-                    };
-
-                    let (redraw, scroll_delta) =
-                        self.on_mouse_drag(doc, viewport, from, to, alt_held);
-
-                    // If there's a scroll delta, emit a scroll event
-                    if let Some((dx, dy)) = scroll_delta {
-                        bus.emit(
-                            "app.drag.scroll",
-                            json!({
-                                "delta_x": dx,
-                                "delta_y": dy
-                            }),
-                            15,
-                            "input_handler",
-                        );
-                    }
-
-                    if redraw {
-                        InputAction::Redraw
-                    } else {
-                        InputAction::None
-                    }
-                } else {
-                    InputAction::None
-                }
-            }
+            "app.keyboard.keypress" => self.handle_keyboard_event(event, doc, bus),
+            "app.mouse.press" => self.handle_mouse_press(event, doc, viewport),
+            "app.mouse.drag" => self.handle_mouse_drag(event, doc, viewport, bus),
             "app.mouse.release" => {
-                // Clear drag anchor
                 self.clear_drag_anchor();
                 InputAction::None
             }
+            // Legacy event handlers for backward compatibility
+            "app.action.nav_back" | "app.action.nav_forward" => InputAction::None,
             _ => InputAction::None,
+        }
+    }
+
+    /// Handle keyboard events and dispatch to appropriate actions
+    fn handle_keyboard_event(&mut self, event: &Event, doc: &Doc, bus: &mut EventBus) -> InputAction {
+        let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
+
+        // Extract key information
+        let key_obj = match event.data.get("key") {
+            Some(k) => k,
+            None => return InputAction::None,
+        };
+
+        let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Track Shift key specifically for double-shift detection
+        if key_type == "named" && key_value == "Shift" {
+            return self.handle_shift_key(state, bus);
+        }
+
+        // Only process key presses (not releases)
+        if state != "pressed" {
+            return InputAction::None;
+        }
+
+        // Extract modifiers
+        let modifiers = event.data.get("modifiers");
+        let shift = modifiers.and_then(|m| m.get("shift")).and_then(|s| s.as_bool()).unwrap_or(false);
+        let cmd = modifiers.and_then(|m| m.get("cmd")).and_then(|c| c.as_bool()).unwrap_or(false);
+        let alt = modifiers.and_then(|m| m.get("alt")).and_then(|a| a.as_bool()).unwrap_or(false);
+
+        // Look up action from key bindings with current mode
+        let action = self.key_bindings.lookup(key_type, key_value, cmd, shift, alt, self.current_mode);
+
+        // Execute the action
+        self.execute_action(action, doc, bus)
+    }
+
+    /// Handle Shift key press/release for double-shift detection
+    fn handle_shift_key(&mut self, state: &str, bus: &mut EventBus) -> InputAction {
+        if state == "pressed" && !self.shift_currently_pressed {
+            self.shift_currently_pressed = true;
+
+            // Check if this is a double-shift (within 300ms of last press)
+            const DOUBLE_SHIFT_TIMEOUT: Duration = Duration::from_millis(300);
+            if let Some(last_press) = self.last_shift_press {
+                if last_press.elapsed() < DOUBLE_SHIFT_TIMEOUT {
+                    // Double-shift detected! Emit file picker event
+                    bus.emit("app.action.open_file_picker", json!({}), 5, "input_handler");
+                    self.last_shift_press = None; // Reset to avoid triple-shift
+                    return InputAction::None;
+                }
+            }
+
+            // Record this press for double-shift detection
+            self.last_shift_press = Some(Instant::now());
+        } else if state == "released" {
+            self.shift_currently_pressed = false;
+        }
+
+        InputAction::None
+    }
+
+    /// Execute an editor action
+    fn execute_action(&mut self, action: EditorAction, doc: &Doc, bus: &mut EventBus) -> InputAction {
+        match action {
+            // Text insertion
+            EditorAction::InsertCharacter(ch) => self.insert_text(doc, &ch),
+            EditorAction::InsertNewline => self.insert_text(doc, "\n"),
+            EditorAction::InsertTab => self.insert_text(doc, "\t"),
+            EditorAction::InsertSpace => self.insert_text(doc, " "),
+
+            // Deletion
+            EditorAction::DeleteBackward => self.delete_at_cursor(doc, false),
+            EditorAction::DeleteForward => self.delete_at_cursor(doc, true),
+
+            // Clipboard
+            EditorAction::Copy => {
+                self.copy(doc);
+                InputAction::None
+            }
+            EditorAction::Cut => {
+                self.cut(doc);
+                InputAction::Redraw
+            }
+            EditorAction::Paste => {
+                self.paste(doc);
+                InputAction::Redraw
+            }
+            EditorAction::SelectAll => {
+                self.select_all(doc);
+                InputAction::Redraw
+            }
+
+            // Cursor movement
+            EditorAction::MoveLeft { extending } => self.move_cursor(doc, -1, 0, extending),
+            EditorAction::MoveRight { extending } => self.move_cursor(doc, 1, 0, extending),
+            EditorAction::MoveUp { extending } => self.move_cursor(doc, 0, -1, extending),
+            EditorAction::MoveDown { extending } => self.move_cursor(doc, 0, 1, extending),
+            EditorAction::MoveToLineStart { extending } => self.move_to_line_edge(doc, false, extending),
+            EditorAction::MoveToLineEnd { extending } => self.move_to_line_edge(doc, true, extending),
+            EditorAction::PageUp { extending } => self.page_jump(doc, true, extending),
+            EditorAction::PageDown { extending } => self.page_jump(doc, false, extending),
+
+            // History
+            EditorAction::Undo => InputAction::Undo,
+            EditorAction::Redo => InputAction::Redo,
+
+            // File operations
+            EditorAction::Save => InputAction::Save,
+
+            // Navigation (emit events for EditorLogic to handle cross-file navigation)
+            EditorAction::GoToDefinition => {
+                bus.emit("app.action.goto_definition", json!({}), 5, "input_handler");
+                InputAction::None
+            }
+            EditorAction::NavigateBack => {
+                bus.emit("app.action.nav_back", json!({}), 5, "input_handler");
+                InputAction::None
+            }
+            EditorAction::NavigateForward => {
+                bus.emit("app.action.nav_forward", json!({}), 5, "input_handler");
+                InputAction::None
+            }
+
+            // App-level actions
+            EditorAction::OpenFilePicker => {
+                bus.emit("app.action.open_file_picker", json!({}), 5, "input_handler");
+                InputAction::None
+            }
+
+            // Mode switching
+            EditorAction::EnterMode(mode) => {
+                self.current_mode = mode;
+                InputAction::Redraw  // Redraw to update mode indicator if UI shows it
+            }
+
+            // No action
+            EditorAction::None => InputAction::None,
+        }
+    }
+
+    /// Handle mouse press events
+    fn handle_mouse_press(&mut self, event: &Event, doc: &Doc, viewport: &Viewport) -> InputAction {
+        let (x, y) = match (
+            event.data.get("x").and_then(|v| v.as_f64()),
+            event.data.get("y").and_then(|v| v.as_f64()),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return InputAction::None,
+        };
+
+        let modifiers = event.data.get("modifiers");
+        let shift_held = modifiers.and_then(|m| m.get("shift")).and_then(|s| s.as_bool()).unwrap_or(false);
+        let alt_held = modifiers.and_then(|m| m.get("alt")).and_then(|a| a.as_bool()).unwrap_or(false);
+
+        let pos = Point {
+            x: tiny_sdk::LogicalPixels(x as f32),
+            y: tiny_sdk::LogicalPixels(y as f32),
+        };
+
+        // Store drag anchor in document coordinates
+        self.drag_anchor = Some(viewport.layout_to_doc(tiny_sdk::LayoutPos {
+            x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
+            y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
+        }));
+
+        // Handle the click
+        self.on_mouse_click(doc, viewport, pos, MouseButton::Left, alt_held, shift_held);
+
+        InputAction::Redraw
+    }
+
+    /// Handle mouse drag events
+    fn handle_mouse_drag(&mut self, event: &Event, doc: &Doc, viewport: &Viewport, bus: &mut EventBus) -> InputAction {
+        let (from_x, from_y, to_x, to_y) = match (
+            event.data.get("from_x").and_then(|v| v.as_f64()),
+            event.data.get("from_y").and_then(|v| v.as_f64()),
+            event.data.get("to_x").and_then(|v| v.as_f64()),
+            event.data.get("to_y").and_then(|v| v.as_f64()),
+        ) {
+            (Some(fx), Some(fy), Some(tx), Some(ty)) => (fx, fy, tx, ty),
+            _ => return InputAction::None,
+        };
+
+        let modifiers = event.data.get("modifiers");
+        let alt_held = modifiers.and_then(|m| m.get("alt")).and_then(|a| a.as_bool()).unwrap_or(false);
+
+        let from = Point {
+            x: tiny_sdk::LogicalPixels(from_x as f32),
+            y: tiny_sdk::LogicalPixels(from_y as f32),
+        };
+        let to = Point {
+            x: tiny_sdk::LogicalPixels(to_x as f32),
+            y: tiny_sdk::LogicalPixels(to_y as f32),
+        };
+
+        let (redraw, scroll_delta) = self.on_mouse_drag(doc, viewport, from, to, alt_held);
+
+        // If there's a scroll delta, emit a scroll event
+        if let Some((dx, dy)) = scroll_delta {
+            bus.emit(
+                "app.drag.scroll",
+                json!({
+                    "delta_x": dx,
+                    "delta_y": dy
+                }),
+                15,
+                "input_handler",
+            );
+        }
+
+        if redraw {
+            InputAction::Redraw
+        } else {
+            InputAction::None
         }
     }
 
@@ -1705,30 +1752,9 @@ impl InputHandler {
             }
         }
 
-        // Convert byte positions back to DocPos
-        let word_start_line = tree.byte_to_line(word_start_byte);
-        let word_start_line_byte = tree.line_to_byte(word_start_line).unwrap_or(0);
-        let word_start_column = tree
-            .get_text_slice(word_start_line_byte..word_start_byte)
-            .chars()
-            .count() as u32;
-        let word_start = DocPos {
-            line: word_start_line,
-            column: word_start_column,
-            byte_offset: 0,
-        };
-
-        let word_end_line = tree.byte_to_line(word_end_byte);
-        let word_end_line_byte = tree.line_to_byte(word_end_line).unwrap_or(0);
-        let word_end_column = tree
-            .get_text_slice(word_end_line_byte..word_end_byte)
-            .chars()
-            .count() as u32;
-        let word_end = DocPos {
-            line: word_end_line,
-            column: word_end_column,
-            byte_offset: 0,
-        };
+        // Convert byte positions back to DocPos using helper
+        let word_start = self.byte_to_doc_pos(&tree, word_start_byte);
+        let word_end = self.byte_to_doc_pos(&tree, word_end_byte);
 
         // Create selection from word start to end
         self.selections = vec![Selection {
@@ -1910,94 +1936,50 @@ impl InputHandler {
         false
     }
 
+    /// Helper to convert byte offset to LSP Position
+    fn byte_to_lsp_position(&self, tree: &tiny_core::tree::Tree, byte_offset: usize) -> lsp_types::Position {
+        let line = tree.byte_to_line(byte_offset);
+        let line_start_byte = tree.line_to_byte(line).unwrap_or(0);
+        let character = tree.get_text_slice(line_start_byte..byte_offset).chars().count() as u32;
+        lsp_types::Position { line, character }
+    }
+
     /// Create an LSP TextChange from a document edit
     fn create_lsp_change(&self, tree: &tiny_core::tree::Tree, edit: &Edit) -> TextChange {
-        use lsp_types::{Position, Range as LspRange};
+        use lsp_types::Range as LspRange;
 
         match edit {
             Edit::Insert { pos, content } => {
-                // For insert, the range is just the insertion point
-                let start_line = tree.byte_to_line(*pos);
-                let line_start_byte = tree.line_to_byte(start_line).unwrap_or(0);
-                let start_char = tree.get_text_slice(line_start_byte..*pos).chars().count() as u32;
-
+                let position = self.byte_to_lsp_position(tree, *pos);
                 TextChange {
                     range: LspRange {
-                        start: Position {
-                            line: start_line,
-                            character: start_char,
-                        },
-                        end: Position {
-                            line: start_line,
-                            character: start_char,
-                        },
+                        start: position,
+                        end: position,
                     },
                     text: match content {
                         Content::Text(s) => s.clone(),
-                        Content::Spatial(_) => String::new(), // Shouldn't happen for LSP
+                        Content::Spatial(_) => String::new(),
                     },
                 }
             }
             Edit::Delete { range } => {
-                // For delete, provide the range being deleted
-                let start_line = tree.byte_to_line(range.start);
-                let start_line_byte = tree.line_to_byte(start_line).unwrap_or(0);
-                let start_char = tree
-                    .get_text_slice(start_line_byte..range.start)
-                    .chars()
-                    .count() as u32;
-
-                let end_line = tree.byte_to_line(range.end);
-                let end_line_byte = tree.line_to_byte(end_line).unwrap_or(0);
-                let end_char = tree
-                    .get_text_slice(end_line_byte..range.end)
-                    .chars()
-                    .count() as u32;
-
                 TextChange {
                     range: LspRange {
-                        start: Position {
-                            line: start_line,
-                            character: start_char,
-                        },
-                        end: Position {
-                            line: end_line,
-                            character: end_char,
-                        },
+                        start: self.byte_to_lsp_position(tree, range.start),
+                        end: self.byte_to_lsp_position(tree, range.end),
                     },
-                    text: String::new(), // Empty string for deletion
+                    text: String::new(),
                 }
             }
             Edit::Replace { range, content } => {
-                // For replace, provide the range being replaced and the new text
-                let start_line = tree.byte_to_line(range.start);
-                let start_line_byte = tree.line_to_byte(start_line).unwrap_or(0);
-                let start_char = tree
-                    .get_text_slice(start_line_byte..range.start)
-                    .chars()
-                    .count() as u32;
-
-                let end_line = tree.byte_to_line(range.end);
-                let end_line_byte = tree.line_to_byte(end_line).unwrap_or(0);
-                let end_char = tree
-                    .get_text_slice(end_line_byte..range.end)
-                    .chars()
-                    .count() as u32;
-
                 TextChange {
                     range: LspRange {
-                        start: Position {
-                            line: start_line,
-                            character: start_char,
-                        },
-                        end: Position {
-                            line: end_line,
-                            character: end_char,
-                        },
+                        start: self.byte_to_lsp_position(tree, range.start),
+                        end: self.byte_to_lsp_position(tree, range.end),
                     },
                     text: match content {
                         Content::Text(s) => s.clone(),
-                        Content::Spatial(_) => String::new(), // Shouldn't happen for LSP
+                        Content::Spatial(_) => String::new(),
                     },
                 }
             }
