@@ -34,7 +34,7 @@ use tiny_core::{
     GpuRenderer, Uniforms,
 };
 use tiny_sdk::{
-    types::DocPos, Hook, LogicalPixels, PaintContext, Paintable as SdkPaint, ServiceRegistry,
+    types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint,
     Updatable as SdkUpdate,
 };
 
@@ -234,14 +234,8 @@ pub struct TinyApp<T: AppLogic> {
     // Track if cursor moved for scrolling
     cursor_needs_scroll: bool,
 
-    // Animation timer
-    animation_timer_started: Arc<AtomicBool>,
-
     // Continuous rendering for animations
     continuous_rendering: bool,
-
-    // Monitor refresh rate (cached frame time in milliseconds)
-    target_frame_time_ms: u64,
 
     // Frame time tracking for dynamic dt
     last_frame_time: std::time::Instant,
@@ -268,8 +262,18 @@ impl<T: AppLogic> TinyApp<T> {
         }
     }
 
+    /// Helper to downcast AppLogic to EditorLogic (immutable)
+    fn as_editor(&self) -> Option<&EditorLogic> {
+        self.logic.as_any().downcast_ref::<EditorLogic>()
+    }
+
+    /// Helper to downcast AppLogic to EditorLogic (mutable)
+    fn as_editor_mut(&mut self) -> Option<&mut EditorLogic> {
+        self.logic.as_any_mut().downcast_mut::<EditorLogic>()
+    }
+
     fn update_window_title(&self) {
-        if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
+        if let Some(editor) = self.as_editor() {
             if let Some(window) = &self.window {
                 window.set_title(&editor.title());
             }
@@ -322,9 +326,7 @@ impl<T: AppLogic> TinyApp<T> {
             mouse_pressed: false,
             drag_start: None,
             cursor_needs_scroll: false,
-            animation_timer_started: Arc::new(AtomicBool::new(false)),
             continuous_rendering: false,
-            target_frame_time_ms: 16, // Default to 16ms (60fps), will be updated based on monitor
             last_frame_time: std::time::Instant::now(),
         }
     }
@@ -420,27 +422,6 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     .expect("Failed to create window"),
             );
 
-            // Get monitor refresh rate for proper frame timing
-            if let Some(monitor) = window.current_monitor() {
-                if let Some(video_mode) = monitor.video_modes().next() {
-                    let refresh_rate_hz = video_mode.refresh_rate_millihertz() / 1000;
-                    if refresh_rate_hz > 0 {
-                        // Calculate target frame time in milliseconds
-                        self.target_frame_time_ms = 1000 / refresh_rate_hz as u64;
-                        println!(
-                            "Monitor refresh rate: {}Hz, target frame time: {}ms",
-                            refresh_rate_hz, self.target_frame_time_ms
-                        );
-                    } else {
-                        println!("Invalid refresh rate detected, using default 16ms (60Hz)");
-                    }
-                } else {
-                    println!("No video modes available, using default 16ms (60Hz)");
-                }
-            } else {
-                println!("No current monitor detected, using default 16ms (60Hz)");
-            }
-
             // Setup GPU renderer
             let mut gpu_renderer = {
                 let window_clone = window.clone();
@@ -505,6 +486,10 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
             cpu_renderer.set_font_size(self.font_size);
             cpu_renderer.set_font_system(font_system.clone());
 
+            // Clone window for background threads before storing
+            let window_for_events = window.clone();
+            let window_for_cursor = window.clone();
+
             // Store everything
             self.window = Some(window);
             self.gpu_renderer = Some(gpu_renderer);
@@ -516,17 +501,23 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
 
             self.logic.on_ready();
 
-            // Set initial window title if using EditorLogic
-            if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
-                if let Some(window) = &self.window {
-                    window.set_title(&editor.title());
-                }
-            }
+            // Set initial window title
+            self.update_window_title();
+
+            // Set up event bus to wake the main thread (request redraw) when events arrive
+            // This allows LSP background threads to emit events and trigger redraws
+            self.event_bus.set_wake_notifier(move || {
+                window_for_events.request_redraw();
+            });
+
+            // Start cursor blink timer (500ms intervals)
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                window_for_cursor.request_redraw();
+            });
 
             // Initial render
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            self.request_redraw();
         }
     }
 
@@ -624,6 +615,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                         self.event_bus.emit("app.action.toggle_scroll_lock", json!({}), 5, "winit");
                     }
                 }
+
+                // Request immediate redraw to process events without waiting for timer
+                self.request_redraw();
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
@@ -641,70 +635,90 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     .and_then(|p| self.physical_to_logical_point(p));
 
                 if let Some(point) = logical_point {
-                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                        // Update diagnostics hover state and request LSP hover
-                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                            // Check if mouse is within editor bounds
-                            let in_editor = point.x.0 >= cpu_renderer.editor_bounds.x.0 &&
-                                           point.x.0 <= cpu_renderer.editor_bounds.x.0 + cpu_renderer.editor_bounds.width.0 &&
-                                           point.y.0 >= cpu_renderer.editor_bounds.y.0 &&
-                                           point.y.0 <= cpu_renderer.editor_bounds.y.0 + cpu_renderer.editor_bounds.height.0;
+                    // Extract all needed data from cpu_renderer first
+                    let (editor_bounds, viewport_scroll, viewport, diagnostics_ptr, editor_local_from, editor_local_to) =
+                        if let Some(cpu_renderer) = &self.cpu_renderer {
+                            let from_local = drag_from.map(|f| cpu_renderer.screen_to_editor_local(f));
+                            let to_local = cpu_renderer.screen_to_editor_local(point);
+                            (
+                                cpu_renderer.editor_bounds,
+                                cpu_renderer.viewport.scroll,
+                                cpu_renderer.viewport.clone(),
+                                cpu_renderer.diagnostics_plugin,
+                                from_local,
+                                to_local
+                            )
+                        } else {
+                            return;
+                        };
 
-                            if in_editor {
-                                if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
-                                    let diagnostics_plugin = unsafe { &mut *diagnostics_ptr };
-                                    // Create widget viewport for diagnostics
-                                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                                        bounds: cpu_renderer.editor_bounds,
-                                        scroll: cpu_renderer.viewport.scroll,
-                                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                                        widget_id: 3,
-                                    };
-                                    diagnostics_plugin.set_mouse_position(point.x.0, point.y.0, Some(&editor_viewport), Some(&cpu_renderer.service_registry));
+                    let cmd_held = self.modifiers.state().super_key();
 
-                                    // Request hover info from LSP if mouse position changed
-                                    if let Some((line, column)) = diagnostics_plugin.get_mouse_document_position() {
-                                        let cmd_held = self.modifiers.state().super_key();
-                                        editor.tab_manager.active_tab_mut().diagnostics.on_mouse_move(line, column, cmd_held);
-                                    }
-                                }
-                            } else {
-                                // Mouse left editor area - clear hover info
-                                editor.tab_manager.active_tab_mut().diagnostics.on_mouse_leave();
+                    // Check if mouse is within editor bounds
+                    let in_editor = point.x.0 >= editor_bounds.x.0 &&
+                                   point.x.0 <= editor_bounds.x.0 + editor_bounds.width.0 &&
+                                   point.y.0 >= editor_bounds.y.0 &&
+                                   point.y.0 <= editor_bounds.y.0 + editor_bounds.height.0;
+
+                    // Get hover position if in editor
+                    let hover_position = if in_editor {
+                        if let Some(diagnostics_ptr) = diagnostics_ptr {
+                            let diagnostics_plugin = unsafe { &mut *diagnostics_ptr };
+                            let editor_viewport = tiny_sdk::types::WidgetViewport {
+                                bounds: editor_bounds,
+                                scroll: viewport_scroll,
+                                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                                widget_id: 3,
+                            };
+                            // Need to access service_registry from cpu_renderer
+                            if let Some(cpu_renderer) = &self.cpu_renderer {
+                                diagnostics_plugin.set_mouse_position(point.x.0, point.y.0, Some(&editor_viewport), Some(&cpu_renderer.service_registry));
                             }
+                            diagnostics_plugin.get_mouse_document_position()
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
 
-                        // Mouse move
-                        if self.logic.on_mouse_move(point, &cpu_renderer.viewport) {
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
+                    // Now handle editor operations without holding cpu_renderer borrow
+                    if let Some(editor) = self.as_editor_mut() {
+                        if let Some((line, column)) = hover_position {
+                            editor.tab_manager.active_tab_mut().diagnostics.on_mouse_move(line, column, cmd_held);
+                        } else if !in_editor {
+                            editor.tab_manager.active_tab_mut().diagnostics.on_mouse_leave();
                         }
+                    }
 
-                        // Mouse drag - emit event
-                        if self.mouse_pressed {
-                            if let Some(from) = drag_from {
-                                // Check if drag started in titlebar area (for transparent titlebar on macOS)
-                                #[cfg(target_os = "macos")]
-                                let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
-                                #[cfg(not(target_os = "macos"))]
-                                let drag_started_in_titlebar = false;
+                    // Mouse move
+                    if self.logic.on_mouse_move(point, &viewport) {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
 
-                                // Only emit drag event if drag didn't start in titlebar area
-                                if !drag_started_in_titlebar {
-                                    // Convert screen coordinates to editor-local coordinates
-                                    let editor_local_from = cpu_renderer.screen_to_editor_local(from);
-                                    let editor_local_to = cpu_renderer.screen_to_editor_local(point);
+                    // Mouse drag - emit event
+                    if self.mouse_pressed {
+                        if let Some(from) = drag_from {
+                            // Check if drag started in titlebar area (for transparent titlebar on macOS)
+                            #[cfg(target_os = "macos")]
+                            let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
+                            #[cfg(not(target_os = "macos"))]
+                            let drag_started_in_titlebar = false;
 
+                            // Only emit drag event if drag didn't start in titlebar area
+                            if !drag_started_in_titlebar {
+                                if let (Some(from_local), to_local) = (editor_local_from, editor_local_to) {
                                     // Emit drag event
                                     use serde_json::json;
                                     self.event_bus.emit(
                                         "app.mouse.drag",
                                         json!({
-                                            "from_x": editor_local_from.x.0,
-                                            "from_y": editor_local_from.y.0,
-                                            "to_x": editor_local_to.x.0,
-                                            "to_y": editor_local_to.y.0,
+                                            "from_x": from_local.x.0,
+                                            "from_y": from_local.y.0,
+                                            "to_x": to_local.x.0,
+                                            "to_y": to_local.y.0,
                                             "modifiers": {
                                                 "shift": self.modifiers.state().shift_key(),
                                                 "ctrl": self.modifiers.state().control_key(),
@@ -752,14 +766,16 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                                         // Don't set drag_start for tab bar clicks
                                         handled_by_tab_bar = true;
 
+                                        // Extract viewport width before mutable borrow
+                                        let viewport_width = self.cpu_renderer.as_ref()
+                                            .map(|r| r.viewport.logical_size.width.0);
+
                                         // Handle tab bar clicks
-                                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                                        if let Some(editor) = self.as_editor_mut() {
                                             let click_x = point.x.0;
                                             let click_y = point.y.0 - tab_bar_start;
 
-                                            if let Some(cpu_renderer) = &self.cpu_renderer {
-                                                let viewport_width = cpu_renderer.viewport.logical_size.width.0;
-
+                                            if let Some(viewport_width) = viewport_width {
                                                 // Check dropdown first
                                                 if editor.tab_bar.hit_test_dropdown(click_x, click_y, viewport_width) {
                                                     editor.tab_bar.toggle_dropdown();
@@ -880,6 +896,9 @@ impl<T: AppLogic> ApplicationHandler for TinyApp<T> {
                     15, // Slightly lower priority than direct input
                     "winit",
                 );
+
+                // Request immediate redraw to process scroll events
+                self.request_redraw();
 
                 // Keep existing scroll handling for now (will be replaced by event handlers)
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
@@ -1071,17 +1090,17 @@ impl<T: AppLogic> TinyApp<T> {
                             event.data.get("delta_x").and_then(|v| v.as_f64()),
                             event.data.get("delta_y").and_then(|v| v.as_f64())
                         ) {
+                            // Get doc directly from logic to avoid borrow issues
+                            let doc = self.logic.doc();
+                            let tree = doc.read();
+
                             if let Some(cpu_renderer) = &mut self.cpu_renderer {
                                 cpu_renderer.viewport.scroll.x.0 += dx as f32;
                                 cpu_renderer.viewport.scroll.y.0 += dy as f32;
 
                                 // Clamp scroll to bounds
-                                if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
-                                    let tree = editor.active_plugin().doc.read();
-                                    cpu_renderer.viewport.clamp_scroll_to_bounds(
-                                        &tree, cpu_renderer.editor_bounds
-                                    );
-                                }
+                                let editor_bounds = cpu_renderer.editor_bounds;
+                                cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
 
                                 self.request_redraw();
                             }
@@ -1090,7 +1109,7 @@ impl<T: AppLogic> TinyApp<T> {
                     }
                     "app.action.open_file_picker" => {
                         // Open file picker (triggered by double-shift)
-                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                        if let Some(editor) = self.as_editor_mut() {
                             editor.file_picker.show();
                             editor.ui_changed = true;
                             self.request_redraw();
@@ -1099,7 +1118,7 @@ impl<T: AppLogic> TinyApp<T> {
                     }
                     "app.action.nav_back" => {
                         // Navigate back across files
-                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                        if let Some(editor) = self.as_editor_mut() {
                             if editor.navigate_back() {
                                 self.request_redraw();
                                 self.cursor_needs_scroll = true;
@@ -1109,7 +1128,7 @@ impl<T: AppLogic> TinyApp<T> {
                     }
                     "app.action.nav_forward" => {
                         // Navigate forward across files
-                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                        if let Some(editor) = self.as_editor_mut() {
                             if editor.navigate_forward() {
                                 self.request_redraw();
                                 self.cursor_needs_scroll = true;
@@ -1120,7 +1139,7 @@ impl<T: AppLogic> TinyApp<T> {
                     "app.action.goto_definition" => {
                         eprintln!("DEBUG: app.action.goto_definition event received");
                         // Go to definition at cursor
-                        if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                        if let Some(editor) = self.as_editor_mut() {
                             editor.goto_definition();
                         }
                         continue;
@@ -1128,8 +1147,15 @@ impl<T: AppLogic> TinyApp<T> {
                     _ => {}
                 }
 
+                // Extract viewport before borrowing editor mutably
+                let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
+
                 // Process with InputHandler for document events
-                if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
+                if self.as_editor().is_some() {
+                    // SAFETY: We're accessing disjoint fields (logic and event_bus)
+                    let editor = unsafe { &mut *(self.logic.as_any_mut() as *mut dyn std::any::Any as *mut EditorLogic) };
+                    let event_bus = unsafe { &mut *(&mut self.event_bus as *mut _) };
+
                     // Check if file picker is open and handle its events first
                     if editor.file_picker.visible && event.name == "app.keyboard.keypress" {
                         let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
@@ -1203,11 +1229,9 @@ impl<T: AppLogic> TinyApp<T> {
                         }
                     }
 
-                    let plugin = editor.active_plugin_mut();
-                    let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
-
                     if let Some(viewport) = viewport {
-                        let action = plugin.input.process_event(&event, &plugin.doc, &viewport, &mut self.event_bus);
+                        let plugin = editor.active_plugin_mut();
+                        let action = plugin.input.process_event(&event, &plugin.doc, &viewport, event_bus);
 
                         if action != InputAction::None {
                             // Handle Save separately since it needs EditorLogic
@@ -1239,9 +1263,11 @@ impl<T: AppLogic> TinyApp<T> {
         self.last_frame_time = current_time;
 
         if self.continuous_rendering {
-            frame_duration.as_secs_f32().min(0.05) // Cap at 50ms to prevent huge jumps
+            // Use actual frame duration for smooth animations
+            frame_duration.as_secs_f32().min(0.05)
         } else {
-            self.target_frame_time_ms as f32 / 1000.0
+            // Use consistent 16ms (60fps) for predictable animations in retained mode
+            0.016
         }
     }
 
@@ -1266,18 +1292,9 @@ impl<T: AppLogic> TinyApp<T> {
             eprintln!("Plugin update error: {}", e);
         }
 
-        // Setup continuous rendering
-        if let Some(window) = &self.window {
-            if self.continuous_rendering {
-                window.request_redraw();
-            } else if !self.animation_timer_started.load(Ordering::Relaxed) {
-                self.animation_timer_started.store(true, Ordering::Relaxed);
-                let window_clone = window.clone();
-                std::thread::spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    window_clone.request_redraw();
-                });
-            }
+        // Request next frame if continuous rendering is enabled
+        if self.continuous_rendering {
+            self.request_redraw();
         }
 
         // Handle cursor scroll when selection actually changed
@@ -1291,181 +1308,214 @@ impl<T: AppLogic> TinyApp<T> {
             }
         }
 
-        if let (Some(window), Some(gpu_renderer), Some(cpu_renderer)) =
-            (&self.window, &mut self.gpu_renderer, &mut self.cpu_renderer)
-        {
-            // Widgets are now handled by plugins
-            gpu_renderer.update_time(dt);
+        // Check if we have all required components
+        if self.window.is_none() || self.gpu_renderer.is_none() || self.cpu_renderer.is_none() {
+            return;
+        }
 
-            // Update viewport
+        // Get window info without holding a borrow
+        let (logical_width, logical_height, scale_factor) = {
+            let window = self.window.as_ref().unwrap();
             let size = window.inner_size();
-            let scale_factor = window.scale_factor() as f32;
-            let logical_width = size.width as f32 / scale_factor;
-            let logical_height = size.height as f32 / scale_factor;
-            cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
+            let scale = window.scale_factor() as f32;
+            (size.width as f32 / scale, size.height as f32 / scale, scale)
+        };
 
-            // Setup text styles
-            if let Some(text_styles) = self.logic.text_styles() {
-                if let Some(syntax_hl) = text_styles
-                    .as_any()
-                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                {
+        // Update GPU renderer time
+        if let Some(gpu_renderer) = &mut self.gpu_renderer {
+            gpu_renderer.update_time(dt);
+        }
+
+        // Update viewport
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
+        }
+
+        // Setup text styles
+        if let Some(text_styles) = self.logic.text_styles() {
+            if let Some(syntax_hl) = text_styles
+                .as_any()
+                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+            {
+                if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let highlighter = Arc::new(syntax_hl.clone());
                     cpu_renderer.set_syntax_highlighter(highlighter);
                     cpu_renderer.text_styles = Some(Box::new(syntax_hl.clone()));
                 }
             }
+        }
 
-            let viewport = Rect {
-                x: LogicalPixels(0.0),
-                y: LogicalPixels(0.0),
-                width: LogicalPixels(logical_width),
-                height: LogicalPixels(logical_height),
-            };
+        let viewport = Rect {
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(logical_width),
+            height: LogicalPixels(logical_height),
+        };
 
-            // Update plugins if EditorLogic
-            if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                let tab = editor.tab_manager.active_tab_mut();
+        // Update plugins if EditorLogic - use raw pointers to avoid borrow conflicts
+        if self.as_editor().is_some() {
+            // SAFETY: We know editor exists, and we're accessing disjoint fields (logic and cpu_renderer)
+            // We need raw pointers here because as_editor_mut() borrows all of self through the trait
+            let editor = unsafe { &mut *(self.logic.as_any_mut() as *mut dyn std::any::Any as *mut EditorLogic) };
+            let cpu_renderer = self.cpu_renderer.as_mut().unwrap();
 
-                // Swap in the active tab's text_renderer to preserve per-tab state
-                cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+            let tab = editor.tab_manager.active_tab_mut();
 
-                // Always update selection widgets
-                cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
+            // Swap in the active tab's text_renderer to preserve per-tab state
+            cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
 
-                // Set line numbers plugin with fresh document reference
-                cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
+            // Always update selection widgets
+            cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
 
-                // Set tab bar and file picker plugins (global UI)
-                cpu_renderer.set_tab_bar_plugin(&mut editor.tab_bar);
-                cpu_renderer.set_file_picker_plugin(&mut editor.file_picker);
+            // Set line numbers plugin with fresh document reference
+            cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
 
-                // Mark renderer UI dirty if UI changed
-                if editor.ui_changed {
-                    cpu_renderer.mark_ui_dirty();
-                    editor.ui_changed = false;
-                }
+            // Set tab bar and file picker plugins (global UI)
+            cpu_renderer.set_tab_bar_plugin(&mut editor.tab_bar);
+            cpu_renderer.set_file_picker_plugin(&mut editor.file_picker);
 
-                // Update diagnostics manager (handles LSP polling, caching, plugin updates)
-                tab.diagnostics.update(&tab.plugin.doc);
+            // Mark renderer UI dirty if UI changed
+            if editor.ui_changed {
+                cpu_renderer.mark_ui_dirty();
+                editor.ui_changed = false;
+            }
 
-                // Set diagnostics plugin for rendering
-                cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
+            // Update diagnostics manager (handles LSP polling, caching, plugin updates)
+            tab.diagnostics.update(&tab.plugin.doc);
 
-                // Initialize diagnostics plugin with GPU resources (first time only)
-                static mut DIAGNOSTICS_INITIALIZED: bool = false;
-                unsafe {
-                    if !DIAGNOSTICS_INITIALIZED {
-                        if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
-                            let diagnostics = &mut *diagnostics_ptr;
-                            if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
-                                let gpu_renderer = &*gpu;
-                                use tiny_sdk::Initializable;
-                                let mut setup_ctx = tiny_sdk::SetupContext {
-                                    device: gpu_renderer.device_arc(),
-                                    queue: gpu_renderer.queue_arc(),
-                                    registry: tiny_sdk::PluginRegistry::empty(),
-                                };
-                                if let Err(e) = diagnostics.setup(&mut setup_ctx) {
-                                    eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
-                                } else {
-                                    DIAGNOSTICS_INITIALIZED = true;
-                                    eprintln!("Diagnostics plugin initialized successfully");
-                                }
+            // Set diagnostics plugin for rendering
+            cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
+
+            // Initialize diagnostics plugin with GPU resources (first time only)
+            static mut DIAGNOSTICS_INITIALIZED: bool = false;
+            unsafe {
+                if !DIAGNOSTICS_INITIALIZED {
+                    if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
+                        let diagnostics = &mut *diagnostics_ptr;
+                        if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
+                            let gpu_renderer = &*gpu;
+                            use tiny_sdk::Initializable;
+                            let mut setup_ctx = tiny_sdk::SetupContext {
+                                device: gpu_renderer.device_arc(),
+                                queue: gpu_renderer.queue_arc(),
+                                registry: tiny_sdk::PluginRegistry::empty(),
+                            };
+                            if let Err(e) = diagnostics.setup(&mut setup_ctx) {
+                                eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
+                            } else {
+                                DIAGNOSTICS_INITIALIZED = true;
+                                eprintln!("Diagnostics plugin initialized successfully");
                             }
                         }
                     }
                 }
-
-                // Set up global margin (only once)
-                static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
-                unsafe {
-                    if !GLOBAL_MARGIN_INITIALIZED {
-                        GLOBAL_MARGIN_INITIALIZED = true;
-
-                        // Set global margin for UI chrome space
-                        cpu_renderer
-                            .viewport
-                            .set_global_margin(0.0, self.title_bar_height);
-                    }
-                }
-
-                // No longer need margin - editor bounds are handled properly in renderer
             }
 
-            // Upload font atlas only if dirty (atlas changed)
-            if let Some(font_system) = &self.font_system {
-                if font_system.is_dirty() {
-                    let atlas_data = font_system.atlas_data();
-                    let (atlas_width, atlas_height) = font_system.atlas_size();
+            // Set up global margin (only once)
+            let title_bar_height = self.title_bar_height;
+            static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
+            unsafe {
+                if !GLOBAL_MARGIN_INITIALIZED {
+                    GLOBAL_MARGIN_INITIALIZED = true;
+                    cpu_renderer.viewport.set_global_margin(0.0, title_bar_height);
+                }
+            }
+        }
+
+        // Upload font atlas only if dirty (atlas changed)
+        if let Some(font_system) = &self.font_system {
+            if font_system.is_dirty() {
+                let atlas_data = font_system.atlas_data();
+                let (atlas_width, atlas_height) = font_system.atlas_size();
+                if let Some(gpu_renderer) = &mut self.gpu_renderer {
                     gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
-                    font_system.clear_dirty();
                 }
+                font_system.clear_dirty();
             }
+        }
 
-            let doc = self.logic.doc();
-            let selections = self.logic.selections();
+        let doc = self.logic.doc();
+        let doc_read = doc.read();
 
-            // Prepare uniforms for GPU rendering
-            let uniforms = Uniforms {
-                viewport_size: [
-                    cpu_renderer.viewport.physical_size.width as f32,
-                    cpu_renderer.viewport.physical_size.height as f32,
-                ],
-                scale_factor: cpu_renderer.viewport.scale_factor,
-                time: gpu_renderer.current_time,
-                theme_mode: gpu_renderer.current_theme_mode,
-                _padding: [0.0, 0.0, 0.0],
-            };
+        // Get renderer state for uniforms
+        let (viewport_size, scale_factor, current_time, theme_mode, cached_version) = {
+            let cpu = self.cpu_renderer.as_ref().unwrap();
+            let gpu = self.gpu_renderer.as_ref().unwrap();
+            (
+                [cpu.viewport.physical_size.width as f32, cpu.viewport.physical_size.height as f32],
+                cpu.viewport.scale_factor,
+                gpu.current_time,
+                gpu.current_theme_mode,
+                cpu.cached_doc_version,
+            )
+        };
 
-            // Set up CPU renderer state
-            cpu_renderer.set_gpu_renderer(gpu_renderer);
+        // Check if version changed without edits (undo/redo)
+        let version_changed_without_edits = doc_read.version != cached_version;
 
-            let doc_read = doc.read();
-
-            // Check if version changed without edits (undo/redo) BEFORE updating cache
-            let version_changed_without_edits = doc_read.version != cpu_renderer.cached_doc_version;
-
+        // Update cached doc state
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
             cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
             cpu_renderer.cached_doc_version = doc_read.version;
+        }
 
-            // Apply pending renderer edits for syntax token adjustment
-            // Note: text_renderer has already been swapped in from the active tab
-            if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                let pending_edits = editor.active_plugin_mut().input.take_renderer_edits();
+        // Apply pending renderer edits for syntax token adjustment
+        // Note: text_renderer has already been swapped in from the active tab
+        if self.as_editor().is_some() {
+            let editor = unsafe { &mut *(self.logic.as_any_mut() as *mut dyn std::any::Any as *mut EditorLogic) };
+            let cpu_renderer = self.cpu_renderer.as_mut().unwrap();
 
-                // If version changed without edits, it's undo/redo
-                // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
-                // This prevents white flash while keeping old (close enough) syntax visible
-                if pending_edits.is_empty() && version_changed_without_edits {
-                    cpu_renderer.clear_edit_deltas();
-                    // Don't clear stable_tokens - causes white flash. Let background parse update them.
-                }
+            let pending_edits = editor.active_plugin_mut().input.take_renderer_edits();
 
-                for edit in pending_edits {
-                    cpu_renderer.apply_incremental_edit(&edit);
-                }
+            // If version changed without edits, it's undo/redo
+            // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
+            // This prevents white flash while keeping old (close enough) syntax visible
+            if pending_edits.is_empty() && version_changed_without_edits {
+                cpu_renderer.clear_edit_deltas();
+                // Don't clear stable_tokens - causes white flash. Let background parse update them.
             }
 
-            // Get tab_manager reference if we have EditorLogic
-            let tab_manager = if let Some(editor) = self.logic.as_any().downcast_ref::<EditorLogic>() {
-                Some(&editor.tab_manager)
-            } else {
-                None
-            };
+            for edit in pending_edits {
+                cpu_renderer.apply_incremental_edit(&edit);
+            }
+        }
+
+        // Get tab_manager reference if we have EditorLogic - using raw ptr to avoid borrow
+        let tab_manager: Option<*const crate::tab_manager::TabManager> = if self.as_editor().is_some() {
+            let editor = unsafe { &*(self.logic.as_any() as *const dyn std::any::Any as *const EditorLogic) };
+            Some(&editor.tab_manager as *const _)
+        } else {
+            None
+        };
+
+        // Prepare uniforms for GPU rendering
+        let uniforms = Uniforms {
+            viewport_size,
+            scale_factor,
+            time: current_time,
+            theme_mode,
+            _padding: [0.0, 0.0, 0.0],
+        };
+
+        // Set up CPU renderer state and render
+        if let (Some(gpu_renderer), Some(cpu_renderer)) = (&mut self.gpu_renderer, &mut self.cpu_renderer) {
+            cpu_renderer.set_gpu_renderer(gpu_renderer);
 
             // Just use the existing render pipeline - it was working!
             unsafe {
+                let tab_manager_ref = tab_manager.map(|ptr| &*ptr);
                 gpu_renderer.render_with_callback(uniforms, |render_pass| {
-                    cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass), tab_manager);
+                    cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass), tab_manager_ref);
                 });
             }
+        }
 
-            // Swap the text_renderer back to the tab to preserve state
-            if let Some(editor) = self.logic.as_any_mut().downcast_mut::<EditorLogic>() {
-                let tab = editor.tab_manager.active_tab_mut();
-                cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
-            }
+        // Swap the text_renderer back to the tab to preserve state
+        if self.as_editor().is_some() {
+            let editor = unsafe { &mut *(self.logic.as_any_mut() as *mut dyn std::any::Any as *mut EditorLogic) };
+            let cpu_renderer = self.cpu_renderer.as_mut().unwrap();
+            let tab = editor.tab_manager.active_tab_mut();
+            cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
         }
     }
 }

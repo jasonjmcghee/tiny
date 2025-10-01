@@ -153,6 +153,8 @@ pub struct EventBus {
     processing: Vec<Event>,
     handlers: HashMap<String, Vec<EventHandler>>,
     patterns: Vec<(String, EventHandler)>,
+    /// Callback to wake up the main thread when events are emitted (e.g., request redraw)
+    wake_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl EventBus {
@@ -163,7 +165,16 @@ impl EventBus {
             processing: Vec::new(),
             handlers: HashMap::new(),
             patterns: Vec::new(),
+            wake_notifier: None,
         }
+    }
+
+    /// Set callback to wake up the main thread when events are emitted
+    pub fn set_wake_notifier<F>(&mut self, notifier: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.wake_notifier = Some(Arc::new(notifier));
     }
 
     /// Emit an event to the queue
@@ -181,6 +192,11 @@ impl EventBus {
             timestamp: Instant::now(),
             source: source.into(),
         });
+
+        // Wake up the main thread to process this event
+        if let Some(notifier) = &self.wake_notifier {
+            notifier();
+        }
     }
 
     /// Register an event handler for a specific event or pattern
@@ -290,6 +306,13 @@ impl SharedEventBus {
 
     pub fn on(&self, pattern: impl Into<String>, handler: EventHandler) {
         self.inner.lock().unwrap().on(pattern, handler);
+    }
+
+    pub fn set_wake_notifier<F>(&self, notifier: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.inner.lock().unwrap().set_wake_notifier(notifier);
     }
 
     pub fn with_bus<F, R>(&self, f: F) -> R
@@ -515,9 +538,12 @@ impl InputHandler {
                                 "a" => {
                                     bus.emit("app.action.select_all", json!({}), 5, "input_handler")
                                 }
-                                "b" => {
-                                    bus.emit("app.action.goto_definition", json!({}), 5, "input_handler")
-                                }
+                                "b" => bus.emit(
+                                    "app.action.goto_definition",
+                                    json!({}),
+                                    5,
+                                    "input_handler",
+                                ),
                                 "[" => {
                                     bus.emit("app.action.nav_back", json!({}), 5, "input_handler")
                                 }
