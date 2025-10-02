@@ -10,12 +10,13 @@ pub mod gpu_ffi_host;
 pub mod app;
 pub mod config;
 pub mod coordinates; // Coordinate system abstraction
+pub mod diagnostics_manager;
+pub mod editor_logic;
+pub mod file_picker_plugin;
 pub mod history;
 pub mod input;
 pub mod input_types;
 pub mod io;
-pub mod diagnostics_manager;
-pub mod file_picker_plugin;
 pub mod line_numbers_plugin;
 pub mod lsp_manager;
 pub mod lsp_service;

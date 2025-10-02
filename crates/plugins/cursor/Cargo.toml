@@ -13,6 +13,7 @@ tiny-sdk = { path = "../../sdk" }
 tiny-core = { path = "../../core" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
+ahash = "0.8"
 
 # For plugin exports
 [dependencies.abi_stable]

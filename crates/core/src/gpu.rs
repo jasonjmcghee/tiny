@@ -131,8 +131,8 @@ pub struct GpuRenderer {
     glyph_bind_group: BindGroup,
 
     // Vertex buffers
-    rect_vertex_buffer: Buffer,      // Unit quad (6 vertices, static)
-    rect_instance_buffer: Buffer,    // Per-rect data (dynamic)
+    rect_vertex_buffer: Buffer,   // Unit quad (6 vertices, static)
+    rect_instance_buffer: Buffer, // Per-rect data (dynamic)
     glyph_vertex_buffer: Buffer,
     line_number_vertex_buffer: Buffer,
 
@@ -171,12 +171,24 @@ where
 /// Create a unit quad (0,0 to 1,1) for instanced rendering
 pub fn create_unit_quad() -> [RectVertex; 6] {
     [
-        RectVertex { position: [0.0, 0.0] }, // TL
-        RectVertex { position: [1.0, 0.0] }, // TR
-        RectVertex { position: [0.0, 1.0] }, // BL
-        RectVertex { position: [1.0, 0.0] }, // TR
-        RectVertex { position: [1.0, 1.0] }, // BR
-        RectVertex { position: [0.0, 1.0] }, // BL
+        RectVertex {
+            position: [0.0, 0.0],
+        }, // TL
+        RectVertex {
+            position: [1.0, 0.0],
+        }, // TR
+        RectVertex {
+            position: [0.0, 1.0],
+        }, // BL
+        RectVertex {
+            position: [1.0, 0.0],
+        }, // TR
+        RectVertex {
+            position: [1.0, 1.0],
+        }, // BR
+        RectVertex {
+            position: [0.0, 1.0],
+        }, // BL
     ]
 }
 
@@ -228,9 +240,9 @@ fn rect_vertex_attributes() -> [VertexAttribute; 1] {
 
 fn rect_instance_attributes() -> [VertexAttribute; 3] {
     [
-        vertex_attr(0, 1, VertexFormat::Float32x2),  // rect_pos
-        vertex_attr(8, 2, VertexFormat::Float32x2),  // rect_size
-        vertex_attr(16, 3, VertexFormat::Uint32),    // color
+        vertex_attr(0, 1, VertexFormat::Float32x2), // rect_pos
+        vertex_attr(8, 2, VertexFormat::Float32x2), // rect_size
+        vertex_attr(16, 3, VertexFormat::Uint32),   // color
     ]
 }
 
@@ -511,7 +523,6 @@ impl GpuRenderer {
 
     /// Get device Arc for custom widget rendering
     pub fn device_arc(&self) -> std::sync::Arc<Device> {
-        // eprintln!("GPU renderer returning device Arc: {:p}, Device: {:p}", &self.device, self.device.as_ref());
         std::sync::Arc::clone(&self.device)
     }
 
@@ -542,7 +553,6 @@ impl GpuRenderer {
 
     /// Get rect vertex buffer for widget backgrounds
     pub fn rect_vertex_buffer(&self) -> &Buffer {
-        // eprintln!("GPU renderer returning rect_vertex_buffer at {:p}", &self.rect_vertex_buffer);
         &self.rect_vertex_buffer
     }
 
@@ -557,9 +567,7 @@ impl GpuRenderer {
 
     /// Test method to write to rect buffer directly
     pub fn test_write_rect_buffer(&self, data: &[u8]) {
-        // eprintln!("GPU renderer writing {} bytes to rect buffer", data.len());
         self.queue.write_buffer(&self.rect_vertex_buffer, 0, data);
-        // eprintln!("GPU renderer successfully wrote to rect buffer");
     }
 
     /// Draw vertices directly for plugins (avoids passing Buffer objects)
@@ -569,9 +577,6 @@ impl GpuRenderer {
         vertex_data: &[u8],
         vertex_count: u32,
     ) {
-        // Uniforms are now updated once per frame in render_with_callback
-
-        // Write data to our rect buffer (reusing it)
         self.queue
             .write_buffer(&self.rect_vertex_buffer, 0, vertex_data);
 
@@ -590,7 +595,6 @@ impl GpuRenderer {
         vertices_len: usize,
         count: u32,
     ) {
-        eprintln!("FFI draw_rect_vertices called with {} vertices", count);
         unsafe {
             let pass = &mut *pass;
             let vertex_data = std::slice::from_raw_parts(vertices, vertices_len);
@@ -732,7 +736,9 @@ impl GpuRenderer {
                                         ty: BindingType::Texture {
                                             multisampled: false,
                                             view_dimension: TextureViewDimension::D1,
-                                            sample_type: TextureSampleType::Float { filterable: true },
+                                            sample_type: TextureSampleType::Float {
+                                                filterable: true,
+                                            },
                                         },
                                         count: None,
                                     },
@@ -749,24 +755,25 @@ impl GpuRenderer {
 
                 // Create bind group using cached layout
                 if let Some(layout) = &self.style_bind_group_layout {
-                    self.styled_bind_group = Some(self.device.create_bind_group(&BindGroupDescriptor {
-                        label: Some("Style Bind Group"),
-                        layout,
-                        entries: &[
-                            BindGroupEntry {
-                                binding: 0,
-                                resource: style_buffer.as_entire_binding(),
-                            },
-                            BindGroupEntry {
-                                binding: 1,
-                                resource: BindingResource::TextureView(palette_view),
-                            },
-                            BindGroupEntry {
-                                binding: 2,
-                                resource: BindingResource::Sampler(palette_sampler),
-                            },
-                        ],
-                    }));
+                    self.styled_bind_group =
+                        Some(self.device.create_bind_group(&BindGroupDescriptor {
+                            label: Some("Style Bind Group"),
+                            layout,
+                            entries: &[
+                                BindGroupEntry {
+                                    binding: 0,
+                                    resource: style_buffer.as_entire_binding(),
+                                },
+                                BindGroupEntry {
+                                    binding: 1,
+                                    resource: BindingResource::TextureView(palette_view),
+                                },
+                                BindGroupEntry {
+                                    binding: 2,
+                                    resource: BindingResource::Sampler(palette_sampler),
+                                },
+                            ],
+                        }));
                 }
             }
         }
@@ -976,7 +983,6 @@ impl GpuRenderer {
 
     /// Reload all shaders from disk and recreate pipelines
     pub fn reload_shaders(&mut self) {
-        eprintln!("Hot-reloading shaders...");
         let mut any_success = false;
 
         // Helper to reload a shader
@@ -1213,7 +1219,10 @@ impl GpuRenderer {
             mapped_at_creation: true,
         });
         // Upload unit quad data immediately
-        rect_vertex_buffer.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&unit_quad));
+        rect_vertex_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&unit_quad));
         rect_vertex_buffer.unmap();
 
         // Create instance buffer for per-rect data (dynamic)
@@ -1429,19 +1438,14 @@ impl GpuRenderer {
             // Convert RectInstance to RectInstanceData
             let instance_data: Vec<RectInstanceData> = instances
                 .iter()
-                .map(|rect| {
-                    RectInstanceData {
-                        rect_pos: [
-                            rect.rect.x.0 * scale_factor,
-                            rect.rect.y.0 * scale_factor,
-                        ],
-                        rect_size: [
-                            rect.rect.width.0 * scale_factor,
-                            rect.rect.height.0 * scale_factor,
-                        ],
-                        color: rect.color,
-                        _padding: 0,
-                    }
+                .map(|rect| RectInstanceData {
+                    rect_pos: [rect.rect.x.0 * scale_factor, rect.rect.y.0 * scale_factor],
+                    rect_size: [
+                        rect.rect.width.0 * scale_factor,
+                        rect.rect.height.0 * scale_factor,
+                    ],
+                    color: rect.color,
+                    _padding: 0,
                 })
                 .collect();
 
@@ -1452,7 +1456,8 @@ impl GpuRenderer {
                 bytemuck::cast_slice(&instance_data),
             );
 
-            self.last_rect_instances_hash.store(instances_hash, Ordering::Relaxed);
+            self.last_rect_instances_hash
+                .store(instances_hash, Ordering::Relaxed);
         }
 
         // Always draw (even if buffer didn't change)
@@ -1599,7 +1604,8 @@ impl GpuRenderer {
         let instances_hash = hasher.finish();
 
         // Check cache
-        let needs_update = self.vertex_cache
+        let needs_update = self
+            .vertex_cache
             .get(&cache_key)
             .map(|(cached_hash, _)| *cached_hash != instances_hash)
             .unwrap_or(true);
@@ -1611,8 +1617,10 @@ impl GpuRenderer {
 
             // Safe to dereference because we know the pointer is valid (it comes from &self.buffer)
             let buffer = unsafe { &*buffer_ptr };
-            self.queue.write_buffer(buffer, offset, bytemuck::cast_slice(&vertices));
-            self.vertex_cache.insert(cache_key, (instances_hash, vertices));
+            self.queue
+                .write_buffer(buffer, offset, bytemuck::cast_slice(&vertices));
+            self.vertex_cache
+                .insert(cache_key, (instances_hash, vertices));
 
             vertex_count
         } else {

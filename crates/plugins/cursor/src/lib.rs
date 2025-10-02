@@ -1,6 +1,8 @@
 //! Cursor Plugin - Blinking text cursor with customizable appearance
 
+use ahash::AHasher;
 use serde::Deserialize;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tiny_sdk::bytemuck;
@@ -12,8 +14,6 @@ use tiny_sdk::{
     Capability, Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext, Updatable, UpdateContext, ViewportInfo,
 };
-use ahash::AHasher;
-use std::hash::{Hash, Hasher};
 
 /// API exposed by cursor plugin
 pub struct CursorAPI {
@@ -206,11 +206,21 @@ impl CursorPlugin {
         // Create two triangles for a quad (no color - it's in uniforms)
         vec![
             CursorVertex { position: [x, y] },
-            CursorVertex { position: [x + w, y] },
-            CursorVertex { position: [x, y + h] },
-            CursorVertex { position: [x + w, y] },
-            CursorVertex { position: [x + w, y + h] },
-            CursorVertex { position: [x, y + h] },
+            CursorVertex {
+                position: [x + w, y],
+            },
+            CursorVertex {
+                position: [x, y + h],
+            },
+            CursorVertex {
+                position: [x + w, y],
+            },
+            CursorVertex {
+                position: [x + w, y + h],
+            },
+            CursorVertex {
+                position: [x, y + h],
+            },
         ]
     }
 }
@@ -281,8 +291,6 @@ impl Plugin for CursorPlugin {
 
 impl Initializable for CursorPlugin {
     fn setup(&mut self, ctx: &mut SetupContext) -> Result<(), PluginError> {
-        // eprintln!("CursorPlugin::setup called");
-
         // Store device and queue for later use
         self.device = Some(ctx.device.clone());
         self.queue = Some(ctx.queue.clone());
@@ -491,7 +499,8 @@ impl Paintable for CursorPlugin {
 
             // Update cached values
             self.last_visibility.store(visible, Ordering::Relaxed);
-            self.last_viewport_size.store(packed_viewport, Ordering::Relaxed);
+            self.last_viewport_size
+                .store(packed_viewport, Ordering::Relaxed);
             self.last_color.store(color, Ordering::Relaxed);
         }
 

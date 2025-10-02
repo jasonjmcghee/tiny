@@ -141,7 +141,7 @@ impl TextRenderer {
 
         // Build map of (line, pos_in_line, char) → (token_id, relative_pos) for preservation
         // This keeps colors stable when layout rebuilds (e.g., after undo)
-        let old_tokens: ahash::HashMap<(u32, u32, char), (u16, f32)> = self
+        let old_tokens: HashMap<(u32, u32, char), (u16, f32)> = self
             .layout_cache
             .iter()
             .enumerate()
@@ -150,18 +150,24 @@ impl TextRenderer {
                     return None; // Skip unstyled glyphs
                 }
                 // Find which line this glyph is on using binary search
-                let line_idx = self.line_cache.binary_search_by(|l| {
-                    if glyph_idx < l.char_range.start {
-                        std::cmp::Ordering::Greater
-                    } else if glyph_idx >= l.char_range.end {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                }).ok()?;
+                let line_idx = self
+                    .line_cache
+                    .binary_search_by(|l| {
+                        if glyph_idx < l.char_range.start {
+                            std::cmp::Ordering::Greater
+                        } else if glyph_idx >= l.char_range.end {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    })
+                    .ok()?;
                 let line_info = self.line_cache.get(line_idx)?;
                 let pos_in_line = (glyph_idx - line_info.char_range.start) as u32;
-                Some(((line_info.line_number, pos_in_line, g.char), (g.token_id, g.relative_pos)))
+                Some((
+                    (line_info.line_number, pos_in_line, g.char),
+                    (g.token_id, g.relative_pos),
+                ))
             })
             .collect();
 
@@ -186,9 +192,12 @@ impl TextRenderer {
 
         // Use editor bounds if available, otherwise fall back to margins
         let (x_offset, mut y_pos) = if let Some(bounds) = &self.editor_bounds {
-            (0.0, 0.0)  // Local coordinates within bounds
+            (0.0, 0.0) // Local coordinates within bounds
         } else {
-            (viewport.margin.x.0, viewport.global_margin.y.0 + viewport.margin.y.0)
+            (
+                viewport.margin.x.0,
+                viewport.global_margin.y.0 + viewport.margin.y.0,
+            )
         };
 
         let text_len = text.len();
@@ -232,7 +241,11 @@ impl TextRenderer {
                 };
 
                 // Try to preserve token from old layout
-                let key = (line_idx as u32, (char_index - line_start_char) as u32, glyph.char);
+                let key = (
+                    line_idx as u32,
+                    (char_index - line_start_char) as u32,
+                    glyph.char,
+                );
                 let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
 
                 self.layout_cache.push(UnifiedGlyph {
@@ -255,7 +268,9 @@ impl TextRenderer {
                     // If source is tab but glyph is space, we're in an expansion
                     if source_char == '\t' && glyph.char == ' ' {
                         // Check if we're at the last space of the tab expansion (tab width = 4)
-                        let next_glyph_is_not_space = layout.glyphs.get(glyph_idx + 1)
+                        let next_glyph_is_not_space = layout
+                            .glyphs
+                            .get(glyph_idx + 1)
                             .map(|g| g.char != ' ')
                             .unwrap_or(true);
                         if next_glyph_is_not_space {
@@ -373,7 +388,8 @@ impl TextRenderer {
 
                 // Build cumulative delta array for efficient binary search
                 // cumulative[i] = sum of all deltas for edits at position <= sorted_edits[i].0
-                let mut cumulative_deltas: Vec<(usize, isize)> = Vec::with_capacity(sorted_edits.len());
+                let mut cumulative_deltas: Vec<(usize, isize)> =
+                    Vec::with_capacity(sorted_edits.len());
                 let mut sum = 0;
                 for &(pos, delta) in &sorted_edits {
                     sum += delta;
@@ -390,7 +406,9 @@ impl TextRenderer {
                 };
 
                 // Adjust stable tokens using binary search
-                adjusted_tokens = self.syntax_state.stable_tokens
+                adjusted_tokens = self
+                    .syntax_state
+                    .stable_tokens
                     .iter()
                     .map(|t| {
                         let original_start = t.byte_range.start;
@@ -409,7 +427,8 @@ impl TextRenderer {
                         };
                         let shift_within = shift_before_end - shift_before_start;
 
-                        let new_start = ((original_start as isize) + shift_before_start).max(0) as usize;
+                        let new_start =
+                            ((original_start as isize) + shift_before_start).max(0) as usize;
                         let new_end = ((original_end as isize) + shift_before_start + shift_within)
                             .max(new_start as isize) as usize;
 
@@ -501,9 +520,7 @@ impl TextRenderer {
                 };
                 (*pos, len as isize)
             }
-            tree::Edit::Delete { range } => {
-                (range.start, -(range.len() as isize))
-            }
+            tree::Edit::Delete { range } => (range.start, -(range.len() as isize)),
             tree::Edit::Replace { range, content } => {
                 let old_len = range.len();
                 let new_len = match content {
@@ -526,9 +543,7 @@ impl TextRenderer {
                 };
                 *pos..*pos + len
             }
-            tree::Edit::Delete { range } => {
-                range.start..range.start
-            }
+            tree::Edit::Delete { range } => range.start..range.start,
             tree::Edit::Replace { range, content } => {
                 let len = match content {
                     tree::Content::Text(text) => text.len(),

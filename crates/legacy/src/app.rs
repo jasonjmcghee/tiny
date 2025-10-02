@@ -3,13 +3,15 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
-    input::{self, EventBus, InputAction, InputHandler},
+    input::{self, Event, EventBus, InputAction, InputHandler},
     input_types, io,
     lsp_manager::LspManager,
     render::Renderer,
     text_editor_plugin::TextEditorPlugin,
     text_effects::TextStyleProvider,
 };
+
+pub use crate::editor_logic::EditorLogic;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 #[allow(unused)]
@@ -33,10 +35,7 @@ use tiny_core::{
     tree::{Doc, Point, Rect},
     GpuRenderer, Uniforms,
 };
-use tiny_sdk::{
-    types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint,
-    Updatable as SdkUpdate,
-};
+use tiny_sdk::{types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {
@@ -180,6 +179,321 @@ impl TinyApp {
         }
     }
 
+    /// Handle cursor movement (mouse move)
+    fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        self.cursor_position = Some(position);
+
+        // Pre-compute logical positions to avoid borrow issues
+        let logical_point = self.physical_to_logical_point(position);
+        let drag_from = self
+            .drag_start
+            .and_then(|p| self.physical_to_logical_point(p));
+
+        if let Some(point) = logical_point {
+            // Extract all needed data from cpu_renderer first
+            let (
+                editor_bounds,
+                viewport_scroll,
+                viewport,
+                diagnostics_ptr,
+                editor_local_from,
+                editor_local_to,
+            ) = if let Some(cpu_renderer) = &self.cpu_renderer {
+                let from_local = drag_from.map(|f| cpu_renderer.screen_to_editor_local(f));
+                let to_local = cpu_renderer.screen_to_editor_local(point);
+                (
+                    cpu_renderer.editor_bounds,
+                    cpu_renderer.viewport.scroll,
+                    cpu_renderer.viewport.clone(),
+                    cpu_renderer.diagnostics_plugin,
+                    from_local,
+                    to_local,
+                )
+            } else {
+                return;
+            };
+
+            let cmd_held = self.modifiers.state().super_key();
+
+            // Check if mouse is within editor bounds
+            let in_editor = point.x.0 >= editor_bounds.x.0
+                && point.x.0 <= editor_bounds.x.0 + editor_bounds.width.0
+                && point.y.0 >= editor_bounds.y.0
+                && point.y.0 <= editor_bounds.y.0 + editor_bounds.height.0;
+
+            // Get hover position if in editor
+            let hover_position = if in_editor {
+                if let Some(diagnostics_ptr) = diagnostics_ptr {
+                    let diagnostics_plugin = unsafe { &mut *diagnostics_ptr };
+                    let editor_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: editor_bounds,
+                        scroll: viewport_scroll,
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 3,
+                    };
+                    // Need to access service_registry from cpu_renderer
+                    if let Some(cpu_renderer) = &self.cpu_renderer {
+                        diagnostics_plugin.set_mouse_position(
+                            point.x.0,
+                            point.y.0,
+                            Some(&editor_viewport),
+                            Some(&cpu_renderer.service_registry),
+                        );
+                    }
+                    diagnostics_plugin.get_mouse_document_position()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Now handle editor operations without holding cpu_renderer borrow
+            if let Some((line, column)) = hover_position {
+                self.editor
+                    .tab_manager
+                    .active_tab_mut()
+                    .diagnostics
+                    .on_mouse_move(line, column, cmd_held);
+            } else if !in_editor {
+                self.editor
+                    .tab_manager
+                    .active_tab_mut()
+                    .diagnostics
+                    .on_mouse_leave();
+            }
+
+            // Mouse move
+            if self.editor.on_mouse_move(point, &viewport) {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+
+            // Mouse drag - emit event
+            if self.mouse_pressed {
+                if let Some(from) = drag_from {
+                    // Check if drag started in titlebar area (for transparent titlebar on macOS)
+                    #[cfg(target_os = "macos")]
+                    let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
+                    #[cfg(not(target_os = "macos"))]
+                    let drag_started_in_titlebar = false;
+
+                    // Only emit drag event if drag didn't start in titlebar area
+                    if !drag_started_in_titlebar {
+                        if let (Some(from_local), to_local) = (editor_local_from, editor_local_to) {
+                            // Emit drag event
+                            use serde_json::json;
+                            self.event_bus.emit(
+                                "app.mouse.drag",
+                                json!({
+                                    "from_x": from_local.x.0,
+                                    "from_y": from_local.y.0,
+                                    "to_x": to_local.x.0,
+                                    "to_y": to_local.y.0,
+                                    "modifiers": {
+                                        "shift": self.modifiers.state().shift_key(),
+                                        "ctrl": self.modifiers.state().control_key(),
+                                        "alt": self.modifiers.state().alt_key(),
+                                        "cmd": self.modifiers.state().super_key(),
+                                    }
+                                }),
+                                10,
+                                "winit",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle mouse button input (press/release)
+    fn handle_mouse_input(
+        &mut self,
+        state: ElementState,
+        position: Option<winit::dpi::PhysicalPosition<f64>>,
+    ) {
+        use serde_json::json;
+
+        match state {
+            ElementState::Pressed => {
+                if let Some(position) = position {
+                    // Emit press event with editor-local coordinates
+                    if let Some(point) = self.physical_to_logical_point(position) {
+                        // Check if click is in titlebar area
+                        #[cfg(target_os = "macos")]
+                        let is_in_titlebar = point.y.0 < self.title_bar_height;
+                        #[cfg(not(target_os = "macos"))]
+                        let is_in_titlebar = false;
+
+                        if !is_in_titlebar {
+                            // Check if click is in tab bar area (before converting coordinates)
+                            let tab_bar_start = self.title_bar_height;
+                            let tab_bar_end = tab_bar_start + 30.0; // TAB_BAR_HEIGHT
+                            let in_tab_bar = point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
+
+                            let mut handled_by_tab_bar = false;
+                            if in_tab_bar {
+                                // Any click in tab bar region should be blocked from reaching editor
+                                // Don't set drag_start for tab bar clicks
+                                handled_by_tab_bar = true;
+
+                                // Extract viewport width before mutable borrow
+                                let viewport_width = self
+                                    .cpu_renderer
+                                    .as_ref()
+                                    .map(|r| r.viewport.logical_size.width.0);
+
+                                // Handle tab bar clicks
+                                if let Some(viewport_width) = viewport_width {
+                                    let click_x = point.x.0;
+                                    let click_y = point.y.0 - tab_bar_start;
+
+                                    if self.editor.handle_tab_bar_click(
+                                        click_x,
+                                        click_y,
+                                        viewport_width,
+                                    ) {
+                                        self.request_redraw();
+                                    }
+                                }
+                            }
+
+                            // Request redraw after handling tab bar (outside the mutable borrow)
+                            if handled_by_tab_bar {
+                                return; // Early return - already handled
+                            }
+
+                            // Only emit mouse press event and set drag state if not handled by tab bar
+                            // Set drag state for editor clicks only
+                            self.mouse_pressed = true;
+                            self.drag_start = Some(position);
+
+                            // Convert to editor-local coordinates if we have a renderer
+                            let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
+                                cpu_renderer.screen_to_editor_local(point)
+                            } else {
+                                point
+                            };
+
+                            self.event_bus.emit(
+                                "app.mouse.press",
+                                json!({
+                                    "x": editor_local.x.0,
+                                    "y": editor_local.y.0,
+                                    "button": "Left",
+                                    "state": "pressed",
+                                    "modifiers": {
+                                        "shift": self.modifiers.state().shift_key(),
+                                        "ctrl": self.modifiers.state().control_key(),
+                                        "alt": self.modifiers.state().alt_key(),
+                                        "cmd": self.modifiers.state().super_key(),
+                                    }
+                                }),
+                                10, // Input priority
+                                "winit",
+                            );
+                        }
+                    }
+                }
+            }
+            ElementState::Released => {
+                self.mouse_pressed = false;
+                self.drag_start = None;
+
+                // Emit release event
+                self.event_bus
+                    .emit("app.mouse.release", json!({}), 10, "winit");
+            }
+        }
+    }
+
+    /// Handle mouse wheel scrolling with scroll lock logic
+    fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        // Emit mouse wheel event to the event bus
+        use serde_json::json;
+
+        let (delta_x, delta_y) = match delta {
+            winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
+            winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+        };
+
+        self.event_bus.emit(
+            "app.mouse.scroll",
+            json!({
+                "delta_x": delta_x,
+                "delta_y": delta_y,
+                "type": match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, _) => "line",
+                    winit::event::MouseScrollDelta::PixelDelta(_) => "pixel",
+                }
+            }),
+            15, // Slightly lower priority than direct input
+            "winit",
+        );
+
+        // Request immediate redraw to process scroll events
+        self.request_redraw();
+
+        // Apply scroll with scroll lock logic
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            let (scroll_x, scroll_y) = match delta {
+                winit::event::MouseScrollDelta::LineDelta(x, y) => (
+                    x * &cpu_renderer.viewport.metrics.space_width,
+                    y * &cpu_renderer.viewport.metrics.line_height,
+                ),
+                winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+            };
+
+            // Apply scroll lock logic
+            let (final_scroll_x, final_scroll_y) = if self.scroll_lock_enabled {
+                // Determine which direction to lock to
+                let new_direction = if scroll_y.abs() > scroll_x.abs() {
+                    ScrollDirection::Vertical
+                } else if scroll_x.abs() > 0.0 {
+                    ScrollDirection::Horizontal
+                } else {
+                    // No movement, keep current direction
+                    self.current_scroll_direction
+                        .unwrap_or(ScrollDirection::Vertical)
+                };
+
+                // Update current direction if we started scrolling
+                if scroll_x.abs() > 0.0 || scroll_y.abs() > 0.0 {
+                    self.current_scroll_direction = Some(new_direction);
+                }
+
+                // Apply scroll lock
+                match new_direction {
+                    ScrollDirection::Vertical => (0.0, scroll_y), // Only vertical
+                    ScrollDirection::Horizontal => (scroll_x, 0.0), // Only horizontal
+                }
+            } else {
+                // No scroll lock - free scrolling
+                (scroll_x, scroll_y)
+            };
+
+            // Update scroll in viewport
+            let viewport = &mut cpu_renderer.viewport;
+
+            // Apply the scroll amounts (note: scroll values are inverted)
+            let new_scroll_y = viewport.scroll.y.0 - final_scroll_y;
+            let new_scroll_x = viewport.scroll.x.0 - final_scroll_x;
+            viewport.scroll.y = LogicalPixels(new_scroll_y);
+            viewport.scroll.x = LogicalPixels(new_scroll_x);
+
+            // Apply document-based scroll bounds
+            let doc = self.editor.doc();
+            let tree = doc.read();
+            viewport.clamp_scroll_to_bounds(&tree, cpu_renderer.editor_bounds);
+
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
     pub fn new(editor: EditorLogic) -> Self {
         // Pre-warm LSP in the background for faster startup
         // Look for workspace root from current directory (find deepest Cargo.toml)
@@ -301,6 +615,442 @@ impl TinyApp {
         }
 
         self.request_redraw();
+    }
+
+    fn setup_shader_watcher(&mut self) {
+        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = channel();
+
+        // Create watcher
+        let mut watcher = match RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    // Only care about modifications to .wgsl files
+                    if event.kind.is_modify()
+                        && event
+                            .paths
+                            .iter()
+                            .any(|p| p.extension().map_or(false, |ext| ext == "wgsl"))
+                    {
+                        let _ = tx.send(());
+                    }
+                }
+            },
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!(
+                    "Failed to create file watcher: {}. Shader hot-reload disabled.",
+                    e
+                );
+                return;
+            }
+        };
+
+        // Watch the shaders directory
+        let shader_path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("crates/core/src/shaders");
+
+        if let Err(e) = watcher.watch(&shader_path, RecursiveMode::NonRecursive) {
+            eprintln!(
+                "Failed to watch shader directory {:?}: {}. Shader hot-reload disabled.",
+                shader_path, e
+            );
+            return;
+        }
+
+        eprintln!("Shader hot-reload enabled! Watching: {:?}", shader_path);
+
+        // Simple debounce thread
+        let reload_flag = self.shader_reload_pending.clone();
+        std::thread::spawn(move || {
+            let mut last_reload = Instant::now();
+            for _ in rx {
+                // Simple 200ms debounce
+                if last_reload.elapsed() > Duration::from_millis(50) {
+                    reload_flag.store(true, Ordering::Relaxed);
+                    last_reload = Instant::now();
+                    eprintln!("Shader change detected, triggering reload...");
+                }
+            }
+        });
+
+        // Store the watcher (it needs to stay alive)
+        self._shader_watcher = Some(watcher);
+    }
+
+    fn process_event_queue(&mut self) {
+        // Process all events in the queue
+        loop {
+            // Get events to process
+            let mut events_to_process = Vec::new();
+            std::mem::swap(&mut events_to_process, &mut self.event_bus.queued);
+
+            if events_to_process.is_empty() {
+                break;
+            }
+
+            // Sort by priority
+            events_to_process.sort_by_key(|e| e.priority);
+
+            // Process each event
+            for event in events_to_process {
+                // Handle app-level command events (from InputHandler's registered handlers)
+                match event.name.as_str() {
+                    "app.command.adjust_font_size" => {
+                        let increase = event
+                            .data
+                            .get("increase")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        self.adjust_font_size(increase);
+                        continue;
+                    }
+                    "app.command.toggle_scroll_lock" => {
+                        self.scroll_lock_enabled = !self.scroll_lock_enabled;
+                        self.current_scroll_direction = None;
+                        println!(
+                            "Scroll lock: {}",
+                            if self.scroll_lock_enabled {
+                                "ENABLED"
+                            } else {
+                                "DISABLED"
+                            }
+                        );
+                        continue;
+                    }
+                    "app.mouse.release" => {
+                        self.editor.on_mouse_release();
+                        continue;
+                    }
+                    "app.drag.scroll" => {
+                        // Apply drag scroll delta
+                        if let (Some(dx), Some(dy)) = (
+                            event.data.get("delta_x").and_then(|v| v.as_f64()),
+                            event.data.get("delta_y").and_then(|v| v.as_f64()),
+                        ) {
+                            // Get doc directly from editor to avoid borrow issues
+                            let doc = self.editor.doc();
+                            let tree = doc.read();
+
+                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                                cpu_renderer.viewport.scroll.x.0 += dx as f32;
+                                cpu_renderer.viewport.scroll.y.0 += dy as f32;
+
+                                // Clamp scroll to bounds
+                                let editor_bounds = cpu_renderer.editor_bounds;
+                                cpu_renderer
+                                    .viewport
+                                    .clamp_scroll_to_bounds(&tree, editor_bounds);
+
+                                self.request_redraw();
+                            }
+                        }
+                        continue;
+                    }
+                    // Navigation events - handled by EditorLogic
+                    "app.action.open_file_picker"
+                    | "app.action.nav_back"
+                    | "app.action.nav_forward"
+                    | "app.action.goto_definition" => {
+                        if let Some(needs_redraw) =
+                            self.editor.handle_navigation_event(event.name.as_str())
+                        {
+                            if needs_redraw {
+                                self.request_redraw();
+                                self.cursor_needs_scroll = true;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Handle file picker events (if visible and it's a keyboard event)
+                if self.editor.handle_file_picker_event(&event) {
+                    self.request_redraw();
+                    continue;
+                }
+
+                // Extract viewport for input processing
+                let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
+
+                // Process input events for document editing
+                if let Some(viewport) = viewport {
+                    let action =
+                        self.editor
+                            .handle_input_event(&event, &viewport, &mut self.event_bus);
+                    if action == InputAction::Redraw {
+                        self.request_redraw();
+                        self.update_window_title();
+                        self.cursor_needs_scroll = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_frame_timing(&mut self) -> f32 {
+        let current_time = std::time::Instant::now();
+        let frame_duration = current_time.duration_since(self.last_frame_time);
+        self.last_frame_time = current_time;
+
+        if self.continuous_rendering {
+            // Use actual frame duration for smooth animations
+            frame_duration.as_secs_f32().min(0.05)
+        } else {
+            // Use consistent 16ms (60fps) for predictable animations in retained mode
+            0.016
+        }
+    }
+
+    fn render_frame(&mut self) {
+        // Process all queued events at the beginning of the frame
+        // This ensures events are handled before rendering
+        self.process_event_queue();
+
+        // Check for pending shader reload
+        if self.shader_reload_pending.load(Ordering::Relaxed) {
+            if let Some(gpu_renderer) = &mut self.gpu_renderer {
+                gpu_renderer.reload_shaders();
+                self.shader_reload_pending.store(false, Ordering::Relaxed);
+            }
+        }
+
+        let dt = self.update_frame_timing();
+        self.editor.on_update();
+
+        // Update plugins through orchestrator
+        if let Err(e) = self.orchestrator.update_all(dt) {
+            eprintln!("Plugin update error: {}", e);
+        }
+
+        // Request next frame if continuous rendering is enabled
+        if self.continuous_rendering {
+            self.request_redraw();
+        }
+
+        // Handle cursor scroll when selection actually changed
+        if self.cursor_needs_scroll {
+            self.cursor_needs_scroll = false;
+            if let Some(cursor_pos) = self.editor.get_cursor_doc_pos() {
+                if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                    let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
+                    cpu_renderer.viewport.ensure_visible(layout_pos);
+                }
+            }
+        }
+
+        // Check if we have all required components
+        if self.window.is_none() || self.gpu_renderer.is_none() || self.cpu_renderer.is_none() {
+            return;
+        }
+
+        // Get window info without holding a borrow
+        let (logical_width, logical_height, scale_factor) = {
+            let window = self.window.as_ref().unwrap();
+            let size = window.inner_size();
+            let scale = window.scale_factor() as f32;
+            (size.width as f32 / scale, size.height as f32 / scale, scale)
+        };
+
+        // Update GPU renderer time
+        if let Some(gpu_renderer) = &mut self.gpu_renderer {
+            gpu_renderer.update_time(dt);
+        }
+
+        // Update viewport
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
+        }
+
+        // Setup text styles
+        if let Some(text_styles) = self.editor.text_styles() {
+            if let Some(syntax_hl) = text_styles
+                .as_any()
+                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
+            {
+                if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                    let highlighter = Arc::new(syntax_hl.clone());
+                    cpu_renderer.set_syntax_highlighter(highlighter);
+                }
+            }
+        }
+
+        let viewport = Rect {
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(logical_width),
+            height: LogicalPixels(logical_height),
+        };
+
+        // Update plugins for editor
+        if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
+            let tab = self.editor.tab_manager.active_tab_mut();
+
+            // Swap in the active tab's text_renderer to preserve per-tab state
+            cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+
+            // Always update selection widgets
+            cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
+
+            // Set line numbers plugin with fresh document reference
+            cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
+
+            // Set tab bar and file picker plugins (global UI)
+            cpu_renderer.set_tab_bar_plugin(&mut self.editor.tab_bar);
+            cpu_renderer.set_file_picker_plugin(&mut self.editor.file_picker);
+
+            // Mark renderer UI dirty if UI changed
+            if self.editor.ui_changed {
+                cpu_renderer.mark_ui_dirty();
+                self.editor.ui_changed = false;
+            }
+
+            // Update diagnostics manager (handles LSP polling, caching, plugin updates)
+            tab.diagnostics.update(&tab.plugin.doc);
+
+            // Set diagnostics plugin for rendering
+            cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
+
+            // Initialize diagnostics plugin with GPU resources (first time only)
+            static mut DIAGNOSTICS_INITIALIZED: bool = false;
+            unsafe {
+                if !DIAGNOSTICS_INITIALIZED {
+                    if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
+                        let diagnostics = &mut *diagnostics_ptr;
+                        if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
+                            let gpu_renderer = &*gpu;
+                            use tiny_sdk::Initializable;
+                            let mut setup_ctx = tiny_sdk::SetupContext {
+                                device: gpu_renderer.device_arc(),
+                                queue: gpu_renderer.queue_arc(),
+                                registry: tiny_sdk::PluginRegistry::empty(),
+                            };
+                            if let Err(e) = diagnostics.setup(&mut setup_ctx) {
+                                eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
+                            } else {
+                                DIAGNOSTICS_INITIALIZED = true;
+                                eprintln!("Diagnostics plugin initialized successfully");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Set up global margin (only once)
+            let title_bar_height = self.title_bar_height;
+            static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
+            unsafe {
+                if !GLOBAL_MARGIN_INITIALIZED {
+                    GLOBAL_MARGIN_INITIALIZED = true;
+                    cpu_renderer
+                        .viewport
+                        .set_global_margin(0.0, title_bar_height);
+                }
+            }
+        }
+
+        // Upload font atlas only if dirty (atlas changed)
+        if let Some(font_system) = &self.font_system {
+            if font_system.is_dirty() {
+                let atlas_data = font_system.atlas_data();
+                let (atlas_width, atlas_height) = font_system.atlas_size();
+                if let Some(gpu_renderer) = &mut self.gpu_renderer {
+                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+                }
+                font_system.clear_dirty();
+            }
+        }
+
+        let doc = self.editor.doc();
+        let doc_read = doc.read();
+
+        // Get renderer state for uniforms
+        let (viewport_size, scale_factor, current_time, theme_mode, cached_version) = {
+            let cpu = self.cpu_renderer.as_ref().unwrap();
+            let gpu = self.gpu_renderer.as_ref().unwrap();
+            (
+                [
+                    cpu.viewport.physical_size.width as f32,
+                    cpu.viewport.physical_size.height as f32,
+                ],
+                cpu.viewport.scale_factor,
+                gpu.current_time,
+                gpu.current_theme_mode,
+                cpu.cached_doc_version,
+            )
+        };
+
+        // Check if version changed without edits (undo/redo)
+        let version_changed_without_edits = doc_read.version != cached_version;
+
+        // Update cached doc state
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
+            cpu_renderer.cached_doc_version = doc_read.version;
+        }
+
+        // Apply pending renderer edits for syntax token adjustment
+        // Note: text_renderer has already been swapped in from the active tab
+        if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
+            let pending_edits = self.editor.active_plugin_mut().input.take_renderer_edits();
+
+            // If version changed without edits, it's undo/redo
+            // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
+            // This prevents white flash while keeping old (close enough) syntax visible
+            if pending_edits.is_empty() && version_changed_without_edits {
+                cpu_renderer.clear_edit_deltas();
+                // Don't clear stable_tokens - causes white flash. Let background parse update them.
+            }
+
+            for edit in pending_edits {
+                cpu_renderer.apply_incremental_edit(&edit);
+            }
+        }
+
+        // Get tab_manager reference
+        let tab_manager: Option<*const crate::tab_manager::TabManager> =
+            Some(&self.editor.tab_manager as *const _);
+
+        // Prepare uniforms for GPU rendering
+        let uniforms = Uniforms {
+            viewport_size,
+            scale_factor,
+            time: current_time,
+            theme_mode,
+            _padding: [0.0, 0.0, 0.0],
+        };
+
+        // Set up CPU renderer state and render
+        if let (Some(gpu_renderer), Some(cpu_renderer)) =
+            (&mut self.gpu_renderer, &mut self.cpu_renderer)
+        {
+            cpu_renderer.set_gpu_renderer(gpu_renderer);
+
+            // Just use the existing render pipeline - it was working!
+            unsafe {
+                let tab_manager_ref = tab_manager.map(|ptr| &*ptr);
+                gpu_renderer.render_with_callback(uniforms, |render_pass| {
+                    cpu_renderer.render_with_pass_and_context(
+                        &doc_read,
+                        Some(render_pass),
+                        tab_manager_ref,
+                    );
+                });
+            }
+        }
+
+        // Swap the text_renderer back to the tab to preserve state
+        if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
+            let tab = self.editor.tab_manager.active_tab_mut();
+            cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+        }
     }
 }
 
@@ -511,18 +1261,31 @@ impl ApplicationHandler for TinyApp {
                     if cmd_held {
                         match &event.logical_key {
                             winit::keyboard::Key::Character(ch) if ch == "=" || ch == "+" => {
-                                self.event_bus.emit("app.action.font_increase", json!({}), 5, "winit");
+                                self.event_bus.emit(
+                                    "app.action.font_increase",
+                                    json!({}),
+                                    5,
+                                    "winit",
+                                );
                             }
                             winit::keyboard::Key::Character(ch) if ch == "-" => {
-                                self.event_bus.emit("app.action.font_decrease", json!({}), 5, "winit");
+                                self.event_bus.emit(
+                                    "app.action.font_decrease",
+                                    json!({}),
+                                    5,
+                                    "winit",
+                                );
                             }
                             _ => {}
                         }
                     }
 
                     // F12 for scroll lock toggle
-                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) = event.logical_key {
-                        self.event_bus.emit("app.action.toggle_scroll_lock", json!({}), 5, "winit");
+                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) =
+                        event.logical_key
+                    {
+                        self.event_bus
+                            .emit("app.action.toggle_scroll_lock", json!({}), 5, "winit");
                     }
                 }
 
@@ -536,242 +1299,13 @@ impl ApplicationHandler for TinyApp {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_position = Some(position);
-
-                // Pre-compute logical positions to avoid borrow issues
-                let logical_point = self.physical_to_logical_point(position);
-                let drag_from = self
-                    .drag_start
-                    .and_then(|p| self.physical_to_logical_point(p));
-
-                if let Some(point) = logical_point {
-                    // Extract all needed data from cpu_renderer first
-                    let (editor_bounds, viewport_scroll, viewport, diagnostics_ptr, editor_local_from, editor_local_to) =
-                        if let Some(cpu_renderer) = &self.cpu_renderer {
-                            let from_local = drag_from.map(|f| cpu_renderer.screen_to_editor_local(f));
-                            let to_local = cpu_renderer.screen_to_editor_local(point);
-                            (
-                                cpu_renderer.editor_bounds,
-                                cpu_renderer.viewport.scroll,
-                                cpu_renderer.viewport.clone(),
-                                cpu_renderer.diagnostics_plugin,
-                                from_local,
-                                to_local
-                            )
-                        } else {
-                            return;
-                        };
-
-                    let cmd_held = self.modifiers.state().super_key();
-
-                    // Check if mouse is within editor bounds
-                    let in_editor = point.x.0 >= editor_bounds.x.0 &&
-                                   point.x.0 <= editor_bounds.x.0 + editor_bounds.width.0 &&
-                                   point.y.0 >= editor_bounds.y.0 &&
-                                   point.y.0 <= editor_bounds.y.0 + editor_bounds.height.0;
-
-                    // Get hover position if in editor
-                    let hover_position = if in_editor {
-                        if let Some(diagnostics_ptr) = diagnostics_ptr {
-                            let diagnostics_plugin = unsafe { &mut *diagnostics_ptr };
-                            let editor_viewport = tiny_sdk::types::WidgetViewport {
-                                bounds: editor_bounds,
-                                scroll: viewport_scroll,
-                                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                                widget_id: 3,
-                            };
-                            // Need to access service_registry from cpu_renderer
-                            if let Some(cpu_renderer) = &self.cpu_renderer {
-                                diagnostics_plugin.set_mouse_position(point.x.0, point.y.0, Some(&editor_viewport), Some(&cpu_renderer.service_registry));
-                            }
-                            diagnostics_plugin.get_mouse_document_position()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Now handle editor operations without holding cpu_renderer borrow
-                    if let Some((line, column)) = hover_position {
-                        self.editor.tab_manager.active_tab_mut().diagnostics.on_mouse_move(line, column, cmd_held);
-                    } else if !in_editor {
-                        self.editor.tab_manager.active_tab_mut().diagnostics.on_mouse_leave();
-                    }
-
-                    // Mouse move
-                    if self.editor.on_mouse_move(point, &viewport) {
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
-                    }
-
-                    // Mouse drag - emit event
-                    if self.mouse_pressed {
-                        if let Some(from) = drag_from {
-                            // Check if drag started in titlebar area (for transparent titlebar on macOS)
-                            #[cfg(target_os = "macos")]
-                            let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
-                            #[cfg(not(target_os = "macos"))]
-                            let drag_started_in_titlebar = false;
-
-                            // Only emit drag event if drag didn't start in titlebar area
-                            if !drag_started_in_titlebar {
-                                if let (Some(from_local), to_local) = (editor_local_from, editor_local_to) {
-                                    // Emit drag event
-                                    use serde_json::json;
-                                    self.event_bus.emit(
-                                        "app.mouse.drag",
-                                        json!({
-                                            "from_x": from_local.x.0,
-                                            "from_y": from_local.y.0,
-                                            "to_x": to_local.x.0,
-                                            "to_y": to_local.y.0,
-                                            "modifiers": {
-                                                "shift": self.modifiers.state().shift_key(),
-                                                "ctrl": self.modifiers.state().control_key(),
-                                                "alt": self.modifiers.state().alt_key(),
-                                                "cmd": self.modifiers.state().super_key(),
-                                            }
-                                        }),
-                                        10,
-                                        "winit",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                self.handle_cursor_moved(position);
             }
 
             WindowEvent::MouseInput { state, button, .. }
                 if button == winit::event::MouseButton::Left =>
             {
-                // Emit mouse events to the event bus
-                use serde_json::json;
-
-                // Update mouse state for drag tracking first
-                match state {
-                    ElementState::Pressed => {
-                        if let Some(position) = self.cursor_position {
-                            // Emit press event with editor-local coordinates
-                            if let Some(point) = self.physical_to_logical_point(position) {
-                                // Check if click is in titlebar area
-                                #[cfg(target_os = "macos")]
-                                let is_in_titlebar = point.y.0 < self.title_bar_height;
-                                #[cfg(not(target_os = "macos"))]
-                                let is_in_titlebar = false;
-
-                                if !is_in_titlebar {
-                                    // Check if click is in tab bar area (before converting coordinates)
-                                    let tab_bar_start = self.title_bar_height;
-                                    let tab_bar_end = tab_bar_start + 30.0; // TAB_BAR_HEIGHT
-                                    let in_tab_bar = point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
-
-                                    let mut handled_by_tab_bar = false;
-                                    if in_tab_bar {
-                                        // Any click in tab bar region should be blocked from reaching editor
-                                        // Don't set drag_start for tab bar clicks
-                                        handled_by_tab_bar = true;
-
-                                        // Extract viewport width before mutable borrow
-                                        let viewport_width = self.cpu_renderer.as_ref()
-                                            .map(|r| r.viewport.logical_size.width.0);
-
-                                        // Handle tab bar clicks
-                                        let click_x = point.x.0;
-                                        let click_y = point.y.0 - tab_bar_start;
-
-                                        if let Some(viewport_width) = viewport_width {
-                                            // Check dropdown first
-                                            if self.editor.tab_bar.hit_test_dropdown(click_x, click_y, viewport_width) {
-                                                self.editor.tab_bar.toggle_dropdown();
-                                                self.editor.ui_changed = true;
-                                            }
-                                            // Check close button
-                                            else if let Some(tab_idx) = self.editor.tab_bar.hit_test_close_button(click_x, click_y, &self.editor.tab_manager) {
-                                                let was_last = self.editor.tab_manager.close_tab(tab_idx);
-                                                if was_last {
-                                                    // TODO: Handle closing last tab (maybe exit app or create new tab)
-                                                    eprintln!("Closed last tab");
-                                                }
-                                                self.editor.ui_changed = true;
-                                            }
-                                            // Check tab click
-                                            else if let Some(tab_idx) = self.editor.tab_bar.hit_test_tab(click_x, click_y, &self.editor.tab_manager) {
-                                                self.editor.tab_manager.switch_to(tab_idx);
-                                                self.editor.tab_bar.close_dropdown();
-                                                self.editor.ui_changed = true;
-
-                                                // Trigger syntax highlighting for newly active tab
-                                                let plugin = &self.editor.tab_manager.active_tab().unwrap().plugin;
-                                                if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
-                                                    let text = plugin.doc.read().flatten_to_string();
-                                                    if let Some(syntax_hl) = syntax_highlighter
-                                                        .as_any()
-                                                        .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                                                    {
-                                                        syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
-                                                    }
-                                                }
-                                            }
-                                            // Else: clicked in empty tab bar space - do nothing
-                                        }
-                                    }
-
-                                    // Request redraw after handling tab bar (outside the mutable borrow)
-                                    if handled_by_tab_bar {
-                                        self.request_redraw();
-                                    }
-
-                                    // Only emit mouse press event and set drag state if not handled by tab bar
-                                    if !handled_by_tab_bar {
-                                        // Set drag state for editor clicks only
-                                        self.mouse_pressed = true;
-                                        self.drag_start = Some(position);
-
-                                        // Convert to editor-local coordinates if we have a renderer
-                                        let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
-                                            cpu_renderer.screen_to_editor_local(point)
-                                        } else {
-                                            point
-                                        };
-
-                                        self.event_bus.emit(
-                                            "app.mouse.press",
-                                            json!({
-                                                "x": editor_local.x.0,
-                                                "y": editor_local.y.0,
-                                                "button": "Left",
-                                                "state": "pressed",
-                                                "modifiers": {
-                                                    "shift": self.modifiers.state().shift_key(),
-                                                    "ctrl": self.modifiers.state().control_key(),
-                                                    "alt": self.modifiers.state().alt_key(),
-                                                    "cmd": self.modifiers.state().super_key(),
-                                                }
-                                            }),
-                                            10, // Input priority
-                                            "winit",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ElementState::Released => {
-                        self.mouse_pressed = false;
-                        self.drag_start = None;
-
-                        // Emit release event
-                        self.event_bus.emit(
-                            "app.mouse.release",
-                            json!({}),
-                            10,
-                            "winit",
-                        );
-                    }
-                }
+                self.handle_mouse_input(state, self.cursor_position);
             }
 
             WindowEvent::RedrawRequested => {
@@ -779,91 +1313,7 @@ impl ApplicationHandler for TinyApp {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // Emit mouse wheel event to the event bus
-                use serde_json::json;
-
-                let (delta_x, delta_y) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                        (pos.x as f32, pos.y as f32)
-                    }
-                };
-
-                self.event_bus.emit(
-                    "app.mouse.scroll",
-                    json!({
-                        "delta_x": delta_x,
-                        "delta_y": delta_y,
-                        "type": match delta {
-                            winit::event::MouseScrollDelta::LineDelta(_, _) => "line",
-                            winit::event::MouseScrollDelta::PixelDelta(_) => "pixel",
-                        }
-                    }),
-                    15, // Slightly lower priority than direct input
-                    "winit",
-                );
-
-                // Request immediate redraw to process scroll events
-                self.request_redraw();
-
-                // Keep existing scroll handling for now (will be replaced by event handlers)
-                if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                    let (scroll_x, scroll_y) = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(x, y) => (
-                            x * &cpu_renderer.viewport.metrics.space_width,
-                            y * &cpu_renderer.viewport.metrics.line_height,
-                        ),
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            (pos.x as f32, pos.y as f32)
-                        }
-                    };
-
-                    // Apply scroll lock logic
-                    let (final_scroll_x, final_scroll_y) = if self.scroll_lock_enabled {
-                        // Determine which direction to lock to
-                        let new_direction = if scroll_y.abs() > scroll_x.abs() {
-                            ScrollDirection::Vertical
-                        } else if scroll_x.abs() > 0.0 {
-                            ScrollDirection::Horizontal
-                        } else {
-                            // No movement, keep current direction
-                            self.current_scroll_direction
-                                .unwrap_or(ScrollDirection::Vertical)
-                        };
-
-                        // Update current direction if we started scrolling
-                        if scroll_x.abs() > 0.0 || scroll_y.abs() > 0.0 {
-                            self.current_scroll_direction = Some(new_direction);
-                        }
-
-                        // Apply scroll lock
-                        match new_direction {
-                            ScrollDirection::Vertical => (0.0, scroll_y), // Only vertical
-                            ScrollDirection::Horizontal => (scroll_x, 0.0), // Only horizontal
-                        }
-                    } else {
-                        // No scroll lock - free scrolling
-                        (scroll_x, scroll_y)
-                    };
-
-                    // Update scroll in viewport
-                    let viewport = &mut cpu_renderer.viewport;
-
-                    // Apply the scroll amounts (note: scroll values are inverted)
-                    let new_scroll_y = viewport.scroll.y.0 - final_scroll_y;
-                    let new_scroll_x = viewport.scroll.x.0 - final_scroll_x;
-                    viewport.scroll.y = LogicalPixels(new_scroll_y);
-                    viewport.scroll.x = LogicalPixels(new_scroll_x);
-
-                    // Apply document-based scroll bounds
-                    let doc = self.editor.doc();
-                    let tree = doc.read();
-                    viewport.clamp_scroll_to_bounds(&tree, cpu_renderer.editor_bounds);
-
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
+                self.handle_mouse_wheel(delta);
             }
 
             WindowEvent::Resized(new_size) => {
@@ -878,521 +1328,6 @@ impl ApplicationHandler for TinyApp {
             }
 
             _ => {}
-        }
-    }
-}
-
-impl TinyApp {
-    fn setup_shader_watcher(&mut self) {
-        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-        use std::sync::mpsc::channel;
-        use std::time::{Duration, Instant};
-
-        let (tx, rx) = channel();
-
-        // Create watcher
-        let mut watcher = match RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    // Only care about modifications to .wgsl files
-                    if event.kind.is_modify()
-                        && event
-                            .paths
-                            .iter()
-                            .any(|p| p.extension().map_or(false, |ext| ext == "wgsl"))
-                    {
-                        let _ = tx.send(());
-                    }
-                }
-            },
-            notify::Config::default(),
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "Failed to create file watcher: {}. Shader hot-reload disabled.",
-                    e
-                );
-                return;
-            }
-        };
-
-        // Watch the shaders directory
-        let shader_path = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("crates/core/src/shaders");
-
-        if let Err(e) = watcher.watch(&shader_path, RecursiveMode::NonRecursive) {
-            eprintln!(
-                "Failed to watch shader directory {:?}: {}. Shader hot-reload disabled.",
-                shader_path, e
-            );
-            return;
-        }
-
-        eprintln!("Shader hot-reload enabled! Watching: {:?}", shader_path);
-
-        // Simple debounce thread
-        let reload_flag = self.shader_reload_pending.clone();
-        std::thread::spawn(move || {
-            let mut last_reload = Instant::now();
-            for _ in rx {
-                // Simple 200ms debounce
-                if last_reload.elapsed() > Duration::from_millis(50) {
-                    reload_flag.store(true, Ordering::Relaxed);
-                    last_reload = Instant::now();
-                    eprintln!("Shader change detected, triggering reload...");
-                }
-            }
-        });
-
-        // Store the watcher (it needs to stay alive)
-        self._shader_watcher = Some(watcher);
-    }
-
-    fn process_event_queue(&mut self) {
-        // Process all events in the queue
-        loop {
-            // Get events to process
-            let mut events_to_process = Vec::new();
-            std::mem::swap(&mut events_to_process, &mut self.event_bus.queued);
-
-            if events_to_process.is_empty() {
-                break;
-            }
-
-            // Sort by priority
-            events_to_process.sort_by_key(|e| e.priority);
-
-            // Process each event
-            for event in events_to_process {
-                // Handle app-level command events (from InputHandler's registered handlers)
-                match event.name.as_str() {
-                    "app.command.adjust_font_size" => {
-                        let increase = event.data.get("increase").and_then(|v| v.as_bool()).unwrap_or(false);
-                        self.adjust_font_size(increase);
-                        continue;
-                    }
-                    "app.command.toggle_scroll_lock" => {
-                        self.scroll_lock_enabled = !self.scroll_lock_enabled;
-                        self.current_scroll_direction = None;
-                        println!(
-                            "Scroll lock: {}",
-                            if self.scroll_lock_enabled {
-                                "ENABLED"
-                            } else {
-                                "DISABLED"
-                            }
-                        );
-                        continue;
-                    }
-                    "app.mouse.release" => {
-                        self.editor.on_mouse_release();
-                        continue;
-                    }
-                    "app.drag.scroll" => {
-                        // Apply drag scroll delta
-                        if let (Some(dx), Some(dy)) = (
-                            event.data.get("delta_x").and_then(|v| v.as_f64()),
-                            event.data.get("delta_y").and_then(|v| v.as_f64())
-                        ) {
-                            // Get doc directly from editor to avoid borrow issues
-                            let doc = self.editor.doc();
-                            let tree = doc.read();
-
-                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                                cpu_renderer.viewport.scroll.x.0 += dx as f32;
-                                cpu_renderer.viewport.scroll.y.0 += dy as f32;
-
-                                // Clamp scroll to bounds
-                                let editor_bounds = cpu_renderer.editor_bounds;
-                                cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
-
-                                self.request_redraw();
-                            }
-                        }
-                        continue;
-                    }
-                    "app.action.open_file_picker" => {
-                        // Open file picker (triggered by double-shift)
-                        self.editor.file_picker.show();
-                        self.editor.ui_changed = true;
-                        self.request_redraw();
-                        continue;
-                    }
-                    "app.action.nav_back" => {
-                        // Navigate back across files
-                        if self.editor.navigate_back() {
-                            self.request_redraw();
-                            self.cursor_needs_scroll = true;
-                        }
-                        continue;
-                    }
-                    "app.action.nav_forward" => {
-                        // Navigate forward across files
-                        if self.editor.navigate_forward() {
-                            self.request_redraw();
-                            self.cursor_needs_scroll = true;
-                        }
-                        continue;
-                    }
-                    "app.action.goto_definition" => {
-                        eprintln!("DEBUG: app.action.goto_definition event received");
-                        // Go to definition at cursor
-                        self.editor.goto_definition();
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                // Extract viewport before borrowing editor mutably
-                let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
-
-                // Process with InputHandler for document events
-                // Check if file picker is open and handle its events first
-                if self.editor.file_picker.visible && event.name == "app.keyboard.keypress" {
-                    let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
-                    if state == "pressed" {
-                        if let Some(key_obj) = event.data.get("key") {
-                            let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
-
-                            let mut handled = false;
-
-                            if key_type == "named" {
-                                match key_value {
-                                    "Escape" => {
-                                        self.editor.file_picker.hide();
-                                        self.editor.ui_changed = true;
-                                        handled = true;
-                                    }
-                                    "ArrowUp" => {
-                                        self.editor.file_picker.move_up();
-                                        self.editor.ui_changed = true;
-                                        handled = true;
-                                    }
-                                    "ArrowDown" => {
-                                        self.editor.file_picker.move_down();
-                                        self.editor.ui_changed = true;
-                                        handled = true;
-                                    }
-                                    "Enter" => {
-                                        // Open selected file
-                                        if let Some(path) = self.editor.file_picker.selected_file() {
-                                            let path_buf = path.to_path_buf();
-                                            self.editor.file_picker.hide();
-
-                                            // Record current location before opening new file
-                                            self.editor.record_navigation();
-
-                                            match self.editor.tab_manager.open_file(path_buf) {
-                                                Ok(_) => {
-                                                    self.editor.ui_changed = true;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("Failed to open file: {}", e);
-                                                }
-                                            }
-                                        }
-                                        handled = true;
-                                    }
-                                    "Backspace" => {
-                                        self.editor.file_picker.backspace();
-                                        self.editor.ui_changed = true;
-                                        handled = true;
-                                    }
-                                    _ => {}
-                                }
-                            } else if key_type == "character" {
-                                // Add character to query
-                                if let Some(ch) = key_value.chars().next() {
-                                    if !ch.is_control() {
-                                        self.editor.file_picker.add_char(ch);
-                                        self.editor.ui_changed = true;
-                                        handled = true;
-                                    }
-                                }
-                            }
-
-                            if handled {
-                                self.request_redraw();
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(viewport) = viewport {
-                    let plugin = self.editor.active_plugin_mut();
-                    let action = plugin.input.process_event(&event, &plugin.doc, &viewport, &mut self.event_bus);
-
-                    if action != InputAction::None {
-                        // Handle Save separately since it needs EditorLogic
-                        let handled = if action == InputAction::Save {
-                            if let Err(e) = self.editor.save() {
-                                eprintln!("Failed to save: {}", e);
-                            }
-                            true
-                        } else {
-                            input::handle_input_action(action, plugin)
-                        };
-
-                        if handled {
-                            self.editor.widgets_dirty = true;
-                            self.request_redraw();
-                            self.update_window_title();
-                            self.cursor_needs_scroll = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn update_frame_timing(&mut self) -> f32 {
-        let current_time = std::time::Instant::now();
-        let frame_duration = current_time.duration_since(self.last_frame_time);
-        self.last_frame_time = current_time;
-
-        if self.continuous_rendering {
-            // Use actual frame duration for smooth animations
-            frame_duration.as_secs_f32().min(0.05)
-        } else {
-            // Use consistent 16ms (60fps) for predictable animations in retained mode
-            0.016
-        }
-    }
-
-    fn render_frame(&mut self) {
-        // Process all queued events at the beginning of the frame
-        // This ensures events are handled before rendering
-        self.process_event_queue();
-
-        // Check for pending shader reload
-        if self.shader_reload_pending.load(Ordering::Relaxed) {
-            if let Some(gpu_renderer) = &mut self.gpu_renderer {
-                gpu_renderer.reload_shaders();
-                self.shader_reload_pending.store(false, Ordering::Relaxed);
-            }
-        }
-
-        let dt = self.update_frame_timing();
-        self.editor.on_update();
-
-        // Update plugins through orchestrator
-        if let Err(e) = self.orchestrator.update_all(dt) {
-            eprintln!("Plugin update error: {}", e);
-        }
-
-        // Request next frame if continuous rendering is enabled
-        if self.continuous_rendering {
-            self.request_redraw();
-        }
-
-        // Handle cursor scroll when selection actually changed
-        if self.cursor_needs_scroll {
-            self.cursor_needs_scroll = false;
-            if let Some(cursor_pos) = self.editor.get_cursor_doc_pos() {
-                if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                    let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
-                    cpu_renderer.viewport.ensure_visible(layout_pos);
-                }
-            }
-        }
-
-        // Check if we have all required components
-        if self.window.is_none() || self.gpu_renderer.is_none() || self.cpu_renderer.is_none() {
-            return;
-        }
-
-        // Get window info without holding a borrow
-        let (logical_width, logical_height, scale_factor) = {
-            let window = self.window.as_ref().unwrap();
-            let size = window.inner_size();
-            let scale = window.scale_factor() as f32;
-            (size.width as f32 / scale, size.height as f32 / scale, scale)
-        };
-
-        // Update GPU renderer time
-        if let Some(gpu_renderer) = &mut self.gpu_renderer {
-            gpu_renderer.update_time(dt);
-        }
-
-        // Update viewport
-        if let Some(cpu_renderer) = &mut self.cpu_renderer {
-            cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
-        }
-
-        // Setup text styles
-        if let Some(text_styles) = self.editor.text_styles() {
-            if let Some(syntax_hl) = text_styles
-                .as_any()
-                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-            {
-                if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                    let highlighter = Arc::new(syntax_hl.clone());
-                    cpu_renderer.set_syntax_highlighter(highlighter);
-                }
-            }
-        }
-
-        let viewport = Rect {
-            x: LogicalPixels(0.0),
-            y: LogicalPixels(0.0),
-            width: LogicalPixels(logical_width),
-            height: LogicalPixels(logical_height),
-        };
-
-        // Update plugins for editor
-        if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
-
-            let tab = self.editor.tab_manager.active_tab_mut();
-
-            // Swap in the active tab's text_renderer to preserve per-tab state
-            cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
-
-            // Always update selection widgets
-            cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
-
-            // Set line numbers plugin with fresh document reference
-            cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
-
-            // Set tab bar and file picker plugins (global UI)
-            cpu_renderer.set_tab_bar_plugin(&mut self.editor.tab_bar);
-            cpu_renderer.set_file_picker_plugin(&mut self.editor.file_picker);
-
-            // Mark renderer UI dirty if UI changed
-            if self.editor.ui_changed {
-                cpu_renderer.mark_ui_dirty();
-                self.editor.ui_changed = false;
-            }
-
-            // Update diagnostics manager (handles LSP polling, caching, plugin updates)
-            tab.diagnostics.update(&tab.plugin.doc);
-
-            // Set diagnostics plugin for rendering
-            cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
-
-            // Initialize diagnostics plugin with GPU resources (first time only)
-            static mut DIAGNOSTICS_INITIALIZED: bool = false;
-            unsafe {
-                if !DIAGNOSTICS_INITIALIZED {
-                    if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
-                        let diagnostics = &mut *diagnostics_ptr;
-                        if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
-                            let gpu_renderer = &*gpu;
-                            use tiny_sdk::Initializable;
-                            let mut setup_ctx = tiny_sdk::SetupContext {
-                                device: gpu_renderer.device_arc(),
-                                queue: gpu_renderer.queue_arc(),
-                                registry: tiny_sdk::PluginRegistry::empty(),
-                            };
-                            if let Err(e) = diagnostics.setup(&mut setup_ctx) {
-                                eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
-                            } else {
-                                DIAGNOSTICS_INITIALIZED = true;
-                                eprintln!("Diagnostics plugin initialized successfully");
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Set up global margin (only once)
-            let title_bar_height = self.title_bar_height;
-            static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
-            unsafe {
-                if !GLOBAL_MARGIN_INITIALIZED {
-                    GLOBAL_MARGIN_INITIALIZED = true;
-                    cpu_renderer.viewport.set_global_margin(0.0, title_bar_height);
-                }
-            }
-        }
-
-        // Upload font atlas only if dirty (atlas changed)
-        if let Some(font_system) = &self.font_system {
-            if font_system.is_dirty() {
-                let atlas_data = font_system.atlas_data();
-                let (atlas_width, atlas_height) = font_system.atlas_size();
-                if let Some(gpu_renderer) = &mut self.gpu_renderer {
-                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
-                }
-                font_system.clear_dirty();
-            }
-        }
-
-        let doc = self.editor.doc();
-        let doc_read = doc.read();
-
-        // Get renderer state for uniforms
-        let (viewport_size, scale_factor, current_time, theme_mode, cached_version) = {
-            let cpu = self.cpu_renderer.as_ref().unwrap();
-            let gpu = self.gpu_renderer.as_ref().unwrap();
-            (
-                [cpu.viewport.physical_size.width as f32, cpu.viewport.physical_size.height as f32],
-                cpu.viewport.scale_factor,
-                gpu.current_time,
-                gpu.current_theme_mode,
-                cpu.cached_doc_version,
-            )
-        };
-
-        // Check if version changed without edits (undo/redo)
-        let version_changed_without_edits = doc_read.version != cached_version;
-
-        // Update cached doc state
-        if let Some(cpu_renderer) = &mut self.cpu_renderer {
-            cpu_renderer.cached_doc_text = Some(doc_read.flatten_to_string());
-            cpu_renderer.cached_doc_version = doc_read.version;
-        }
-
-        // Apply pending renderer edits for syntax token adjustment
-        // Note: text_renderer has already been swapped in from the active tab
-        if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
-            let pending_edits = self.editor.active_plugin_mut().input.take_renderer_edits();
-
-            // If version changed without edits, it's undo/redo
-            // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
-            // This prevents white flash while keeping old (close enough) syntax visible
-            if pending_edits.is_empty() && version_changed_without_edits {
-                cpu_renderer.clear_edit_deltas();
-                // Don't clear stable_tokens - causes white flash. Let background parse update them.
-            }
-
-            for edit in pending_edits {
-                cpu_renderer.apply_incremental_edit(&edit);
-            }
-        }
-
-        // Get tab_manager reference
-        let tab_manager: Option<*const crate::tab_manager::TabManager> = Some(&self.editor.tab_manager as *const _);
-
-        // Prepare uniforms for GPU rendering
-        let uniforms = Uniforms {
-            viewport_size,
-            scale_factor,
-            time: current_time,
-            theme_mode,
-            _padding: [0.0, 0.0, 0.0],
-        };
-
-        // Set up CPU renderer state and render
-        if let (Some(gpu_renderer), Some(cpu_renderer)) = (&mut self.gpu_renderer, &mut self.cpu_renderer) {
-            cpu_renderer.set_gpu_renderer(gpu_renderer);
-
-            // Just use the existing render pipeline - it was working!
-            unsafe {
-                let tab_manager_ref = tab_manager.map(|ptr| &*ptr);
-                gpu_renderer.render_with_callback(uniforms, |render_pass| {
-                    cpu_renderer.render_with_pass_and_context(&doc_read, Some(render_pass), tab_manager_ref);
-                });
-            }
-        }
-
-        // Swap the text_renderer back to the tab to preserve state
-        if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
-            let tab = self.editor.tab_manager.active_tab_mut();
-            cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
         }
     }
 }
@@ -1424,428 +1359,4 @@ fn find_word_at_position(line_text: &str, column: usize) -> Option<(usize, usize
     }
 
     Some((start, end))
-}
-
-/// Basic editor with cursor and text editing
-pub struct EditorLogic {
-    /// Tab manager for handling multiple open files (each tab owns its own plugin + line numbers + diagnostics)
-    pub tab_manager: crate::tab_manager::TabManager,
-    /// Tab bar plugin for rendering tabs (global UI)
-    pub tab_bar: crate::tab_bar_plugin::TabBarPlugin,
-    /// File picker plugin for opening files (global UI)
-    pub file_picker: crate::file_picker_plugin::FilePickerPlugin,
-    /// Flag to indicate widgets need updating
-    widgets_dirty: bool,
-    /// Extra text style providers (e.g., for effects)
-    pub extra_text_styles: Vec<Box<dyn TextStyleProvider>>,
-    /// Pending scroll delta from drag operations
-    pub pending_scroll: Option<(f32, f32)>,
-    /// Flag to indicate UI needs re-rendering (tabs, file picker, etc)
-    pub ui_changed: bool,
-    /// Global navigation history for cross-file navigation (Cmd+[/])
-    pub global_nav_history: crate::history::FileNavigationHistory,
-}
-
-impl EditorLogic {
-    /// Get the active tab's plugin
-    fn active_plugin(&self) -> &TextEditorPlugin {
-        &self.tab_manager.active_tab().expect("No active tab").plugin
-    }
-
-    /// Get the active tab's plugin mutably
-    fn active_plugin_mut(&mut self) -> &mut TextEditorPlugin {
-        &mut self.tab_manager.active_tab_mut().plugin
-    }
-
-    /// Handle mouse click at logical position
-    pub fn on_click(
-        &mut self,
-        pos: Point,
-        viewport: &crate::coordinates::Viewport,
-        modifiers: &input_types::Modifiers,
-    ) -> bool {
-        let cmd_held = modifiers.state().super_key();
-
-        // Cmd+Click triggers go-to-definition
-        if cmd_held {
-            eprintln!("DEBUG: Cmd+Click detected at {:?}", pos);
-            // Get document position at click location
-            let tab = self.tab_manager.active_tab();
-            if let Some(tab) = tab {
-                let doc_pos = viewport.layout_to_doc(pos);
-                eprintln!("DEBUG: Cmd+Click at doc pos: {:?}", doc_pos);
-
-                // Request go-to-definition at click location
-                self.goto_definition();
-                self.widgets_dirty = true;
-                return true;
-            }
-        }
-
-        // Normal click handling
-        let plugin = self.active_plugin_mut();
-        let alt_held = modifiers.state().alt_key();
-        let shift_held = modifiers.state().shift_key();
-        plugin.input.on_mouse_click(
-            &plugin.doc,
-            viewport,
-            pos,
-            input_types::MouseButton::Left,
-            alt_held,
-            shift_held,
-        );
-        self.widgets_dirty = true;
-        true
-    }
-
-    /// Handle mouse move (for tracking position)
-    pub fn on_mouse_move(&mut self, _pos: Point, _viewport: &crate::coordinates::Viewport) -> bool {
-        false
-    }
-
-    /// Handle mouse button release (for cleaning up drag state)
-    pub fn on_mouse_release(&mut self) {
-        self.active_plugin_mut().input.clear_drag_anchor();
-        self.pending_scroll = None;
-    }
-
-    /// Get document to render
-    pub fn doc(&self) -> &Doc {
-        &self.active_plugin().doc
-    }
-
-    /// Get cursor document position for scrolling
-    pub fn get_cursor_doc_pos(&self) -> Option<DocPos> {
-        self.active_plugin().get_cursor_doc_pos()
-    }
-
-    /// Get current selections for rendering
-    pub fn selections(&self) -> &[crate::input::Selection] {
-        self.active_plugin().selections()
-    }
-
-    /// Get text style provider for syntax highlighting
-    pub fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
-        self.active_plugin().syntax_highlighter.as_deref()
-    }
-
-    /// Called after setup is complete
-    pub fn on_ready(&mut self) {}
-
-    /// Register custom text effect shaders
-    pub fn register_shaders(&self) -> Vec<(u32, &'static str, u64)> {
-        vec![]
-    }
-
-    /// Called before each render (for animations, LSP polling, etc.)
-    pub fn on_update(&mut self) {
-        let plugin = self.active_plugin_mut();
-        // Check if we should send pending syntax updates (debounce timer expired)
-        if plugin.input.should_flush() {
-            println!("DEBOUNCE: Sending pending syntax updates after idle timeout");
-            plugin.input.flush_syntax_updates(&plugin.doc);
-        }
-
-        // Check for LSP go-to-definition results
-        let tab = self.tab_manager.active_tab_mut();
-        tab.diagnostics.poll_lsp_results();
-
-        if let Some(locations) = tab.diagnostics.take_goto_definition() {
-            eprintln!("DEBUG: on_update got {} goto_definition location(s)", locations.len());
-            if let Some(location) = locations.first() {
-                eprintln!("DEBUG: Navigating to {:?} at line {}, col {}",
-                    location.file_path, location.position.line, location.position.column);
-                // Convert LSP position to our format
-                let target_location = crate::history::FileLocation {
-                    path: Some(location.file_path.clone()),
-                    position: tiny_sdk::DocPos {
-                        line: location.position.line as u32,
-                        column: location.position.column as u32,
-                        byte_offset: 0,
-                    },
-                };
-
-                // Navigate to the definition
-                if self.navigate_to_location(target_location) {
-                    eprintln!("DEBUG: Navigation successful!");
-                    self.ui_changed = true;
-                } else {
-                    eprintln!("DEBUG: Navigation failed!");
-                }
-            }
-        }
-
-        // Update cmd_hover_range for underline rendering
-        let tab = self.tab_manager.active_tab_mut();
-        if let Some((line, column)) = tab.diagnostics.cmd_hover_position() {
-            // Find word boundaries at hover position
-            let doc = &tab.plugin.doc;
-            let tree = doc.read();
-            let line_text = tree.line_text(line as u32);
-            let word_range = find_word_at_position(&line_text, column);
-            if let Some((start, end)) = word_range {
-                tab.plugin.cmd_hover_range = Some((line as u32, start as u32, end as u32));
-                self.ui_changed = true;
-            } else {
-                tab.plugin.cmd_hover_range = None;
-            }
-        } else {
-            let tab = self.tab_manager.active_tab_mut();
-            if tab.plugin.cmd_hover_range.is_some() {
-                tab.plugin.cmd_hover_range = None;
-                self.ui_changed = true;
-            }
-        }
-    }
-
-    /// Record current location in global navigation history
-    pub fn record_navigation(&mut self) {
-        let plugin = self.active_plugin();
-        let location = crate::history::FileLocation {
-            path: plugin.file_path.clone(),
-            position: plugin.input.primary_cursor_doc_pos(&plugin.doc),
-        };
-        self.global_nav_history.checkpoint_if_changed(location);
-    }
-
-    /// Navigate back in global history (across files)
-    pub fn navigate_back(&mut self) -> bool {
-        let current_location = crate::history::FileLocation {
-            path: self.active_plugin().file_path.clone(),
-            position: self.active_plugin().input.primary_cursor_doc_pos(&self.active_plugin().doc),
-        };
-
-        if let Some(target) = self.global_nav_history.undo(current_location) {
-            self.navigate_to_location(target)
-        } else {
-            false
-        }
-    }
-
-    /// Navigate forward in global history (across files)
-    pub fn navigate_forward(&mut self) -> bool {
-        let current_location = crate::history::FileLocation {
-            path: self.active_plugin().file_path.clone(),
-            position: self.active_plugin().input.primary_cursor_doc_pos(&self.active_plugin().doc),
-        };
-
-        if let Some(target) = self.global_nav_history.redo(current_location) {
-            self.navigate_to_location(target)
-        } else {
-            false
-        }
-    }
-
-    /// Navigate to a specific file and position
-    fn navigate_to_location(&mut self, location: crate::history::FileLocation) -> bool {
-        // Open file if needed (without recording - we're already in a navigation)
-        if let Some(ref path) = location.path {
-            match self.tab_manager.open_file(path.clone()) {
-                Ok(_) => {},
-                Err(e) => {
-                    eprintln!("Failed to open file for navigation: {}", e);
-                    return false;
-                }
-            }
-        }
-
-        // Set cursor position in active tab
-        let plugin = self.active_plugin_mut();
-        plugin.input.set_cursor(location.position);
-        self.ui_changed = true;
-        true
-    }
-
-    /// Go to definition at current cursor position
-    pub fn goto_definition(&mut self) {
-        eprintln!("DEBUG: goto_definition() called");
-        // Record current location before jumping
-        self.record_navigation();
-
-        let tab = self.tab_manager.active_tab_mut();
-        let plugin = &tab.plugin;
-        let cursor_pos = plugin.input.primary_cursor_doc_pos(&plugin.doc);
-
-        // Debug: show what's at the cursor
-        let tree = plugin.doc.read();
-        let line_text = tree.line_text(cursor_pos.line);
-        eprintln!("DEBUG: Line text: {:?}", line_text);
-        eprintln!("DEBUG: Cursor at line {}, col {} (visual column)", cursor_pos.line, cursor_pos.column);
-        if cursor_pos.column < line_text.len() as u32 {
-            let chars: Vec<char> = line_text.chars().collect();
-            if (cursor_pos.column as usize) < chars.len() {
-                eprintln!("DEBUG: Character at cursor: {:?}", chars[cursor_pos.column as usize]);
-            }
-        }
-
-        // Request go-to-definition from diagnostics manager
-        // Note: cursor_pos is already in document coordinates (0-indexed)
-        tab.diagnostics.request_goto_definition(cursor_pos.line as usize, cursor_pos.column as usize);
-    }
-}
-
-impl EditorLogic {
-    fn needs_syntax_highlighter_update(&self, path: &str) -> bool {
-        let desired_language = crate::syntax::SyntaxHighlighter::file_extension_to_language(path);
-        let plugin = self.active_plugin();
-
-        if let Some(ref current_highlighter) = plugin.syntax_highlighter {
-            if let Some(syntax_hl) = current_highlighter
-                .as_any()
-                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-            {
-                syntax_hl.name() != desired_language
-            } else {
-                true
-            }
-        } else {
-            true
-        }
-    }
-
-    fn setup_syntax_highlighter(&mut self, path: &str) {
-        if let Some(new_highlighter) = crate::syntax::SyntaxHighlighter::from_file_path(path) {
-            println!(
-                "EditorLogic: Switching to {} syntax highlighter for {}",
-                new_highlighter.name(),
-                path
-            );
-            let plugin = self.active_plugin_mut();
-            let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
-            plugin.syntax_highlighter = Some(syntax_highlighter);
-
-            if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
-                if let Some(syntax_hl) = syntax_highlighter
-                    .as_any()
-                    .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-                {
-                    let shared_highlighter = Arc::new(syntax_hl.clone());
-                    plugin.input.set_syntax_highlighter(shared_highlighter);
-                }
-            }
-        } else {
-            println!(
-                "EditorLogic: No syntax highlighter available for {}, keeping existing",
-                path
-            );
-        }
-    }
-
-    fn request_syntax_update(&self) {
-        let plugin = self.active_plugin();
-        if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
-            let text = plugin.doc.read().flatten_to_string();
-            if let Some(syntax_hl) = syntax_highlighter
-                .as_any()
-                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-            {
-                syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
-            }
-        }
-    }
-
-    pub fn with_text_style(mut self, style: Box<dyn TextStyleProvider>) -> Self {
-        self.extra_text_styles.push(style);
-        self
-    }
-
-    pub fn with_file(mut self, path: PathBuf) -> Self {
-        // Replace the initial tab with a tab for this file
-        match self.tab_manager.open_file(path.clone()) {
-            Ok(_) => {
-                // Remove the empty initial tab if it exists
-                if self.tab_manager.len() > 1 {
-                    // Find and remove the first tab if it's untitled and empty
-                    if let Some(first_tab) = self.tab_manager.tabs().get(0) {
-                        if first_tab.path().is_none() {
-                            // Close the empty tab (index 0)
-                            self.tab_manager.close_tab(0);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to open initial file: {}", e);
-            }
-        }
-        self
-    }
-
-    /// Check if document has unsaved changes by comparing content hash
-    pub fn is_modified(&self) -> bool {
-        self.active_plugin().is_modified()
-    }
-
-    pub fn save(&mut self) -> std::io::Result<()> {
-        let tab = self.tab_manager.active_tab_mut();
-        let plugin = &mut tab.plugin;
-        if let Some(ref path) = plugin.file_path {
-            io::autosave(&plugin.doc, path)?;
-
-            // Update saved content hash
-            let current_text = plugin.doc.read().flatten_to_string();
-            let mut hasher = AHasher::default();
-            current_text.hash(&mut hasher);
-            plugin.last_saved_content_hash = hasher.finish();
-
-            // Notify diagnostics manager of save
-            tab.diagnostics.document_saved(current_text.to_string());
-
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No file path set",
-            ))
-        }
-    }
-
-    pub fn title(&self) -> String {
-        let plugin = self.active_plugin();
-        let filename = if let Some(ref path) = plugin.file_path {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("Untitled")
-                .to_string()
-        } else {
-            "Demo Text".to_string()
-        };
-
-        let modified_marker = if self.is_modified() {
-            " (modified)"
-        } else {
-            ""
-        };
-        format!("{}{}", filename, modified_marker)
-    }
-
-    pub fn new(doc: Doc) -> Self {
-        let mut plugin = TextEditorPlugin::new(doc);
-
-        // No default syntax highlighter - will be set based on file extension when file is opened
-        // Calculate initial content hash
-        let initial_text = plugin.doc.read().flatten_to_string();
-        let mut hasher = AHasher::default();
-        initial_text.hash(&mut hasher);
-        plugin.last_saved_content_hash = hasher.finish();
-
-        // Create initial tab with the plugin (tab owns line numbers + diagnostics)
-        let initial_tab = crate::tab_manager::Tab::new(plugin);
-        let tab_manager = crate::tab_manager::TabManager::with_initial_tab(initial_tab);
-
-        // Create global UI plugins
-        let tab_bar = crate::tab_bar_plugin::TabBarPlugin::new();
-        let file_picker = crate::file_picker_plugin::FilePickerPlugin::new();
-
-        Self {
-            tab_manager,
-            tab_bar,
-            file_picker,
-            widgets_dirty: true,
-            extra_text_styles: Vec::new(),
-            pending_scroll: None,
-            ui_changed: true,
-            global_nav_history: crate::history::FileNavigationHistory::with_max_size(50),
-        }
-    }
 }

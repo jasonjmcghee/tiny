@@ -50,18 +50,16 @@ extern "C" {
 
     // Shader and pipeline creation
     pub fn gpu_create_shader_module(source: *const u8, len: usize) -> ShaderModuleId;
-    pub fn gpu_create_render_pipeline_simple(
-        vertex_shader: ShaderModuleId,
-        fragment_shader: ShaderModuleId,
-        vertex_buffer_layout: *const u8,
-        layout_len: usize,
-    ) -> PipelineId;
 
     // Advanced pipeline creation
     pub fn gpu_create_bind_group_layout(
         entries: *const u8,
         entries_len: usize,
     ) -> BindGroupLayoutId;
+    pub fn gpu_create_bind_group(
+        layout: BindGroupLayoutId,
+        buffer: BufferId,
+    ) -> BindGroupId;
     pub fn gpu_create_render_pipeline_with_layout(
         vertex_shader: ShaderModuleId,
         fragment_shader: ShaderModuleId,
@@ -78,16 +76,8 @@ extern "C" {
         index: u32,
         bind_group_id: BindGroupId,
     );
-    pub fn gpu_render_set_vertex_buffer(
-        render_pass: *mut c_void,
-        slot: u32,
-        buffer_id: BufferId,
-    );
-    pub fn gpu_render_draw(
-        render_pass: *mut c_void,
-        vertices: u32,
-        instances: u32,
-    );
+    pub fn gpu_render_set_vertex_buffer(render_pass: *mut c_void, slot: u32, buffer_id: BufferId);
+    pub fn gpu_render_draw(render_pass: *mut c_void, vertices: u32, instances: u32);
 }
 
 // Safe wrappers for plugins to use
@@ -111,6 +101,12 @@ impl BindGroupLayoutId {
     pub fn create_uniform() -> Self {
         // Create standard uniform bind group layout
         unsafe { gpu_create_bind_group_layout(std::ptr::null(), 0) }
+    }
+}
+
+impl BindGroupId {
+    pub fn create_with_buffer(layout: BindGroupLayoutId, buffer: BufferId) -> Self {
+        unsafe { gpu_create_bind_group(layout, buffer) }
     }
 }
 
@@ -175,11 +171,6 @@ pub enum VertexFormat {
 }
 
 impl PipelineId {
-    pub fn create_simple(vertex_shader: ShaderModuleId, fragment_shader: ShaderModuleId) -> Self {
-        // For now, pass empty layout data - the host will use defaults
-        unsafe { gpu_create_render_pipeline_simple(vertex_shader, fragment_shader, std::ptr::null(), 0) }
-    }
-
     pub fn create_with_layout(
         vertex_shader: ShaderModuleId,
         fragment_shader: ShaderModuleId,
@@ -209,7 +200,12 @@ impl PipelineId {
 }
 
 impl PluginGpuContext {
-    pub fn draw_vertices(&self, render_pass: &mut wgpu::RenderPass, buffer_id: BufferId, vertex_count: u32) {
+    pub fn draw_vertices(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        buffer_id: BufferId,
+        vertex_count: u32,
+    ) {
         unsafe {
             gpu_draw_vertices(
                 render_pass as *mut _ as *mut c_void,
@@ -228,13 +224,23 @@ impl PluginGpuContext {
         }
     }
 
-    pub fn set_bind_group(&self, render_pass: &mut wgpu::RenderPass, index: u32, bind_group_id: BindGroupId) {
+    pub fn set_bind_group(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        index: u32,
+        bind_group_id: BindGroupId,
+    ) {
         unsafe {
             gpu_render_set_bind_group(render_pass as *mut _ as *mut c_void, index, bind_group_id);
         }
     }
 
-    pub fn set_vertex_buffer(&self, render_pass: &mut wgpu::RenderPass, slot: u32, buffer_id: BufferId) {
+    pub fn set_vertex_buffer(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        slot: u32,
+        buffer_id: BufferId,
+    ) {
         unsafe {
             gpu_render_set_vertex_buffer(render_pass as *mut _ as *mut c_void, slot, buffer_id);
         }
