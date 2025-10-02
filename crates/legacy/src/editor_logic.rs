@@ -458,65 +458,6 @@ impl EditorLogic {
 }
 
 impl EditorLogic {
-    fn needs_syntax_highlighter_update(&self, path: &str) -> bool {
-        let desired_language = syntax::SyntaxHighlighter::file_extension_to_language(path);
-        let plugin = self.active_plugin();
-
-        if let Some(ref current_highlighter) = plugin.syntax_highlighter {
-            if let Some(syntax_hl) = current_highlighter
-                .as_any()
-                .downcast_ref::<syntax::SyntaxHighlighter>()
-            {
-                syntax_hl.name() != desired_language
-            } else {
-                true
-            }
-        } else {
-            true
-        }
-    }
-
-    fn setup_syntax_highlighter(&mut self, path: &str) {
-        if let Some(new_highlighter) = syntax::SyntaxHighlighter::from_file_path(path) {
-            println!(
-                "EditorLogic: Switching to {} syntax highlighter for {}",
-                new_highlighter.name(),
-                path
-            );
-            let plugin = self.active_plugin_mut();
-            let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(new_highlighter);
-            plugin.syntax_highlighter = Some(syntax_highlighter);
-
-            if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
-                if let Some(syntax_hl) = syntax_highlighter
-                    .as_any()
-                    .downcast_ref::<syntax::SyntaxHighlighter>()
-                {
-                    let shared_highlighter = Arc::new(syntax_hl.clone());
-                    plugin.input.set_syntax_highlighter(shared_highlighter);
-                }
-            }
-        } else {
-            println!(
-                "EditorLogic: No syntax highlighter available for {}, keeping existing",
-                path
-            );
-        }
-    }
-
-    fn request_syntax_update(&self) {
-        let plugin = self.active_plugin();
-        if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
-            let text = plugin.doc.read().flatten_to_string();
-            if let Some(syntax_hl) = syntax_highlighter
-                .as_any()
-                .downcast_ref::<syntax::SyntaxHighlighter>()
-            {
-                syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
-            }
-        }
-    }
-
     pub fn with_text_style(mut self, style: Box<dyn TextStyleProvider>) -> Self {
         self.extra_text_styles.push(style);
         self

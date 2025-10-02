@@ -896,81 +896,6 @@ impl Renderer {
         }
     }
 
-    fn walk_visible_range_with_pass(
-        &mut self,
-        tree: &Tree,
-        byte_range: std::ops::Range<usize>,
-        mut render_pass: Option<&mut wgpu::RenderPass>,
-    ) {
-        if let Some(pass) = render_pass.as_mut() {
-            if let Some(gpu_ptr) = self.gpu_renderer {
-                let gpu_renderer = unsafe { &*gpu_ptr };
-                let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
-
-                // Always use text_renderer for main document rendering
-                let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
-
-                if gpu_renderer.has_styled_pipeline() && !visible_glyphs.is_empty() {
-                    let style_buffer: Vec<u32> =
-                        visible_glyphs.iter().map(|g| g.token_id as u32).collect();
-                    gpu_mut.upload_style_buffer_u32(&style_buffer);
-                }
-
-                let glyph_instances: Vec<_> = visible_glyphs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, g)| {
-                        // Debug: Print first few glyphs' texture coordinates
-                        if i < 3 {
-                            println!("Main text glyph {}: tex_coords={:?}", i, g.tex_coords);
-                        }
-                        // Transform from local editor coordinates to screen coordinates
-                        let screen_pos = LayoutPos::new(
-                            g.layout_pos.x.0 + self.editor_bounds.x.0,
-                            g.layout_pos.y.0 + self.editor_bounds.y.0,
-                        );
-                        let physical = self.viewport.layout_to_physical(screen_pos);
-                        GlyphInstance {
-                            pos: LayoutPos::new(physical.x.0, physical.y.0),
-                            tex_coords: g.tex_coords,
-                            token_id: g.token_id as u8,
-                            relative_pos: g.relative_pos,
-                            shader_id: 0,
-                            _padding: [0; 3],
-                        }
-                    })
-                    .collect();
-
-                if !glyph_instances.is_empty() {
-                    let use_styled =
-                        self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
-                    println!(
-                        "MAIN TEXT: Drawing {} glyphs (styled={})",
-                        glyph_instances.len(),
-                        use_styled
-                    );
-                    gpu_mut.draw_glyphs_styled(pass, &glyph_instances, use_styled);
-                }
-
-                // Still handle inline spatial widgets
-                tree.walk_visible_range(byte_range, |spans, _, _| {
-                    for span in spans {
-                        if let tree::Span::Spatial(widget) = span {
-                            let ctx = PaintContext::new(
-                                self.viewport.to_viewport_info(),
-                                gpu_renderer.device_arc(),
-                                gpu_renderer.queue_arc(),
-                                gpu_ptr as *mut _,
-                                &self.service_registry,
-                            );
-                            widget.paint(&ctx, pass);
-                        }
-                    }
-                });
-            }
-        }
-    }
-
     fn collect_line_number_glyphs(&mut self) {
         // Directly create line number glyphs without going through plugin paint
         if let Some(plugin_ptr) = self.line_numbers_plugin {
@@ -1114,11 +1039,6 @@ impl Renderer {
         self.accumulated_glyphs.extend(glyph_instances);
     }
 
-    fn collect_foreground_glyphs(&mut self) {
-        // For other plugins that generate glyphs
-        // Currently none, but this is where they'd go
-    }
-
     fn draw_all_accumulated_glyphs(&mut self, pass: &mut wgpu::RenderPass) {
         if self.accumulated_glyphs.is_empty() {
             return;
@@ -1146,32 +1066,6 @@ impl Renderer {
 
                 gpu_mut.draw_glyphs_styled(pass, &self.accumulated_glyphs, use_styled);
             }
-        }
-    }
-
-    fn paint_spatial_widgets(
-        &mut self,
-        tree: &Tree,
-        visible_range: std::ops::Range<usize>,
-        pass: &mut wgpu::RenderPass,
-    ) {
-        if let Some(gpu_ptr) = self.gpu_renderer {
-            let gpu_renderer = unsafe { &*gpu_ptr };
-
-            tree.walk_visible_range(visible_range, |spans, _, _| {
-                for span in spans {
-                    if let tree::Span::Spatial(widget) = span {
-                        let ctx = PaintContext::new(
-                            self.viewport.to_viewport_info(),
-                            gpu_renderer.device_arc(),
-                            gpu_renderer.queue_arc(),
-                            gpu_ptr as *mut _,
-                            &self.service_registry,
-                        );
-                        widget.paint(&ctx, pass);
-                    }
-                }
-            });
         }
     }
 

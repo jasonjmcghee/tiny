@@ -482,33 +482,6 @@ impl TextRenderer {
     }
 
     /// Infer style from surrounding context for dirty regions
-    fn infer_style_from_context(&self, glyph_idx: usize) -> u16 {
-        // Simple heuristic: look for the style of the previous non-whitespace character
-        // This helps maintain visual continuity when typing within a token
-
-        // Look backwards for a styled character
-        for i in (0..glyph_idx).rev() {
-            if let Some(glyph) = self.layout_cache.get(i) {
-                // Skip whitespace when looking for context
-                if !glyph.char.is_whitespace() && glyph.token_id != 0 {
-                    return glyph.token_id;
-                }
-            }
-        }
-
-        // If no context found, look forward
-        for i in glyph_idx + 1..self.layout_cache.len().min(glyph_idx + 10) {
-            if let Some(glyph) = self.layout_cache.get(i) {
-                if !glyph.char.is_whitespace() && glyph.token_id != 0 {
-                    return glyph.token_id;
-                }
-            }
-        }
-
-        // No context found - return default (no highlighting)
-        0
-    }
-
     /// Handle incremental syntax update (while tree-sitter is parsing)
     pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
         // Track the edit delta for token range adjustment

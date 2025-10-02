@@ -1066,35 +1066,6 @@ fn send_did_open(
     send_message(writer, &msg)
 }
 
-fn send_did_change(
-    writer: &mut dyn Write,
-    uri: &Uri,
-    text: &str,
-    version: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let params = DidChangeTextDocumentParams {
-        text_document: VersionedTextDocumentIdentifier {
-            uri: uri.clone(),
-            version: version as i32,
-        },
-        content_changes: vec![TextDocumentContentChangeEvent {
-            range: None,
-            range_length: None,
-            text: text.to_string(),
-        }],
-    };
-
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: None,
-        method: Some("textDocument/didChange".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    send_message(writer, &msg)
-}
-
 fn send_did_change_incremental(
     writer: &mut dyn Write,
     uri: &Uri,

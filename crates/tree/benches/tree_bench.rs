@@ -47,7 +47,8 @@ fn bench_single_insert(c: &mut Criterion) {
                         pos: mid,
                         content: Content::Text("x".to_string()),
                     });
-                    std::hint::black_box(doc);
+                    doc.flush();
+                    std::hint::black_box(doc.read());
                 },
                 criterion::BatchSize::SmallInput,
             );

@@ -474,19 +474,24 @@ impl TinyApp {
                 (scroll_x, scroll_y)
             };
 
-            // Update scroll in viewport
-            let viewport = &mut cpu_renderer.viewport;
+            // Get active tab's current scroll
+            let tab = self.editor.tab_manager.active_tab_mut();
 
             // Apply the scroll amounts (note: scroll values are inverted)
-            let new_scroll_y = viewport.scroll.y.0 - final_scroll_y;
-            let new_scroll_x = viewport.scroll.x.0 - final_scroll_x;
-            viewport.scroll.y = LogicalPixels(new_scroll_y);
-            viewport.scroll.x = LogicalPixels(new_scroll_x);
+            let new_scroll_y = tab.scroll_position.y.0 - final_scroll_y;
+            let new_scroll_x = tab.scroll_position.x.0 - final_scroll_x;
+            tab.scroll_position.y = LogicalPixels(new_scroll_y);
+            tab.scroll_position.x = LogicalPixels(new_scroll_x);
 
             // Apply document-based scroll bounds
-            let doc = self.editor.doc();
+            let doc = &tab.plugin.doc;
             let tree = doc.read();
-            viewport.clamp_scroll_to_bounds(&tree, cpu_renderer.editor_bounds);
+            let editor_bounds = cpu_renderer.editor_bounds;
+
+            // Temporarily set viewport scroll to clamp it, then save back to tab
+            cpu_renderer.viewport.scroll = tab.scroll_position;
+            cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
+            tab.scroll_position = cpu_renderer.viewport.scroll;
 
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -734,19 +739,20 @@ impl TinyApp {
                             event.data.get("delta_x").and_then(|v| v.as_f64()),
                             event.data.get("delta_y").and_then(|v| v.as_f64()),
                         ) {
-                            // Get doc directly from editor to avoid borrow issues
-                            let doc = self.editor.doc();
+                            let tab = self.editor.tab_manager.active_tab_mut();
+                            tab.scroll_position.x.0 += dx as f32;
+                            tab.scroll_position.y.0 += dy as f32;
+
+                            // Clamp scroll to bounds
+                            let doc = &tab.plugin.doc;
                             let tree = doc.read();
 
                             if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                                cpu_renderer.viewport.scroll.x.0 += dx as f32;
-                                cpu_renderer.viewport.scroll.y.0 += dy as f32;
-
-                                // Clamp scroll to bounds
                                 let editor_bounds = cpu_renderer.editor_bounds;
-                                cpu_renderer
-                                    .viewport
-                                    .clamp_scroll_to_bounds(&tree, editor_bounds);
+                                // Temporarily set viewport scroll to clamp it, then save back to tab
+                                cpu_renderer.viewport.scroll = tab.scroll_position;
+                                cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
+                                tab.scroll_position = cpu_renderer.viewport.scroll;
 
                                 self.request_redraw();
                             }
@@ -840,8 +846,13 @@ impl TinyApp {
             self.cursor_needs_scroll = false;
             if let Some(cursor_pos) = self.editor.get_cursor_doc_pos() {
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                    let tab = self.editor.tab_manager.active_tab_mut();
+                    // Set viewport to current tab scroll before ensure_visible
+                    cpu_renderer.viewport.scroll = tab.scroll_position;
                     let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
                     cpu_renderer.viewport.ensure_visible(layout_pos);
+                    // Save modified scroll back to tab
+                    tab.scroll_position = cpu_renderer.viewport.scroll;
                 }
             }
         }
@@ -895,6 +906,9 @@ impl TinyApp {
 
             // Swap in the active tab's text_renderer to preserve per-tab state
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+
+            // Use the active tab's scroll position for rendering
+            cpu_renderer.viewport.scroll = tab.scroll_position;
 
             // Always update selection widgets
             cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
@@ -1046,10 +1060,12 @@ impl TinyApp {
             }
         }
 
-        // Swap the text_renderer back to the tab to preserve state
+        // Swap the text_renderer back to the tab and save scroll position
         if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
             let tab = self.editor.tab_manager.active_tab_mut();
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+            // Save any scroll changes back to the tab
+            tab.scroll_position = cpu_renderer.viewport.scroll;
         }
     }
 }
@@ -1332,31 +1348,3 @@ impl ApplicationHandler for TinyApp {
     }
 }
 
-/// Find word boundaries at a given column position in a line
-/// Returns (start_col, end_col) if a word is found, None otherwise
-fn find_word_at_position(line_text: &str, column: usize) -> Option<(usize, usize)> {
-    let chars: Vec<char> = line_text.chars().collect();
-    if column >= chars.len() {
-        return None;
-    }
-
-    // Check if current character is part of an identifier
-    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
-    if !is_word_char(chars[column]) {
-        return None;
-    }
-
-    // Find start of word
-    let mut start = column;
-    while start > 0 && is_word_char(chars[start - 1]) {
-        start -= 1;
-    }
-
-    // Find end of word
-    let mut end = column;
-    while end < chars.len() && is_word_char(chars[end]) {
-        end += 1;
-    }
-
-    Some((start, end))
-}

@@ -5,6 +5,7 @@ use crate::text_editor_plugin::TextEditorPlugin;
 use crate::line_numbers_plugin::LineNumbersPlugin;
 use crate::diagnostics_manager::DiagnosticsManager;
 use crate::text_renderer::TextRenderer;
+use tiny_core::tree::Point;
 
 pub struct Tab {
     pub plugin: TextEditorPlugin,
@@ -12,6 +13,7 @@ pub struct Tab {
     pub diagnostics: DiagnosticsManager,
     pub text_renderer: TextRenderer,
     pub display_name: String,
+    pub scroll_position: Point,
 }
 
 impl Tab {
@@ -38,6 +40,7 @@ impl Tab {
             diagnostics,
             text_renderer: TextRenderer::new(),
             display_name,
+            scroll_position: Point::default(),
         }
     }
 
@@ -94,6 +97,11 @@ impl TabManager {
     /// Get active index
     pub fn active_index(&self) -> usize {
         self.active_index
+    }
+
+    /// Get a specific tab mutably by index
+    pub fn tab_mut(&mut self, index: usize) -> Option<&mut Tab> {
+        self.tabs.get_mut(index)
     }
 
     /// Add a new tab and make it active

@@ -1194,28 +1194,6 @@ impl InputHandler {
         InputAction::Redraw
     }
 
-    /// Navigate through cursor history
-    fn navigate_history(&mut self, doc: &Doc, back: bool) -> InputAction {
-        let current_pos = self.primary_cursor_doc_pos(doc);
-        let new_pos = if back {
-            self.nav_history.undo(current_pos)
-        } else {
-            self.nav_history.redo(current_pos)
-        };
-
-        if let Some(pos) = new_pos {
-            self.selections = vec![Selection {
-                cursor: pos,
-                anchor: pos,
-                id: self.next_id,
-            }];
-            self.next_id += 1;
-            InputAction::Redraw
-        } else {
-            InputAction::None
-        }
-    }
-
     /// Set the syntax highlighter for InputEdit coordination
     pub fn set_syntax_highlighter(&mut self, highlighter: Arc<SyntaxHighlighter>) {
         self.syntax_highlighter = Some(highlighter);

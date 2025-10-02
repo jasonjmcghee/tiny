@@ -130,6 +130,7 @@ pub struct DiagnosticsPlugin {
 enum HoverState {
     None,
     WaitingForDelay {
+        #[allow(dead_code)]
         over_symbol: bool,
         line: usize,
         column: usize,
@@ -139,6 +140,7 @@ enum HoverState {
         column: usize,
     },
     ShowingHover {
+        #[allow(dead_code)]
         content: String,
         line: usize,
         column: usize,
