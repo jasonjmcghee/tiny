@@ -22,6 +22,12 @@ pub struct SearchMatch {
 }
 
 impl SearchMatch {
+    /// Create a new search match
+    #[inline]
+    fn new(byte_range: Range<usize>, line: u32, column: u32) -> Self {
+        Self { byte_range, line, column }
+    }
+
     /// Get the actual text of this match (allocates on demand)
     pub fn text<'a>(&self, tree: &'a Tree) -> String {
         tree.get_text_slice(self.byte_range.clone())
@@ -44,6 +50,69 @@ impl Default for SearchOptions {
             whole_word: false,
             regex: false,
             limit: None,
+        }
+    }
+}
+
+// === Helper Functions ===
+
+/// Calculate column from UTF-8 byte slice
+#[inline]
+fn calculate_column(bytes: &[u8], line_start: usize, match_start: usize) -> u32 {
+    if let Ok(text) = from_utf8(&bytes[line_start..match_start]) {
+        text.chars().count() as u32
+    } else {
+        (match_start - line_start) as u32
+    }
+}
+
+/// Calculate column using UTF-8 continuation byte check
+#[inline]
+fn calculate_column_fast(bytes: &[u8], line_start: usize, match_start: usize) -> u32 {
+    bytes[line_start..match_start]
+        .iter()
+        .filter(|&&b| (b & 0xC0) != 0x80)
+        .count() as u32
+}
+
+/// Incremental line and column tracker for search operations
+struct IncrementalLineTracker {
+    current_line: u32,
+    line_start_byte: usize,
+    last_checked_byte: usize,
+}
+
+impl IncrementalLineTracker {
+    fn new(base_line: u32, base_byte: usize) -> Self {
+        Self {
+            current_line: base_line,
+            line_start_byte: base_byte,
+            last_checked_byte: base_byte,
+        }
+    }
+
+    /// Advance to a new match position and return (line, column)
+    fn advance_to(&mut self, bytes: &[u8], match_start: usize) -> (u32, u32) {
+        let slice = &bytes[self.last_checked_byte..match_start];
+        let newline_count = bytecount_count(slice, b'\n') as u32;
+
+        if newline_count > 0 {
+            // We crossed newline(s) - update line and reset column tracking
+            self.current_line += newline_count;
+            self.line_start_byte = memchr_iter(b'\n', slice)
+                .last()
+                .map(|p| self.last_checked_byte + p + 1)
+                .unwrap_or(self.line_start_byte);
+            self.last_checked_byte = self.line_start_byte;
+
+            // Count chars from new line_start_byte to match_start
+            let remaining_slice = &bytes[self.line_start_byte..match_start];
+            let column = calculate_column_fast(remaining_slice, 0, remaining_slice.len());
+            (self.current_line, column)
+        } else {
+            // No newlines - count UTF-8 chars incrementally
+            let column = calculate_column_fast(slice, 0, slice.len());
+            (self.current_line, column)
         }
     }
 }
@@ -154,17 +223,13 @@ fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -
                             .unwrap_or(0);
 
                         // Use simdutf8 for faster UTF-8 validation
-                        let column = if let Ok(text) = from_utf8(&bytes[final_line_start..match_start]) {
-                            text.chars().count() as u32
-                        } else {
-                            (match_start - final_line_start) as u32
-                        };
+                        let column = calculate_column(bytes, final_line_start, match_start);
 
-                        return Some(SearchMatch {
-                            byte_range: match_start..match_end,
-                            line: final_line,
+                        return Some(SearchMatch::new(
+                            match_start..match_end,
+                            final_line,
                             column,
-                        });
+                        ));
                     }
                     pos = match_start + 1;
                 } else {
@@ -191,13 +256,13 @@ fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -
                         .map(|p| p + 1)
                         .unwrap_or(0);
 
-                    let column = text[line_start..match_start].chars().count() as u32;
+                    let column = calculate_column(text.as_bytes(), line_start, match_start);
 
-                    return Some(SearchMatch {
-                        byte_range: match_start..match_end,
-                        line: current_line,
+                    return Some(SearchMatch::new(
+                        match_start..match_end,
+                        current_line,
                         column,
-                    });
+                    ));
                 }
             }
             None
@@ -231,17 +296,13 @@ fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> 
                         }
 
                         // Use simdutf8 for faster UTF-8 validation
-                        let column = if let Ok(text) = from_utf8(&search_bytes[line_start_byte..match_start]) {
-                            text.chars().count() as u32
-                        } else {
-                            (match_start - line_start_byte) as u32
-                        };
+                        let column = calculate_column(search_bytes, line_start_byte, match_start);
 
-                        last_match = Some(SearchMatch {
-                            byte_range: match_start..match_end,
-                            line: current_line,
+                        last_match = Some(SearchMatch::new(
+                            match_start..match_end,
+                            current_line,
                             column,
-                        });
+                        ));
                     }
                     pos = match_start + 1;
                 } else {
@@ -277,13 +338,13 @@ fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> 
                             .unwrap_or(line_start_byte);
                     }
 
-                    let column = text[line_start_byte..match_start].chars().count() as u32;
+                    let column = calculate_column(text.as_bytes(), line_start_byte, match_start);
 
-                    last_match = Some(SearchMatch {
-                        byte_range: match_start..match_end,
-                        line: current_line,
+                    last_match = Some(SearchMatch::new(
+                        match_start..match_end,
+                        current_line,
                         column,
-                    });
+                    ));
                 }
 
                 return last_match;
@@ -311,11 +372,7 @@ fn search_byte_ranges_only(engine: &SearchEngine, bytes: &[u8], limit: Option<us
                 if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
                     if searcher.is_word_boundary(bytes, match_start, match_end) {
                         // No line/column calculation - just byte ranges
-                        matches.push(SearchMatch {
-                            byte_range: match_start..match_end,
-                            line: 0,
-                            column: 0,
-                        });
+                        matches.push(SearchMatch::new(match_start..match_end, 0, 0));
                     }
                     pos = match_start + 1;
                 } else {
@@ -332,11 +389,7 @@ fn search_byte_ranges_only(engine: &SearchEngine, bytes: &[u8], limit: Option<us
                         }
                     }
 
-                    matches.push(SearchMatch {
-                        byte_range: m.start()..m.end(),
-                        line: 0,
-                        column: 0,
-                    });
+                    matches.push(SearchMatch::new(m.start()..m.end(), 0, 0));
                 }
             }
         }
@@ -351,10 +404,7 @@ fn search_in_bytes(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) ->
     match engine {
         SearchEngine::Plain(searcher) => {
             let mut pos = 0;
-            let mut current_line = 0u32;
-            let mut line_start_byte = 0;
-            let mut last_checked_byte = 0;
-            let mut current_column = 0u32;
+            let mut tracker = IncrementalLineTracker::new(0, 0);
 
             while pos < bytes.len() {
                 if let Some(lim) = limit {
@@ -365,36 +415,11 @@ fn search_in_bytes(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) ->
 
                 if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
                     if searcher.is_word_boundary(bytes, match_start, match_end) {
-                        // Use SIMD for incremental counting (faster than single-pass scalar loop)
-                        let slice = &bytes[last_checked_byte..match_start];
-                        let newline_count = bytecount_count(slice, b'\n') as u32;
-
-                        if newline_count > 0 {
-                            // We crossed newline(s) - update line and reset column tracking
-                            current_line += newline_count;
-                            line_start_byte = memchr_iter(b'\n', slice)
-                                .last()
-                                .map(|p| last_checked_byte + p + 1)
-                                .unwrap_or(line_start_byte);
-                            last_checked_byte = line_start_byte;
-                            current_column = 0;
-
-                            // Count chars from new line_start_byte to match_start
-                            let remaining_slice = &bytes[line_start_byte..match_start];
-                            current_column = remaining_slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
-                        } else {
-                            // No newlines - count UTF-8 chars incrementally
-                            current_column += slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
-                        }
-
-                        matches.push(SearchMatch {
-                            byte_range: match_start..match_end,
-                            line: current_line,
-                            column: current_column,
-                        });
+                        let (line, column) = tracker.advance_to(bytes, match_start);
+                        matches.push(SearchMatch::new(match_start..match_end, line, column));
 
                         // Update last_checked to match_start for next iteration
-                        last_checked_byte = match_start;
+                        tracker.last_checked_byte = match_start;
                     }
                     pos = match_start + 1;
                 } else {
@@ -405,10 +430,7 @@ fn search_in_bytes(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) ->
         SearchEngine::Regex(searcher) => {
             // Use simdutf8 for faster UTF-8 validation
             if let Ok(text) = from_utf8(bytes) {
-                let mut current_line = 0u32;
-                let mut line_start_byte = 0;
-                let mut last_checked_byte = 0;
-                let mut current_column = 0u32;
+                let mut tracker = IncrementalLineTracker::new(0, 0);
 
                 for m in searcher.regex.find_iter(text) {
                     if let Some(lim) = limit {
@@ -420,36 +442,11 @@ fn search_in_bytes(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) ->
                     let match_start = m.start();
                     let match_end = m.end();
 
-                    // Use SIMD for incremental counting (faster than single-pass scalar loop)
-                    let slice = &bytes[last_checked_byte..match_start];
-                    let newline_count = bytecount_count(slice, b'\n') as u32;
-
-                    if newline_count > 0 {
-                        // We crossed newline(s) - update line and reset column tracking
-                        current_line += newline_count;
-                        line_start_byte = memchr_iter(b'\n', slice)
-                            .last()
-                            .map(|p| last_checked_byte + p + 1)
-                            .unwrap_or(line_start_byte);
-                        last_checked_byte = line_start_byte;
-                        current_column = 0;
-
-                        // Count chars from new line_start_byte to match_start
-                        let remaining_slice = &bytes[line_start_byte..match_start];
-                        current_column = remaining_slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
-                    } else {
-                        // No newlines - count UTF-8 chars incrementally
-                        current_column += slice.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u32;
-                    }
-
-                    matches.push(SearchMatch {
-                        byte_range: match_start..match_end,
-                        line: current_line,
-                        column: current_column,
-                    });
+                    let (line, column) = tracker.advance_to(bytes, match_start);
+                    matches.push(SearchMatch::new(match_start..match_end, line, column));
 
                     // Update last_checked to match_start for next iteration
-                    last_checked_byte = match_start;
+                    tracker.last_checked_byte = match_start;
                 }
             }
         }
@@ -1058,17 +1055,13 @@ impl<'a> TreeCursor<'a> {
                                 }
                             }
 
-                            let column = if let Ok(text) = std::str::from_utf8(&bytes[line_start_pos..match_start]) {
-                                text.chars().count() as u32
-                            } else {
-                                (match_start - line_start_pos) as u32
-                            };
+                            let column = calculate_column(bytes, line_start_pos, match_start);
 
-                            let new_match = SearchMatch {
-                                byte_range: (byte_offset + match_start)..(byte_offset + match_end),
-                                line: current_line,
+                            let new_match = SearchMatch::new(
+                                (byte_offset + match_start)..(byte_offset + match_end),
+                                current_line,
                                 column,
-                            };
+                            );
 
                             if matches.last() != Some(&new_match) {
                                 matches.push(new_match);
@@ -1111,13 +1104,13 @@ impl<'a> TreeCursor<'a> {
                             .map(|p| p + 1)
                             .unwrap_or(0);
 
-                        let column = text[line_start..match_start_bytes].chars().count() as u32;
+                        let column = calculate_column(text.as_bytes(), line_start, match_start_bytes);
 
-                        let new_match = SearchMatch {
-                            byte_range: (byte_offset + match_start_bytes)..(byte_offset + match_end_bytes),
-                            line: current_line,
+                        let new_match = SearchMatch::new(
+                            (byte_offset + match_start_bytes)..(byte_offset + match_end_bytes),
+                            current_line,
                             column,
-                        };
+                        );
 
                         if matches.last() != Some(&new_match) {
                             matches.push(new_match);
@@ -1162,17 +1155,13 @@ impl<'a> TreeCursor<'a> {
                             }
 
                             // Calculate column (only for the small slice from line start to match)
-                            let column = if let Ok(text) = std::str::from_utf8(&bytes[line_start_pos..match_start]) {
-                                text.chars().count() as u32
-                            } else {
-                                (match_start - line_start_pos) as u32
-                            };
+                            let column = calculate_column(bytes, line_start_pos, match_start);
 
-                            let new_match = SearchMatch {
-                                byte_range: (byte_offset + match_start)..(byte_offset + match_end),
-                                line: current_line,
+                            let new_match = SearchMatch::new(
+                                (byte_offset + match_start)..(byte_offset + match_end),
+                                current_line,
                                 column,
-                            };
+                            );
 
                             // Deduplicate - only add if not already present
                             if matches.last() != Some(&new_match) {
@@ -1216,13 +1205,13 @@ impl<'a> TreeCursor<'a> {
                             .map(|p| p + 1)
                             .unwrap_or(0);
 
-                        let column = text[line_start..match_start_bytes].chars().count() as u32;
+                        let column = calculate_column(text.as_bytes(), line_start, match_start_bytes);
 
-                        let new_match = SearchMatch {
-                            byte_range: (byte_offset + match_start_bytes)..(byte_offset + match_end_bytes),
-                            line: current_line,
+                        let new_match = SearchMatch::new(
+                            (byte_offset + match_start_bytes)..(byte_offset + match_end_bytes),
+                            current_line,
                             column,
-                        };
+                        );
 
                         // Deduplicate - only add if not already present
                         if matches.last() != Some(&new_match) {

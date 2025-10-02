@@ -37,21 +37,20 @@ fn bench_single_insert(c: &mut Criterion) {
 
     for size in [100, 1000, 10000, 100000].iter() {
         let text = generate_document(*size);
+        let mid = text.len() / 2;
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| {
-                let doc = Doc::from_str(&text);
-                let mid = text.len() / 2;
-
-                // Single character insert (typical keystroke)
-                doc.edit(Edit::Insert {
-                    pos: mid,
-                    content: Content::Text("x".to_string()),
-                });
-                doc.flush();
-
-                std::hint::black_box(doc.read());
-            });
+            b.iter_batched(
+                || Doc::from_str(&text), // Setup - not measured
+                |doc| {
+                    doc.edit(Edit::Insert {
+                        pos: mid,
+                        content: Content::Text("x".to_string()),
+                    });
+                    std::hint::black_box(doc);
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
@@ -63,25 +62,23 @@ fn bench_batched_edits(c: &mut Criterion) {
 
     for size in [1000, 10000, 100000].iter() {
         let text = generate_document(*size);
+        let mid = text.len() / 2;
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| {
-                let doc = Doc::from_str(&text);
-                let start = text.len() / 2;
-
-                // Simulate ~10 keystrokes in 16ms window
-                for i in 0..10 {
-                    doc.edit(Edit::Insert {
-                        pos: start + i,
-                        content: Content::Text("a".to_string()),
-                    });
-                }
-
-                // Single flush for all edits (RCU batch)
-                doc.flush();
-
-                std::hint::black_box(doc.read());
-            });
+            b.iter_batched(
+                || Doc::from_str(&text), // Setup - not measured
+                |doc| {
+                    // Simulate ~10 keystrokes in 16ms window
+                    for i in 0..10 {
+                        doc.edit(Edit::Insert {
+                            pos: mid + i,
+                            content: Content::Text("a".to_string()),
+                        });
+                    }
+                    std::hint::black_box(doc.read());
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
@@ -179,38 +176,41 @@ fn bench_rcu_concurrency(c: &mut Criterion) {
     let text = generate_document(10000);
 
     group.bench_function("concurrent_reads_during_writes", |b| {
-        b.iter(|| {
-            let doc = Arc::new(Doc::from_str(&text));
-            let doc_clone = Arc::clone(&doc);
+        b.iter_batched(
+            || Arc::new(Doc::from_str(&text)),
+            |doc| {
+                let doc_clone = Arc::clone(&doc);
 
-            // Spawn reader thread (simulating renderer at 120fps)
-            let reader = thread::spawn(move || {
-                let mut sum = 0usize;
-                for _ in 0..120 {
-                    let tree = doc_clone.read();
-                    sum += tree.byte_count();
-                    // Simulate 8.3ms frame time
-                    thread::sleep(Duration::from_micros(8300));
-                }
-                sum
-            });
-
-            // Writer thread (simulating typing)
-            for i in 0..100 {
-                doc.edit(Edit::Insert {
-                    pos: i,
-                    content: Content::Text("x".to_string()),
+                // Spawn reader thread (simulating renderer at 120fps)
+                let reader = thread::spawn(move || {
+                    let mut sum = 0usize;
+                    for _ in 0..120 {
+                        let tree = doc_clone.read();
+                        sum += tree.byte_count();
+                        // Simulate 8.3ms frame time
+                        thread::sleep(Duration::from_micros(8300));
+                    }
+                    sum
                 });
 
-                // Flush every 16ms (60fps editing)
-                if i % 10 == 0 {
-                    doc.flush();
-                    thread::sleep(Duration::from_micros(16000));
-                }
-            }
+                // Writer thread (simulating typing)
+                for i in 0..100 {
+                    doc.edit(Edit::Insert {
+                        pos: i,
+                        content: Content::Text("x".to_string()),
+                    });
 
-            std::hint::black_box(reader.join().unwrap());
-        });
+                    // Flush every 16ms (60fps editing)
+                    if i % 10 == 0 {
+                        doc.flush();
+                        thread::sleep(Duration::from_micros(16000));
+                    }
+                }
+
+                std::hint::black_box(reader.join().unwrap());
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();
@@ -225,37 +225,44 @@ fn bench_deletion(c: &mut Criterion) {
 
         // Single character deletion (backspace)
         group.bench_with_input(BenchmarkId::new("single_delete", size), size, |b, _| {
-            b.iter(|| {
-                let doc = Doc::from_str(&text);
-                let mid = text.len() / 2;
+            let mid = text.len() / 2;
 
-                doc.edit(Edit::Delete {
-                    range: mid..mid + 1,
-                });
-                doc.flush();
+            b.iter_batched(
+                || Doc::from_str(&text),
+                |doc| {
+                    doc.edit(Edit::Delete {
+                        range: mid..mid + 1,
+                    });
+                    doc.flush();
 
-                std::hint::black_box(doc.read());
-            });
+                    std::hint::black_box(doc.read());
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
 
         // Line deletion (Ctrl+K)
         group.bench_with_input(BenchmarkId::new("line_delete", size), size, |b, _| {
-            b.iter(|| {
-                let doc = Doc::from_str(&text);
-                let tree = doc.read();
-                let mid = text.len() / 2;
+            let mid = text.len() / 2;
 
-                // Find line boundaries
-                let line_start = tree.find_line_start_at(mid);
-                let line_end = tree.find_line_end_at(mid);
+            b.iter_batched(
+                || Doc::from_str(&text),
+                |doc| {
+                    let tree = doc.read();
 
-                doc.edit(Edit::Delete {
-                    range: line_start..line_end,
-                });
-                doc.flush();
+                    // Find line boundaries
+                    let line_start = tree.find_line_start_at(mid);
+                    let line_end = tree.find_line_end_at(mid);
 
-                std::hint::black_box(doc.read());
-            });
+                    doc.edit(Edit::Delete {
+                        range: line_start..line_end,
+                    });
+                    doc.flush();
+
+                    std::hint::black_box(doc.read());
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
@@ -314,51 +321,55 @@ fn bench_realistic_session(c: &mut Criterion) {
 
     group.bench_function("typing_burst", |b| {
         let text = generate_document(5000);
+        let start_pos = text.len() / 2;
 
-        b.iter(|| {
-            let doc = Doc::from_str(&text);
-            let mut pos = text.len() / 2;
+        b.iter_batched(
+            || Doc::from_str(&text),
+            |doc| {
+                let mut pos = start_pos;
 
-            // Simulate typing a function
-            let code = "fn example() {\n    let x = 42;\n    println!(\"x = {}\", x);\n}\n";
+                // Simulate typing a function
+                let code = "fn example() {\n    let x = 42;\n    println!(\"x = {}\", x);\n}\n";
 
-            for ch in code.chars() {
-                doc.edit(Edit::Insert {
-                    pos,
-                    content: Content::Text(ch.to_string()),
-                });
-                pos += ch.len_utf8();
+                for ch in code.chars() {
+                    doc.edit(Edit::Insert {
+                        pos,
+                        content: Content::Text(ch.to_string()),
+                    });
+                    pos += ch.len_utf8();
 
-                // Flush every ~16ms worth of typing (about 3 chars at 60wpm)
-                if pos % 3 == 0 {
-                    doc.flush();
+                    // Flush every ~16ms worth of typing (about 3 chars at 60wpm)
+                    if pos % 3 == 0 {
+                        doc.flush();
+                    }
                 }
-            }
 
-            std::hint::black_box(doc.read());
-        });
+                std::hint::black_box(doc.read());
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.bench_function("multi_cursor_edit", |b| {
         let text = generate_document(1000);
+        let positions: Vec<usize> = (0..10).map(|i| (text.len() * i) / 10).collect();
 
-        b.iter(|| {
-            let doc = Doc::from_str(&text);
+        b.iter_batched(
+            || Doc::from_str(&text),
+            |doc| {
+                // Insert same text at all positions
+                for &pos in &positions {
+                    doc.edit(Edit::Insert {
+                        pos,
+                        content: Content::Text("TODO: ".to_string()),
+                    });
+                }
 
-            // Simulate multi-cursor editing at 10 positions
-            let positions: Vec<usize> = (0..10).map(|i| (text.len() * i) / 10).collect();
-
-            // Insert same text at all positions
-            for &pos in &positions {
-                doc.edit(Edit::Insert {
-                    pos,
-                    content: Content::Text("TODO: ".to_string()),
-                });
-            }
-
-            doc.flush();
-            std::hint::black_box(doc.read());
-        });
+                doc.flush();
+                std::hint::black_box(doc.read());
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();
