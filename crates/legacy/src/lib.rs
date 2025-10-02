@@ -27,7 +27,6 @@ pub mod tab_manager;
 pub mod text_editor_plugin;
 pub mod text_effects;
 pub mod text_renderer;
-pub mod text_style_box_adapter;
 pub mod theme;
 
 // Re-export core types

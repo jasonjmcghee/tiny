@@ -95,7 +95,6 @@ impl PluginState {
 }
 
 pub struct Renderer {
-    pub text_styles: Option<Box<dyn text_effects::TextStyleProvider>>,
     pub syntax_highlighter: Option<Arc<syntax::SyntaxHighlighter>>,
     pub font_system: Option<Arc<tiny_font::SharedFontSystem>>,
     pub viewport: Viewport,
@@ -147,7 +146,6 @@ impl Renderer {
         viewport.margin = LayoutPos::new(0.0, 0.0);
 
         Self {
-            text_styles: None,
             syntax_highlighter: None,
             font_system: None,
             viewport,
@@ -411,12 +409,6 @@ impl Renderer {
                 self.config_watchers.push(watcher);
             }
         }
-    }
-
-    pub fn set_text_styles(&mut self, provider: Box<dyn text_effects::TextStyleProvider>) {
-        let adapter = crate::text_style_box_adapter::BoxedTextStyleAdapter::from_ref(&provider);
-        self.service_registry.register(adapter);
-        self.text_styles = Some(provider);
     }
 
     pub fn set_syntax_highlighter(&mut self, highlighter: Arc<syntax::SyntaxHighlighter>) {
