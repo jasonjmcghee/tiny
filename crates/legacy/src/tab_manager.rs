@@ -5,7 +5,10 @@ use crate::text_editor_plugin::TextEditorPlugin;
 use crate::line_numbers_plugin::LineNumbersPlugin;
 use crate::diagnostics_manager::DiagnosticsManager;
 use crate::text_renderer::TextRenderer;
-use tiny_core::tree::Point;
+use crate::scroll::Scrollable;
+use crate::coordinates::Viewport;
+use tiny_core::tree::{Point, Rect};
+use tiny_sdk::LogicalPixels;
 
 pub struct Tab {
     pub plugin: TextEditorPlugin,
@@ -115,6 +118,14 @@ impl TabManager {
     pub fn switch_to(&mut self, index: usize) -> bool {
         if index < self.tabs.len() && index != self.active_index {
             self.active_index = index;
+
+            // Notify LSP about the file switch
+            let tab = &mut self.tabs[index];
+            if let Some(ref path) = tab.plugin.file_path {
+                let content = tab.plugin.doc.read().flatten_to_string();
+                tab.diagnostics.lsp_service_mut().open_file(path.clone(), (*content).clone());
+            }
+
             true
         } else {
             false
@@ -179,5 +190,61 @@ impl TabManager {
     /// Check if there are no tabs
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+}
+
+// === Scrollable Implementation for Tab ===
+
+impl Scrollable for Tab {
+    fn get_scroll(&self) -> Point {
+        self.scroll_position
+    }
+
+    fn set_scroll(&mut self, scroll: Point) {
+        self.scroll_position = scroll;
+    }
+
+    fn handle_scroll(&mut self, delta: Point, viewport: &Viewport, widget_bounds: Rect) -> bool {
+        // Apply scroll delta (inverted for natural scrolling)
+        self.scroll_position.y.0 -= delta.y.0;
+        self.scroll_position.x.0 -= delta.x.0;
+
+        // Get document for proper clamping
+        let doc = &self.plugin.doc;
+        let tree = doc.read();
+
+        // Use viewport's proper clamp_scroll_to_bounds with actual widget bounds
+        // This handles all edge cases, soft wrap, etc.
+        let mut temp_viewport = viewport.clone();
+        temp_viewport.scroll = self.scroll_position;
+        temp_viewport.clamp_scroll_to_bounds(&tree, widget_bounds);
+        self.scroll_position = temp_viewport.scroll;
+
+        true // Always handle scroll for editor
+    }
+
+    fn get_content_bounds(&self, viewport: &Viewport) -> Rect {
+        // Content bounds based on actual document size and viewport metrics
+        let doc = &self.plugin.doc;
+        let tree = doc.read();
+        let line_count = tree.line_count();
+
+        // Use actual line height from viewport metrics
+        let content_height = (line_count as f32) * viewport.metrics.line_height;
+
+        // Calculate maximum line width from document
+        let mut max_width = 0.0f32;
+        for line_idx in 0..line_count {
+            let line_text = tree.line_text(line_idx);
+            let line_width = (line_text.len() as f32) * viewport.metrics.space_width;
+            max_width = max_width.max(line_width);
+        }
+
+        Rect {
+            x: LogicalPixels(0.0),
+            y: LogicalPixels(0.0),
+            width: LogicalPixels(max_width),
+            height: LogicalPixels(content_height),
+        }
     }
 }

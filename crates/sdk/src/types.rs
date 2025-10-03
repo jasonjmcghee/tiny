@@ -321,8 +321,10 @@ pub struct GlyphInstance {
     pub shader_id: u32,
     /// Token ID for syntax coloring (0 = default)
     pub token_id: u8,
+    /// Format flags for visual effects (0x01 = half-opacity, 0x02 = underline, 0x04 = highlight)
+    pub format: u8,
     /// Padding for alignment
-    pub _padding: [u8; 3],
+    pub _padding: [u8; 2],
 }
 
 // === Rect ===

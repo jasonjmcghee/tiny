@@ -485,6 +485,16 @@ impl Viewport {
         }
     }
 
+    /// Center the viewport on a layout position
+    pub fn center_on(&mut self, pos: LayoutPos) {
+        // Center vertically
+        self.scroll.y.0 = (pos.y.0 - self.logical_size.height.0 / 2.0).max(0.0);
+
+        // Center horizontally with some left margin for readability
+        let target_x = pos.x.0 - self.logical_size.width.0 * 0.3;
+        self.scroll.x.0 = target_x.max(0.0);
+    }
+
     /// Get visible line range
     pub fn visible_lines(&self) -> std::ops::Range<u32> {
         let first_line = (self.scroll.y / self.metrics.line_height) as u32;

@@ -3,6 +3,7 @@
 use crate::{
     coordinates::Viewport,
     input, syntax,
+    scroll::Scrollable,
     text_effects::{self, TextStyleProvider},
     text_renderer::{self, TextRenderer},
 };
@@ -76,7 +77,6 @@ impl PluginState {
                     }
                     "cursor" => {
                         if let Some((x, y)) = self.cursor_pos {
-                            // Use ViewPos which is Pod/Zeroable
                             let pos = tiny_sdk::ViewPos::new(x, y);
                             let args = bytemuck::bytes_of(&pos);
                             let _ = library.call("set_position", args);
@@ -127,6 +127,8 @@ pub struct Renderer {
     tab_bar_rects: Vec<tiny_sdk::types::RectInstance>,
     /// File picker glyphs (rendered separately)
     file_picker_glyphs: Vec<GlyphInstance>,
+    /// File picker background rectangle
+    file_picker_rects: Vec<tiny_sdk::types::RectInstance>,
 
     /// Dirty flags to track what needs regeneration
     glyphs_dirty: bool,
@@ -166,13 +168,14 @@ impl Renderer {
             diagnostics_plugin: None,
             tab_bar_plugin: None,
             file_picker_plugin: None,
-            // Default editor bounds - will be updated based on layout
+            // Default editor bounds - updated in update_viewport
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
             line_number_glyphs: Vec::new(),
             tab_bar_glyphs: Vec::new(),
             tab_bar_rects: Vec::new(),
             file_picker_glyphs: Vec::new(),
+            file_picker_rects: Vec::new(),
             glyphs_dirty: true,
             line_numbers_dirty: true,
             ui_dirty: true,
@@ -503,17 +506,8 @@ impl Renderer {
             self.last_viewport_size = (width, height);
         }
 
-        // Always recalculate editor bounds (cheap) - plugins may have changed
         let mut offset_x = 0.0;
         let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
-
-        // Check if file picker is visible and add its height
-        if let Some(plugin_ptr) = self.file_picker_plugin {
-            let plugin = unsafe { &*plugin_ptr };
-            if plugin.visible {
-                offset_y += FILE_PICKER_HEIGHT;
-            }
-        }
 
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
@@ -544,9 +538,6 @@ impl Renderer {
     pub fn set_selection_plugin(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
         let (cursor_pos, selections) = input_handler.get_selection_data(doc, &self.viewport);
 
-        // Cursor and selection positions are now in document layout space
-        // (no global_margin included after our fix to coordinates.rs)
-        // They match how text is rendered (starting at 0,0 in editor space)
         let transformed_cursor_pos = cursor_pos;
 
         let transformed_selections: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = selections;
@@ -599,7 +590,6 @@ impl Renderer {
         let scroll_changed = current_scroll != self.last_scroll;
         if scroll_changed {
             self.glyphs_dirty = true;
-            // Don't mark line_numbers_dirty - they cache scroll internally
             self.last_scroll = current_scroll;
         }
 
@@ -654,9 +644,8 @@ impl Renderer {
             }
 
             // === DRAW EDITOR CONTENT FIRST ===
-            // Set scissor rect slightly outside the content area to avoid edge clipping
-            // Content is at editor_bounds (which includes padding), scissor needs to be larger
-            let scissor_margin = 2.0; // Extra margin to prevent edge clipping
+            // Set scissor rect with small margin to avoid edge clipping
+            let scissor_margin = 2.0;
             let scissor_x = ((self.editor_bounds.x.0 - scissor_margin) * scale)
                 .floor()
                 .max(0.0) as u32;
@@ -668,7 +657,7 @@ impl Renderer {
             let scissor_h =
                 ((self.editor_bounds.height.0 + scissor_margin * 2.0) * scale).ceil() as u32;
 
-            // Clamp to render target bounds
+            // Clamp scissor rect to render target bounds
             let (target_w, target_h) = (
                 self.viewport.physical_size.width,
                 self.viewport.physical_size.height,
@@ -687,7 +676,7 @@ impl Renderer {
             // Paint foreground layers (cursor)
             self.paint_layers(pass, false);
 
-            // === DRAW TAB BAR BACKGROUNDS FIRST ===
+            // === DRAW TAB BAR BACKGROUNDS ===
             if !self.tab_bar_rects.is_empty() {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
@@ -698,21 +687,40 @@ impl Renderer {
                 }
             }
 
-            // === DRAW ALL UI TEXT ELEMENTS (combine into one buffer to avoid conflicts) ===
-            let mut all_ui_glyphs = Vec::new();
-            all_ui_glyphs.extend_from_slice(&self.line_number_glyphs);
-            all_ui_glyphs.extend_from_slice(&self.tab_bar_glyphs);
-            all_ui_glyphs.extend_from_slice(&self.file_picker_glyphs);
+            // === DRAW UI TEXT ELEMENTS (line numbers, tab bar) ===
+            let mut ui_glyphs = Vec::new();
+            ui_glyphs.extend_from_slice(&self.line_number_glyphs);
+            ui_glyphs.extend_from_slice(&self.tab_bar_glyphs);
 
-            if !all_ui_glyphs.is_empty() {
-                // Disable scissor rect for UI elements (each is positioned correctly already)
+            if !ui_glyphs.is_empty() {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
-
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        // Use line number buffer for all UI (separate from main text)
-                        gpu_renderer.draw_line_number_glyphs(pass, &all_ui_glyphs);
+                        gpu_renderer.draw_line_number_glyphs(pass, &ui_glyphs);
+                    }
+                }
+            }
+
+            // === DRAW FILE PICKER OVERLAY (on top of everything) ===
+            // Render background first
+            if !self.file_picker_rects.is_empty() {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        gpu_renderer.draw_rects(pass, &self.file_picker_rects, scale);
+                    }
+                }
+            }
+
+            // Then render text on top of background
+            if !self.file_picker_glyphs.is_empty() {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
+                        gpu_renderer.draw_line_number_glyphs(pass, &self.file_picker_glyphs);
                     }
                 }
             }
@@ -804,7 +812,6 @@ impl Renderer {
     }
 
     pub fn paint_plugins(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
-        // Extract just the plugin painting logic
         if let Some(ref loader_arc) = self.plugin_loader {
             if let Ok(loader) = loader_arc.lock() {
                 let z_filter = if background {
@@ -816,12 +823,11 @@ impl Renderer {
                 if let Some(gpu) = self.gpu_renderer {
                     let gpu_renderer = unsafe { &*gpu };
 
-                    // Create editor-specific viewport for text-related plugins
                     let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,   // Bounds already include padding
-                        scroll: self.viewport.scroll, // Use main viewport scroll
+                        bounds: self.editor_bounds,
+                        scroll: self.viewport.scroll,
                         content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 2, // Editor widget ID
+                        widget_id: 2,
                     };
 
                     let mut ctx = PaintContext::new(
@@ -833,16 +839,6 @@ impl Renderer {
                     )
                     .with_widget_viewport(editor_viewport);
                     ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
-                    // Set scissor rect to editor bounds for plugin rendering
-                    // This ensures selection and cursor stay within editor bounds
-                    let scale = self.viewport.scale_factor;
-                    // pass.set_scissor_rect(
-                    //     (self.editor_bounds.x.0 * scale) as u32,
-                    //     (self.editor_bounds.y.0 * scale) as u32,
-                    //     (self.editor_bounds.width.0 * scale) as u32,
-                    //     (self.editor_bounds.height.0 * scale) as u32,
-                    // );
 
                     for key in loader.list_plugins() {
                         if let Some(plugin) = loader.get_plugin(&key) {
@@ -860,24 +856,20 @@ impl Renderer {
     }
 
     fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
-        // Paint other plugins (cursor, selection, etc.)
         self.paint_plugins(pass, background);
 
-        // Paint diagnostics plugin if present
         if !background {
-            // Diagnostics renders on foreground (z-index 50)
             if let Some(diagnostics_ptr) = self.diagnostics_plugin {
                 let diagnostics = unsafe { &*diagnostics_ptr };
 
                 if let Some(gpu) = self.gpu_renderer {
                     let gpu_renderer = unsafe { &*gpu };
 
-                    // Create editor-specific viewport for diagnostics
                     let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds, // Bounds already include padding
+                        bounds: self.editor_bounds,
                         scroll: self.viewport.scroll,
                         content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 3, // Diagnostics widget ID
+                        widget_id: 3,
                     };
 
                     let mut ctx = PaintContext::new(
@@ -897,22 +889,11 @@ impl Renderer {
     }
 
     fn collect_line_number_glyphs(&mut self) {
-        // Directly create line number glyphs without going through plugin paint
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
 
-            // Line numbers start after title bar + tab bar + file picker (if visible)
-            let mut line_numbers_y = self.viewport.global_margin.y.0 + TAB_BAR_HEIGHT;
+            let line_numbers_y = self.viewport.global_margin.y.0 + TAB_BAR_HEIGHT;
 
-            // Add file picker height if visible
-            if let Some(fp_ptr) = self.file_picker_plugin {
-                let fp = unsafe { &*fp_ptr };
-                if fp.visible {
-                    line_numbers_y += FILE_PICKER_HEIGHT;
-                }
-            }
-
-            // Use the collect_glyphs method to get glyphs
             let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
                 self.viewport.global_margin.x.0 + FILE_EXPLORER_WIDTH,
                 line_numbers_y,
@@ -982,19 +963,25 @@ impl Renderer {
 
             if !plugin.visible {
                 self.file_picker_glyphs.clear();
+                self.file_picker_rects.clear();
                 return;
             }
 
-            let file_picker_bounds = tiny_sdk::types::LayoutRect::new(
-                0.0,
-                self.viewport.global_margin.y.0 + TAB_BAR_HEIGHT,
-                self.viewport.logical_size.width.0,
-                FILE_PICKER_HEIGHT,
-            );
+            let bounds = plugin.get_bounds();
 
+            const FILE_PICKER_BG: u32 = 0x1A1A1AF2;
+
+            let bg_rect = tiny_sdk::types::RectInstance {
+                rect: bounds,
+                color: FILE_PICKER_BG,
+            };
+
+            self.file_picker_rects = vec![bg_rect];
+
+            let scroll = plugin.get_scroll();
             let widget_viewport = tiny_sdk::types::WidgetViewport {
-                bounds: file_picker_bounds,
-                scroll: tiny_sdk::types::LayoutPos::new(0.0, 0.0), // No scroll for file picker
+                bounds,
+                scroll: tiny_sdk::types::LayoutPos::new(scroll.x.0, scroll.y.0),
                 content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
                 widget_id: 11,
             };
@@ -1011,17 +998,16 @@ impl Renderer {
     }
 
     fn collect_main_text_glyphs(&mut self, tree: &Tree, visible_range: std::ops::Range<usize>) {
-        // Collect main document glyphs without drawing
         let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
 
         let glyph_instances: Vec<_> = visible_glyphs
             .into_iter()
             .map(|g| {
-                // First apply scroll to get view position
+                // Apply scroll to get view position
                 let view_x = g.layout_pos.x.0 - self.viewport.scroll.x.0;
                 let view_y = g.layout_pos.y.0 - self.viewport.scroll.y.0;
 
-                // Then add editor bounds offset (already includes padding) and scale to physical
+                // Add editor bounds offset and scale to physical coordinates
                 let physical_x = (view_x + self.editor_bounds.x.0) * self.viewport.scale_factor;
                 let physical_y = (view_y + self.editor_bounds.y.0) * self.viewport.scale_factor;
 
@@ -1031,7 +1017,8 @@ impl Renderer {
                     token_id: g.token_id as u8,
                     relative_pos: g.relative_pos,
                     shader_id: 0,
-                    _padding: [0; 3],
+                    format: 0,
+                    _padding: [0; 2],
                 }
             })
             .collect();
@@ -1075,12 +1062,9 @@ impl Renderer {
         visible_range: std::ops::Range<usize>,
         pass: &mut wgpu::RenderPass,
     ) {
-        // Same as walk_visible_range_with_pass but skip the main text glyph drawing
-        // (since we do that in the batched call)
         if let Some(gpu_ptr) = self.gpu_renderer {
             let gpu_renderer = unsafe { &*gpu_ptr };
 
-            // Skip the main text glyph rendering - just do spatial widgets
             tree.walk_visible_range(visible_range, |spans, _, _| {
                 for span in spans {
                     if let tree::Span::Spatial(widget) = span {

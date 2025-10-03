@@ -276,10 +276,15 @@ impl DiagnosticsPlugin {
             }
         }
 
-        // Check if we're over a symbol
-        let over_symbol = self.symbols.iter().any(|symbol| {
-            symbol.line == line && column >= symbol.column_range.0 && column < symbol.column_range.1
-        });
+        // Check if we're over a symbol (only if we have symbols loaded)
+        let over_symbol = if self.symbols.is_empty() {
+            // No symbols loaded yet - don't trigger hover
+            false
+        } else {
+            self.symbols.iter().any(|symbol| {
+                symbol.line == line && column >= symbol.column_range.0 && column < symbol.column_range.1
+            })
+        };
 
         // Update hover state machine
         match &self.hover_state {
@@ -1282,6 +1287,12 @@ impl DiagnosticsPlugin {
 
     /// Update timing and check if we should request hover (call every frame)
     pub fn update(&mut self) -> Option<(usize, usize)> {
+        // Don't request hover if no symbols loaded yet
+        if self.symbols.is_empty() {
+            self.hover_state = HoverState::None;
+            return None;
+        }
+
         // Check if we need to transition hover state based on timing
         if let HoverState::WaitingForDelay { line, column, .. } = self.hover_state {
             if let Some(start_time) = self.hover_start_time {
@@ -1320,6 +1331,7 @@ impl DiagnosticsPlugin {
 
     /// Set document symbols from LSP
     pub fn set_symbols(&mut self, symbols: Vec<Symbol>) {
+        eprintln!("Diagnostics: Loaded {} symbols for hover", symbols.len());
         self.symbols = symbols;
     }
 

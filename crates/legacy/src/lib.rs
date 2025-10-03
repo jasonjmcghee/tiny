@@ -8,6 +8,7 @@ pub mod gpu_ffi_host;
 
 #[cfg(feature = "winit")]
 pub mod app;
+pub mod accelerator;
 pub mod config;
 pub mod coordinates; // Coordinate system abstraction
 pub mod diagnostics_manager;
@@ -22,6 +23,9 @@ pub mod lsp_manager;
 pub mod lsp_service;
 pub use diagnostics_plugin;
 pub mod render;
+pub mod scroll;
+pub mod gpu_buffer_manager;
+pub mod shortcuts;
 pub mod syntax;
 pub mod tab_bar_plugin;
 pub mod tab_manager;
@@ -29,6 +33,8 @@ pub mod text_editor_plugin;
 pub mod text_effects;
 pub mod text_renderer;
 pub mod theme;
+#[cfg(feature = "winit")]
+pub mod winit_adapter;
 
 // Re-export core types
 pub use history::History;

@@ -11,11 +11,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_tree::Doc;
 
-/// Position in a document (line, column)
+/// Position in a document (line, column in UTF-16 code units for LSP compatibility)
 #[derive(Debug, Clone, Copy)]
 pub struct DocPosition {
     pub line: usize,
-    pub column: usize,
+    pub column: usize, // UTF-16 code units
 }
 
 /// Location reference (file + position)
@@ -33,6 +33,22 @@ pub struct HoverInfo {
     pub range: Option<(DocPosition, DocPosition)>,
 }
 
+/// Code action available at a position
+#[derive(Debug, Clone)]
+pub struct CodeAction {
+    pub title: String,
+    pub kind: Option<String>,
+    pub is_preferred: bool,
+    pub action: lsp_types::CodeActionOrCommand,
+}
+
+/// Text edit to apply to document
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub range_utf16: (DocPosition, DocPosition), // Start and end positions in UTF-16
+    pub new_text: String,
+}
+
 /// LSP feature results
 #[derive(Debug, Clone)]
 pub enum LspResult {
@@ -41,26 +57,22 @@ pub enum LspResult {
     GoToDefinition(Vec<LocationRef>),
     FindReferences(Vec<LocationRef>),
     DocumentSymbols(Vec<lsp_types::DocumentSymbol>),
+    CodeActions(Vec<CodeAction>),
+    TextEdits(Vec<TextEdit>),
 }
 
 /// Comprehensive LSP service
 pub struct LspService {
     lsp_manager: Option<Arc<LspManager>>,
     current_file: Option<PathBuf>,
-    results_rx: std::sync::mpsc::Receiver<LspResult>,
-    _results_tx: std::sync::mpsc::Sender<LspResult>, // Keep sender alive
 }
 
 impl LspService {
     /// Create a new LSP service
     pub fn new() -> Self {
-        let (results_tx, results_rx) = std::sync::mpsc::channel();
-
         Self {
             lsp_manager: None,
             current_file: None,
-            results_rx,
-            _results_tx: results_tx,
         }
     }
 
@@ -135,56 +147,104 @@ impl LspService {
     pub fn poll_results(&self) -> Vec<LspResult> {
         let mut results = Vec::new();
 
-        // Poll diagnostics
+        // Use the unified poll_responses() method to avoid dropping messages
         if let Some(ref lsp) = self.lsp_manager {
-            if let Some(diagnostic_update) = lsp.poll_diagnostics() {
-                results.push(LspResult::Diagnostics(diagnostic_update.diagnostics));
+            let responses = lsp.poll_responses();
+            if !responses.is_empty() {
+                eprintln!("LspService: poll_results() received {} responses", responses.len());
             }
+            for response in responses {
+                match response {
+                    crate::lsp_manager::LspResponse::Diagnostics(diagnostic_update) => {
+                        eprintln!("LspService: Received {} diagnostics", diagnostic_update.diagnostics.len());
+                        results.push(LspResult::Diagnostics(diagnostic_update.diagnostics));
+                    }
+                    crate::lsp_manager::LspResponse::Hover(hover_update) => {
+                        results.push(LspResult::Hover(Some(HoverInfo {
+                            contents: hover_update.content,
+                            range: None, // TODO: Track hover range
+                        })));
+                    }
+                    crate::lsp_manager::LspResponse::Symbols(symbols_update) => {
+                        results.push(LspResult::DocumentSymbols(symbols_update.symbols));
+                    }
+                    crate::lsp_manager::LspResponse::GotoDefinition(goto_def_update) => {
+                        let location_refs: Vec<LocationRef> = goto_def_update
+                            .locations
+                            .into_iter()
+                            .filter_map(|loc| {
+                                // Convert URI path to PathBuf
+                                let uri_str = loc.uri.as_str();
+                                let file_path = if uri_str.starts_with("file://") {
+                                    PathBuf::from(&uri_str[7..])
+                                } else {
+                                    return None;
+                                };
 
-            // Poll hover info
-            if let Some(hover_update) = lsp.poll_hover() {
-                results.push(LspResult::Hover(Some(HoverInfo {
-                    contents: hover_update.content,
-                    range: None, // TODO: Track hover range
-                })));
+                                Some(LocationRef {
+                                    file_path,
+                                    position: DocPosition {
+                                        line: loc.range.start.line as usize,
+                                        column: loc.range.start.character as usize,
+                                    },
+                                    text: String::new(), // We don't have the text yet
+                                })
+                            })
+                            .collect();
+                        results.push(LspResult::GoToDefinition(location_refs));
+                    }
+                    crate::lsp_manager::LspResponse::CodeAction(code_action_update) => {
+                        let actions: Vec<CodeAction> = code_action_update
+                            .actions
+                            .into_iter()
+                            .map(|action| {
+                                let (title, kind, is_preferred) = match &action {
+                                    lsp_types::CodeActionOrCommand::Command(cmd) => {
+                                        (cmd.title.clone(), None, false)
+                                    }
+                                    lsp_types::CodeActionOrCommand::CodeAction(ca) => {
+                                        (
+                                            ca.title.clone(),
+                                            ca.kind.as_ref().map(|k| k.as_str().to_string()),
+                                            ca.is_preferred.unwrap_or(false),
+                                        )
+                                    }
+                                };
+                                CodeAction {
+                                    title,
+                                    kind,
+                                    is_preferred,
+                                    action,
+                                }
+                            })
+                            .collect();
+                        results.push(LspResult::CodeActions(actions));
+                    }
+                    crate::lsp_manager::LspResponse::TextEdit(text_edit_update) => {
+                        let edits: Vec<TextEdit> = text_edit_update
+                            .edits
+                            .into_iter()
+                            .map(|edit| TextEdit {
+                                range_utf16: (
+                                    DocPosition {
+                                        line: edit.range.start.line as usize,
+                                        column: edit.range.start.character as usize,
+                                    },
+                                    DocPosition {
+                                        line: edit.range.end.line as usize,
+                                        column: edit.range.end.character as usize,
+                                    },
+                                ),
+                                new_text: edit.new_text,
+                            })
+                            .collect();
+                        results.push(LspResult::TextEdits(edits));
+                    }
+                    crate::lsp_manager::LspResponse::Error(err) => {
+                        eprintln!("LspService: LSP error: {}", err);
+                    }
+                }
             }
-
-            // Poll document symbols
-            if let Some(symbols_update) = lsp.poll_symbols() {
-                results.push(LspResult::DocumentSymbols(symbols_update.symbols));
-            }
-
-            // Poll go-to-definition
-            if let Some(goto_def_update) = lsp.poll_goto_definition() {
-                let location_refs: Vec<LocationRef> = goto_def_update
-                    .locations
-                    .into_iter()
-                    .filter_map(|loc| {
-                        // Convert URI path to PathBuf
-                        let uri_str = loc.uri.as_str();
-                        let file_path = if uri_str.starts_with("file://") {
-                            PathBuf::from(&uri_str[7..])
-                        } else {
-                            return None;
-                        };
-
-                        Some(LocationRef {
-                            file_path,
-                            position: DocPosition {
-                                line: loc.range.start.line as usize,
-                                column: loc.range.start.character as usize,
-                            },
-                            text: String::new(), // We don't have the text yet
-                        })
-                    })
-                    .collect();
-                results.push(LspResult::GoToDefinition(location_refs));
-            }
-        }
-
-        // Poll other LSP results from the channel
-        while let Ok(result) = self.results_rx.try_recv() {
-            results.push(result);
         }
 
         results
@@ -218,6 +278,20 @@ impl LspService {
     /// Request find references at position
     pub fn request_find_references(&self, position: DocPosition) {
         // TODO: Send find references request to LSP
+    }
+
+    /// Request code actions at position (for auto-fix)
+    pub fn request_code_action(&self, position: DocPosition) {
+        if let Some(ref lsp) = self.lsp_manager {
+            lsp.request_code_action(position.line as u32, position.column as u32);
+        }
+    }
+
+    /// Execute a code action (for auto-fix)
+    pub fn execute_code_action(&self, action: &CodeAction) {
+        if let Some(ref lsp) = self.lsp_manager {
+            lsp.execute_code_action(&action.action);
+        }
     }
 
     /// Check if LSP is ready for requests

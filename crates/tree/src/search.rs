@@ -1,8 +1,8 @@
 //! Search and replace functionality for the document tree
 
 use super::*;
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use ahash::{AHashMap, AHasher};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use bytecount::count as bytecount_count;
 use memchr::memchr_iter;
 use regex::Regex;
@@ -18,14 +18,18 @@ pub struct SearchMatch {
     pub byte_range: Range<usize>,
     pub line: u32,
     pub column: u32, // UTF-8 character column within line
-    // Note: match_text removed - extract from tree when needed to avoid allocation
+                     // Note: match_text removed - extract from tree when needed to avoid allocation
 }
 
 impl SearchMatch {
     /// Create a new search match
     #[inline]
     fn new(byte_range: Range<usize>, line: u32, column: u32) -> Self {
-        Self { byte_range, line, column }
+        Self {
+            byte_range,
+            line,
+            column,
+        }
     }
 
     /// Get the actual text of this match (allocates on demand)
@@ -100,7 +104,7 @@ impl IncrementalLineTracker {
             // We crossed newline(s) - update line and reset column tracking
             self.current_line += newline_count;
             self.line_start_byte = memchr_iter(b'\n', slice)
-                .last()
+                .next_back()
                 .map(|p| self.last_checked_byte + p + 1)
                 .unwrap_or(self.line_start_byte);
             self.last_checked_byte = self.line_start_byte;
@@ -152,13 +156,21 @@ impl SearcherCache {
 
     fn get_or_create(&mut self, pattern: &str, options: &SearchOptions) -> Arc<SearchEngine> {
         // Compute hash once (no allocation)
-        let hash = Self::compute_hash(pattern, options.case_sensitive, options.whole_word, options.regex);
+        let hash = Self::compute_hash(
+            pattern,
+            options.case_sensitive,
+            options.whole_word,
+            options.regex,
+        );
 
         // O(1) lookup with hash
         if let Some((cached_pattern, cs, ww, rx, engine)) = self.cache.get(&hash) {
             // Verify no collision (extremely rare)
-            if cached_pattern == pattern && *cs == options.case_sensitive
-                && *ww == options.whole_word && *rx == options.regex {
+            if cached_pattern == pattern
+                && *cs == options.case_sensitive
+                && *ww == options.whole_word
+                && *rx == options.regex
+            {
                 return Arc::clone(engine);
             }
         }
@@ -173,7 +185,13 @@ impl SearcherCache {
         // Add to cache
         self.cache.insert(
             hash,
-            (pattern.to_string(), options.case_sensitive, options.whole_word, options.regex, Arc::clone(&engine))
+            (
+                pattern.to_string(),
+                options.case_sensitive,
+                options.whole_word,
+                options.regex,
+                Arc::clone(&engine),
+            ),
         );
 
         // Simple eviction: if cache gets too big, clear it entirely
@@ -182,7 +200,13 @@ impl SearcherCache {
             // Re-insert current pattern
             self.cache.insert(
                 hash,
-                (pattern.to_string(), options.case_sensitive, options.whole_word, options.regex, Arc::clone(&engine))
+                (
+                    pattern.to_string(),
+                    options.case_sensitive,
+                    options.whole_word,
+                    options.regex,
+                    Arc::clone(&engine),
+                ),
             );
         }
 
@@ -198,7 +222,11 @@ impl SearcherCache {
 
 // === Helper: Fast search in flat buffer ===
 
-fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -> Option<SearchMatch> {
+fn search_next_in_bytes(
+    engine: &SearchEngine,
+    bytes: &[u8],
+    start_pos: usize,
+) -> Option<SearchMatch> {
     match engine {
         SearchEngine::Plain(searcher) => {
             let mut pos = start_pos;
@@ -206,15 +234,18 @@ fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -
             // Count lines up to start_pos using SIMD
             let current_line = bytecount_count(&bytes[..start_pos.min(bytes.len())], b'\n') as u32;
             let line_start_byte = memchr_iter(b'\n', &bytes[..start_pos.min(bytes.len())])
-                .last()
+                .next_back()
                 .map(|p| p + 1)
                 .unwrap_or(0);
 
             while pos < bytes.len() {
                 if let Some((match_start, match_end)) = searcher.find_in_bytes(bytes, pos) {
-                    if match_start > start_pos && searcher.is_word_boundary(bytes, match_start, match_end) {
+                    if match_start > start_pos
+                        && searcher.is_word_boundary(bytes, match_start, match_end)
+                    {
                         // Count lines from line_start_byte to match_start using SIMD
-                        let lines_to_match = bytecount_count(&bytes[line_start_byte..match_start], b'\n') as u32;
+                        let lines_to_match =
+                            bytecount_count(&bytes[line_start_byte..match_start], b'\n') as u32;
                         let final_line = current_line + lines_to_match;
 
                         let final_line_start = memchr_iter(b'\n', &bytes[..match_start])
@@ -225,11 +256,7 @@ fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -
                         // Use simdutf8 for faster UTF-8 validation
                         let column = calculate_column(bytes, final_line_start, match_start);
 
-                        return Some(SearchMatch::new(
-                            match_start..match_end,
-                            final_line,
-                            column,
-                        ));
+                        return Some(SearchMatch::new(match_start..match_end, final_line, column));
                     }
                     pos = match_start + 1;
                 } else {
@@ -252,7 +279,7 @@ fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -
 
                     // Find line start using SIMD
                     let line_start = memchr_iter(b'\n', &bytes[..match_start])
-                        .last()
+                        .next_back()
                         .map(|p| p + 1)
                         .unwrap_or(0);
 
@@ -270,7 +297,11 @@ fn search_next_in_bytes(engine: &SearchEngine, bytes: &[u8], start_pos: usize) -
     }
 }
 
-fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> Option<SearchMatch> {
+fn search_prev_in_bytes(
+    engine: &SearchEngine,
+    bytes: &[u8],
+    end_pos: usize,
+) -> Option<SearchMatch> {
     let search_bytes = &bytes[..end_pos.min(bytes.len())];
 
     match engine {
@@ -282,17 +313,22 @@ fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> 
 
             while pos < search_bytes.len() {
                 if let Some((match_start, match_end)) = searcher.find_in_bytes(search_bytes, pos) {
-                    if match_end <= end_pos && searcher.is_word_boundary(search_bytes, match_start, match_end) {
+                    if match_end <= end_pos
+                        && searcher.is_word_boundary(search_bytes, match_start, match_end)
+                    {
                         // Incrementally count lines from last position using SIMD
-                        let lines_between = bytecount_count(&search_bytes[line_start_byte..match_start], b'\n') as u32;
+                        let lines_between =
+                            bytecount_count(&search_bytes[line_start_byte..match_start], b'\n')
+                                as u32;
                         current_line += lines_between;
 
                         // Find line start for this match using memchr (SIMD)
                         if lines_between > 0 {
-                            line_start_byte = memchr_iter(b'\n', &search_bytes[line_start_byte..match_start])
-                                .last()
-                                .map(|p| line_start_byte + p + 1)
-                                .unwrap_or(line_start_byte);
+                            line_start_byte =
+                                memchr_iter(b'\n', &search_bytes[line_start_byte..match_start])
+                                    .next_back()
+                                    .map(|p| line_start_byte + p + 1)
+                                    .unwrap_or(line_start_byte);
                         }
 
                         // Use simdutf8 for faster UTF-8 validation
@@ -327,15 +363,17 @@ fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> 
                     let match_end = m.end();
 
                     // Incrementally count lines from last position using SIMD
-                    let lines_between = bytecount_count(&search_bytes[line_start_byte..match_start], b'\n') as u32;
+                    let lines_between =
+                        bytecount_count(&search_bytes[line_start_byte..match_start], b'\n') as u32;
                     current_line += lines_between;
 
                     // Find line start for this match using memchr (SIMD)
                     if lines_between > 0 {
-                        line_start_byte = memchr_iter(b'\n', &search_bytes[line_start_byte..match_start])
-                            .last()
-                            .map(|p| line_start_byte + p + 1)
-                            .unwrap_or(line_start_byte);
+                        line_start_byte =
+                            memchr_iter(b'\n', &search_bytes[line_start_byte..match_start])
+                                .next_back()
+                                .map(|p| line_start_byte + p + 1)
+                                .unwrap_or(line_start_byte);
                     }
 
                     let column = calculate_column(text.as_bytes(), line_start_byte, match_start);
@@ -355,7 +393,11 @@ fn search_prev_in_bytes(engine: &SearchEngine, bytes: &[u8], end_pos: usize) -> 
 }
 
 /// Fast search that only returns byte ranges (no line/column calculation)
-fn search_byte_ranges_only(engine: &SearchEngine, bytes: &[u8], limit: Option<usize>) -> Vec<SearchMatch> {
+fn search_byte_ranges_only(
+    engine: &SearchEngine,
+    bytes: &[u8],
+    limit: Option<usize>,
+) -> Vec<SearchMatch> {
     let mut matches = Vec::new();
 
     match engine {
@@ -469,16 +511,20 @@ impl Tree {
         let bytes = text.as_bytes();
 
         // Get cached searcher or create new one
-        let searcher = SEARCHER_CACHE.with(|cache| {
-            cache.borrow_mut().get_or_create(pattern, &options)
-        });
+        let searcher =
+            SEARCHER_CACHE.with(|cache| cache.borrow_mut().get_or_create(pattern, &options));
 
         // Search in flat buffer (like ripgrep does)
         search_in_bytes(&searcher, bytes, options.limit)
     }
 
     /// Find next occurrence after given position
-    pub fn search_next(&self, pattern: &str, start_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
+    pub fn search_next(
+        &self,
+        pattern: &str,
+        start_pos: usize,
+        options: SearchOptions,
+    ) -> Option<SearchMatch> {
         if pattern.is_empty() {
             return None;
         }
@@ -492,16 +538,20 @@ impl Tree {
         }
 
         // Get cached searcher
-        let searcher = SEARCHER_CACHE.with(|cache| {
-            cache.borrow_mut().get_or_create(pattern, &options)
-        });
+        let searcher =
+            SEARCHER_CACHE.with(|cache| cache.borrow_mut().get_or_create(pattern, &options));
 
         // Search from start_pos to end
         search_next_in_bytes(&searcher, bytes, start_pos)
     }
 
     /// Find previous occurrence before given position
-    pub fn search_prev(&self, pattern: &str, end_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
+    pub fn search_prev(
+        &self,
+        pattern: &str,
+        end_pos: usize,
+        options: SearchOptions,
+    ) -> Option<SearchMatch> {
         if pattern.is_empty() {
             return None;
         }
@@ -511,9 +561,8 @@ impl Tree {
         let bytes = text.as_bytes();
 
         // Get cached searcher
-        let searcher = SEARCHER_CACHE.with(|cache| {
-            cache.borrow_mut().get_or_create(pattern, &options)
-        });
+        let searcher =
+            SEARCHER_CACHE.with(|cache| cache.borrow_mut().get_or_create(pattern, &options));
 
         // Search from beginning to end_pos
         search_prev_in_bytes(&searcher, bytes, end_pos)
@@ -530,9 +579,8 @@ impl Tree {
         let bytes = text.as_bytes();
 
         // Get cached searcher
-        let searcher = SEARCHER_CACHE.with(|cache| {
-            cache.borrow_mut().get_or_create(pattern, &options)
-        });
+        let searcher =
+            SEARCHER_CACHE.with(|cache| cache.borrow_mut().get_or_create(pattern, &options));
 
         // Use fast search that skips line/column calculation (replace_all doesn't need it)
         let matches = search_byte_ranges_only(&searcher, bytes, options.limit);
@@ -549,7 +597,10 @@ impl Tree {
                 SearchEngine::Plain(p) => p.pattern.len(),
                 SearchEngine::Regex(_) => {
                     // For regex, estimate from first match if available
-                    matches.first().map(|m| m.byte_range.len()).unwrap_or(pattern.len())
+                    matches
+                        .first()
+                        .map(|m| m.byte_range.len())
+                        .unwrap_or(pattern.len())
                 }
             };
             let size_diff = replacement.len().saturating_sub(pattern_len);
@@ -613,8 +664,10 @@ impl Tree {
             let text = self.flatten_to_string();
 
             // Estimate capacity
-            let avg_match_len = replacements.iter().map(|(r, _)| r.len()).sum::<usize>() / replacements.len();
-            let avg_replacement_len = replacements.iter().map(|(_, s)| s.len()).sum::<usize>() / replacements.len();
+            let avg_match_len =
+                replacements.iter().map(|(r, _)| r.len()).sum::<usize>() / replacements.len();
+            let avg_replacement_len =
+                replacements.iter().map(|(_, s)| s.len()).sum::<usize>() / replacements.len();
             let size_diff = avg_replacement_len.saturating_sub(avg_match_len);
             let estimated_capacity = text.len() + (replacements.len() * size_diff);
 
@@ -654,19 +707,34 @@ impl Doc {
     }
 
     /// Find next occurrence after given position
-    pub fn search_next(&self, pattern: &str, start_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
+    pub fn search_next(
+        &self,
+        pattern: &str,
+        start_pos: usize,
+        options: SearchOptions,
+    ) -> Option<SearchMatch> {
         self.flush();
         self.read().search_next(pattern, start_pos, options)
     }
 
     /// Find previous occurrence before given position
-    pub fn search_prev(&self, pattern: &str, end_pos: usize, options: SearchOptions) -> Option<SearchMatch> {
+    pub fn search_prev(
+        &self,
+        pattern: &str,
+        end_pos: usize,
+        options: SearchOptions,
+    ) -> Option<SearchMatch> {
         self.flush();
         self.read().search_prev(pattern, end_pos, options)
     }
 
     /// Replace all occurrences and return new tree
-    pub fn replace_all(&self, pattern: &str, replacement: &str, options: SearchOptions) -> Arc<Tree> {
+    pub fn replace_all(
+        &self,
+        pattern: &str,
+        replacement: &str,
+        options: SearchOptions,
+    ) -> Arc<Tree> {
         self.flush();
         let new_tree = self.read().replace_all(pattern, replacement, options);
         let new_arc = Arc::new(new_tree);
@@ -751,7 +819,6 @@ impl PlainSearcher {
     }
 }
 
-
 pub(super) struct RegexSearcher {
     regex: Regex,
 }
@@ -778,7 +845,6 @@ impl RegexSearcher {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1125,8 +1191,8 @@ mod tests {
             let mut expected_positions = Vec::new();
             for i in 0..100 {
                 let base = i * 19; // "Test TEST test TeSt" is 19 bytes
-                expected_positions.push(base);      // Test
-                expected_positions.push(base + 5);  // TEST
+                expected_positions.push(base); // Test
+                expected_positions.push(base + 5); // TEST
                 expected_positions.push(base + 10); // test
                 expected_positions.push(base + 15); // TeSt
             }
@@ -1143,3 +1209,4 @@ mod tests {
         assert_eq!(matches.len(), expected);
     }
 }
+

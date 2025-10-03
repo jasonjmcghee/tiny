@@ -4,11 +4,10 @@
 
 use crate::coordinates::Viewport;
 use crate::history::{DocumentHistory, DocumentSnapshot, SelectionHistory};
-use crate::input_types::{ElementState, Key, KeyEvent, Modifiers, MouseButton, NamedKey};
+use crate::input_types::MouseButton;
 use crate::lsp_manager::TextChange;
 use crate::syntax::SyntaxHighlighter;
 use crate::text_editor_plugin::TextEditorPlugin;
-use ahash::AHashMap as HashMap;
 use arboard::Clipboard;
 use serde_json::{json, Value};
 use std::ops::Range;
@@ -46,181 +45,6 @@ impl Default for InputMode {
     }
 }
 
-/// Editor actions that can be bound to keys
-#[derive(Debug, Clone, PartialEq)]
-pub enum EditorAction {
-    // Text insertion
-    InsertCharacter(String),
-    InsertNewline,
-    InsertTab,
-    InsertSpace,
-
-    // Deletion
-    DeleteBackward,
-    DeleteForward,
-
-    // Clipboard
-    Copy,
-    Cut,
-    Paste,
-    SelectAll,
-
-    // Cursor movement
-    MoveLeft { extending: bool },
-    MoveRight { extending: bool },
-    MoveUp { extending: bool },
-    MoveDown { extending: bool },
-    MoveToLineStart { extending: bool },
-    MoveToLineEnd { extending: bool },
-    PageUp { extending: bool },
-    PageDown { extending: bool },
-
-    // History
-    Undo,
-    Redo,
-
-    // File operations
-    Save,
-
-    // Navigation
-    GoToDefinition,
-    NavigateBack,
-    NavigateForward,
-
-    // App-level
-    OpenFilePicker,
-
-    // Mode switching
-    EnterMode(InputMode),
-
-    // No action
-    None,
-}
-
-/// A key pattern for matching keyboard input
-#[derive(Debug, Clone, PartialEq)]
-pub struct KeyPattern {
-    key_type: String,  // "character" or "named"
-    key_value: String, // the actual key
-    cmd: bool,
-    shift: bool,
-    alt: bool,
-    mode: InputMode,  // Which mode this binding applies to
-}
-
-impl KeyPattern {
-    pub fn character(ch: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> Self {
-        Self {
-            key_type: "character".to_string(),
-            key_value: ch.to_string(),
-            cmd,
-            shift,
-            alt,
-            mode,
-        }
-    }
-
-    pub fn named(key: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> Self {
-        Self {
-            key_type: "named".to_string(),
-            key_value: key.to_string(),
-            cmd,
-            shift,
-            alt,
-            mode,
-        }
-    }
-
-    fn matches(&self, key_type: &str, key_value: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> bool {
-        self.key_type == key_type
-            && self.key_value == key_value
-            && self.cmd == cmd
-            && self.shift == shift
-            && self.alt == alt
-            && self.mode == mode
-    }
-}
-
-/// Centralized key bindings configuration
-pub struct KeyBindings {
-    bindings: Vec<(KeyPattern, EditorAction)>,
-}
-
-impl KeyBindings {
-    pub fn default() -> Self {
-        let mut bindings = Vec::new();
-        let insert = InputMode::Insert;
-
-        // Cmd+Key combinations (order matters for shift variants)
-        bindings.push((KeyPattern::character("z", true, true, false, insert), EditorAction::Redo));
-        bindings.push((KeyPattern::character("z", true, false, false, insert), EditorAction::Undo));
-        bindings.push((KeyPattern::character("s", true, false, false, insert), EditorAction::Save));
-        bindings.push((KeyPattern::character("c", true, false, false, insert), EditorAction::Copy));
-        bindings.push((KeyPattern::character("x", true, false, false, insert), EditorAction::Cut));
-        bindings.push((KeyPattern::character("v", true, false, false, insert), EditorAction::Paste));
-        bindings.push((KeyPattern::character("a", true, false, false, insert), EditorAction::SelectAll));
-        bindings.push((KeyPattern::character("b", true, false, false, insert), EditorAction::GoToDefinition));
-        bindings.push((KeyPattern::character("[", true, false, false, insert), EditorAction::NavigateBack));
-        bindings.push((KeyPattern::character("]", true, false, false, insert), EditorAction::NavigateForward));
-
-        // Named keys without modifiers
-        bindings.push((KeyPattern::named("Enter", false, false, false, insert), EditorAction::InsertNewline));
-        bindings.push((KeyPattern::named("Tab", false, false, false, insert), EditorAction::InsertTab));
-        bindings.push((KeyPattern::named("Space", false, false, false, insert), EditorAction::InsertSpace));
-        bindings.push((KeyPattern::named("Backspace", false, false, false, insert), EditorAction::DeleteBackward));
-        bindings.push((KeyPattern::named("Delete", false, false, false, insert), EditorAction::DeleteForward));
-
-        // Arrow keys with optional shift (extending selection)
-        for shift in [false, true] {
-            bindings.push((KeyPattern::named("ArrowLeft", false, shift, false, insert), EditorAction::MoveLeft { extending: shift }));
-            bindings.push((KeyPattern::named("ArrowRight", false, shift, false, insert), EditorAction::MoveRight { extending: shift }));
-            bindings.push((KeyPattern::named("ArrowUp", false, shift, false, insert), EditorAction::MoveUp { extending: shift }));
-            bindings.push((KeyPattern::named("ArrowDown", false, shift, false, insert), EditorAction::MoveDown { extending: shift }));
-            bindings.push((KeyPattern::named("Home", false, shift, false, insert), EditorAction::MoveToLineStart { extending: shift }));
-            bindings.push((KeyPattern::named("End", false, shift, false, insert), EditorAction::MoveToLineEnd { extending: shift }));
-            bindings.push((KeyPattern::named("PageUp", false, shift, false, insert), EditorAction::PageUp { extending: shift }));
-            bindings.push((KeyPattern::named("PageDown", false, shift, false, insert), EditorAction::PageDown { extending: shift }));
-        }
-
-        Self { bindings }
-    }
-
-    pub fn lookup(&self, key_type: &str, key_value: &str, cmd: bool, shift: bool, alt: bool, mode: InputMode) -> EditorAction {
-        // First try to find a mode-specific binding
-        for (pattern, action) in &self.bindings {
-            if pattern.matches(key_type, key_value, cmd, shift, alt, mode) {
-                return action.clone();
-            }
-        }
-
-        // Fallback: regular character insertion in Insert mode only (no modifiers, not control chars)
-        if mode == InputMode::Insert && key_type == "character" && !cmd && !alt && !key_value.chars().any(|c| c.is_control()) {
-            return EditorAction::InsertCharacter(key_value.to_string());
-        }
-
-        EditorAction::None
-    }
-
-    /// Add a new binding (for runtime customization)
-    pub fn add_binding(&mut self, pattern: KeyPattern, action: EditorAction) {
-        self.bindings.push((pattern, action));
-    }
-
-    /// Create a vim-like binding set (example of how to extend)
-    pub fn with_vim_bindings(mut self) -> Self {
-        let normal = InputMode::Normal;
-
-        // Example vim normal mode bindings - users can extend this
-        self.bindings.push((KeyPattern::character("h", false, false, false, normal), EditorAction::MoveLeft { extending: false }));
-        self.bindings.push((KeyPattern::character("j", false, false, false, normal), EditorAction::MoveDown { extending: false }));
-        self.bindings.push((KeyPattern::character("k", false, false, false, normal), EditorAction::MoveUp { extending: false }));
-        self.bindings.push((KeyPattern::character("l", false, false, false, normal), EditorAction::MoveRight { extending: false }));
-        self.bindings.push((KeyPattern::character("i", false, false, false, normal), EditorAction::EnterMode(InputMode::Insert)));
-        self.bindings.push((KeyPattern::named("Escape", false, false, false, InputMode::Insert), EditorAction::EnterMode(InputMode::Normal)));
-
-        self
-    }
-}
 
 /// Selection with cursor and anchor in document coordinates
 #[derive(Clone)]
@@ -322,13 +146,6 @@ impl Selection {
     }
 }
 
-/// Result of event handling
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EventResult {
-    Continue,
-    StopPropagation,
-}
-
 /// Event with JSON data payload
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -339,15 +156,10 @@ pub struct Event {
     pub source: String,
 }
 
-/// Event handler callback type
-pub type EventHandler = Box<dyn FnMut(&Event, &mut EventBus) -> EventResult>;
-
-/// Global event bus for queuing and processing events
+/// Simple event bus for queuing and prioritizing events
+/// Components handle events by checking names in dispatch loop
 pub struct EventBus {
     pub queued: Vec<Event>,
-    processing: Vec<Event>,
-    handlers: HashMap<String, Vec<EventHandler>>,
-    patterns: Vec<(String, EventHandler)>,
     /// Callback to wake up the main thread when events are emitted (e.g., request redraw)
     wake_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -357,9 +169,6 @@ impl EventBus {
     pub fn new() -> Self {
         Self {
             queued: Vec::new(),
-            processing: Vec::new(),
-            handlers: HashMap::new(),
-            patterns: Vec::new(),
             wake_notifier: None,
         }
     }
@@ -394,83 +203,17 @@ impl EventBus {
         }
     }
 
-    /// Register an event handler for a specific event or pattern
-    pub fn on(&mut self, pattern: impl Into<String>, handler: EventHandler) {
-        let pattern = pattern.into();
-        if pattern.contains('*') {
-            self.patterns.push((pattern, handler));
-        } else {
-            self.handlers.entry(pattern).or_default().push(handler);
-        }
+    /// Get and consume all queued events, sorted by priority
+    /// Lower priority number = higher priority (processed first)
+    pub fn drain_sorted(&mut self) -> Vec<Event> {
+        let mut events = std::mem::take(&mut self.queued);
+        events.sort_by_key(|e| e.priority);
+        events
     }
 
-    /// Process all queued events
-    pub fn process_events(&mut self) {
-        // Swap buffers to avoid re-entrancy issues
-        std::mem::swap(&mut self.queued, &mut self.processing);
-
-        // Sort by priority (lower number = higher priority)
-        // Stable sort preserves insertion order for same priority
-        self.processing.sort_by_key(|e| e.priority);
-
-        // Process each event - we need to avoid borrow issues
-        while !self.processing.is_empty() {
-            let event = self.processing.remove(0);
-            let mut stop_propagation = false;
-
-            // Check for direct handlers
-            let has_direct_handlers = self.handlers.contains_key(&event.name);
-            if has_direct_handlers {
-                // We need to temporarily take the handlers to avoid borrow issues
-                let mut handlers = self.handlers.remove(&event.name).unwrap_or_default();
-                for handler in handlers.iter_mut() {
-                    if handler(&event, self) == EventResult::StopPropagation {
-                        stop_propagation = true;
-                        break;
-                    }
-                }
-                // Put the handlers back
-                self.handlers.insert(event.name.clone(), handlers);
-            }
-
-            // Pattern handlers (wildcards) if not stopped
-            if !stop_propagation {
-                // We need to process patterns carefully to avoid borrow issues
-                let mut i = 0;
-                while i < self.patterns.len() {
-                    let matches = Self::matches_pattern(&event.name, &self.patterns[i].0);
-                    if matches {
-                        // Temporarily remove the pattern handler
-                        let (pattern, mut handler) = self.patterns.remove(i);
-                        let result = handler(&event, self);
-                        // Put it back
-                        self.patterns.insert(i, (pattern, handler));
-
-                        if result == EventResult::StopPropagation {
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-            }
-        }
-    }
-
-    /// Check if an event name matches a pattern (supports * wildcards)
-    fn matches_pattern(event_name: &str, pattern: &str) -> bool {
-        if pattern == "*" {
-            return true;
-        }
-
-        if pattern.ends_with(".*") {
-            let prefix = &pattern[..pattern.len() - 2];
-            event_name.starts_with(prefix) && event_name[prefix.len()..].starts_with('.')
-        } else if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
-            event_name.starts_with(prefix)
-        } else {
-            event_name == pattern
-        }
+    /// Check if there are pending events
+    pub fn has_events(&self) -> bool {
+        !self.queued.is_empty()
     }
 }
 
@@ -497,10 +240,6 @@ impl SharedEventBus {
             .lock()
             .unwrap()
             .emit(name, data, priority, source);
-    }
-
-    pub fn on(&self, pattern: impl Into<String>, handler: EventHandler) {
-        self.inner.lock().unwrap().on(pattern, handler);
     }
 
     pub fn set_wake_notifier<F>(&self, notifier: F)
@@ -560,13 +299,10 @@ pub struct InputHandler {
     ignore_next_drag: bool,
     /// Time of last undo checkpoint for grouping edits
     last_checkpoint_time: Option<Instant>,
-    /// Double-shift detection for file picker
-    last_shift_press: Option<Instant>,
-    shift_currently_pressed: bool,
     /// Current input mode (for vim-like modal editing)
     current_mode: InputMode,
-    /// Key bindings configuration
-    key_bindings: KeyBindings,
+    /// Pending scroll delta from drag operations (to be consumed by app)
+    pub pending_scroll_delta: Option<(f32, f32)>,
 }
 
 impl InputHandler {
@@ -596,10 +332,8 @@ impl InputHandler {
             click_count: 0,
             ignore_next_drag: false,
             last_checkpoint_time: None,
-            last_shift_press: None,
-            shift_currently_pressed: false,
             current_mode: InputMode::default(),
-            key_bindings: KeyBindings::default(),
+            pending_scroll_delta: None,
         }
     }
 
@@ -617,7 +351,10 @@ impl InputHandler {
     fn byte_to_doc_pos(&self, tree: &tiny_core::tree::Tree, byte_offset: usize) -> DocPos {
         let line = tree.byte_to_line(byte_offset);
         let line_start_byte = tree.line_to_byte(line).unwrap_or(0);
-        let column = tree.get_text_slice(line_start_byte..byte_offset).chars().count() as u32;
+        let column = tree
+            .get_text_slice(line_start_byte..byte_offset)
+            .chars()
+            .count() as u32;
         DocPos {
             line,
             column,
@@ -625,216 +362,81 @@ impl InputHandler {
         }
     }
 
-    /// Register app-level event handlers (font size, scroll lock, etc)
-    /// These are handlers that don't directly manipulate the document
-    pub fn register_app_handlers(bus: &mut EventBus) {
-        // Font size increase handler
-        bus.on(
-            "app.action.font_increase",
-            Box::new(|_event, bus| {
-                // Re-emit as a command that app.rs will handle
-                bus.emit(
-                    "app.command.adjust_font_size",
-                    json!({ "increase": true }),
-                    5,
-                    "input_handler",
-                );
-                EventResult::Continue
-            }),
-        );
-
-        // Font size decrease handler
-        bus.on(
-            "app.action.font_decrease",
-            Box::new(|_event, bus| {
-                // Re-emit as a command that app.rs will handle
-                bus.emit(
-                    "app.command.adjust_font_size",
-                    json!({ "increase": false }),
-                    5,
-                    "input_handler",
-                );
-                EventResult::Continue
-            }),
-        );
-
-        // Scroll lock toggle handler
-        bus.on(
-            "app.action.toggle_scroll_lock",
-            Box::new(|_event, bus| {
-                // Re-emit as a command that app.rs will handle
-                bus.emit(
-                    "app.command.toggle_scroll_lock",
-                    json!({}),
-                    5,
-                    "input_handler",
-                );
-                EventResult::Continue
-            }),
-        );
-    }
-
-    /// Process events from the bus - handles keyboard, mouse, and action events
-    pub fn process_event(
-        &mut self,
-        event: &Event,
-        doc: &Doc,
-        viewport: &Viewport,
-        bus: &mut EventBus,
-    ) -> InputAction {
+    /// Handle an event (new event system)
+    /// Returns the action that should be taken
+    pub fn handle_event(&mut self, event: &Event, doc: &Doc, viewport: &Viewport) -> InputAction {
         match event.name.as_str() {
-            "app.keyboard.keypress" => self.handle_keyboard_event(event, doc, bus),
-            "app.mouse.press" => self.handle_mouse_press(event, doc, viewport),
-            "app.mouse.drag" => self.handle_mouse_drag(event, doc, viewport, bus),
-            "app.mouse.release" => {
-                self.clear_drag_anchor();
-                InputAction::None
-            }
-            // Legacy event handlers for backward compatibility
-            "app.action.nav_back" | "app.action.nav_forward" => InputAction::None,
-            _ => InputAction::None,
-        }
-    }
-
-    /// Handle keyboard events and dispatch to appropriate actions
-    fn handle_keyboard_event(&mut self, event: &Event, doc: &Doc, bus: &mut EventBus) -> InputAction {
-        let state = event.data.get("state").and_then(|s| s.as_str()).unwrap_or("");
-
-        // Extract key information
-        let key_obj = match event.data.get("key") {
-            Some(k) => k,
-            None => return InputAction::None,
-        };
-
-        let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Track Shift key specifically for double-shift detection
-        if key_type == "named" && key_value == "Shift" {
-            return self.handle_shift_key(state, bus);
-        }
-
-        // Only process key presses (not releases)
-        if state != "pressed" {
-            return InputAction::None;
-        }
-
-        // Extract modifiers
-        let modifiers = event.data.get("modifiers");
-        let shift = modifiers.and_then(|m| m.get("shift")).and_then(|s| s.as_bool()).unwrap_or(false);
-        let cmd = modifiers.and_then(|m| m.get("cmd")).and_then(|c| c.as_bool()).unwrap_or(false);
-        let alt = modifiers.and_then(|m| m.get("alt")).and_then(|a| a.as_bool()).unwrap_or(false);
-
-        // Look up action from key bindings with current mode
-        let action = self.key_bindings.lookup(key_type, key_value, cmd, shift, alt, self.current_mode);
-
-        // Execute the action
-        self.execute_action(action, doc, bus)
-    }
-
-    /// Handle Shift key press/release for double-shift detection
-    fn handle_shift_key(&mut self, state: &str, bus: &mut EventBus) -> InputAction {
-        if state == "pressed" && !self.shift_currently_pressed {
-            self.shift_currently_pressed = true;
-
-            // Check if this is a double-shift (within 300ms of last press)
-            const DOUBLE_SHIFT_TIMEOUT: Duration = Duration::from_millis(300);
-            if let Some(last_press) = self.last_shift_press {
-                if last_press.elapsed() < DOUBLE_SHIFT_TIMEOUT {
-                    // Double-shift detected! Emit file picker event
-                    bus.emit("app.action.open_file_picker", json!({}), 5, "input_handler");
-                    self.last_shift_press = None; // Reset to avoid triple-shift
-                    return InputAction::None;
+            // Text insertion
+            "editor.insert_char" => {
+                if let Some(ch) = event.data.get("char").and_then(|v| v.as_str()) {
+                    self.insert_text(doc, ch)
+                } else {
+                    InputAction::None
                 }
             }
-
-            // Record this press for double-shift detection
-            self.last_shift_press = Some(Instant::now());
-        } else if state == "released" {
-            self.shift_currently_pressed = false;
-        }
-
-        InputAction::None
-    }
-
-    /// Execute an editor action
-    fn execute_action(&mut self, action: EditorAction, doc: &Doc, bus: &mut EventBus) -> InputAction {
-        match action {
-            // Text insertion
-            EditorAction::InsertCharacter(ch) => self.insert_text(doc, &ch),
-            EditorAction::InsertNewline => self.insert_text(doc, "\n"),
-            EditorAction::InsertTab => self.insert_text(doc, "\t"),
-            EditorAction::InsertSpace => self.insert_text(doc, " "),
+            "editor.insert_newline" => self.insert_text(doc, "\n"),
+            "editor.insert_tab" => self.insert_text(doc, "\t"),
+            "editor.insert_space" => self.insert_text(doc, " "),
 
             // Deletion
-            EditorAction::DeleteBackward => self.delete_at_cursor(doc, false),
-            EditorAction::DeleteForward => self.delete_at_cursor(doc, true),
+            "editor.delete_backward" => self.delete_at_cursor(doc, false),
+            "editor.delete_forward" => self.delete_at_cursor(doc, true),
 
             // Clipboard
-            EditorAction::Copy => {
+            "editor.copy" => {
                 self.copy(doc);
                 InputAction::None
             }
-            EditorAction::Cut => {
+            "editor.cut" => {
                 self.cut(doc);
                 InputAction::Redraw
             }
-            EditorAction::Paste => {
+            "editor.paste" => {
                 self.paste(doc);
                 InputAction::Redraw
             }
-            EditorAction::SelectAll => {
+            "editor.select_all" => {
                 self.select_all(doc);
                 InputAction::Redraw
             }
 
             // Cursor movement
-            EditorAction::MoveLeft { extending } => self.move_cursor(doc, -1, 0, extending),
-            EditorAction::MoveRight { extending } => self.move_cursor(doc, 1, 0, extending),
-            EditorAction::MoveUp { extending } => self.move_cursor(doc, 0, -1, extending),
-            EditorAction::MoveDown { extending } => self.move_cursor(doc, 0, 1, extending),
-            EditorAction::MoveToLineStart { extending } => self.move_to_line_edge(doc, false, extending),
-            EditorAction::MoveToLineEnd { extending } => self.move_to_line_edge(doc, true, extending),
-            EditorAction::PageUp { extending } => self.page_jump(doc, true, extending),
-            EditorAction::PageDown { extending } => self.page_jump(doc, false, extending),
+            "editor.move_left" => self.move_cursor(doc, -1, 0, false),
+            "editor.move_right" => self.move_cursor(doc, 1, 0, false),
+            "editor.move_up" => self.move_cursor(doc, 0, -1, false),
+            "editor.move_down" => self.move_cursor(doc, 0, 1, false),
+            "editor.extend_left" => self.move_cursor(doc, -1, 0, true),
+            "editor.extend_right" => self.move_cursor(doc, 1, 0, true),
+            "editor.extend_up" => self.move_cursor(doc, 0, -1, true),
+            "editor.extend_down" => self.move_cursor(doc, 0, 1, true),
+            "editor.move_line_start" => self.move_to_line_edge(doc, false, false),
+            "editor.move_line_end" => self.move_to_line_edge(doc, true, false),
+            "editor.extend_line_start" => self.move_to_line_edge(doc, false, true),
+            "editor.extend_line_end" => self.move_to_line_edge(doc, true, true),
+            "editor.page_up" => self.page_jump(doc, true, false),
+            "editor.page_down" => self.page_jump(doc, false, false),
+            "editor.extend_page_up" => self.page_jump(doc, true, true),
+            "editor.extend_page_down" => self.page_jump(doc, false, true),
 
             // History
-            EditorAction::Undo => InputAction::Undo,
-            EditorAction::Redo => InputAction::Redo,
+            "editor.undo" => InputAction::Undo,
+            "editor.redo" => InputAction::Redo,
 
             // File operations
-            EditorAction::Save => InputAction::Save,
+            "editor.save" => InputAction::Save,
 
-            // Navigation (emit events for EditorLogic to handle cross-file navigation)
-            EditorAction::GoToDefinition => {
-                bus.emit("app.action.goto_definition", json!({}), 5, "input_handler");
-                InputAction::None
-            }
-            EditorAction::NavigateBack => {
-                bus.emit("app.action.nav_back", json!({}), 5, "input_handler");
-                InputAction::None
-            }
-            EditorAction::NavigateForward => {
-                bus.emit("app.action.nav_forward", json!({}), 5, "input_handler");
+            // Mouse events
+            "mouse.press" => self.handle_mouse_press(event, doc, viewport),
+            "mouse.drag" => self.handle_mouse_drag_event(event, doc, viewport),
+            "mouse.release" => {
+                self.clear_drag_anchor();
                 InputAction::None
             }
 
-            // App-level actions
-            EditorAction::OpenFilePicker => {
-                bus.emit("app.action.open_file_picker", json!({}), 5, "input_handler");
-                InputAction::None
-            }
-
-            // Mode switching
-            EditorAction::EnterMode(mode) => {
-                self.current_mode = mode;
-                InputAction::Redraw  // Redraw to update mode indicator if UI shows it
-            }
-
-            // No action
-            EditorAction::None => InputAction::None,
+            _ => InputAction::None,
         }
     }
+
 
     /// Handle mouse press events
     fn handle_mouse_press(&mut self, event: &Event, doc: &Doc, viewport: &Viewport) -> InputAction {
@@ -847,8 +449,14 @@ impl InputHandler {
         };
 
         let modifiers = event.data.get("modifiers");
-        let shift_held = modifiers.and_then(|m| m.get("shift")).and_then(|s| s.as_bool()).unwrap_or(false);
-        let alt_held = modifiers.and_then(|m| m.get("alt")).and_then(|a| a.as_bool()).unwrap_or(false);
+        let shift_held = modifiers
+            .and_then(|m| m.get("shift"))
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+        let alt_held = modifiers
+            .and_then(|m| m.get("alt"))
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
 
         let pos = Point {
             x: tiny_sdk::LogicalPixels(x as f32),
@@ -868,7 +476,12 @@ impl InputHandler {
     }
 
     /// Handle mouse drag events
-    fn handle_mouse_drag(&mut self, event: &Event, doc: &Doc, viewport: &Viewport, bus: &mut EventBus) -> InputAction {
+    fn handle_mouse_drag_event(
+        &mut self,
+        event: &Event,
+        doc: &Doc,
+        viewport: &Viewport,
+    ) -> InputAction {
         let (from_x, from_y, to_x, to_y) = match (
             event.data.get("from_x").and_then(|v| v.as_f64()),
             event.data.get("from_y").and_then(|v| v.as_f64()),
@@ -879,8 +492,7 @@ impl InputHandler {
             _ => return InputAction::None,
         };
 
-        let modifiers = event.data.get("modifiers");
-        let alt_held = modifiers.and_then(|m| m.get("alt")).and_then(|a| a.as_bool()).unwrap_or(false);
+        let alt_held = event.data.get("alt").and_then(|a| a.as_bool()).unwrap_or(false);
 
         let from = Point {
             x: tiny_sdk::LogicalPixels(from_x as f32),
@@ -893,18 +505,8 @@ impl InputHandler {
 
         let (redraw, scroll_delta) = self.on_mouse_drag(doc, viewport, from, to, alt_held);
 
-        // If there's a scroll delta, emit a scroll event
-        if let Some((dx, dy)) = scroll_delta {
-            bus.emit(
-                "app.drag.scroll",
-                json!({
-                    "delta_x": dx,
-                    "delta_y": dy
-                }),
-                15,
-                "input_handler",
-            );
-        }
+        // Store scroll delta for app to consume
+        self.pending_scroll_delta = scroll_delta;
 
         if redraw {
             InputAction::Redraw
@@ -1327,77 +929,6 @@ impl InputHandler {
         true
     }
 
-    /// Get what edits would be applied for a key event (without applying them)
-    pub fn get_pending_edits(
-        &self,
-        doc: &Doc,
-        _viewport: &Viewport,
-        event: &KeyEvent,
-        _modifiers: &Modifiers,
-    ) -> Vec<tiny_core::tree::Edit> {
-        if event.state != ElementState::Pressed {
-            return Vec::new();
-        }
-
-        let mut edits = Vec::new();
-        println!(
-            "INPUT: get_pending_edits called for key: {:?}",
-            event.logical_key
-        );
-
-        match &event.logical_key {
-            Key::Character(ch) if ch.chars().all(|c| !c.is_control()) => {
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    }
-                    let tree = doc.read();
-                    edits.push(Edit::Insert {
-                        pos: tree.doc_pos_to_byte(sel.min_pos()),
-                        content: Content::Text(ch.to_string()),
-                    });
-                }
-            }
-            Key::Named(NamedKey::Backspace) => {
-                for sel in &self.selections {
-                    if !sel.is_cursor() {
-                        edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    } else if sel.cursor.column > 0 || sel.cursor.line > 0 {
-                        let tree = doc.read();
-                        let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
-                        if cursor_byte > 0 {
-                            edits.push(Edit::Delete {
-                                range: (cursor_byte - 1)..cursor_byte,
-                            });
-                        }
-                    }
-                }
-            }
-            Key::Named(NamedKey::Delete) => {
-                for sel in &self.selections {
-                    let tree = doc.read();
-                    if !sel.is_cursor() {
-                        edits.push(Edit::Delete {
-                            range: sel.byte_range(doc),
-                        });
-                    } else {
-                        let cursor_byte = tree.doc_pos_to_byte(sel.cursor);
-                        if cursor_byte < tree.byte_count() {
-                            edits.push(Edit::Delete {
-                                range: cursor_byte..(cursor_byte + 1),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        edits
-    }
 
     /// Handle mouse click
     pub fn on_mouse_click(
@@ -1915,10 +1446,17 @@ impl InputHandler {
     }
 
     /// Helper to convert byte offset to LSP Position
-    fn byte_to_lsp_position(&self, tree: &tiny_core::tree::Tree, byte_offset: usize) -> lsp_types::Position {
+    fn byte_to_lsp_position(
+        &self,
+        tree: &tiny_core::tree::Tree,
+        byte_offset: usize,
+    ) -> lsp_types::Position {
         let line = tree.byte_to_line(byte_offset);
         let line_start_byte = tree.line_to_byte(line).unwrap_or(0);
-        let character = tree.get_text_slice(line_start_byte..byte_offset).chars().count() as u32;
+        let character = tree
+            .get_text_slice(line_start_byte..byte_offset)
+            .chars()
+            .count() as u32;
         lsp_types::Position { line, character }
     }
 
@@ -1940,27 +1478,23 @@ impl InputHandler {
                     },
                 }
             }
-            Edit::Delete { range } => {
-                TextChange {
-                    range: LspRange {
-                        start: self.byte_to_lsp_position(tree, range.start),
-                        end: self.byte_to_lsp_position(tree, range.end),
-                    },
-                    text: String::new(),
-                }
-            }
-            Edit::Replace { range, content } => {
-                TextChange {
-                    range: LspRange {
-                        start: self.byte_to_lsp_position(tree, range.start),
-                        end: self.byte_to_lsp_position(tree, range.end),
-                    },
-                    text: match content {
-                        Content::Text(s) => s.clone(),
-                        Content::Spatial(_) => String::new(),
-                    },
-                }
-            }
+            Edit::Delete { range } => TextChange {
+                range: LspRange {
+                    start: self.byte_to_lsp_position(tree, range.start),
+                    end: self.byte_to_lsp_position(tree, range.end),
+                },
+                text: String::new(),
+            },
+            Edit::Replace { range, content } => TextChange {
+                range: LspRange {
+                    start: self.byte_to_lsp_position(tree, range.start),
+                    end: self.byte_to_lsp_position(tree, range.end),
+                },
+                text: match content {
+                    Content::Text(s) => s.clone(),
+                    Content::Spatial(_) => String::new(),
+                },
+            },
         }
     }
 

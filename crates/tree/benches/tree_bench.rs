@@ -657,6 +657,195 @@ fn bench_search_patterns(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark UTF-16 conversions (critical for LSP operations)
+fn bench_utf16_conversions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("utf16_conversions");
+
+    // Generate documents with varying amounts of multibyte characters
+    let ascii_doc = generate_document(5000);
+    let mixed_doc = "Hello 世界 function 测试 variable 函数 🌍\n".repeat(500);
+    let emoji_heavy = "🔴🟠🟡🟢🔵🟣 code here\n".repeat(500);
+
+    // Benchmark offset → UTF-16 offset conversions
+    for (name, text) in [
+        ("ascii", ascii_doc.as_str()),
+        ("mixed_unicode", mixed_doc.as_str()),
+        ("emoji_heavy", emoji_heavy.as_str()),
+    ] {
+        let doc = Doc::from_str(text);
+        let tree = doc.read();
+        let positions: Vec<usize> = (0..100).map(|i| (text.len() * i) / 100).collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("offset_to_offset_utf16", name),
+            &name,
+            |b, _| {
+                b.iter(|| {
+                    for &pos in &positions {
+                        std::hint::black_box(tree.offset_to_offset_utf16(pos));
+                    }
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("offset_utf16_to_offset", name),
+            &name,
+            |b, _| {
+                let utf16_positions: Vec<_> = positions
+                    .iter()
+                    .map(|&p| tree.offset_to_offset_utf16(p))
+                    .collect();
+
+                b.iter(|| {
+                    for &utf16_pos in &utf16_positions {
+                        std::hint::black_box(tree.offset_utf16_to_offset(utf16_pos));
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark UTF-16 point conversions (LSP position protocol)
+fn bench_utf16_point_conversions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("utf16_point_conversions");
+
+    let mixed_doc = "Hello 世界 function 测试 variable 函数 🌍\n".repeat(500);
+    let doc = Doc::from_str(&mixed_doc);
+    let tree = doc.read();
+
+    // Point → PointUtf16 (sending positions to LSP server)
+    group.bench_function("doc_pos_to_point_utf16", |b| {
+        let positions: Vec<(u32, u32)> = (0..100)
+            .map(|i| {
+                let line = (tree.line_count() * i) / 100;
+                let line_len = tree.line_text_trimmed(line).len() as u32;
+                let col = if line_len > 0 { line_len / 2 } else { 0 };
+                (line, col)
+            })
+            .collect();
+
+        b.iter(|| {
+            for &(line, col) in &positions {
+                std::hint::black_box(tree.doc_pos_to_point_utf16(line, col));
+            }
+        });
+    });
+
+    // PointUtf16 → Point (receiving positions from LSP server)
+    group.bench_function("point_utf16_to_doc_pos", |b| {
+        let positions: Vec<_> = (0..100)
+            .map(|i| {
+                let line = (tree.line_count() * i) / 100;
+                let line_len = tree.line_text_trimmed(line).len() as u32;
+                let col = if line_len > 0 { line_len / 2 } else { 0 };
+                tree.doc_pos_to_point_utf16(line, col)
+            })
+            .collect();
+
+        b.iter(|| {
+            for &point_utf16 in &positions {
+                std::hint::black_box(tree.point_utf16_to_doc_pos(point_utf16));
+            }
+        });
+    });
+
+    // PointUtf16 → byte offset (most common LSP operation: diagnostics, hovers, etc.)
+    group.bench_function("point_utf16_to_byte", |b| {
+        let positions: Vec<_> = (0..100)
+            .map(|i| {
+                let line = (tree.line_count() * i) / 100;
+                let line_len = tree.line_text_trimmed(line).len() as u32;
+                let col = if line_len > 0 { line_len / 2 } else { 0 };
+                tree.doc_pos_to_point_utf16(line, col)
+            })
+            .collect();
+
+        b.iter(|| {
+            for &point_utf16 in &positions {
+                std::hint::black_box(tree.point_utf16_to_byte(point_utf16));
+            }
+        });
+    });
+
+    // Byte offset → PointUtf16 (sending cursor position to LSP)
+    group.bench_function("offset_to_point_utf16", |b| {
+        let positions: Vec<usize> = (0..100).map(|i| (mixed_doc.len() * i) / 100).collect();
+
+        b.iter(|| {
+            for &pos in &positions {
+                std::hint::black_box(tree.offset_to_point_utf16(pos));
+            }
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark realistic LSP usage patterns
+fn bench_lsp_scenarios(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lsp_scenarios");
+
+    let code_with_unicode = r#"
+// TypeScript file with comments in various languages
+function calculateDistance(点1: Point, 点2: Point): number {
+    // Вычисление расстояния между точками
+    const dx = 点2.x - 点1.x;
+    const dy = 点2.y - 点1.y;
+    return Math.sqrt(dx * dx + dy * dy); // √(Δx² + Δy²)
+}
+
+interface Config {
+    name: string;      // 名前
+    enabled: boolean;  // 有効化
+    emoji: string;     // 🎯 Target emoji
+}
+"#
+    .repeat(100);
+
+    let doc = Doc::from_str(&code_with_unicode);
+    let tree = doc.read();
+
+    // Simulate receiving LSP diagnostic
+    group.bench_function("receive_diagnostic", |b| {
+        use tiny_tree::PointUtf16;
+
+        // LSP sends position in UTF-16
+        let lsp_positions = vec![
+            PointUtf16::new(5, 10),
+            PointUtf16::new(15, 20),
+            PointUtf16::new(25, 5),
+        ];
+
+        b.iter(|| {
+            for &lsp_pos in &lsp_positions {
+                // Convert LSP position to byte offset for highlighting
+                let byte_offset = tree.point_utf16_to_byte(lsp_pos);
+                std::hint::black_box(byte_offset);
+            }
+        });
+    });
+
+    // Simulate sending completion request
+    group.bench_function("send_completion_request", |b| {
+        // User cursor positions in bytes
+        let cursor_positions = vec![100, 500, 1000, 2000];
+
+        b.iter(|| {
+            for &cursor_pos in &cursor_positions {
+                // Convert byte offset to UTF-16 for LSP
+                let lsp_pos = tree.offset_to_point_utf16(cursor_pos);
+                std::hint::black_box(lsp_pos);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_insert,
@@ -672,7 +861,10 @@ criterion_group!(
     bench_replace,
     bench_incremental_search,
     bench_searcher_cache,
-    bench_search_patterns
+    bench_search_patterns,
+    bench_utf16_conversions,
+    bench_utf16_point_conversions,
+    bench_lsp_scenarios
 );
 
 criterion_main!(benches);

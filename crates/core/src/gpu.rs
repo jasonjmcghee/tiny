@@ -56,7 +56,7 @@ pub struct GlyphVertex {
     pub tex_coord: [f32; 2],
     pub token_id: u32,
     pub relative_pos: f32,
-    pub _padding: f32,
+    pub format: u32,
 }
 
 /// Uniform data for shaders
@@ -200,6 +200,7 @@ fn create_glyph_vertices(
     tex_coords: [f32; 4],
     token_id: u32,
     relative_pos: f32,
+    format: u32,
 ) -> [GlyphVertex; 6] {
     let [u0, v0, u1, v1] = tex_coords;
     quad_vertices(x, y, w, h, |[px, py], is_right| {
@@ -210,7 +211,7 @@ fn create_glyph_vertices(
             tex_coord: [u, v],
             token_id,
             relative_pos,
-            _padding: 0.0,
+            format,
         }
     })
 }
@@ -223,12 +224,13 @@ fn vertex_attr(offset: u64, location: u32, format: VertexFormat) -> VertexAttrib
     }
 }
 
-fn glyph_vertex_attributes() -> [VertexAttribute; 4] {
+fn glyph_vertex_attributes() -> [VertexAttribute; 5] {
     [
         vertex_attr(0, 0, VertexFormat::Float32x2),
         vertex_attr(8, 1, VertexFormat::Float32x2),
         vertex_attr(16, 2, VertexFormat::Uint32),
         vertex_attr(20, 3, VertexFormat::Float32),
+        vertex_attr(24, 4, VertexFormat::Uint32),
     ]
 }
 
@@ -1230,7 +1232,7 @@ impl GpuRenderer {
 
         let glyph_vertex_buffer = create_vertex_buffer("Glyph Vertex Buffer", GLYPH_BUFFER_SIZE);
         let line_number_vertex_buffer =
-            create_vertex_buffer("Line Number Vertex Buffer", 256 * 1024); // 256KB for line numbers
+            create_vertex_buffer("Line Number Vertex Buffer", 1024 * 1024); // 1MB for line numbers + overlays
 
         let builder = PipelineBuilder {
             device: &device,
@@ -1569,6 +1571,7 @@ impl GpuRenderer {
                     glyph.tex_coords,
                     glyph.token_id as u32,
                     glyph.relative_pos,
+                    glyph.format as u32,
                 )
             })
             .collect()

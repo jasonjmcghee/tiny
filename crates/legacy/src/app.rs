@@ -3,17 +3,18 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
-    input::{self, Event, EventBus, InputAction, InputHandler},
-    input_types, io,
+    accelerator::Modifiers,
+    input::{self, EventBus, InputAction},
     lsp_manager::LspManager,
     render::Renderer,
-    text_editor_plugin::TextEditorPlugin,
+    scroll::ScrollFocusManager,
+    shortcuts::{ShortcutContext, ShortcutRegistry},
     text_effects::TextStyleProvider,
+    winit_adapter,
 };
 
 pub use crate::editor_logic::EditorLogic;
-use ahash::AHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 #[allow(unused)]
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -32,10 +33,10 @@ use winit::{
 
 // Plugin orchestration support
 use tiny_core::{
-    tree::{Doc, Point, Rect},
+    tree::{Point, Rect},
     GpuRenderer, Uniforms,
 };
-use tiny_sdk::{types::DocPos, Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
+use tiny_sdk::{Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection {
@@ -117,6 +118,9 @@ pub struct TinyApp {
     // Event bus for event-driven architecture
     event_bus: EventBus,
 
+    // Shortcut registry for accelerator handling
+    shortcuts: ShortcutRegistry,
+
     // Plugin orchestrator (will eventually move to core)
     orchestrator: PluginOrchestrator,
 
@@ -135,8 +139,8 @@ pub struct TinyApp {
     // Track cursor position for clicks
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
 
-    // Track modifier keys
-    modifiers: input_types::Modifiers,
+    // Track modifier keys (accelerator format)
+    modifiers: Modifiers,
 
     // Track mouse drag
     mouse_pressed: bool,
@@ -150,6 +154,9 @@ pub struct TinyApp {
 
     // Frame time tracking for dynamic dt
     last_frame_time: std::time::Instant,
+
+    // Scroll focus management
+    scroll_focus: ScrollFocusManager,
 }
 
 impl TinyApp {
@@ -190,6 +197,34 @@ impl TinyApp {
             .and_then(|p| self.physical_to_logical_point(p));
 
         if let Some(point) = logical_point {
+            // Ensure file picker bounds are up to date before hit testing
+            if self.editor.file_picker.visible {
+                if let Some(cpu_renderer) = &self.cpu_renderer {
+                    self.editor
+                        .file_picker
+                        .calculate_bounds(&cpu_renderer.viewport);
+                }
+            }
+
+            // Update scroll focus based on mouse position and actual widget bounds
+            use crate::scroll::WidgetId;
+            let mut widget_bounds = vec![];
+
+            // File picker (overlay, high z-index)
+            if self.editor.file_picker.visible {
+                widget_bounds.push((
+                    WidgetId::FilePicker,
+                    self.editor.file_picker.get_bounds(),
+                    1000, // z-index
+                ));
+            }
+
+            // Editor (full screen, low z-index)
+            if let Some(cpu_renderer) = &self.cpu_renderer {
+                widget_bounds.push((WidgetId::Editor, cpu_renderer.editor_bounds, 0));
+            }
+
+            self.scroll_focus.update_focus(point, &widget_bounds);
             // Extract all needed data from cpu_renderer first
             let (
                 editor_bounds,
@@ -213,7 +248,7 @@ impl TinyApp {
                 return;
             };
 
-            let cmd_held = self.modifiers.state().super_key();
+            let cmd_held = self.modifiers.cmd;
 
             // Check if mouse is within editor bounds
             let in_editor = point.x.0 >= editor_bounds.x.0
@@ -285,18 +320,13 @@ impl TinyApp {
                             // Emit drag event
                             use serde_json::json;
                             self.event_bus.emit(
-                                "app.mouse.drag",
+                                "mouse.drag",
                                 json!({
                                     "from_x": from_local.x.0,
                                     "from_y": from_local.y.0,
                                     "to_x": to_local.x.0,
                                     "to_y": to_local.y.0,
-                                    "modifiers": {
-                                        "shift": self.modifiers.state().shift_key(),
-                                        "ctrl": self.modifiers.state().control_key(),
-                                        "alt": self.modifiers.state().alt_key(),
-                                        "cmd": self.modifiers.state().super_key(),
-                                    }
+                                    "alt": self.modifiers.alt,
                                 }),
                                 10,
                                 "winit",
@@ -308,110 +338,11 @@ impl TinyApp {
         }
     }
 
-    /// Handle mouse button input (press/release)
-    fn handle_mouse_input(
-        &mut self,
-        state: ElementState,
-        position: Option<winit::dpi::PhysicalPosition<f64>>,
-    ) {
-        use serde_json::json;
 
-        match state {
-            ElementState::Pressed => {
-                if let Some(position) = position {
-                    // Emit press event with editor-local coordinates
-                    if let Some(point) = self.physical_to_logical_point(position) {
-                        // Check if click is in titlebar area
-                        #[cfg(target_os = "macos")]
-                        let is_in_titlebar = point.y.0 < self.title_bar_height;
-                        #[cfg(not(target_os = "macos"))]
-                        let is_in_titlebar = false;
-
-                        if !is_in_titlebar {
-                            // Check if click is in tab bar area (before converting coordinates)
-                            let tab_bar_start = self.title_bar_height;
-                            let tab_bar_end = tab_bar_start + 30.0; // TAB_BAR_HEIGHT
-                            let in_tab_bar = point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
-
-                            let mut handled_by_tab_bar = false;
-                            if in_tab_bar {
-                                // Any click in tab bar region should be blocked from reaching editor
-                                // Don't set drag_start for tab bar clicks
-                                handled_by_tab_bar = true;
-
-                                // Extract viewport width before mutable borrow
-                                let viewport_width = self
-                                    .cpu_renderer
-                                    .as_ref()
-                                    .map(|r| r.viewport.logical_size.width.0);
-
-                                // Handle tab bar clicks
-                                if let Some(viewport_width) = viewport_width {
-                                    let click_x = point.x.0;
-                                    let click_y = point.y.0 - tab_bar_start;
-
-                                    if self.editor.handle_tab_bar_click(
-                                        click_x,
-                                        click_y,
-                                        viewport_width,
-                                    ) {
-                                        self.request_redraw();
-                                    }
-                                }
-                            }
-
-                            // Request redraw after handling tab bar (outside the mutable borrow)
-                            if handled_by_tab_bar {
-                                return; // Early return - already handled
-                            }
-
-                            // Only emit mouse press event and set drag state if not handled by tab bar
-                            // Set drag state for editor clicks only
-                            self.mouse_pressed = true;
-                            self.drag_start = Some(position);
-
-                            // Convert to editor-local coordinates if we have a renderer
-                            let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
-                                cpu_renderer.screen_to_editor_local(point)
-                            } else {
-                                point
-                            };
-
-                            self.event_bus.emit(
-                                "app.mouse.press",
-                                json!({
-                                    "x": editor_local.x.0,
-                                    "y": editor_local.y.0,
-                                    "button": "Left",
-                                    "state": "pressed",
-                                    "modifiers": {
-                                        "shift": self.modifiers.state().shift_key(),
-                                        "ctrl": self.modifiers.state().control_key(),
-                                        "alt": self.modifiers.state().alt_key(),
-                                        "cmd": self.modifiers.state().super_key(),
-                                    }
-                                }),
-                                10, // Input priority
-                                "winit",
-                            );
-                        }
-                    }
-                }
-            }
-            ElementState::Released => {
-                self.mouse_pressed = false;
-                self.drag_start = None;
-
-                // Emit release event
-                self.event_bus
-                    .emit("app.mouse.release", json!({}), 10, "winit");
-            }
-        }
-    }
-
-    /// Handle mouse wheel scrolling with scroll lock logic
+    /// Handle mouse wheel scrolling - routes to focused widget
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         // Emit mouse wheel event to the event bus
+        use crate::scroll::{Scrollable, WidgetId};
         use serde_json::json;
 
         let (delta_x, delta_y) = match delta {
@@ -436,66 +367,77 @@ impl TinyApp {
         // Request immediate redraw to process scroll events
         self.request_redraw();
 
-        // Apply scroll with scroll lock logic
-        if let Some(cpu_renderer) = &mut self.cpu_renderer {
-            let (scroll_x, scroll_y) = match delta {
+        // Convert scroll delta to logical units
+        let (scroll_x, scroll_y) = if let Some(cpu_renderer) = &self.cpu_renderer {
+            match delta {
                 winit::event::MouseScrollDelta::LineDelta(x, y) => (
-                    x * &cpu_renderer.viewport.metrics.space_width,
-                    y * &cpu_renderer.viewport.metrics.line_height,
+                    x * cpu_renderer.viewport.metrics.space_width,
+                    y * cpu_renderer.viewport.metrics.line_height,
                 ),
                 winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
-            };
+            }
+        } else {
+            return;
+        };
 
-            // Apply scroll lock logic
-            let (final_scroll_x, final_scroll_y) = if self.scroll_lock_enabled {
-                // Determine which direction to lock to
-                let new_direction = if scroll_y.abs() > scroll_x.abs() {
-                    ScrollDirection::Vertical
-                } else if scroll_x.abs() > 0.0 {
-                    ScrollDirection::Horizontal
-                } else {
-                    // No movement, keep current direction
-                    self.current_scroll_direction
-                        .unwrap_or(ScrollDirection::Vertical)
-                };
-
-                // Update current direction if we started scrolling
-                if scroll_x.abs() > 0.0 || scroll_y.abs() > 0.0 {
-                    self.current_scroll_direction = Some(new_direction);
-                }
-
-                // Apply scroll lock
-                match new_direction {
-                    ScrollDirection::Vertical => (0.0, scroll_y), // Only vertical
-                    ScrollDirection::Horizontal => (scroll_x, 0.0), // Only horizontal
-                }
+        // Apply scroll lock logic
+        let (final_scroll_x, final_scroll_y) = if self.scroll_lock_enabled {
+            let new_direction = if scroll_y.abs() > scroll_x.abs() {
+                ScrollDirection::Vertical
+            } else if scroll_x.abs() > 0.0 {
+                ScrollDirection::Horizontal
             } else {
-                // No scroll lock - free scrolling
-                (scroll_x, scroll_y)
+                self.current_scroll_direction
+                    .unwrap_or(ScrollDirection::Vertical)
             };
 
-            // Get active tab's current scroll
-            let tab = self.editor.tab_manager.active_tab_mut();
+            if scroll_x.abs() > 0.0 || scroll_y.abs() > 0.0 {
+                self.current_scroll_direction = Some(new_direction);
+            }
 
-            // Apply the scroll amounts (note: scroll values are inverted)
-            let new_scroll_y = tab.scroll_position.y.0 - final_scroll_y;
-            let new_scroll_x = tab.scroll_position.x.0 - final_scroll_x;
-            tab.scroll_position.y = LogicalPixels(new_scroll_y);
-            tab.scroll_position.x = LogicalPixels(new_scroll_x);
+            match new_direction {
+                ScrollDirection::Vertical => (0.0, scroll_y),
+                ScrollDirection::Horizontal => (scroll_x, 0.0),
+            }
+        } else {
+            (scroll_x, scroll_y)
+        };
 
-            // Apply document-based scroll bounds
-            let doc = &tab.plugin.doc;
-            let tree = doc.read();
+        // Create scroll delta point
+        let scroll_delta = Point {
+            x: LogicalPixels(final_scroll_x),
+            y: LogicalPixels(final_scroll_y),
+        };
+
+        // Route scroll to focused widget
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            let viewport = &cpu_renderer.viewport;
             let editor_bounds = cpu_renderer.editor_bounds;
 
-            // Temporarily set viewport scroll to clamp it, then save back to tab
-            cpu_renderer.viewport.scroll = tab.scroll_position;
-            cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
-            tab.scroll_position = cpu_renderer.viewport.scroll;
+            match self.scroll_focus.focused_widget() {
+                Some(WidgetId::FilePicker) => {
+                    // Route to file picker with its bounds
+                    let picker_bounds = self.editor.file_picker.get_bounds();
+                    self.editor
+                        .file_picker
+                        .handle_scroll(scroll_delta, viewport, picker_bounds);
+                }
+                Some(WidgetId::Editor) | None => {
+                    // Route to active editor tab with editor bounds
+                    let tab = self.editor.tab_manager.active_tab_mut();
+                    tab.handle_scroll(scroll_delta, viewport, editor_bounds);
 
-            if let Some(window) = &self.window {
-                window.request_redraw();
+                    // Update viewport scroll for rendering
+                    cpu_renderer.viewport.scroll = tab.scroll_position;
+                }
+                _ => {
+                    // Other widgets - not yet implemented
+                }
             }
+        }
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -519,10 +461,8 @@ impl TinyApp {
         });
         LspManager::prewarm_for_workspace(workspace_root);
 
-        let mut event_bus = EventBus::new();
-
-        // Register app-level event handlers from InputHandler
-        InputHandler::register_app_handlers(&mut event_bus);
+        let event_bus = EventBus::new();
+        let shortcuts = ShortcutRegistry::new();
 
         Self {
             window: None,
@@ -533,6 +473,7 @@ impl TinyApp {
             shader_reload_pending: Arc::new(AtomicBool::new(false)),
             editor,
             event_bus,
+            shortcuts,
             orchestrator: PluginOrchestrator::new(),
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
@@ -541,12 +482,13 @@ impl TinyApp {
             scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
             cursor_position: None,
-            modifiers: input_types::Modifiers::default(),
+            modifiers: Modifiers::default(),
             mouse_pressed: false,
             drag_start: None,
             cursor_needs_scroll: false,
             continuous_rendering: false,
             last_frame_time: std::time::Instant::now(),
+            scroll_focus: ScrollFocusManager::new(),
         }
     }
 
@@ -690,112 +632,192 @@ impl TinyApp {
     }
 
     fn process_event_queue(&mut self) {
-        // Process all events in the queue
-        loop {
-            // Get events to process
-            let mut events_to_process = Vec::new();
-            std::mem::swap(&mut events_to_process, &mut self.event_bus.queued);
+        use serde_json::json;
 
-            if events_to_process.is_empty() {
-                break;
-            }
+        // Get all events sorted by priority
+        let events = self.event_bus.drain_sorted();
 
-            // Sort by priority
-            events_to_process.sort_by_key(|e| e.priority);
-
-            // Process each event
-            for event in events_to_process {
-                // Handle app-level command events (from InputHandler's registered handlers)
-                match event.name.as_str() {
-                    "app.command.adjust_font_size" => {
-                        let increase = event
-                            .data
-                            .get("increase")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        self.adjust_font_size(increase);
-                        continue;
-                    }
-                    "app.command.toggle_scroll_lock" => {
-                        self.scroll_lock_enabled = !self.scroll_lock_enabled;
-                        self.current_scroll_direction = None;
-                        println!(
-                            "Scroll lock: {}",
-                            if self.scroll_lock_enabled {
-                                "ENABLED"
-                            } else {
-                                "DISABLED"
-                            }
-                        );
-                        continue;
-                    }
-                    "app.mouse.release" => {
-                        self.editor.on_mouse_release();
-                        continue;
-                    }
-                    "app.drag.scroll" => {
-                        // Apply drag scroll delta
-                        if let (Some(dx), Some(dy)) = (
-                            event.data.get("delta_x").and_then(|v| v.as_f64()),
-                            event.data.get("delta_y").and_then(|v| v.as_f64()),
-                        ) {
-                            let tab = self.editor.tab_manager.active_tab_mut();
-                            tab.scroll_position.x.0 += dx as f32;
-                            tab.scroll_position.y.0 += dy as f32;
-
-                            // Clamp scroll to bounds
-                            let doc = &tab.plugin.doc;
-                            let tree = doc.read();
-
-                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                                let editor_bounds = cpu_renderer.editor_bounds;
-                                // Temporarily set viewport scroll to clamp it, then save back to tab
-                                cpu_renderer.viewport.scroll = tab.scroll_position;
-                                cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
-                                tab.scroll_position = cpu_renderer.viewport.scroll;
-
-                                self.request_redraw();
-                            }
-                        }
-                        continue;
-                    }
-                    // Navigation events - handled by EditorLogic
-                    "app.action.open_file_picker"
-                    | "app.action.nav_back"
-                    | "app.action.nav_forward"
-                    | "app.action.goto_definition" => {
-                        if let Some(needs_redraw) =
-                            self.editor.handle_navigation_event(event.name.as_str())
-                        {
-                            if needs_redraw {
-                                self.request_redraw();
-                                self.cursor_needs_scroll = true;
-                            }
-                        }
-                        continue;
-                    }
-                    _ => {}
+        for event in events {
+            // Dispatch to appropriate handler based on event name
+            match event.name.as_str() {
+                // App-level events
+                "app.font_increase" => {
+                    self.adjust_font_size(true);
+                }
+                "app.font_decrease" => {
+                    self.adjust_font_size(false);
+                }
+                "app.toggle_scroll_lock" => {
+                    self.scroll_lock_enabled = !self.scroll_lock_enabled;
+                    self.current_scroll_direction = None;
+                    println!(
+                        "Scroll lock: {}",
+                        if self.scroll_lock_enabled { "ENABLED" } else { "DISABLED" }
+                    );
                 }
 
-                // Handle file picker events (if visible and it's a keyboard event)
-                if self.editor.handle_file_picker_event(&event) {
-                    self.request_redraw();
-                    continue;
+                // Mouse events
+                "mouse.press" => {
+                    if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
+                        let plugin = self.editor.active_plugin_mut();
+                        let action = plugin.input.handle_event(&event, &plugin.doc, &viewport);
+
+                        if action == InputAction::Redraw {
+                            self.request_redraw();
+                            self.cursor_needs_scroll = true;
+                        }
+                    }
                 }
+                "mouse.release" => {
+                    self.editor.on_mouse_release();
+                }
+                "mouse.drag" => {
+                    if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
+                        let plugin = self.editor.active_plugin_mut();
+                        plugin.input.handle_event(&event, &plugin.doc, &viewport);
 
-                // Extract viewport for input processing
-                let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone());
+                        // Check if InputHandler wants to scroll
+                        if let Some((dx, dy)) = plugin.input.pending_scroll_delta.take() {
+                            self.event_bus.emit(
+                                "app.drag.scroll",
+                                json!({ "delta_x": dx, "delta_y": dy }),
+                                15,
+                                "mouse_drag",
+                            );
+                        }
 
-                // Process input events for document editing
-                if let Some(viewport) = viewport {
-                    let action =
-                        self.editor
-                            .handle_input_event(&event, &viewport, &mut self.event_bus);
-                    if action == InputAction::Redraw {
                         self.request_redraw();
-                        self.update_window_title();
+                    }
+                }
+                "app.drag.scroll" => {
+                    if let (Some(dx), Some(dy)) = (
+                        event.data.get("delta_x").and_then(|v| v.as_f64()),
+                        event.data.get("delta_y").and_then(|v| v.as_f64()),
+                    ) {
+                        let tab = self.editor.tab_manager.active_tab_mut();
+                        tab.scroll_position.x.0 += dx as f32;
+                        tab.scroll_position.y.0 += dy as f32;
+
+                        let doc = &tab.plugin.doc;
+                        let tree = doc.read();
+
+                        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                            let editor_bounds = cpu_renderer.editor_bounds;
+                            cpu_renderer.viewport.scroll = tab.scroll_position;
+                            cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
+                            tab.scroll_position = cpu_renderer.viewport.scroll;
+                            self.request_redraw();
+                        }
+                    }
+                }
+
+                // Navigation events
+                "navigation.goto_definition" => {
+                    self.editor.goto_definition();
+                    self.cursor_needs_scroll = true;
+                }
+                "navigation.back" => {
+                    if self.editor.navigate_back() {
+                        self.request_redraw();
                         self.cursor_needs_scroll = true;
                     }
+                }
+                "navigation.forward" => {
+                    if self.editor.navigate_forward() {
+                        self.request_redraw();
+                        self.cursor_needs_scroll = true;
+                    }
+                }
+
+                // Tab events
+                "tabs.close" => {
+                    self.editor.tab_manager.close_active_tab();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+
+                // File picker events
+                "file_picker.open" => {
+                    self.editor.file_picker.show();
+                    self.editor.ui_changed = true;
+                    self.shortcuts.set_context(ShortcutContext::FilePicker);
+                    self.scroll_focus.set_focus(crate::scroll::WidgetId::FilePicker);
+                    self.request_redraw();
+                }
+                "file_picker.close" => {
+                    self.editor.file_picker.hide();
+                    self.editor.ui_changed = true;
+                    self.shortcuts.set_context(ShortcutContext::Editor);
+                    self.scroll_focus.clear_focus();
+                    self.request_redraw();
+                }
+                "file_picker.select" => {
+                    if let Some(path) = self.editor.file_picker.selected_file() {
+                        let path_buf = path.to_path_buf();
+                        self.editor.file_picker.hide();
+                        self.shortcuts.set_context(ShortcutContext::Editor);
+                        self.scroll_focus.clear_focus();
+
+                        self.editor.record_navigation();
+                        match self.editor.tab_manager.open_file(path_buf) {
+                            Ok(_) => {
+                                self.editor.ui_changed = true;
+                                self.request_redraw();
+                            }
+                            Err(e) => eprintln!("Failed to open file: {}", e),
+                        }
+                    }
+                }
+                "file_picker.move_up" => {
+                    self.editor.file_picker.move_up();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                "file_picker.move_down" => {
+                    self.editor.file_picker.move_down();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                "file_picker.backspace" => {
+                    self.editor.file_picker.backspace();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+
+                // Editor events - delegate to InputHandler
+                name if name.starts_with("editor.") => {
+                    if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
+                        let plugin = self.editor.active_plugin_mut();
+                        let action = plugin.input.handle_event(&event, &plugin.doc, &viewport);
+
+                        match action {
+                            InputAction::Save => {
+                                if let Err(e) = self.editor.save() {
+                                    eprintln!("Failed to save: {}", e);
+                                }
+                                self.request_redraw();
+                                self.update_window_title();
+                                self.cursor_needs_scroll = true;
+                            }
+                            InputAction::Undo | InputAction::Redo | InputAction::Redraw => {
+                                if input::handle_input_action(action, plugin) {
+                                    self.request_redraw();
+                                    self.update_window_title();
+                                    self.cursor_needs_scroll = true;
+                                }
+                            }
+                            InputAction::None => {}
+                        }
+                    }
+                }
+
+                // Code action
+                "editor.code_action" => {
+                    self.editor.handle_code_action_request();
+                }
+
+                _ => {
+                    // Unknown event - ignore
                 }
             }
         }
@@ -829,7 +851,10 @@ impl TinyApp {
         }
 
         let dt = self.update_frame_timing();
-        self.editor.on_update();
+        let cursor_moved = self.editor.on_update();
+        if cursor_moved {
+            self.cursor_needs_scroll = true;
+        }
 
         // Update plugins through orchestrator
         if let Err(e) = self.orchestrator.update_all(dt) {
@@ -847,10 +872,18 @@ impl TinyApp {
             if let Some(cursor_pos) = self.editor.get_cursor_doc_pos() {
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let tab = self.editor.tab_manager.active_tab_mut();
-                    // Set viewport to current tab scroll before ensure_visible
+                    // Set viewport to current tab scroll before scrolling
                     cpu_renderer.viewport.scroll = tab.scroll_position;
                     let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
-                    cpu_renderer.viewport.ensure_visible(layout_pos);
+
+                    // Center for goto-definition, otherwise just ensure visible
+                    if self.editor.cursor_needs_centering {
+                        self.editor.cursor_needs_centering = false;
+                        cpu_renderer.viewport.center_on(layout_pos);
+                    } else {
+                        cpu_renderer.viewport.ensure_visible(layout_pos);
+                    }
+
                     // Save modified scroll back to tab
                     tab.scroll_position = cpu_renderer.viewport.scroll;
                 }
@@ -878,6 +911,11 @@ impl TinyApp {
         // Update viewport
         if let Some(cpu_renderer) = &mut self.cpu_renderer {
             cpu_renderer.update_viewport(logical_width, logical_height, scale_factor);
+
+            // Update file picker bounds based on viewport (overlay mode)
+            self.editor
+                .file_picker
+                .calculate_bounds(&cpu_renderer.viewport);
         }
 
         // Setup text styles
@@ -1209,119 +1247,172 @@ impl ApplicationHandler for TinyApp {
                 event_loop.exit();
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
-                // Convert winit event to proper JSON format for event bus
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
                 use serde_json::json;
 
-                // Build proper key data
-                let key_data = match &event.logical_key {
-                    winit::keyboard::Key::Character(ch) => json!({
-                        "type": "character",
-                        "value": ch.to_string(),
-                    }),
-                    winit::keyboard::Key::Named(named) => {
-                        use winit::keyboard::NamedKey;
-                        let name = match named {
-                            NamedKey::Enter => "Enter",
-                            NamedKey::Tab => "Tab",
-                            NamedKey::Backspace => "Backspace",
-                            NamedKey::Delete => "Delete",
-                            NamedKey::ArrowLeft => "ArrowLeft",
-                            NamedKey::ArrowRight => "ArrowRight",
-                            NamedKey::ArrowUp => "ArrowUp",
-                            NamedKey::ArrowDown => "ArrowDown",
-                            NamedKey::Home => "Home",
-                            NamedKey::End => "End",
-                            NamedKey::PageUp => "PageUp",
-                            NamedKey::PageDown => "PageDown",
-                            NamedKey::Space => "Space",
-                            NamedKey::Shift => "Shift",
-                            NamedKey::F12 => "F12",
-                            _ => "Unknown",
+                // Only handle key presses
+                if key_event.state == ElementState::Pressed {
+                    if let Some(trigger) = winit_adapter::convert_key(&key_event.logical_key) {
+                        // When the trigger itself is a modifier key, use empty modifiers
+                        // This allows sequences like "shift shift" to work correctly
+                        let effective_modifiers = match &trigger {
+                            crate::accelerator::Trigger::Named(name)
+                                if name == "Shift" || name == "Ctrl" || name == "Alt" || name == "Cmd" => {
+                                Modifiers::default()
+                            }
+                            _ => self.modifiers.clone(),
                         };
-                        json!({
-                            "type": "named",
-                            "value": name,
-                        })
-                    }
-                    _ => json!({
-                        "type": "unknown",
-                        "value": null,
-                    }),
-                };
 
-                self.event_bus.emit(
-                    "app.keyboard.keypress",
-                    json!({
-                        "key": key_data,
-                        "state": if event.state == ElementState::Pressed { "pressed" } else { "released" },
-                        "modifiers": {
-                            "shift": self.modifiers.state().shift_key(),
-                            "ctrl": self.modifiers.state().control_key(),
-                            "alt": self.modifiers.state().alt_key(),
-                            "cmd": self.modifiers.state().super_key(),
-                        }
-                    }),
-                    10, // Input priority
-                    "winit",
-                );
+                        let event_names = self.shortcuts.match_input(&effective_modifiers, &trigger);
 
-                // Font size and scroll lock will be handled through event handlers
-                // Only emit these special events on key press (not release)
-                if event.state == ElementState::Pressed {
-                    #[cfg(target_os = "macos")]
-                    let cmd_held = self.modifiers.state().super_key();
-                    #[cfg(not(target_os = "macos"))]
-                    let cmd_held = self.modifiers.state().control_key();
-
-                    if cmd_held {
-                        match &event.logical_key {
-                            winit::keyboard::Key::Character(ch) if ch == "=" || ch == "+" => {
-                                self.event_bus.emit(
-                                    "app.action.font_increase",
-                                    json!({}),
-                                    5,
-                                    "winit",
-                                );
+                        if !event_names.is_empty() {
+                            // Shortcut matched - emit events
+                            for event_name in event_names {
+                                self.event_bus.emit(event_name, json!({}), 10, "shortcuts");
                             }
-                            winit::keyboard::Key::Character(ch) if ch == "-" => {
-                                self.event_bus.emit(
-                                    "app.action.font_decrease",
-                                    json!({}),
-                                    5,
-                                    "winit",
-                                );
+                        } else {
+                            // No shortcut matched - check for plain character input
+                            match &trigger {
+                                crate::accelerator::Trigger::Char(ch) => {
+                                    // Plain character with no modifiers
+                                    if !self.modifiers.cmd
+                                        && !self.modifiers.ctrl
+                                        && !self.modifiers.alt
+                                    {
+                                        // Check context
+                                        if self.shortcuts.context() == ShortcutContext::FilePicker {
+                                            // Add character to file picker query
+                                            if let Some(c) = ch.chars().next() {
+                                                self.editor.file_picker.add_char(c);
+                                                self.editor.ui_changed = true;
+                                            }
+                                        } else {
+                                            // Insert character in editor
+                                            self.event_bus.emit(
+                                                "editor.insert_char",
+                                                json!({ "char": ch }),
+                                                10,
+                                                "keyboard",
+                                            );
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-
-                    // F12 for scroll lock toggle
-                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) =
-                        event.logical_key
-                    {
-                        self.event_bus
-                            .emit("app.action.toggle_scroll_lock", json!({}), 5, "winit");
                     }
                 }
 
-                // Request immediate redraw to process events without waiting for timer
+                // Request immediate redraw to process events
                 self.request_redraw();
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
-                // Convert winit modifiers to our types
-                self.modifiers = (&new_modifiers).into();
+                // Convert winit modifiers to accelerator format
+                self.modifiers = winit_adapter::convert_modifiers(&new_modifiers);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.handle_cursor_moved(position);
             }
 
-            WindowEvent::MouseInput { state, button, .. }
-                if button == winit::event::MouseButton::Left =>
-            {
-                self.handle_mouse_input(state, self.cursor_position);
+            WindowEvent::MouseInput { state, button, .. } => {
+                use serde_json::json;
+
+                // Convert button to trigger
+                let trigger = match button {
+                    winit::event::MouseButton::Left => {
+                        crate::accelerator::Trigger::MouseButton(crate::accelerator::MouseButton::Left)
+                    }
+                    winit::event::MouseButton::Right => {
+                        crate::accelerator::Trigger::MouseButton(crate::accelerator::MouseButton::Right)
+                    }
+                    winit::event::MouseButton::Middle => {
+                        crate::accelerator::Trigger::MouseButton(crate::accelerator::MouseButton::Middle)
+                    }
+                    _ => return, // Ignore other buttons
+                };
+
+                match state {
+                    ElementState::Pressed => {
+                        // Try to match shortcuts first
+                        let event_names = self.shortcuts.match_input(&self.modifiers, &trigger);
+
+                        if !event_names.is_empty() {
+                            // Shortcut matched (e.g., "cmd+click" or "click click")
+                            for event_name in event_names {
+                                self.event_bus.emit(event_name, json!({}), 10, "shortcuts");
+                            }
+                        } else {
+                            // No shortcut - emit default mouse press event
+                            if let Some(position) = self.cursor_position {
+                                if let Some(point) = self.physical_to_logical_point(position) {
+                                    // Check titlebar and tab bar
+                                    #[cfg(target_os = "macos")]
+                                    let is_in_titlebar = point.y.0 < self.title_bar_height;
+                                    #[cfg(not(target_os = "macos"))]
+                                    let is_in_titlebar = false;
+
+                                    if !is_in_titlebar {
+                                        let tab_bar_start = self.title_bar_height;
+                                        let tab_bar_end = tab_bar_start + 30.0;
+                                        let in_tab_bar = point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
+
+                                        if in_tab_bar {
+                                            let viewport_width = self.cpu_renderer.as_ref().map(|r| r.viewport.logical_size.width.0);
+                                            if let Some(viewport_width) = viewport_width {
+                                                let click_x = point.x.0;
+                                                let click_y = point.y.0 - tab_bar_start;
+                                                if self.editor.handle_tab_bar_click(click_x, click_y, viewport_width) {
+                                                    self.request_redraw();
+                                                }
+                                            }
+                                        } else {
+                                            // Editor click - set drag state and emit event
+                                            self.mouse_pressed = true;
+                                            self.drag_start = Some(position);
+
+                                            let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
+                                                cpu_renderer.screen_to_editor_local(point)
+                                            } else {
+                                                point
+                                            };
+
+                                            let button_name = match button {
+                                                winit::event::MouseButton::Left => "Left",
+                                                winit::event::MouseButton::Right => "Right",
+                                                winit::event::MouseButton::Middle => "Middle",
+                                                _ => "Unknown",
+                                            };
+
+                                            self.event_bus.emit(
+                                                "mouse.press",
+                                                json!({
+                                                    "x": editor_local.x.0,
+                                                    "y": editor_local.y.0,
+                                                    "button": button_name,
+                                                    "modifiers": {
+                                                        "shift": self.modifiers.shift,
+                                                        "ctrl": self.modifiers.ctrl,
+                                                        "alt": self.modifiers.alt,
+                                                        "cmd": self.modifiers.cmd,
+                                                    }
+                                                }),
+                                                10,
+                                                "winit",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        self.mouse_pressed = false;
+                        self.drag_start = None;
+                        self.event_bus.emit("mouse.release", json!({}), 10, "winit");
+                    }
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -1329,7 +1420,41 @@ impl ApplicationHandler for TinyApp {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                self.handle_mouse_wheel(delta);
+                use serde_json::json;
+
+                // Determine wheel direction for accelerator matching
+                let (delta_x, delta_y) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                };
+
+                // Determine primary direction
+                let trigger = if delta_y.abs() > delta_x.abs() {
+                    if delta_y > 0.0 {
+                        crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Up)
+                    } else {
+                        crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Down)
+                    }
+                } else if delta_x > 0.0 {
+                    crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Right)
+                } else if delta_x < 0.0 {
+                    crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Left)
+                } else {
+                    return; // No scroll
+                };
+
+                // Try to match shortcuts
+                let event_names = self.shortcuts.match_input(&self.modifiers, &trigger);
+
+                if !event_names.is_empty() {
+                    // Shortcut matched
+                    for event_name in event_names {
+                        self.event_bus.emit(event_name, json!({}), 15, "shortcuts");
+                    }
+                } else {
+                    // No shortcut - do default scroll behavior
+                    self.handle_mouse_wheel(delta);
+                }
             }
 
             WindowEvent::Resized(new_size) => {
@@ -1347,4 +1472,3 @@ impl ApplicationHandler for TinyApp {
         }
     }
 }
-

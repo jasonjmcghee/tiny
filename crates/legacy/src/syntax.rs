@@ -298,7 +298,13 @@ impl SyntaxHighlighter {
     }
 
     /// Request update with optional tree reset
-    pub fn request_update_with_reset(&self, text: &str, version: u64, edit: Option<TextEdit>, reset_tree: bool) {
+    pub fn request_update_with_reset(
+        &self,
+        text: &str,
+        version: u64,
+        edit: Option<TextEdit>,
+        reset_tree: bool,
+    ) {
         let _ = self.tx.send(ParseRequest {
             text: text.to_string(),
             version,
@@ -386,7 +392,10 @@ impl SyntaxHighlighter {
                 let final_request = rx.try_iter().last().unwrap_or(request);
 
                 // Skip if text hasn't changed (avoid redundant parsing)
-                if final_request.text == last_text && final_request.edit.is_none() && !final_request.reset_tree {
+                if final_request.text == last_text
+                    && final_request.edit.is_none()
+                    && !final_request.reset_tree
+                {
                     continue;
                 }
                 last_text = final_request.text.clone();
@@ -541,9 +550,15 @@ impl SyntaxHighlighter {
     }
 
     /// Create highlighter based on file path
-    pub fn from_file_path(path: &str) -> Option<Self> {
-        std::path::Path::new(path)
-            .extension()
+    pub fn from_file_path(path_raw: &str) -> Option<Self> {
+        let path = std::path::Path::new(path_raw);
+        if let Some(file_name) = path.file_name() {
+            if file_name == "Cargo.lock" {
+                return Some(Self::new_toml());
+            }
+        }
+
+        path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(Self::from_file_extension)
     }
@@ -893,7 +908,7 @@ fn byte_to_point(tree: &tiny_core::tree::Tree, byte_pos: usize) -> Point {
         if byte_offset >= byte_in_line {
             break;
         }
-        column += 1;  // Each character is 1 column (including tabs)
+        column += 1; // Each character is 1 column (including tabs)
         byte_offset += ch.len_utf8();
     }
 
@@ -957,7 +972,6 @@ pub fn create_text_edit(tree: &tiny_core::tree::Tree, edit: &tiny_core::tree::Ed
     } else {
         calc_new_point(start_position, content_text)
     };
-
 
     TextEdit {
         start_byte,

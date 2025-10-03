@@ -17,6 +17,10 @@ pub struct DiagnosticsManager {
     pending_goto_definition: Option<Vec<crate::lsp_service::LocationRef>>,
     /// Current hover position with Cmd held (for go-to-definition preview)
     cmd_hover_position: Option<(usize, usize)>,
+    /// Pending text edits from code actions
+    pending_text_edits: Option<Vec<crate::lsp_service::TextEdit>>,
+    /// Current document symbols from LSP
+    document_symbols: Vec<lsp_types::DocumentSymbol>,
 }
 
 impl DiagnosticsManager {
@@ -29,20 +33,29 @@ impl DiagnosticsManager {
             current_hover_position: None,
             pending_goto_definition: None,
             cmd_hover_position: None,
+            pending_text_edits: None,
+            document_symbols: Vec::new(),
         }
     }
 
     /// Open a file and set up diagnostics (with instant cached results)
     pub fn open_file(&mut self, file_path: PathBuf, content: String) {
+        eprintln!("DiagnosticsManager: Opening file {:?}", file_path);
+
         // 1. INSTANT: Load cached diagnostics immediately
         if let Some(cached_diagnostics) = LspManager::load_cached_diagnostics(&file_path, &content) {
+            eprintln!("  Using {} cached diagnostics", cached_diagnostics.len());
             self.apply_diagnostics(&cached_diagnostics, &content);
+        } else {
+            eprintln!("  No cached diagnostics available");
         }
 
         // 2. BACKGROUND: Start LSP service (handles all LSP features)
+        eprintln!("  Starting LSP service...");
         self.lsp_service.open_file(file_path, content);
 
         // 3. Request document symbols for hover support
+        eprintln!("  Requesting document symbols...");
         self.lsp_service.request_document_symbols();
     }
 
@@ -72,9 +85,14 @@ impl DiagnosticsManager {
         // Poll for any LSP results
         let results = self.lsp_service.poll_results();
 
+        if !results.is_empty() {
+            eprintln!("DiagnosticsManager: poll_results returned {} results", results.len());
+        }
+
         for result in results {
             match result {
                 LspResult::Diagnostics(diagnostics) => {
+                    eprintln!("DiagnosticsManager: Received {} diagnostics from LSP", diagnostics.len());
                     let content = doc.read().flatten_to_string();
 
                     // Apply fresh diagnostics
@@ -94,12 +112,17 @@ impl DiagnosticsManager {
                     }
                 }
                 LspResult::DocumentSymbols(symbols) => {
-                    // Convert LSP symbols to plugin symbols
+                    eprintln!("LSP: Received {} document symbols", symbols.len());
+
+                    // Store raw symbols for goto_definition lookups
+                    self.document_symbols = symbols.clone();
+
+                    // Convert LSP symbols to plugin symbols for display
                     let mut plugin_symbols = Vec::new();
-                    for symbol in symbols {
+                    for symbol in &symbols {
                         // Convert line/character positions to our format
                         plugin_symbols.push(diagnostics_plugin::Symbol {
-                            name: symbol.name,
+                            name: symbol.name.clone(),
                             line: symbol.range.start.line as usize,
                             column_range: (
                                 symbol.range.start.character as usize,
@@ -108,17 +131,33 @@ impl DiagnosticsManager {
                             kind: format!("{:?}", symbol.kind),
                         });
                     }
+
                     self.plugin.set_symbols(plugin_symbols);
 
                     // Request symbols again if file changed
                     // This ensures we always have up-to-date symbols
                 }
                 LspResult::GoToDefinition(locations) => {
-                    // Store for app.rs to consume
-                    self.pending_goto_definition = Some(locations);
+                    if !locations.is_empty() {
+                        eprintln!("DiagnosticsManager: Received {} goto_definition location(s)", locations.len());
+                        self.pending_goto_definition = Some(locations);
+                    }
                 }
                 LspResult::FindReferences(_) => {
                     // TODO: Handle find references results
+                }
+                LspResult::CodeActions(actions) => {
+                    // Auto-execute the first preferred action, or just the first action
+                    if let Some(action) = actions.iter().find(|a| a.is_preferred).or_else(|| actions.first()) {
+                        eprintln!("LSP: Executing code action: {}", action.title);
+                        self.lsp_service.execute_code_action(action);
+                    } else {
+                        eprintln!("LSP: No code actions available");
+                    }
+                }
+                LspResult::TextEdits(edits) => {
+                    eprintln!("LSP: update() received {} text edits", edits.len());
+                    self.pending_text_edits = Some(edits);
                 }
             }
         }
@@ -126,7 +165,6 @@ impl DiagnosticsManager {
 
     /// Handle mouse movement (requests hover info from LSP with debouncing)
     pub fn on_mouse_move(&mut self, line: usize, column: usize, cmd_held: bool) {
-        let now = Instant::now();
         self.current_hover_position = Some((line, column));
 
         // Track Cmd+hover for go-to-definition preview
@@ -136,18 +174,9 @@ impl DiagnosticsManager {
             self.cmd_hover_position = None;
         }
 
-        // Debounce hover requests - only send if position changed and enough time passed
-        let should_request = if let Some((last_line, last_col, last_time)) = self.last_hover_request {
-            // Different position or enough time has passed
-            (line != last_line || column != last_col) && now.duration_since(last_time).as_millis() > 100
-        } else {
-            true // First request
-        };
-
-        if should_request && self.lsp_service.is_ready() {
-            self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
-            self.last_hover_request = Some((line, column, now));
-        }
+        // DISABLED: This was spamming hover requests on every mouse move!
+        // The diagnostics plugin now handles hover timing and symbol checking.
+        // We only track the position here for Cmd+hover underline.
     }
 
     /// Clear hover info when mouse leaves text area
@@ -179,10 +208,45 @@ impl DiagnosticsManager {
         self.pending_goto_definition.take()
     }
 
-    /// Poll for LSP results and update plugin state
-    pub fn poll_lsp_results(&mut self) {
-        self.lsp_service.poll_results();
+    /// Take pending text edits (consumes them)
+    pub fn take_text_edits(&mut self) -> Option<Vec<crate::lsp_service::TextEdit>> {
+        self.pending_text_edits.take()
     }
+
+    /// Find symbol at the given position (line, UTF-16 column)
+    pub fn find_symbol_at_position(&self, line: u32, utf16_column: u32) -> Option<&lsp_types::DocumentSymbol> {
+        fn find_in_symbol(symbol: &lsp_types::DocumentSymbol, line: u32, col: u32) -> Option<&lsp_types::DocumentSymbol> {
+            // Check if position is within this symbol's range
+            let in_range = line >= symbol.range.start.line && line <= symbol.range.end.line
+                && (line != symbol.range.start.line || col >= symbol.range.start.character)
+                && (line != symbol.range.end.line || col <= symbol.range.end.character);
+
+            if !in_range {
+                return None;
+            }
+
+            // Check children first (prefer most specific symbol)
+            if let Some(ref children) = symbol.children {
+                for child in children {
+                    if let Some(found) = find_in_symbol(child, line, col) {
+                        return Some(found);
+                    }
+                }
+            }
+
+            // No child matched, return this symbol
+            Some(symbol)
+        }
+
+        for symbol in &self.document_symbols {
+            if let Some(found) = find_in_symbol(symbol, line, utf16_column) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
+
 
     /// Get mutable access to the plugin for rendering setup
     pub fn plugin_mut(&mut self) -> &mut diagnostics_plugin::DiagnosticsPlugin {

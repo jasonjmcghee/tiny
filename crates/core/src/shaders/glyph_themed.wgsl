@@ -13,6 +13,7 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
     @location(2) token_id: f32,
     @location(3) relative_pos: f32,
+    @location(4) format: u32,
 }
 
 @group(0) @binding(0)
@@ -45,6 +46,7 @@ fn vs_main(
     @location(1) tex_coord: vec2<f32>,
     @location(2) token_id: u32,
     @location(3) relative_pos: f32,
+    @location(4) format: u32,
 ) -> VertexOutput {
     // Convert position from pixel coordinates to normalized device coordinates
     let ndc_x = (position.x / uniforms.viewport_size.x) * 2.0 - 1.0;
@@ -55,6 +57,7 @@ fn vs_main(
     out.tex_coords = tex_coord;
     out.token_id = f32(token_id);
     out.relative_pos = relative_pos;
+    out.format = format;
 
     return out;
 }
@@ -228,6 +231,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Combine glyph shape with chosen color effect
-    return vec4<f32>(final_color, glyph_alpha);
+    // Apply format modifiers
+    // Format bits:
+    // Bit 0 (0x01): Half opacity (for autocomplete)
+    // Bit 1 (0x02): Underline
+    // Bit 2 (0x04): Background highlight
+    // Bit 3-7: Reserved for future use
+
+    var final_alpha = glyph_alpha;
+
+    // Half opacity for autocomplete suggestions
+    if (in.format & 0x01u) != 0u {
+        final_alpha *= 0.5;
+    }
+
+    // TODO: Underline rendering (bit 1)
+    // TODO: Background highlight (bit 2)
+
+    // Combine glyph shape with chosen color effect and format modifiers
+    return vec4<f32>(final_color, final_alpha);
 }

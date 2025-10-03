@@ -1,14 +1,14 @@
 use crate::{
     coordinates, file_picker_plugin, history,
-    input::{self, Event, EventBus, InputAction},
-    input_types, io, syntax, tab_bar_plugin, tab_manager,
-    text_editor_plugin::TextEditorPlugin, text_effects::TextStyleProvider,
+    input::{self, InputAction},
+    io, syntax, tab_bar_plugin, tab_manager,
+    text_editor_plugin::TextEditorPlugin,
+    text_effects::TextStyleProvider,
 };
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tiny_core::tree::{self, Doc, Point};
+use tiny_core::tree::{Doc, Point};
 use tiny_sdk::DocPos;
 
 pub struct EditorLogic {
@@ -28,11 +28,13 @@ pub struct EditorLogic {
     pub ui_changed: bool,
     /// Global navigation history for cross-file navigation (Cmd+[/])
     pub global_nav_history: history::FileNavigationHistory,
+    /// Flag to indicate cursor should be centered (for goto definition)
+    pub cursor_needs_centering: bool,
 }
 
 impl EditorLogic {
     /// Get the active tab's plugin
-    fn active_plugin(&self) -> &TextEditorPlugin {
+    fn active_editor(&self) -> &TextEditorPlugin {
         &self.tab_manager.active_tab().expect("No active tab").plugin
     }
 
@@ -41,139 +43,23 @@ impl EditorLogic {
         &mut self.tab_manager.active_tab_mut().plugin
     }
 
-    /// Handle file picker keyboard input
-    /// Returns true if the event was handled and should stop propagation
-    pub fn handle_file_picker_event(&mut self, event: &Event) -> bool {
-        if !self.file_picker.visible || event.name != "app.keyboard.keypress" {
-            return false;
-        }
+    /// Handle code action request (Alt+Enter)
+    pub fn handle_code_action_request(&mut self) {
+        let tab = self.tab_manager.active_tab_mut();
+        let cursor_pos = tab.plugin.input.selections()[0].cursor;
 
-        let state = event
-            .data
-            .get("state")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        if state != "pressed" {
-            return false;
-        }
+        // Convert cursor position to UTF-16
+        let tree = tab.plugin.doc.read();
+        let byte_offset = tree.doc_pos_to_byte(cursor_pos);
+        let cursor_utf16 = tree.offset_to_point_utf16(byte_offset);
 
-        let key_obj = match event.data.get("key") {
-            Some(k) => k,
-            None => return false,
-        };
-
-        let key_type = key_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let key_value = key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
-
-        let mut handled = false;
-
-        if key_type == "named" {
-            match key_value {
-                "Escape" => {
-                    self.file_picker.hide();
-                    self.ui_changed = true;
-                    handled = true;
-                }
-                "ArrowUp" => {
-                    self.file_picker.move_up();
-                    self.ui_changed = true;
-                    handled = true;
-                }
-                "ArrowDown" => {
-                    self.file_picker.move_down();
-                    self.ui_changed = true;
-                    handled = true;
-                }
-                "Enter" => {
-                    // Open selected file
-                    if let Some(path) = self.file_picker.selected_file() {
-                        let path_buf = path.to_path_buf();
-                        self.file_picker.hide();
-
-                        // Record current location before opening new file
-                        self.record_navigation();
-
-                        match self.tab_manager.open_file(path_buf) {
-                            Ok(_) => {
-                                self.ui_changed = true;
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to open file: {}", e);
-                            }
-                        }
-                    }
-                    handled = true;
-                }
-                "Backspace" => {
-                    self.file_picker.backspace();
-                    self.ui_changed = true;
-                    handled = true;
-                }
-                _ => {}
-            }
-        } else if key_type == "character" {
-            // Add character to query
-            if let Some(ch) = key_value.chars().next() {
-                if !ch.is_control() {
-                    self.file_picker.add_char(ch);
-                    self.ui_changed = true;
-                    handled = true;
-                }
-            }
-        }
-
-        handled
-    }
-
-    /// Handle navigation action events
-    pub fn handle_navigation_event(&mut self, event_name: &str) -> Option<bool> {
-        match event_name {
-            "app.action.nav_back" => Some(self.navigate_back()),
-            "app.action.nav_forward" => Some(self.navigate_forward()),
-            "app.action.goto_definition" => {
-                self.goto_definition();
-                Some(true)
-            }
-            "app.action.open_file_picker" => {
-                self.file_picker.show();
-                self.ui_changed = true;
-                Some(true)
-            }
-            _ => None,
-        }
-    }
-
-    /// Handle input processing for document editing
-    /// Returns the InputAction to be processed
-    pub fn handle_input_event(
-        &mut self,
-        event: &Event,
-        viewport: &coordinates::Viewport,
-        event_bus: &mut EventBus,
-    ) -> InputAction {
-        let plugin = self.active_plugin_mut();
-        let action = plugin
-            .input
-            .process_event(event, &plugin.doc, viewport, event_bus);
-
-        if action != InputAction::None {
-            // Handle Save separately since it needs EditorLogic
-            if action == InputAction::Save {
-                if let Err(e) = self.save() {
-                    eprintln!("Failed to save: {}", e);
-                }
-                self.widgets_dirty = true;
-                return InputAction::Redraw;
-            } else {
-                let plugin = self.active_plugin_mut();
-                if input::handle_input_action(action, plugin) {
-                    self.widgets_dirty = true;
-                    return InputAction::Redraw;
-                }
-            }
-        }
-
-        InputAction::None
+        // Send the exact cursor position - LSP will figure out what diagnostic/action applies
+        tab.diagnostics
+            .lsp_service()
+            .request_code_action(crate::lsp_service::DocPosition {
+                line: cursor_utf16.row as usize,
+                column: cursor_utf16.column as usize,
+            });
     }
 
     /// Handle tab bar click at the given position (relative to tab bar top-left)
@@ -200,8 +86,8 @@ impl EditorLogic {
         {
             let was_last = self.tab_manager.close_tab(tab_idx);
             if was_last {
-                // TODO: Handle closing last tab (maybe exit app or create new tab)
-                eprintln!("Closed last tab");
+                // TODO: Fix this
+                panic!("Closed last tab")
             }
             self.ui_changed = true;
             return true;
@@ -237,10 +123,10 @@ impl EditorLogic {
         &mut self,
         pos: Point,
         viewport: &coordinates::Viewport,
-        modifiers: &input_types::Modifiers,
+        cmd_held: bool,
+        alt_held: bool,
+        shift_held: bool,
     ) -> bool {
-        let cmd_held = modifiers.state().super_key();
-
         // Cmd+Click triggers go-to-definition
         if cmd_held {
             eprintln!("DEBUG: Cmd+Click detected at {:?}", pos);
@@ -259,13 +145,11 @@ impl EditorLogic {
 
         // Normal click handling
         let plugin = self.active_plugin_mut();
-        let alt_held = modifiers.state().alt_key();
-        let shift_held = modifiers.state().shift_key();
         plugin.input.on_mouse_click(
             &plugin.doc,
             viewport,
             pos,
-            input_types::MouseButton::Left,
+            crate::input_types::MouseButton::Left,
             alt_held,
             shift_held,
         );
@@ -286,22 +170,22 @@ impl EditorLogic {
 
     /// Get document to render
     pub fn doc(&self) -> &Doc {
-        &self.active_plugin().doc
+        &self.active_editor().doc
     }
 
     /// Get cursor document position for scrolling
     pub fn get_cursor_doc_pos(&self) -> Option<DocPos> {
-        self.active_plugin().get_cursor_doc_pos()
+        self.active_editor().get_cursor_doc_pos()
     }
 
     /// Get current selections for rendering
     pub fn selections(&self) -> &[input::Selection] {
-        self.active_plugin().selections()
+        self.active_editor().selections()
     }
 
     /// Get text style provider for syntax highlighting
     pub fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
-        self.active_plugin().syntax_highlighter.as_deref()
+        self.active_editor().syntax_highlighter.as_deref()
     }
 
     /// Called after setup is complete
@@ -313,7 +197,9 @@ impl EditorLogic {
     }
 
     /// Called before each render (for animations, LSP polling, etc.)
-    pub fn on_update(&mut self) {
+    /// Returns true if cursor moved (requiring scroll update)
+    pub fn on_update(&mut self) -> bool {
+        let mut cursor_moved = false;
         let plugin = self.active_plugin_mut();
         // Check if we should send pending syntax updates (debounce timer expired)
         if plugin.input.should_flush() {
@@ -321,10 +207,72 @@ impl EditorLogic {
             plugin.input.flush_syntax_updates(&plugin.doc);
         }
 
-        // Check for LSP go-to-definition results
+        // LSP results are now handled in tab.diagnostics.update() in app.rs
         let tab = self.tab_manager.active_tab_mut();
-        tab.diagnostics.poll_lsp_results();
 
+        // Apply pending text edits from code actions
+        if let Some(edits) = tab.diagnostics.take_text_edits() {
+            eprintln!("DEBUG: Applying {} text edits to document", edits.len());
+
+            // Sort edits by position (reverse order to apply from end to start)
+            let mut sorted_edits = edits.clone();
+            sorted_edits.sort_by(|a, b| {
+                b.range_utf16
+                    .0
+                    .line
+                    .cmp(&a.range_utf16.0.line)
+                    .then(b.range_utf16.0.column.cmp(&a.range_utf16.0.column))
+            });
+
+            // Convert UTF-16 positions to byte offsets and apply edits
+            for edit in sorted_edits {
+                let tree = tab.plugin.doc.read();
+
+                let start_utf16 = tiny_tree::PointUtf16::new(
+                    edit.range_utf16.0.line as u32,
+                    edit.range_utf16.0.column as u32,
+                );
+                let end_utf16 = tiny_tree::PointUtf16::new(
+                    edit.range_utf16.1.line as u32,
+                    edit.range_utf16.1.column as u32,
+                );
+
+                let start_byte = tree.point_utf16_to_byte(start_utf16);
+                let end_byte = tree.point_utf16_to_byte(end_utf16);
+                drop(tree);
+
+                eprintln!(
+                    "DEBUG: Edit range UTF-16 ({},{}) to ({},{}) = bytes {} to {}",
+                    edit.range_utf16.0.line,
+                    edit.range_utf16.0.column,
+                    edit.range_utf16.1.line,
+                    edit.range_utf16.1.column,
+                    start_byte,
+                    end_byte
+                );
+
+                // Apply the edit
+                if start_byte == end_byte {
+                    // Insert
+                    tab.plugin.doc.edit(tiny_tree::Edit::Insert {
+                        pos: start_byte,
+                        content: tiny_tree::Content::Text(edit.new_text),
+                    });
+                } else {
+                    // Replace
+                    tab.plugin.doc.edit(tiny_tree::Edit::Replace {
+                        range: start_byte..end_byte,
+                        content: tiny_tree::Content::Text(edit.new_text),
+                    });
+                }
+            }
+
+            tab.plugin.doc.flush();
+            self.ui_changed = true;
+        }
+
+        // Check for go-to-definition results
+        let tab = self.tab_manager.active_tab_mut();
         if let Some(locations) = tab.diagnostics.take_goto_definition() {
             eprintln!(
                 "DEBUG: on_update got {} goto_definition location(s)",
@@ -332,25 +280,46 @@ impl EditorLogic {
             );
             if let Some(location) = locations.first() {
                 eprintln!(
-                    "DEBUG: Navigating to {:?} at line {}, col {}",
+                    "DEBUG: Navigating to {:?} at line {}, UTF-16 col {}",
                     location.file_path, location.position.line, location.position.column
                 );
-                // Convert LSP position to our format
-                let target_location = history::FileLocation {
-                    path: Some(location.file_path.clone()),
-                    position: tiny_sdk::DocPos {
-                        line: location.position.line as u32,
-                        column: location.position.column as u32,
-                        byte_offset: 0,
-                    },
-                };
 
-                // Navigate to the definition
-                if self.navigate_to_location(target_location) {
-                    eprintln!("DEBUG: Navigation successful!");
+                // Store location for conversion after file is opened
+                let location_utf16 = location.clone();
+
+                // Open file first
+                if let Ok(_) = self.tab_manager.open_file(location.file_path.clone()) {
+                    // Now convert UTF-16 position to byte-based DocPos using the opened file's Tree
+                    let (line, byte_column) = {
+                        let tab = self.tab_manager.active_tab().expect("No active tab");
+                        let tree = tab.plugin.doc.read();
+                        let utf16_point = tiny_tree::PointUtf16::new(
+                            location_utf16.position.line as u32,
+                            location_utf16.position.column as u32,
+                        );
+                        let result = tree.point_utf16_to_doc_pos(utf16_point);
+                        eprintln!(
+                            "DEBUG: Converted UTF-16 ({}, {}) to byte-based ({}, {})",
+                            location_utf16.position.line,
+                            location_utf16.position.column,
+                            result.0,
+                            result.1
+                        );
+                        result
+                    };
+
+                    // Set cursor to the converted position
+                    let plugin = self.active_plugin_mut();
+                    plugin.input.set_cursor(tiny_sdk::DocPos {
+                        line,
+                        column: byte_column,
+                        byte_offset: 0,
+                    });
                     self.ui_changed = true;
+                    self.cursor_needs_centering = true;
+                    cursor_moved = true;
                 } else {
-                    eprintln!("DEBUG: Navigation failed!");
+                    eprintln!("DEBUG: Failed to open file!");
                 }
             }
         }
@@ -376,11 +345,13 @@ impl EditorLogic {
                 self.ui_changed = true;
             }
         }
+
+        cursor_moved
     }
 
     /// Record current location in global navigation history
     pub fn record_navigation(&mut self) {
-        let plugin = self.active_plugin();
+        let plugin = self.active_editor();
         let location = history::FileLocation {
             path: plugin.file_path.clone(),
             position: plugin.input.primary_cursor_doc_pos(&plugin.doc),
@@ -391,11 +362,11 @@ impl EditorLogic {
     /// Navigate back in global history (across files)
     pub fn navigate_back(&mut self) -> bool {
         let current_location = history::FileLocation {
-            path: self.active_plugin().file_path.clone(),
+            path: self.active_editor().file_path.clone(),
             position: self
-                .active_plugin()
+                .active_editor()
                 .input
-                .primary_cursor_doc_pos(&self.active_plugin().doc),
+                .primary_cursor_doc_pos(&self.active_editor().doc),
         };
 
         if let Some(target) = self.global_nav_history.undo(current_location) {
@@ -408,11 +379,11 @@ impl EditorLogic {
     /// Navigate forward in global history (across files)
     pub fn navigate_forward(&mut self) -> bool {
         let current_location = history::FileLocation {
-            path: self.active_plugin().file_path.clone(),
+            path: self.active_editor().file_path.clone(),
             position: self
-                .active_plugin()
+                .active_editor()
                 .input
-                .primary_cursor_doc_pos(&self.active_plugin().doc),
+                .primary_cursor_doc_pos(&self.active_editor().doc),
         };
 
         if let Some(target) = self.global_nav_history.redo(current_location) {
@@ -450,10 +421,19 @@ impl EditorLogic {
         let plugin = &tab.plugin;
         let cursor_pos = plugin.input.primary_cursor_doc_pos(&plugin.doc);
 
-        // Request go-to-definition from diagnostics manager
-        // Note: cursor_pos is already in document coordinates (0-indexed)
+        // Convert cursor position to UTF-16
+        let tree = plugin.doc.read();
+        let byte_offset = tree.doc_pos_to_byte(cursor_pos);
+        let cursor_utf16 = tree.offset_to_point_utf16(byte_offset);
+
+        eprintln!(
+            "DEBUG: Cursor DocPos ({}, {}) -> byte {} -> UTF-16 ({}, {})",
+            cursor_pos.line, cursor_pos.column, byte_offset, cursor_utf16.row, cursor_utf16.column
+        );
+
+        // Send the exact cursor position - let rust-analyzer figure out the identifier
         tab.diagnostics
-            .request_goto_definition(cursor_pos.line as usize, cursor_pos.column as usize);
+            .request_goto_definition(cursor_utf16.row as usize, cursor_utf16.column as usize);
     }
 }
 
@@ -487,7 +467,7 @@ impl EditorLogic {
 
     /// Check if document has unsaved changes by comparing content hash
     pub fn is_modified(&self) -> bool {
-        self.active_plugin().is_modified()
+        self.active_editor().is_modified()
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -515,7 +495,7 @@ impl EditorLogic {
     }
 
     pub fn title(&self) -> String {
-        let plugin = self.active_plugin();
+        let plugin = self.active_editor();
         let filename = if let Some(ref path) = plugin.file_path {
             path.file_name()
                 .and_then(|n| n.to_str())
@@ -559,8 +539,36 @@ impl EditorLogic {
             pending_scroll: None,
             ui_changed: true,
             global_nav_history: history::FileNavigationHistory::with_max_size(50),
+            cursor_needs_centering: false,
         }
     }
+}
+
+/// Find the start of an identifier at the given column position
+/// Returns the column where the identifier starts (handles cursor anywhere in identifier)
+fn find_identifier_start(line_text: &str, column: usize) -> usize {
+    let chars: Vec<char> = line_text.chars().collect();
+
+    // If past end of line, return column as-is
+    if column >= chars.len() {
+        return column;
+    }
+
+    // Standard identifier: alphanumeric and underscore only
+    let is_identifier_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    // If not on an identifier, return column as-is
+    if !is_identifier_char(chars[column]) {
+        return column;
+    }
+
+    // Find start of identifier (go backwards)
+    let mut start = column;
+    while start > 0 && is_identifier_char(chars[start - 1]) {
+        start -= 1;
+    }
+
+    start
 }
 
 /// Find word boundaries at the given column position in a line of text
