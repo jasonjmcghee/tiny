@@ -202,6 +202,25 @@ struct CachedDiagnostics {
     pub cached_at: SystemTime,
 }
 
+/// Cached definitions with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedDefinitions {
+    /// Map of (line, column) to locations
+    pub definitions: ahash::AHashMap<(usize, usize), Vec<CachedLocation>>,
+    pub file_path: PathBuf,
+    pub content_hash: u64,
+    pub modification_time: SystemTime,
+    pub cached_at: SystemTime,
+}
+
+/// Simplified location for caching (avoids complex LSP types)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedLocation {
+    pub file_path: PathBuf,
+    pub line: usize,
+    pub column: usize,
+}
+
 /// JSON-RPC message structure
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcMessage {
@@ -530,6 +549,74 @@ impl LspManager {
             .join(".cache")
             .join("diagnostics");
         cache_dir.join(format!("{}.json", cache_key))
+    }
+
+    /// Get cache file path for definitions
+    fn get_definitions_cache_path(cache_key: &str) -> PathBuf {
+        let cache_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".cache")
+            .join("definitions");
+        cache_dir.join(format!("{}.json", cache_key))
+    }
+
+    /// Load cached definitions if available and valid
+    pub fn load_cached_definitions(
+        file_path: &PathBuf,
+        content: &str,
+    ) -> Option<ahash::AHashMap<(usize, usize), Vec<CachedLocation>>> {
+        let cache_key = Self::compute_cache_key(file_path, content)?;
+        let cache_file = Self::get_definitions_cache_path(&cache_key);
+
+        if !cache_file.exists() {
+            return None;
+        }
+
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            if let Ok(mod_time) = metadata.modified() {
+                if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
+                    if let Ok(cached) = serde_json::from_str::<CachedDefinitions>(&cache_content) {
+                        if cached.modification_time <= mod_time
+                            && cached.content_hash == Self::hash_content(content)
+                        {
+                            return Some(cached.definitions);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save definitions to cache
+    pub fn cache_definitions(
+        file_path: &PathBuf,
+        content: &str,
+        definitions: &ahash::AHashMap<(usize, usize), Vec<CachedLocation>>,
+    ) {
+        if let Some(cache_key) = Self::compute_cache_key(file_path, content) {
+            let cache_file = Self::get_definitions_cache_path(&cache_key);
+
+            if let Some(parent) = cache_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            if let Ok(metadata) = std::fs::metadata(file_path) {
+                if let Ok(mod_time) = metadata.modified() {
+                    let cached = CachedDefinitions {
+                        definitions: definitions.clone(),
+                        file_path: file_path.clone(),
+                        content_hash: Self::hash_content(content),
+                        modification_time: mod_time,
+                        cached_at: SystemTime::now(),
+                    };
+
+                    if let Ok(json) = serde_json::to_string_pretty(&cached) {
+                        let _ = std::fs::write(&cache_file, json);
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -287,8 +287,12 @@ impl EditorLogic {
                 // Store location for conversion after file is opened
                 let location_utf16 = location.clone();
 
-                // Open file first
-                if let Ok(_) = self.tab_manager.open_file(location.file_path.clone()) {
+                // Canonicalize path to ensure it matches existing tabs
+                let canonical_path = std::fs::canonicalize(&location.file_path)
+                    .unwrap_or_else(|_| location.file_path.clone());
+
+                // Open file first (will switch to existing tab if already open)
+                if let Ok(_) = self.tab_manager.open_file(canonical_path) {
                     // Now convert UTF-16 position to byte-based DocPos using the opened file's Tree
                     let (line, byte_column) = {
                         let tab = self.tab_manager.active_tab().expect("No active tab");

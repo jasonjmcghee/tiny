@@ -48,7 +48,9 @@ impl Tab {
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, std::io::Error> {
-        let plugin = TextEditorPlugin::from_file(path)?;
+        // Canonicalize path for consistent comparison across tabs
+        let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
+        let plugin = TextEditorPlugin::from_file(canonical_path)?;
         Ok(Self::new(plugin))
     }
 
@@ -170,14 +172,17 @@ impl TabManager {
     /// Open a file (or switch to it if already open)
     /// Returns Ok(true) if a tab switch/open occurred, Ok(false) if no change
     pub fn open_file(&mut self, path: PathBuf) -> Result<bool, std::io::Error> {
+        // Canonicalize path for consistent comparison
+        let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
+
         // Check if already open
-        if let Some(index) = self.find_tab_by_path(&path) {
+        if let Some(index) = self.find_tab_by_path(&canonical_path) {
             let switched = self.switch_to(index);
             return Ok(switched);
         }
 
         // Open new tab
-        let tab = Tab::from_file(path)?;
+        let tab = Tab::from_file(canonical_path)?;
         self.add_tab(tab);
         Ok(true)
     }

@@ -2,25 +2,31 @@
 
 use crate::lsp_manager::{LspManager, ParsedDiagnostic};
 use crate::lsp_service::{LspService, LspResult};
+use ahash::AHashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 use tiny_tree::Doc;
+
+const DEFINITION_CACHE_SAVE_DEBOUNCE_SECS: u64 = 5;
 
 /// High-level diagnostics manager (now uses LspService for broader LSP support)
 pub struct DiagnosticsManager {
     plugin: diagnostics_plugin::DiagnosticsPlugin,
     lsp_service: LspService,
-    last_hover_request: Option<(usize, usize, Instant)>, // (line, col, time) for debouncing
-    current_hover_position: Option<(usize, usize)>, // Current hover position for tracking
     /// Pending go-to-definition result
     pending_goto_definition: Option<Vec<crate::lsp_service::LocationRef>>,
     /// Current hover position with Cmd held (for go-to-definition preview)
     cmd_hover_position: Option<(usize, usize)>,
     /// Pending text edits from code actions
     pending_text_edits: Option<Vec<crate::lsp_service::TextEdit>>,
-    /// Current document symbols from LSP
+    /// Cached go-to-definition results: (line, column) -> locations
+    definition_cache: AHashMap<(usize, usize), Vec<crate::lsp_service::LocationRef>>,
+    /// Document symbols for proactive definition requests
     document_symbols: Vec<lsp_types::DocumentSymbol>,
+    /// Last time definition cache was modified
+    definition_cache_modified: Option<Instant>,
+    /// Last time definition cache was saved to disk
+    definition_cache_last_saved: Option<Instant>,
 }
 
 impl DiagnosticsManager {
@@ -29,48 +35,72 @@ impl DiagnosticsManager {
         Self {
             plugin: diagnostics_plugin::DiagnosticsPlugin::new(),
             lsp_service: LspService::new(),
-            last_hover_request: None,
-            current_hover_position: None,
             pending_goto_definition: None,
             cmd_hover_position: None,
             pending_text_edits: None,
+            definition_cache: AHashMap::new(),
             document_symbols: Vec::new(),
+            definition_cache_modified: None,
+            definition_cache_last_saved: None,
         }
     }
 
     /// Open a file and set up diagnostics (with instant cached results)
     pub fn open_file(&mut self, file_path: PathBuf, content: String) {
-        eprintln!("DiagnosticsManager: Opening file {:?}", file_path);
+        // Clear caches for new file
+        self.definition_cache.clear();
+        self.document_symbols.clear();
 
-        // 1. INSTANT: Load cached diagnostics immediately
+        // Load cached diagnostics immediately
         if let Some(cached_diagnostics) = LspManager::load_cached_diagnostics(&file_path, &content) {
-            eprintln!("  Using {} cached diagnostics", cached_diagnostics.len());
             self.apply_diagnostics(&cached_diagnostics, &content);
-        } else {
-            eprintln!("  No cached diagnostics available");
         }
 
-        // 2. BACKGROUND: Start LSP service (handles all LSP features)
-        eprintln!("  Starting LSP service...");
+        // Load cached definitions immediately for instant go-to-definition
+        if let Some(cached_defs) = LspManager::load_cached_definitions(&file_path, &content) {
+            // Convert CachedLocation to LocationRef
+            for ((line, col), locations) in cached_defs {
+                let location_refs: Vec<_> = locations
+                    .into_iter()
+                    .map(|loc| crate::lsp_service::LocationRef {
+                        file_path: loc.file_path,
+                        position: crate::lsp_service::DocPosition {
+                            line: loc.line,
+                            column: loc.column,
+                        },
+                        text: String::new(),
+                    })
+                    .collect();
+                self.definition_cache.insert((line, col), location_refs);
+            }
+        }
+
+        // Start LSP service (handles all LSP features)
         self.lsp_service.open_file(file_path, content);
 
-        // 3. Request document symbols for hover support
-        eprintln!("  Requesting document symbols...");
+        // Request document symbols for hover support
         self.lsp_service.request_document_symbols();
     }
 
     /// Handle document changes with incremental updates
     pub fn document_changed_incremental(&mut self, changes: Vec<crate::lsp_manager::TextChange>) {
+        self.definition_cache.clear();
         self.lsp_service.document_changed_incremental(changes);
     }
 
     /// Handle document changes (legacy full text)
     pub fn document_changed(&mut self, content: String) {
+        self.definition_cache.clear();
         self.lsp_service.document_changed(content);
     }
 
     /// Handle document save
     pub fn document_saved(&mut self, content: String) {
+        // Save definition cache immediately when file is saved
+        if self.definition_cache_modified.is_some() {
+            self.save_definition_cache();
+            self.definition_cache_last_saved = Some(Instant::now());
+        }
         self.lsp_service.document_saved(content);
     }
 
@@ -78,50 +108,41 @@ impl DiagnosticsManager {
     pub fn update(&mut self, doc: &Doc) {
         // Check if plugin needs hover info (500ms timer elapsed)
         if let Some((line, column)) = self.plugin.update() {
-            // Request hover from LSP
             self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
         }
 
-        // Poll for any LSP results
-        let results = self.lsp_service.poll_results();
+        // Check if we should save definition cache (debounced)
+        if let Some(modified_time) = self.definition_cache_modified {
+            let should_save = self.definition_cache_last_saved
+                .map(|saved_time| modified_time > saved_time)
+                .unwrap_or(true);
 
-        if !results.is_empty() {
-            eprintln!("DiagnosticsManager: poll_results returned {} results", results.len());
+            if should_save && modified_time.elapsed().as_secs() >= DEFINITION_CACHE_SAVE_DEBOUNCE_SECS {
+                self.save_definition_cache();
+                self.definition_cache_last_saved = Some(Instant::now());
+            }
         }
 
-        for result in results {
+        for result in self.lsp_service.poll_results() {
             match result {
                 LspResult::Diagnostics(diagnostics) => {
-                    eprintln!("DiagnosticsManager: Received {} diagnostics from LSP", diagnostics.len());
                     let content = doc.read().flatten_to_string();
-
-                    // Apply fresh diagnostics
                     self.apply_diagnostics(&diagnostics, &content);
-
-                    // Cache them for next time
                     if let Some(file_path) = self.lsp_service.current_file() {
                         LspManager::cache_diagnostics(file_path, &content, &diagnostics);
                     }
                 }
-                LspResult::Hover(hover_info) => {
-                    // Send hover content to plugin
-                    if let Some(hover) = hover_info {
-                        if let Some((line, col)) = self.current_hover_position {
-                            self.plugin.set_hover_content(hover.contents, line, col);
-                        }
+                LspResult::Hover(Some(hover)) => {
+                    if let Some((line, col)) = self.plugin.get_mouse_document_position() {
+                        self.plugin.set_hover_content(hover.contents, line, col);
                     }
                 }
                 LspResult::DocumentSymbols(symbols) => {
-                    eprintln!("LSP: Received {} document symbols", symbols.len());
-
-                    // Store raw symbols for goto_definition lookups
+                    // Store symbols for proactive definition requests
                     self.document_symbols = symbols.clone();
 
-                    // Convert LSP symbols to plugin symbols for display
-                    let mut plugin_symbols = Vec::new();
-                    for symbol in &symbols {
-                        // Convert line/character positions to our format
-                        plugin_symbols.push(diagnostics_plugin::Symbol {
+                    let plugin_symbols: Vec<_> = symbols.iter().map(|symbol| {
+                        diagnostics_plugin::Symbol {
                             name: symbol.name.clone(),
                             line: symbol.range.start.line as usize,
                             column_range: (
@@ -129,61 +150,42 @@ impl DiagnosticsManager {
                                 symbol.range.end.character as usize,
                             ),
                             kind: format!("{:?}", symbol.kind),
-                        });
-                    }
-
+                        }
+                    }).collect();
                     self.plugin.set_symbols(plugin_symbols);
 
-                    // Request symbols again if file changed
-                    // This ensures we always have up-to-date symbols
+                    // Proactively request definitions for top-level symbols to warm cache
+                    self.warm_definition_cache();
                 }
-                LspResult::GoToDefinition(locations) => {
-                    if !locations.is_empty() {
-                        eprintln!("DiagnosticsManager: Received {} goto_definition location(s)", locations.len());
-                        self.pending_goto_definition = Some(locations);
+                LspResult::GoToDefinition(locations) if !locations.is_empty() => {
+                    // Store in cache for instant future lookups
+                    if let Some((line, col)) = self.plugin.get_mouse_document_position() {
+                        self.definition_cache.insert((line, col), locations.clone());
+                        self.definition_cache_modified = Some(Instant::now());
                     }
-                }
-                LspResult::FindReferences(_) => {
-                    // TODO: Handle find references results
+                    self.pending_goto_definition = Some(locations);
                 }
                 LspResult::CodeActions(actions) => {
-                    // Auto-execute the first preferred action, or just the first action
                     if let Some(action) = actions.iter().find(|a| a.is_preferred).or_else(|| actions.first()) {
-                        eprintln!("LSP: Executing code action: {}", action.title);
                         self.lsp_service.execute_code_action(action);
-                    } else {
-                        eprintln!("LSP: No code actions available");
                     }
                 }
                 LspResult::TextEdits(edits) => {
-                    eprintln!("LSP: update() received {} text edits", edits.len());
                     self.pending_text_edits = Some(edits);
                 }
+                _ => {}
             }
         }
     }
 
-    /// Handle mouse movement (requests hover info from LSP with debouncing)
+    /// Handle mouse movement for Cmd+hover go-to-definition preview
     pub fn on_mouse_move(&mut self, line: usize, column: usize, cmd_held: bool) {
-        self.current_hover_position = Some((line, column));
-
-        // Track Cmd+hover for go-to-definition preview
-        if cmd_held {
-            self.cmd_hover_position = Some((line, column));
-        } else {
-            self.cmd_hover_position = None;
-        }
-
-        // DISABLED: This was spamming hover requests on every mouse move!
-        // The diagnostics plugin now handles hover timing and symbol checking.
-        // We only track the position here for Cmd+hover underline.
+        self.cmd_hover_position = if cmd_held { Some((line, column)) } else { None };
     }
 
     /// Clear hover info when mouse leaves text area
     pub fn on_mouse_leave(&mut self) {
         self.plugin.clear_symbols();
-        self.last_hover_request = None;
-        self.current_hover_position = None;
         self.cmd_hover_position = None;
     }
 
@@ -192,14 +194,15 @@ impl DiagnosticsManager {
         self.cmd_hover_position
     }
 
-    /// Request hover information at cursor position (for future use)
-    pub fn request_hover(&self, line: usize, column: usize) {
-        self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
-    }
+    /// Request go-to-definition at cursor position (checks cache first)
+    pub fn request_goto_definition(&mut self, line: usize, column: usize) {
+        // Check cache first for instant response
+        if let Some(cached_locations) = self.definition_cache.get(&(line, column)) {
+            self.pending_goto_definition = Some(cached_locations.clone());
+            return;
+        }
 
-    /// Request go-to-definition at cursor position
-    pub fn request_goto_definition(&self, line: usize, column: usize) {
-        eprintln!("DEBUG: DiagnosticsManager requesting goto_definition at line {}, col {}", line, column);
+        // Not in cache, request from LSP
         self.lsp_service.request_goto_definition(crate::lsp_service::DocPosition { line, column });
     }
 
@@ -213,41 +216,6 @@ impl DiagnosticsManager {
         self.pending_text_edits.take()
     }
 
-    /// Find symbol at the given position (line, UTF-16 column)
-    pub fn find_symbol_at_position(&self, line: u32, utf16_column: u32) -> Option<&lsp_types::DocumentSymbol> {
-        fn find_in_symbol(symbol: &lsp_types::DocumentSymbol, line: u32, col: u32) -> Option<&lsp_types::DocumentSymbol> {
-            // Check if position is within this symbol's range
-            let in_range = line >= symbol.range.start.line && line <= symbol.range.end.line
-                && (line != symbol.range.start.line || col >= symbol.range.start.character)
-                && (line != symbol.range.end.line || col <= symbol.range.end.character);
-
-            if !in_range {
-                return None;
-            }
-
-            // Check children first (prefer most specific symbol)
-            if let Some(ref children) = symbol.children {
-                for child in children {
-                    if let Some(found) = find_in_symbol(child, line, col) {
-                        return Some(found);
-                    }
-                }
-            }
-
-            // No child matched, return this symbol
-            Some(symbol)
-        }
-
-        for symbol in &self.document_symbols {
-            if let Some(found) = find_in_symbol(symbol, line, utf16_column) {
-                return Some(found);
-            }
-        }
-
-        None
-    }
-
-
     /// Get mutable access to the plugin for rendering setup
     pub fn plugin_mut(&mut self) -> &mut diagnostics_plugin::DiagnosticsPlugin {
         &mut self.plugin
@@ -260,12 +228,10 @@ impl DiagnosticsManager {
 
     /// Apply diagnostics to the plugin (internal helper)
     fn apply_diagnostics(&mut self, diagnostics: &[ParsedDiagnostic], content: &str) {
-        eprintln!("DIAG: Clearing old diagnostics and applying {} new ones", diagnostics.len());
         self.plugin.clear_diagnostics();
-
         let lines: Vec<&str> = content.lines().collect();
         for diag in diagnostics {
-            if let Some(line_text) = lines.get(diag.line) {
+            if let Some(&line_text) = lines.get(diag.line) {
                 self.plugin.add_diagnostic_with_line_text(
                     diagnostics_plugin::Diagnostic {
                         line: diag.line,
@@ -288,5 +254,38 @@ impl DiagnosticsManager {
     /// Get mutable LSP service for advanced features
     pub fn lsp_service_mut(&mut self) -> &mut LspService {
         &mut self.lsp_service
+    }
+
+    /// Proactively request definitions for all symbols to warm cache
+    fn warm_definition_cache(&self) {
+        for symbol in &self.document_symbols {
+            let line = symbol.selection_range.start.line as usize;
+            let column = symbol.selection_range.start.character as usize;
+
+            if !self.definition_cache.contains_key(&(line, column)) {
+                self.lsp_service.request_goto_definition(crate::lsp_service::DocPosition { line, column });
+            }
+        }
+    }
+
+    /// Save definition cache to disk
+    fn save_definition_cache(&self) {
+        if let Some(file_path) = self.lsp_service.current_file() {
+            if let Ok(content) = std::fs::read_to_string(file_path) {
+                let mut cached_defs = AHashMap::new();
+                for ((line, col), locations) in &self.definition_cache {
+                    let cached_locations: Vec<_> = locations
+                        .iter()
+                        .map(|loc| crate::lsp_manager::CachedLocation {
+                            file_path: loc.file_path.clone(),
+                            line: loc.position.line,
+                            column: loc.position.column,
+                        })
+                        .collect();
+                    cached_defs.insert((*line, *col), cached_locations);
+                }
+                LspManager::cache_definitions(file_path, &content, &cached_defs);
+            }
+        }
     }
 }

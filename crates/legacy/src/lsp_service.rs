@@ -84,11 +84,19 @@ impl LspService {
             return;
         }
 
-        // Find workspace root (same logic as before)
         let abs_path = std::fs::canonicalize(&file_path)
             .unwrap_or_else(|_| file_path.clone());
 
-        // Store the absolute path for consistency with LSP
+        // Skip LSP for dependency/library files (read-only, not part of current workspace)
+        let path_str = abs_path.to_string_lossy();
+        if path_str.contains("/.cargo/registry/")
+            || path_str.contains("/target/")
+            || path_str.contains("/.rustup/")
+        {
+            self.current_file = Some(abs_path);
+            return;
+        }
+
         self.current_file = Some(abs_path.clone());
 
         let workspace_root = abs_path

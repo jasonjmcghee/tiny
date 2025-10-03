@@ -20,7 +20,7 @@ authors = ["Tiny Editor Contributors"]
 # Shared dependencies across all crates
 wgpu = { version = "26.0.1", features = ["metal"] }
 bytemuck = { version = "1", features = ["derive"] }
-ahash = "0.8.12"
+ahash = { version = "0.8.12", features = ["serde"] }
 winit = "0.30"
 
 [profile.release]
