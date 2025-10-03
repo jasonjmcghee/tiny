@@ -288,161 +288,95 @@ impl LspManager {
 
     /// Initialize LSP for a file
     pub fn initialize(&self, file_path: PathBuf, text: String) {
-        if let Err(e) = self.tx.send(LspRequest::Initialize { file_path, text }) {
-            eprintln!("LSP ERROR: Failed to send Initialize request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::Initialize { file_path, text });
     }
 
     /// Notify LSP of document changes with incremental updates
     pub fn document_changed(&self, changes: Vec<TextChange>) {
-        // Cancel pending hover/goto-def requests - they'll fail with "content modified"
-        if let Err(e) = self.tx.send(LspRequest::CancelPendingRequests) {
-            eprintln!("LSP ERROR: Failed to send CancelPendingRequests: {}", e);
-        }
-
-        // Version will be determined by the background thread from DocumentInfo
-        let version = if let Ok(doc_info) = self.document_info.read() {
-            doc_info.as_ref().map(|d| d.version + 1).unwrap_or(1)
-        } else {
-            1
-        };
-
-        if let Err(e) = self
-            .tx
-            .send(LspRequest::DocumentChanged { changes, version })
-        {
-            eprintln!("LSP ERROR: Failed to send DocumentChanged request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::CancelPendingRequests);
+        let version = self.document_info.read()
+            .ok()
+            .and_then(|d| d.as_ref().map(|d| d.version + 1))
+            .unwrap_or(1);
+        let _ = self.tx.send(LspRequest::DocumentChanged { changes, version });
     }
 
     /// Notify LSP of document changes with full text (legacy)
     pub fn document_changed_full(&self, text: String) {
-        // Cancel pending hover/goto-def requests - they'll fail with "content modified"
-        if let Err(e) = self.tx.send(LspRequest::CancelPendingRequests) {
-            eprintln!("LSP ERROR: Failed to send CancelPendingRequests: {}", e);
-        }
-
-        // Version will be determined by the background thread from DocumentInfo
-        let version = if let Ok(doc_info) = self.document_info.read() {
-            doc_info.as_ref().map(|d| d.version + 1).unwrap_or(1)
-        } else {
-            1
-        };
-
-        // Convert to a single change representing the entire document (full sync)
+        let _ = self.tx.send(LspRequest::CancelPendingRequests);
+        let version = self.document_info.read()
+            .ok()
+            .and_then(|d| d.as_ref().map(|d| d.version + 1))
+            .unwrap_or(1);
         let changes = vec![TextChange {
             range: Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: u32::MAX,
-                    character: u32::MAX,
-                },
+                start: Position { line: 0, character: 0 },
+                end: Position { line: u32::MAX, character: u32::MAX },
             },
             text,
         }];
-        if let Err(e) = self
-            .tx
-            .send(LspRequest::DocumentChanged { changes, version })
-        {
-            eprintln!("LSP ERROR: Failed to send DocumentChanged request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::DocumentChanged { changes, version });
     }
 
     /// Notify LSP of document save
     pub fn document_saved(&self, path: PathBuf, text: String) {
-        if let Err(e) = self.tx.send(LspRequest::DocumentSaved { path, text }) {
-            eprintln!("LSP ERROR: Failed to send DocumentSaved request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::DocumentSaved { path, text });
     }
 
     /// Poll for any LSP responses (non-blocking)
     /// Returns all pending responses
     pub fn poll_responses(&self) -> Vec<LspResponse> {
-        let mut responses = Vec::new();
-        if let Ok(rx) = self.response_rx.lock() {
-            while let Ok(response) = rx.try_recv() {
-                responses.push(response);
-            }
-        }
-        responses
+        self.response_rx.lock()
+            .ok()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Request hover information at position
     pub fn request_hover(&self, line: u32, character: u32) {
-        if let Err(e) = self.tx.send(LspRequest::Hover { line, character }) {
-            eprintln!("LSP ERROR: Failed to send Hover request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::Hover { line, character });
     }
 
     /// Request document symbols
     pub fn request_document_symbols(&self) {
-        if let Err(e) = self.tx.send(LspRequest::DocumentSymbols) {
-            eprintln!("LSP ERROR: Failed to send DocumentSymbols request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::DocumentSymbols);
     }
 
     /// Request go-to-definition at position
     pub fn request_goto_definition(&self, line: u32, character: u32) {
-        if let Err(e) = self.tx.send(LspRequest::GotoDefinition { line, character }) {
-            eprintln!("LSP ERROR: Failed to send GotoDefinition request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::GotoDefinition { line, character });
     }
 
     /// Request code actions at position
     pub fn request_code_action(&self, line: u32, character: u32) {
-        // Get current diagnostics for this position
-        let diagnostics = if let Ok(diags) = self.current_diagnostics.read() {
-            diags
-                .iter()
+        let diagnostics = self.current_diagnostics.read()
+            .ok()
+            .map(|diags| diags.iter()
                 .filter(|d| d.range.start.line <= line && line <= d.range.end.line)
                 .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        if let Err(e) = self.tx.send(LspRequest::CodeAction {
-            line,
-            character,
-            diagnostics,
-        }) {
-            eprintln!("LSP ERROR: Failed to send CodeAction request: {}", e);
-        }
+                .collect())
+            .unwrap_or_default();
+        let _ = self.tx.send(LspRequest::CodeAction { line, character, diagnostics });
     }
 
     /// Execute a code action (either command or workspace edit)
     pub fn execute_code_action(&self, action: &lsp_types::CodeActionOrCommand) {
         match action {
             lsp_types::CodeActionOrCommand::Command(cmd) => {
-                if let Err(e) = self.tx.send(LspRequest::ExecuteCommand {
+                let _ = self.tx.send(LspRequest::ExecuteCommand {
                     command: cmd.command.clone(),
                     arguments: cmd.arguments.clone().unwrap_or_default(),
-                }) {
-                    eprintln!("LSP ERROR: Failed to send ExecuteCommand request: {}", e);
-                }
+                });
             }
             lsp_types::CodeActionOrCommand::CodeAction(action) => {
                 if let Some(ref edit) = action.edit {
-                    if let Err(e) = self
-                        .tx
-                        .send(LspRequest::ApplyWorkspaceEdit { edit: edit.clone() })
-                    {
-                        eprintln!(
-                            "LSP ERROR: Failed to send ApplyWorkspaceEdit request: {}",
-                            e
-                        );
-                    }
+                    let _ = self.tx.send(LspRequest::ApplyWorkspaceEdit { edit: edit.clone() });
                 }
                 if let Some(ref cmd) = action.command {
-                    if let Err(e) = self.tx.send(LspRequest::ExecuteCommand {
+                    let _ = self.tx.send(LspRequest::ExecuteCommand {
                         command: cmd.command.clone(),
                         arguments: cmd.arguments.clone().unwrap_or_default(),
-                    }) {
-                        eprintln!("LSP ERROR: Failed to send ExecuteCommand request: {}", e);
-                    }
+                    });
                 }
             }
         }
@@ -450,9 +384,7 @@ impl LspManager {
 
     /// Shutdown the LSP server
     pub fn shutdown(&self) {
-        if let Err(e) = self.tx.send(LspRequest::Shutdown) {
-            eprintln!("LSP ERROR: Failed to send Shutdown request: {}", e);
-        }
+        let _ = self.tx.send(LspRequest::Shutdown);
     }
 
     /// Get or create the global LSP manager instance
@@ -749,22 +681,18 @@ fn utf8_to_utf16_position(
     line: u32,
     character: u32,
 ) -> u32 {
-    if let Ok(tree_guard) = document_tree.read() {
-        if let Some(ref tree) = *tree_guard {
-            let utf16_point = tree.doc_pos_to_point_utf16(line, character);
-            return utf16_point.column;
-        }
-    }
-    character
+    document_tree.read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|tree| tree.doc_pos_to_point_utf16(line, character).column))
+        .unwrap_or(character)
 }
 
 /// Get current document version
 fn get_document_version(document_info: &Arc<RwLock<Option<DocumentInfo>>>) -> u64 {
-    if let Ok(info_guard) = document_info.read() {
-        info_guard.as_ref().map(|d| d.version).unwrap_or(0)
-    } else {
-        0
-    }
+    document_info.read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|d| d.version))
+        .unwrap_or(0)
 }
 
 /// Track a pending request
@@ -1014,11 +942,10 @@ fn run_lsp_client(
                             INIT_COMPLETE => {
                                 *current_file.write().unwrap() = Some(file_uri.clone());
                                 last_text = text.clone();
-                                let new_version = if let Ok(doc_info) = document_info.read() {
-                                    doc_info.as_ref().map(|d| d.version + 1).unwrap_or(1)
-                                } else {
-                                    1
-                                };
+                                let new_version = document_info.read()
+                                    .ok()
+                                    .and_then(|d| d.as_ref().map(|d| d.version + 1))
+                                    .unwrap_or(1);
                                 *document_tree.write().unwrap() = Some(tree::Tree::from_str(&text));
                                 *document_info.write().unwrap() = Some(DocumentInfo {
                                     uri: file_uri.clone(),
@@ -1153,21 +1080,15 @@ fn run_lsp_client(
                         }
                     }
                     LspRequest::ApplyWorkspaceEdit { edit } => {
-                        // Extract text edits for the current file
                         if let Some(ref changes) = edit.changes {
                             if let Ok(doc_info_guard) = document_info.read() {
                                 if let Some(ref doc_info) = *doc_info_guard {
-                                    let current_uri = &doc_info.uri;
-                                    if let Some(edits) = changes.get(current_uri) {
-                                        eprintln!(
-                                            "DEBUG: Sending {} text edits to editor",
-                                            edits.len()
-                                        );
+                                    if let Some(edits) = changes.get(&doc_info.uri) {
                                         let _ = response_tx.send(LspResponse::TextEdit(
                                             TextEditUpdate {
-                                                uri: current_uri.clone(),
+                                                uri: doc_info.uri.clone(),
                                                 edits: edits.clone(),
-                                            },
+                                            }
                                         ));
                                     }
                                 }
@@ -1361,26 +1282,20 @@ fn handle_lsp_message(
             if method == "textDocument/publishDiagnostics" {
                 if let Some(params) = msg.params {
                     if let Ok(publish_params) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
-                        // Only process diagnostics for the currently open file
-                        let should_process = if let Ok(current_uri_guard) = current_file.read() {
-                            if let Some(ref current_uri) = *current_uri_guard {
-                                publish_params.uri == *current_uri
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
+                        let should_process = current_file.read()
+                            .ok()
+                            .and_then(|guard| guard.as_ref().map(|uri| publish_params.uri == *uri))
+                            .unwrap_or(false);
 
                         if should_process {
                             if let Ok(mut diags) = current_diagnostics.write() {
                                 *diags = publish_params.diagnostics.clone();
                             }
-
                             let diagnostics = parse_diagnostics(publish_params.diagnostics);
                             let current_version = get_document_version(document_info);
-                            let update = DiagnosticUpdate { diagnostics, version: current_version };
-                            let _ = response_tx.send(LspResponse::Diagnostics(update));
+                            let _ = response_tx.send(LspResponse::Diagnostics(
+                                DiagnosticUpdate { diagnostics, version: current_version }
+                            ));
                         }
                     }
                 }
@@ -1612,6 +1527,37 @@ fn send_message(
     Ok(())
 }
 
+macro_rules! send_request {
+    ($writer:expr, $next_id:expr, $method:expr, $params:expr) => {{
+        let request_id = *$next_id;
+        let msg = JsonRpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(request_id),
+            method: Some($method.to_string()),
+            params: Some(serde_json::to_value($params)?),
+            result: None,
+            error: None,
+        };
+        *$next_id += 1;
+        send_message($writer, &msg)?;
+        Ok(request_id)
+    }};
+}
+
+macro_rules! send_notification {
+    ($writer:expr, $method:expr, $params:expr) => {{
+        let msg = JsonRpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some($method.to_string()),
+            params: Some(serde_json::to_value($params)?),
+            result: None,
+            error: None,
+        };
+        send_message($writer, &msg)
+    }};
+}
+
 #[allow(deprecated)]
 fn send_initialize(
     writer: &mut dyn Write,
@@ -1710,15 +1656,7 @@ fn send_initialize(
 }
 
 fn send_initialized(writer: &mut dyn Write) -> Result<(), Box<dyn std::error::Error>> {
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: None,
-        method: Some("initialized".to_string()),
-        params: Some(serde_json::to_value(InitializedParams {})?),
-        result: None,
-        error: None,
-    };
-    send_message(writer, &msg)
+    send_notification!(writer, "initialized", InitializedParams {})
 }
 
 fn send_did_open(
@@ -1726,31 +1664,14 @@ fn send_did_open(
     uri: &Uri,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!(
-        "DEBUG: send_did_open for {:?}, text length: {} bytes, first 200 chars: {:?}",
-        uri,
-        text.len(),
-        text.chars().take(200).collect::<String>()
-    );
-
-    let params = DidOpenTextDocumentParams {
+    send_notification!(writer, "textDocument/didOpen", DidOpenTextDocumentParams {
         text_document: TextDocumentItem {
             uri: uri.clone(),
             language_id: "rust".to_string(),
             version: 1,
             text: text.to_string(),
         },
-    };
-
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: None,
-        method: Some("textDocument/didOpen".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    send_message(writer, &msg)
+    })
 }
 
 fn send_did_change_incremental(
@@ -1762,46 +1683,25 @@ fn send_did_change_incremental(
     let content_changes: Vec<TextDocumentContentChangeEvent> = changes
         .iter()
         .map(|change| {
-            // Check if this is a full document sync (range with MAX values)
             let is_full_sync = change.range.start.line == 0
                 && change.range.start.character == 0
                 && (change.range.end.line == u32::MAX || change.range.end.character == u32::MAX);
 
-            if is_full_sync {
-                // Full document replacement - use None for range per LSP spec
-                TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: change.text.clone(),
-                }
-            } else {
-                // Incremental change
-                TextDocumentContentChangeEvent {
-                    range: Some(change.range.clone()),
-                    range_length: None, // Let LSP calculate this
-                    text: change.text.clone(),
-                }
+            TextDocumentContentChangeEvent {
+                range: if is_full_sync { None } else { Some(change.range.clone()) },
+                range_length: None,
+                text: change.text.clone(),
             }
         })
         .collect();
 
-    let params = DidChangeTextDocumentParams {
+    send_notification!(writer, "textDocument/didChange", DidChangeTextDocumentParams {
         text_document: VersionedTextDocumentIdentifier {
             uri: uri.clone(),
             version: version as i32,
         },
         content_changes,
-    };
-
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: None,
-        method: Some("textDocument/didChange".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    send_message(writer, &msg)
+    })
 }
 
 fn send_did_save(
@@ -1809,20 +1709,10 @@ fn send_did_save(
     uri: &Uri,
     text: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let params = DidSaveTextDocumentParams {
+    send_notification!(writer, "textDocument/didSave", DidSaveTextDocumentParams {
         text_document: TextDocumentIdentifier { uri: uri.clone() },
         text: text.map(|s| s.to_string()),
-    };
-
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: None,
-        method: Some("textDocument/didSave".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    send_message(writer, &msg)
+    })
 }
 
 fn send_hover(
@@ -1832,26 +1722,13 @@ fn send_hover(
     line: u32,
     character: u32,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let params = lsp_types::HoverParams {
+    send_request!(writer, next_id, "textDocument/hover", lsp_types::HoverParams {
         text_document_position_params: lsp_types::TextDocumentPositionParams {
             text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
             position: lsp_types::Position { line, character },
         },
         work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-    };
-
-    let request_id = *next_id;
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: Some(request_id),
-        method: Some("textDocument/hover".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    *next_id += 1;
-    send_message(writer, &msg)?;
-    Ok(request_id)
+    })
 }
 
 fn send_document_symbols(
@@ -1859,24 +1736,11 @@ fn send_document_symbols(
     next_id: &mut u64,
     uri: &Uri,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let params = DocumentSymbolParams {
+    send_request!(writer, next_id, "textDocument/documentSymbol", DocumentSymbolParams {
         text_document: TextDocumentIdentifier { uri: uri.clone() },
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: lsp_types::PartialResultParams::default(),
-    };
-
-    let request_id = *next_id;
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: Some(request_id),
-        method: Some("textDocument/documentSymbol".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    *next_id += 1;
-    send_message(writer, &msg)?;
-    Ok(request_id)
+    })
 }
 
 fn send_goto_definition(
@@ -1886,40 +1750,14 @@ fn send_goto_definition(
     line: u32,
     character: u32,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    // Note: character parameter should already be in UTF-16 code units
-    // (converted by caller using DocumentState::utf8_to_utf16_col)
-    eprintln!(
-        "DEBUG: send_goto_definition called with line={}, char={} (UTF-16)",
-        line, character
-    );
-
-    let params = lsp_types::GotoDefinitionParams {
+    send_request!(writer, next_id, "textDocument/definition", lsp_types::GotoDefinitionParams {
         text_document_position_params: lsp_types::TextDocumentPositionParams {
             text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
             position: lsp_types::Position { line, character },
         },
         work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
         partial_result_params: lsp_types::PartialResultParams::default(),
-    };
-
-    let request_id = *next_id;
-
-    eprintln!(
-        "DEBUG: Sending LSP message: {}",
-        serde_json::to_string_pretty(&params).unwrap_or_default()
-    );
-
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: Some(request_id),
-        method: Some("textDocument/definition".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    *next_id += 1;
-    send_message(writer, &msg)?;
-    Ok(request_id)
+    })
 }
 
 fn send_code_action(
@@ -1930,7 +1768,7 @@ fn send_code_action(
     character: u32,
     diagnostics: &[LspDiagnostic],
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let params = lsp_types::CodeActionParams {
+    send_request!(writer, next_id, "textDocument/codeAction", lsp_types::CodeActionParams {
         text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
         range: lsp_types::Range {
             start: lsp_types::Position { line, character },
@@ -1943,20 +1781,7 @@ fn send_code_action(
         },
         work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
         partial_result_params: lsp_types::PartialResultParams::default(),
-    };
-
-    let request_id = *next_id;
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: Some(request_id),
-        method: Some("textDocument/codeAction".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    *next_id += 1;
-    send_message(writer, &msg)?;
-    Ok(request_id)
+    })
 }
 
 fn send_execute_command(
@@ -1965,42 +1790,18 @@ fn send_execute_command(
     command: &str,
     arguments: &[serde_json::Value],
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let params = lsp_types::ExecuteCommandParams {
+    send_request!(writer, next_id, "workspace/executeCommand", lsp_types::ExecuteCommandParams {
         command: command.to_string(),
         arguments: arguments.to_vec(),
         work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-    };
-
-    let request_id = *next_id;
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: Some(request_id),
-        method: Some("workspace/executeCommand".to_string()),
-        params: Some(serde_json::to_value(params)?),
-        result: None,
-        error: None,
-    };
-    *next_id += 1;
-    send_message(writer, &msg)?;
-    Ok(request_id)
+    })
 }
 
 fn send_shutdown(
     writer: &mut dyn Write,
     next_id: &mut u64,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let request_id = *next_id;
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: Some(request_id),
-        method: Some("shutdown".to_string()),
-        params: None,
-        result: None,
-        error: None,
-    };
-    *next_id += 1;
-    send_message(writer, &msg)?;
-    Ok(request_id)
+    send_request!(writer, next_id, "shutdown", serde_json::Value::Null)
 }
 
 /// Send cancellation notification for a request
@@ -2012,15 +1813,5 @@ fn send_cancel_request(
     struct CancelParams {
         id: u64,
     }
-
-    let msg = JsonRpcMessage {
-        jsonrpc: "2.0".to_string(),
-        id: None, // Notifications have no ID
-        method: Some("$/cancelRequest".to_string()),
-        params: Some(serde_json::to_value(CancelParams { id: request_id })?),
-        result: None,
-        error: None,
-    };
-    send_message(writer, &msg)?;
-    Ok(())
+    send_notification!(writer, "$/cancelRequest", CancelParams { id: request_id })
 }

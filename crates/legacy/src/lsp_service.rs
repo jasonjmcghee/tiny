@@ -108,8 +108,6 @@ impl LspService {
                 found_cargo_toml
             });
 
-        eprintln!("DEBUG: Opening file {:?} with workspace root {:?}", abs_path, workspace_root);
-
         // Get or create LSP manager
         match LspManager::get_or_create_global(workspace_root) {
             Ok(manager) => {
@@ -147,16 +145,10 @@ impl LspService {
     pub fn poll_results(&self) -> Vec<LspResult> {
         let mut results = Vec::new();
 
-        // Use the unified poll_responses() method to avoid dropping messages
         if let Some(ref lsp) = self.lsp_manager {
-            let responses = lsp.poll_responses();
-            if !responses.is_empty() {
-                eprintln!("LspService: poll_results() received {} responses", responses.len());
-            }
-            for response in responses {
+            for response in lsp.poll_responses() {
                 match response {
                     crate::lsp_manager::LspResponse::Diagnostics(diagnostic_update) => {
-                        eprintln!("LspService: Received {} diagnostics", diagnostic_update.diagnostics.len());
                         results.push(LspResult::Diagnostics(diagnostic_update.diagnostics));
                     }
                     crate::lsp_manager::LspResponse::Hover(hover_update) => {
@@ -241,7 +233,7 @@ impl LspService {
                         results.push(LspResult::TextEdits(edits));
                     }
                     crate::lsp_manager::LspResponse::Error(err) => {
-                        eprintln!("LspService: LSP error: {}", err);
+                        eprintln!("LSP error: {}", err);
                     }
                 }
             }
@@ -259,12 +251,8 @@ impl LspService {
 
     /// Request go-to-definition at position
     pub fn request_goto_definition(&self, position: DocPosition) {
-        eprintln!("DEBUG: LspService requesting goto_definition at line {}, col {}", position.line, position.column);
         if let Some(ref lsp) = self.lsp_manager {
-            eprintln!("DEBUG: LSP manager exists, sending request");
             lsp.request_goto_definition(position.line as u32, position.column as u32);
-        } else {
-            eprintln!("DEBUG: No LSP manager available!");
         }
     }
 
