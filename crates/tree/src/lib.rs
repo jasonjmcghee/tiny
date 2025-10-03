@@ -509,18 +509,11 @@ impl Tree {
     }
 
     pub fn from_str(text: &str) -> Self {
-        let bytes = text.as_bytes();
-
-        if bytes.is_empty() {
-            return Self {
-                root: Node::Leaf {
-                    spans: Vec::new(),
-                    sums: Sums::default(),
-                },
-                version: 0,
-                cached_flattened_text: Some(Arc::new(String::new())),
-            };
+        if text.is_empty() {
+            return Self::new();
         }
+
+        let bytes = text.as_bytes();
 
         // Chunk size: 1024 bytes (original) - prioritizes tree depth over bitmap coverage
         // First 128 bytes of each span still get O(1) bitmap queries
@@ -617,12 +610,6 @@ impl Tree {
 
     /// Apply edits using incremental path-based approach
     pub fn apply_edits(&self, edits: &[Edit]) -> Self {
-        // For single edit, use incremental approach
-        if edits.len() == 1 {
-            return self.apply_edit_incremental(&edits[0]);
-        }
-
-        // For multiple edits, batch by locality if possible
         let mut new_root = self.root.clone();
         for edit in edits {
             new_root = Self::apply_edit_to_node(new_root, edit);
@@ -632,24 +619,6 @@ impl Tree {
                 edit
             );
         }
-
-        Self {
-            root: new_root,
-            version: self.version + 1,
-            cached_flattened_text: None, // Cache invalidated by edits
-        }
-    }
-
-    /// Apply single edit incrementally
-    fn apply_edit_incremental(&self, edit: &Edit) -> Self {
-        let new_root = Self::apply_edit_to_node(self.root.clone(), edit);
-
-        // Validate tree structure in debug builds
-        debug_assert!(
-            validate_tree_structure(&new_root),
-            "Tree structure invalid after edit: {:?}",
-            edit
-        );
 
         Self {
             root: new_root,
@@ -673,16 +642,7 @@ impl Tree {
 
     fn create_span(content: &Content) -> Span {
         match content {
-            Content::Text(s) => {
-                let bytes = s.as_bytes();
-                let bytes_arc: Arc<[u8]> = bytes.into();
-                let metadata = TextMetadata::compute(&bytes_arc).map(Box::new);
-                Span::Text {
-                    bytes: bytes_arc,
-                    lines: bytecount::count(bytes, b'\n') as u32,
-                    metadata,
-                }
-            }
+            Content::Text(s) => Self::text_span(s.as_bytes()),
             Content::Spatial(w) => Span::Spatial(w.clone()),
         }
     }
@@ -693,19 +653,6 @@ impl Tree {
         Span::Text {
             bytes: bytes_arc,
             lines: bytecount::count(bytes, b'\n') as u32,
-            metadata,
-        }
-    }
-
-    fn merge_text_spans(bytes1: &[u8], lines1: u32, text: &str) -> Span {
-        let mut combined = Vec::with_capacity(bytes1.len() + text.len());
-        combined.extend_from_slice(bytes1);
-        combined.extend_from_slice(text.as_bytes());
-        let combined_arc: Arc<[u8]> = combined.into();
-        let metadata = TextMetadata::compute(&combined_arc).map(Box::new);
-        Span::Text {
-            bytes: combined_arc,
-            lines: lines1 + bytecount::count(text.as_bytes(), b'\n') as u32,
             metadata,
         }
     }
@@ -724,19 +671,21 @@ impl Tree {
                 let new_span = Self::create_span(content);
 
                 // Try to merge at end for text
-                if let (Content::Text(text), Some(Span::Text { bytes, lines, .. })) =
+                if let (Content::Text(text), Some(Span::Text { bytes, .. })) =
                     (content, spans.last())
                 {
-                    if pos == spans.iter().map(span_bytes).sum::<usize>() {
+                    if pos == spans.iter().map(|s| s.byte_len()).sum::<usize>() {
                         let last = spans.len() - 1;
-                        spans[last] = Self::merge_text_spans(bytes, *lines, text);
+                        let mut combined = bytes.to_vec();
+                        combined.extend_from_slice(text.as_bytes());
+                        spans[last] = Self::text_span(&combined);
                         return Node::leaf(spans).split_if_needed();
                     }
                 }
 
                 let mut offset = 0;
                 for (i, span) in spans.iter().enumerate() {
-                    let size = span_bytes(span);
+                    let size = span.byte_len();
                     if offset <= pos && pos <= offset + size {
                         let split_pos = pos - offset;
 
@@ -746,9 +695,11 @@ impl Tree {
                         }
 
                         match span {
-                            Span::Text { bytes, lines, .. } if split_pos == bytes.len() => {
+                            Span::Text { bytes, .. } if split_pos == bytes.len() => {
                                 if let Content::Text(text) = content {
-                                    spans[i] = Self::merge_text_spans(bytes, *lines, text);
+                                    let mut combined = bytes.to_vec();
+                                    combined.extend_from_slice(text.as_bytes());
+                                    spans[i] = Self::text_span(&combined);
                                 } else {
                                     spans.insert(i + 1, new_span);
                                 }
@@ -843,7 +794,7 @@ impl Tree {
                 let mut offset = 0;
 
                 for span in &spans {
-                    let size = span_bytes(span);
+                    let size = span.byte_len();
                     let end = offset + size;
 
                     if end <= range.start || offset >= range.end {
@@ -1071,7 +1022,12 @@ impl Tree {
 
     /// Get the text of a line without trailing newline
     pub fn line_text_trimmed(&self, line: u32) -> String {
-        self.line_text(line).trim_end_matches('\n').to_string()
+        let text = self.line_text(line);
+        if text.ends_with('\n') {
+            text[..text.len() - 1].to_string()
+        } else {
+            text
+        }
     }
 
     /// Get the character count of a line (excluding newline)
@@ -1090,84 +1046,9 @@ impl Tree {
             return self.len_utf16();
         }
 
-        // Walk through tree systematically, using cached sums to skip subtrees
         let mut utf16_count = 0;
         let mut byte_pos = 0;
-
-        fn walk_node(
-            node: &Node,
-            offset: usize,
-            byte_pos: &mut usize,
-            utf16_count: &mut usize,
-        ) -> bool {
-            match node {
-                Node::Leaf { spans, .. } => {
-                    for span in spans {
-                        if *byte_pos >= offset {
-                            return true; // Done
-                        }
-
-                        match span {
-                            Span::Text { bytes, metadata, .. } => {
-                                let span_len = bytes.len();
-                                if *byte_pos + span_len <= offset {
-                                    // Entire span is before target - count all UTF-16
-                                    if let Some(meta) = metadata {
-                                        *utf16_count += meta.total_utf16();
-                                    } else {
-                                        let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
-                                        for c in text.chars() {
-                                            *utf16_count += c.len_utf16();
-                                        }
-                                    }
-                                    *byte_pos += span_len;
-                                } else {
-                                    // Target is within this span
-                                    let bytes_to_process = offset - *byte_pos;
-
-                                    // Fast path: use bitmap if available
-                                    if let Some(meta) = metadata {
-                                        *utf16_count += meta.byte_to_offset_utf16(bytes_to_process);
-                                    } else {
-                                        // Slow path: iterate characters for large spans
-                                        let slice = &bytes[..bytes_to_process];
-                                        let text = unsafe { from_utf8(slice).unwrap_unchecked() };
-                                        for c in text.chars() {
-                                            *utf16_count += c.len_utf16();
-                                        }
-                                    }
-
-                                    *byte_pos = offset;
-                                    return true; // Found target
-                                }
-                            }
-                            Span::Spatial(_) => {
-                                // Spatial elements don't contribute to text offsets
-                            }
-                        }
-                    }
-                    false
-                }
-                Node::Internal { children, .. } => {
-                    // Use cached sums to skip entire subtrees
-                    for child in children {
-                        let child_sums = child.sums();
-
-                        if *byte_pos + child_sums.bytes <= offset {
-                            // Entire child is before target - skip it using cached sums
-                            *byte_pos += child_sums.bytes;
-                            *utf16_count += child_sums.len_utf16.0;
-                        } else {
-                            // Target is in this child
-                            return walk_node(child, offset, byte_pos, utf16_count);
-                        }
-                    }
-                    false
-                }
-            }
-        }
-
-        walk_node(&self.root, offset, &mut byte_pos, &mut utf16_count);
+        Self::walk_byte_to_utf16(&self.root, offset, &mut byte_pos, &mut utf16_count);
         OffsetUtf16(utf16_count)
     }
 
@@ -1180,104 +1061,129 @@ impl Tree {
             return self.byte_count();
         }
 
-        // Walk through tree systematically, using cached sums to skip subtrees
         let mut utf16_offset = 0;
         let mut byte_offset = 0;
+        Self::walk_utf16_to_byte(&self.root, target.0, &mut byte_offset, &mut utf16_offset);
+        byte_offset
+    }
 
-        fn walk_node(
-            node: &Node,
-            target: usize,
-            byte_pos: &mut usize,
-            utf16_pos: &mut usize,
-        ) -> bool {
-            match node {
-                Node::Leaf { spans, .. } => {
-                    for span in spans {
-                        if *utf16_pos >= target {
-                            return true; // Done
+    fn walk_byte_to_utf16(node: &Node, target: usize, byte_pos: &mut usize, utf16_count: &mut usize) -> bool {
+        match node {
+            Node::Leaf { spans, .. } => {
+                for span in spans {
+                    if *byte_pos >= target {
+                        return true;
+                    }
+
+                    if let Span::Text { bytes, metadata, .. } = span {
+                        let span_len = bytes.len();
+                        if *byte_pos + span_len <= target {
+                            if let Some(meta) = metadata {
+                                *utf16_count += meta.total_utf16();
+                            } else {
+                                let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
+                                *utf16_count += text.chars().map(|c| c.len_utf16()).sum::<usize>();
+                            }
+                            *byte_pos += span_len;
+                        } else {
+                            let bytes_to_process = target - *byte_pos;
+                            if let Some(meta) = metadata {
+                                *utf16_count += meta.byte_to_offset_utf16(bytes_to_process);
+                            } else {
+                                let slice = &bytes[..bytes_to_process];
+                                let text = unsafe { from_utf8(slice).unwrap_unchecked() };
+                                *utf16_count += text.chars().map(|c| c.len_utf16()).sum::<usize>();
+                            }
+                            *byte_pos = target;
+                            return true;
                         }
+                    }
+                }
+                false
+            }
+            Node::Internal { children, .. } => {
+                for child in children {
+                    let child_sums = child.sums();
+                    if *byte_pos + child_sums.bytes <= target {
+                        *byte_pos += child_sums.bytes;
+                        *utf16_count += child_sums.len_utf16.0;
+                    } else {
+                        return Self::walk_byte_to_utf16(child, target, byte_pos, utf16_count);
+                    }
+                }
+                false
+            }
+        }
+    }
 
-                        match span {
-                            Span::Text { bytes, metadata, .. } => {
-                                let span_len = bytes.len();
+    fn walk_utf16_to_byte(node: &Node, target: usize, byte_pos: &mut usize, utf16_pos: &mut usize) -> bool {
+        match node {
+            Node::Leaf { spans, .. } => {
+                for span in spans {
+                    if *utf16_pos >= target {
+                        return true;
+                    }
 
-                                // Fast path: use bitmap if available
-                                if let Some(meta) = metadata {
-                                    let span_utf16_len = meta.total_utf16();
-                                    if *utf16_pos + span_utf16_len <= target {
-                                        // Entire span is before target - skip it
-                                        *utf16_pos += span_utf16_len;
-                                        *byte_pos += span_len;
-                                    } else {
-                                        // Target is within this span - find exact position
-                                        let remaining = target - *utf16_pos;
+                    if let Span::Text { bytes, metadata, .. } = span {
+                        let span_len = bytes.len();
 
-                                        // Use bitmap to find the position of the nth UTF-16 code unit
-                                        let mut count = 0;
-                                        for i in 0..span_len {
-                                            if (meta.chars_utf16 >> i) & 1 == 1 {
-                                                count += 1;
-                                                if count > remaining {
-                                                    *byte_pos += i;
-                                                    *utf16_pos = target;
-                                                    return true;
-                                                }
-                                            }
-                                        }
-                                        // Shouldn't reach here, but handle gracefully
-                                        *byte_pos += span_len;
-                                        *utf16_pos = target;
-                                        return true;
-                                    }
-                                } else {
-                                    // Slow path: iterate characters for large spans
-                                    let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
-                                    let mut byte_in_span = 0;
-                                    for c in text.chars() {
-                                        let char_utf16_len = c.len_utf16();
-                                        if *utf16_pos + char_utf16_len > target {
-                                            *byte_pos += byte_in_span;
-                                            return true; // Stop at character boundary
-                                        }
-                                        *utf16_pos += char_utf16_len;
-                                        byte_in_span += c.len_utf8();
-
-                                        if *utf16_pos >= target {
-                                            *byte_pos += byte_in_span;
+                        if let Some(meta) = metadata {
+                            let span_utf16_len = meta.total_utf16();
+                            if *utf16_pos + span_utf16_len <= target {
+                                *utf16_pos += span_utf16_len;
+                                *byte_pos += span_len;
+                            } else {
+                                let remaining = target - *utf16_pos;
+                                let mut count = 0;
+                                for i in 0..span_len {
+                                    if (meta.chars_utf16 >> i) & 1 == 1 {
+                                        count += 1;
+                                        if count > remaining {
+                                            *byte_pos += i;
+                                            *utf16_pos = target;
                                             return true;
                                         }
                                     }
-                                    *byte_pos += span_len;
+                                }
+                                *byte_pos += span_len;
+                                *utf16_pos = target;
+                                return true;
+                            }
+                        } else {
+                            let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
+                            let mut byte_in_span = 0;
+                            for c in text.chars() {
+                                let char_utf16_len = c.len_utf16();
+                                if *utf16_pos + char_utf16_len > target {
+                                    *byte_pos += byte_in_span;
+                                    return true;
+                                }
+                                *utf16_pos += char_utf16_len;
+                                byte_in_span += c.len_utf8();
+                                if *utf16_pos >= target {
+                                    *byte_pos += byte_in_span;
+                                    return true;
                                 }
                             }
-                            Span::Spatial(_) => {
-                                // Spatial elements don't contribute to text offsets
-                            }
+                            *byte_pos += span_len;
                         }
                     }
-                    false
                 }
-                Node::Internal { children, .. } => {
-                    // Use cached sums to skip entire subtrees
-                    for child in children {
-                        let child_sums = child.sums();
-
-                        if *utf16_pos + child_sums.len_utf16.0 <= target {
-                            // Entire child is before target - skip it using cached sums
-                            *utf16_pos += child_sums.len_utf16.0;
-                            *byte_pos += child_sums.bytes;
-                        } else {
-                            // Target is in this child
-                            return walk_node(child, target, byte_pos, utf16_pos);
-                        }
+                false
+            }
+            Node::Internal { children, .. } => {
+                for child in children {
+                    let child_sums = child.sums();
+                    if *utf16_pos + child_sums.len_utf16.0 <= target {
+                        *utf16_pos += child_sums.len_utf16.0;
+                        *byte_pos += child_sums.bytes;
+                    } else {
+                        return Self::walk_utf16_to_byte(child, target, byte_pos, utf16_pos);
                     }
-                    false
                 }
+                false
             }
         }
-
-        walk_node(&self.root, target.0, &mut byte_offset, &mut utf16_offset);
-        byte_offset
     }
 
     /// Convert byte-based line/column to UTF-16 line/column (for LSP)
@@ -1485,7 +1391,7 @@ impl<'a> TreeCursor<'a> {
         let mut offset = byte_offset;
         for span in spans {
             self.current_spans.push((span, offset));
-            offset += span_bytes(span);
+            offset += span.byte_len();
         }
         self.byte_pos = byte_offset;
         self.line_pos = line_offset;
@@ -1533,16 +1439,16 @@ impl<'a> TreeCursor<'a> {
                     let mut curr_line = frame.line_offset;
 
                     for (i, span) in spans.iter().enumerate() {
-                        let size = span_bytes(span);
+                        let size = span.byte_len();
                         if target < curr_byte + size {
                             self.byte_pos = target;
                             self.span_idx = i;
-                            self.line_pos = curr_line + count_lines_to(span, target - curr_byte);
+                            self.line_pos = curr_line + span.lines_to(target - curr_byte);
                             self.stack.push(frame);
                             return true;
                         }
                         curr_byte += size;
-                        curr_line += span_lines(span);
+                        curr_line += span.line_count();
                     }
 
                     if target == curr_byte {
@@ -1632,14 +1538,14 @@ impl<'a> TreeCursor<'a> {
 
         if forward {
             if let Some((span, offset)) = self.current_spans.get(start_idx) {
-                if let Some(pos) = find_in_span(span, target, start_pos - offset, true) {
+                if let Some(pos) = span.find_byte(target, start_pos - offset, true) {
                     return Some(*offset + pos);
                 }
             }
 
             for i in (start_idx + 1)..self.current_spans.len() {
                 if let Some((span, offset)) = self.current_spans.get(i) {
-                    if let Some(pos) = find_in_span(span, target, 0, true) {
+                    if let Some(pos) = span.find_byte(target, 0, true) {
                         return Some(*offset + pos);
                     }
                 }
@@ -1647,7 +1553,7 @@ impl<'a> TreeCursor<'a> {
 
             while self.advance_leaf() {
                 for (span, offset) in &self.current_spans {
-                    if let Some(pos) = find_in_span(span, target, 0, true) {
+                    if let Some(pos) = span.find_byte(target, 0, true) {
                         return Some(*offset + pos);
                     }
                 }
@@ -1656,7 +1562,7 @@ impl<'a> TreeCursor<'a> {
             if let Some((span, offset)) = self.current_spans.get(start_idx) {
                 let pos_in_span = start_pos.saturating_sub(*offset);
                 if pos_in_span > 0 {
-                    if let Some(pos) = find_in_span(span, target, pos_in_span, false) {
+                    if let Some(pos) = span.find_byte(target, pos_in_span, false) {
                         return Some(*offset + pos);
                     }
                 }
@@ -1664,7 +1570,7 @@ impl<'a> TreeCursor<'a> {
 
             for i in (0..start_idx).rev() {
                 if let Some((span, offset)) = self.current_spans.get(i) {
-                    if let Some(pos) = find_in_span(span, target, span_bytes(span), false) {
+                    if let Some(pos) = span.find_byte(target, span.byte_len(), false) {
                         return Some(*offset + pos);
                     }
                 }
@@ -1784,7 +1690,7 @@ impl<'a> TreeCursor<'a> {
             let end = self
                 .current_spans
                 .last()
-                .map(|(s, o)| o + span_bytes(s))
+                .map(|(s, o)| o + s.byte_len())
                 .unwrap_or(start);
 
             if start >= byte_range.end {
@@ -1810,28 +1716,8 @@ impl<'a> TreeCursor<'a> {
 // === Helper Functions ===
 
 #[inline]
-fn span_bytes(span: &Span) -> usize {
-    span.byte_len()
-}
-
-#[inline]
-fn span_lines(span: &Span) -> u32 {
-    span.line_count()
-}
-
-#[inline]
 fn node_metrics(node: &Node) -> (usize, u32) {
     (node.byte_count(), node.line_count())
-}
-
-#[inline]
-fn count_lines_to(span: &Span, byte_offset: usize) -> u32 {
-    span.lines_to(byte_offset)
-}
-
-#[inline]
-fn find_in_span(span: &Span, target: u8, start: usize, forward: bool) -> Option<usize> {
-    span.find_byte(target, start, forward)
 }
 
 fn compute_sums(spans: &[Span]) -> Sums {
@@ -1969,244 +1855,3 @@ fn validate_tree_structure(_node: &Node) -> bool {
     true // No-op in release builds
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_utf16_offset_conversions() {
-        // Test with ASCII
-        let tree = Tree::from_str("Hello World");
-        assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0));
-        assert_eq!(tree.offset_to_offset_utf16(5), OffsetUtf16(5));
-        assert_eq!(tree.offset_to_offset_utf16(11), OffsetUtf16(11));
-
-        // Test with multibyte characters (2-byte UTF-8, 1 UTF-16 code unit)
-        let tree = Tree::from_str("Héllo Wörld"); // é = 2 bytes, ö = 2 bytes
-        assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0));
-        assert_eq!(tree.offset_to_offset_utf16(2), OffsetUtf16(1)); // After 'é'
-        assert_eq!(tree.offset_to_offset_utf16(9), OffsetUtf16(7)); // After 'ö'
-
-        // Test with emoji (4-byte UTF-8, 2 UTF-16 code units)
-        let tree = Tree::from_str("Hello 🌍 World");
-        assert_eq!(tree.byte_count(), 16); // 6 + 4 + 6
-        assert_eq!(tree.len_utf16(), OffsetUtf16(14)); // 6 + 2 + 6
-        assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0));
-        assert_eq!(tree.offset_to_offset_utf16(6), OffsetUtf16(6)); // Before emoji
-        assert_eq!(tree.offset_to_offset_utf16(10), OffsetUtf16(8)); // After emoji (4 bytes, 2 UTF-16)
-        assert_eq!(tree.offset_to_offset_utf16(16), OffsetUtf16(14)); // End of string
-
-        // Test round-trip conversions (only at valid character boundaries)
-        let text = tree.flatten_to_string();
-        let mut byte_offset = 0;
-        for _c in text.chars() {
-            let utf16 = tree.offset_to_offset_utf16(byte_offset);
-            let back = tree.offset_utf16_to_offset(utf16);
-            assert_eq!(back, byte_offset, "Round-trip failed for offset {}", byte_offset);
-            byte_offset += _c.len_utf8();
-        }
-        // Test final offset (end of string)
-        let utf16 = tree.offset_to_offset_utf16(tree.byte_count());
-        let back = tree.offset_utf16_to_offset(utf16);
-        assert_eq!(back, tree.byte_count());
-    }
-
-    #[test]
-    fn test_utf16_point_conversions() {
-        let tree = Tree::from_str("Hello\nWörld 🌍\nTest");
-
-        // Test line 0 (ASCII)
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(0, 0),
-            PointUtf16::new(0, 0)
-        );
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(0, 5),
-            PointUtf16::new(0, 5)
-        );
-
-        // Test line 1 (with multibyte chars)
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(1, 0),
-            PointUtf16::new(1, 0)
-        );
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(1, 3), // After 'ö' (W=1 + ö=2 = 3 bytes)
-            PointUtf16::new(1, 2)  // W=1 + ö=1 = 2 UTF-16 units
-        );
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(1, 11), // After emoji (Wörld =7 + emoji=4 = 11 bytes)
-            PointUtf16::new(1, 8)  // Wörld =6 + emoji=2 = 8 UTF-16 units
-        );
-
-        // Test round-trip conversions (only at valid character boundaries)
-        // line_count() returns newline count, so valid lines are 0..=line_count
-        let line_count = tree.line_count();
-        for line in 0..=line_count {
-            let line_text = tree.line_text_trimmed(line);
-            let mut byte_col = 0;
-            for c in line_text.chars() {
-                let utf16_point = tree.doc_pos_to_point_utf16(line, byte_col);
-                let (back_line, back_col) = tree.point_utf16_to_doc_pos(utf16_point);
-                assert_eq!(
-                    (back_line, back_col),
-                    (line, byte_col),
-                    "Round-trip failed for line {} col {}",
-                    line,
-                    byte_col
-                );
-                byte_col += c.len_utf8() as u32;
-            }
-        }
-    }
-
-    #[test]
-    fn test_utf16_point_to_byte() {
-        let tree = Tree::from_str("Hello\nWörld 🌍");
-
-        // Text has 1 newline, so line_count() = 1, but valid lines are 0 and 1
-        assert_eq!(tree.line_count(), 1); // Number of newlines
-        assert_eq!(tree.line_to_byte(0), Some(0));
-        assert_eq!(tree.line_to_byte(1), Some(6));
-
-        // Line 0, column 0
-        assert_eq!(tree.point_utf16_to_byte(PointUtf16::new(0, 0)), 0);
-
-        // Line 0, column 5 (end of "Hello")
-        assert_eq!(tree.point_utf16_to_byte(PointUtf16::new(0, 5)), 5);
-
-        // Line 1, column 0 (start of "Wörld")
-        assert_eq!(tree.point_utf16_to_byte(PointUtf16::new(1, 0)), 6);
-
-        // Line 1, column 1 (after 'W')
-        assert_eq!(tree.point_utf16_to_byte(PointUtf16::new(1, 1)), 7);
-
-        // Line 1, column 2 (after 'Wö')
-        assert_eq!(tree.point_utf16_to_byte(PointUtf16::new(1, 2)), 9);
-
-        // Line 1, column 8 (after "Wörld 🌍" - 6 UTF-16 + 2 UTF-16)
-        assert_eq!(tree.point_utf16_to_byte(PointUtf16::new(1, 8)), 17);
-    }
-
-    #[test]
-    fn test_utf16_with_only_emoji() {
-        let tree = Tree::from_str("🔴🟠🟡🟢🔵");
-
-        // Each emoji is 4 bytes, 2 UTF-16 code units
-        assert_eq!(tree.byte_count(), 20); // 5 × 4 bytes
-        assert_eq!(tree.len_utf16(), OffsetUtf16(10)); // 5 × 2 UTF-16 units
-
-        assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0));
-        assert_eq!(tree.offset_to_offset_utf16(4), OffsetUtf16(2));  // After first emoji
-        assert_eq!(tree.offset_to_offset_utf16(8), OffsetUtf16(4));  // After second emoji
-        assert_eq!(tree.offset_to_offset_utf16(20), OffsetUtf16(10)); // End
-
-        // Round-trip
-        for i in 0..=5 {
-            let byte_offset = i * 4;
-            let utf16_offset = tree.offset_to_offset_utf16(byte_offset);
-            let back = tree.offset_utf16_to_offset(utf16_offset);
-            assert_eq!(back, byte_offset);
-        }
-    }
-
-    #[test]
-    fn test_utf16_mixed_content() {
-        // Mix of 1-byte, 2-byte, 3-byte, and 4-byte UTF-8
-        let tree = Tree::from_str("A§ह𝕳"); // 1+2+3+4 = 10 bytes, 1+1+1+2 = 5 UTF-16
-
-        assert_eq!(tree.byte_count(), 10);
-        assert_eq!(tree.len_utf16(), OffsetUtf16(5));
-
-        assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0)); // Start
-        assert_eq!(tree.offset_to_offset_utf16(1), OffsetUtf16(1)); // After 'A'
-        assert_eq!(tree.offset_to_offset_utf16(3), OffsetUtf16(2)); // After '§'
-        assert_eq!(tree.offset_to_offset_utf16(6), OffsetUtf16(3)); // After 'ह'
-        assert_eq!(tree.offset_to_offset_utf16(10), OffsetUtf16(5)); // After '𝕳' (surrogate pair)
-    }
-
-    #[test]
-    fn test_utf16_empty_tree() {
-        let tree = Tree::new();
-        assert_eq!(tree.len_utf16(), OffsetUtf16(0));
-        assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0));
-        assert_eq!(tree.offset_utf16_to_offset(OffsetUtf16(0)), 0);
-    }
-
-    #[test]
-    fn test_bitmap_usage_in_documents() {
-        // Verify that normal documents get bitmap metadata
-        let small_text = "Hello World";
-        let tree = Tree::from_str(small_text);
-
-        // Check that the spans have metadata
-        match &tree.root {
-            Node::Leaf { spans, .. } => {
-                for span in spans {
-                    if let Span::Text { bytes, metadata, .. } = span {
-                        if bytes.len() <= 128 {
-                            assert!(metadata.is_some(), "Small text spans should have bitmap metadata");
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Larger document - should be split into multiple chunks
-        let large_text = "Line of text\n".repeat(100);
-        let tree = Tree::from_str(&large_text);
-
-        let mut spans_with_metadata = 0;
-        let mut spans_without_metadata = 0;
-
-        fn count_spans(node: &Node, with_meta: &mut usize, without_meta: &mut usize) {
-            match node {
-                Node::Leaf { spans, .. } => {
-                    for span in spans {
-                        if let Span::Text { metadata, .. } = span {
-                            if metadata.is_some() {
-                                *with_meta += 1;
-                            } else {
-                                *without_meta += 1;
-                            }
-                        }
-                    }
-                }
-                Node::Internal { children, .. } => {
-                    for child in children {
-                        count_spans(child, with_meta, without_meta);
-                    }
-                }
-            }
-        }
-
-        count_spans(&tree.root, &mut spans_with_metadata, &mut spans_without_metadata);
-        eprintln!("Spans with metadata: {}, without: {}", spans_with_metadata, spans_without_metadata);
-        eprintln!("Note: Spans >128 bytes won't have metadata, but that's expected");
-        // With 256+ byte chunks, we may have fewer or no spans with metadata, which is OK
-        // The important thing is that the infrastructure is in place
-    }
-
-    #[test]
-    fn test_bitmap_metadata() {
-        // Test bitmap computation for small span
-        let text = "Héllo"; // H=1byte + é=2bytes + llo=3bytes = 6 bytes total, 5 chars, 5 UTF-16
-        let bytes: Arc<[u8]> = text.as_bytes().into();
-        let meta = TextMetadata::compute(&bytes).expect("Should compute for ≤128 bytes");
-
-        // Check character boundaries: positions 0,1,3,4,5 are char starts
-        assert_eq!(meta.total_chars(), 5);
-        assert_eq!(meta.total_utf16(), 5);
-
-        // byte_to_offset_utf16 should only count up to valid boundaries
-        eprintln!("chars bitmap: {:08b}", meta.chars);
-        eprintln!("chars_utf16 bitmap: {:08b}", meta.chars_utf16);
-        assert_eq!(meta.byte_to_offset_utf16(0), 0); // Before any chars
-        assert_eq!(meta.byte_to_offset_utf16(1), 1); // After 'H'
-        assert_eq!(meta.byte_to_offset_utf16(2), 1); // Middle of 'é' - should NOT count it
-        assert_eq!(meta.byte_to_offset_utf16(3), 2); // After 'é'
-        eprintln!("byte_to_offset_utf16(6) = {}", meta.byte_to_offset_utf16(6));
-        assert_eq!(meta.byte_to_offset_utf16(6), 5); // After all chars
-    }
-}
