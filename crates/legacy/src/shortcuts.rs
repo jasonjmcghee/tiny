@@ -13,6 +13,8 @@ use std::collections::HashMap;
 pub enum ShortcutContext {
     /// File picker is active
     FilePicker,
+    /// Grep search is active
+    Grep,
     /// Editor is active (default)
     Editor,
     /// Global shortcuts (always active)
@@ -180,12 +182,22 @@ impl ShortcutRegistry {
         // Double-shift for file picker
         self.register(ShortcutContext::Editor, "shift shift", "file_picker.open");
 
+        // Cmd+Shift+F for grep search
+        self.register(ShortcutContext::Editor, "cmd+shift+f", "grep.open");
+
         // File picker shortcuts
         self.register(ShortcutContext::FilePicker, "escape", "file_picker.close");
         self.register(ShortcutContext::FilePicker, "enter", "file_picker.select");
         self.register(ShortcutContext::FilePicker, "up", "file_picker.move_up");
         self.register(ShortcutContext::FilePicker, "down", "file_picker.move_down");
         self.register(ShortcutContext::FilePicker, "backspace", "file_picker.backspace");
+
+        // Grep shortcuts
+        self.register(ShortcutContext::Grep, "escape", "grep.close");
+        self.register(ShortcutContext::Grep, "enter", "grep.select");
+        self.register(ShortcutContext::Grep, "up", "grep.move_up");
+        self.register(ShortcutContext::Grep, "down", "grep.move_down");
+        self.register(ShortcutContext::Grep, "backspace", "grep.backspace");
     }
 }
 

@@ -44,7 +44,8 @@ url = "2.5"  # URL parsing for LSP
 arboard = "3.4"  # Clipboard support
 pollster = "0.3"  # Async executor for main
 notify = "6"  # File watching for shader hot-reload
-regex = "1"  # Regex for file picker search
+regex = "1"  # Regex for grep search
+nucleo = "0.5.0"  # Fuzzy matching for file picker and grep
 ignore = "0.4"  # Fast directory traversal with gitignore support
 
 # Async runtime for LSP

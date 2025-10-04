@@ -12,8 +12,9 @@ use tiny_core::tree::{Point, Rect};
 use crate::scroll::Scrollable;
 use crate::coordinates::Viewport;
 use tiny_sdk::LogicalPixels;
+use nucleo::{Config, Nucleo, Utf32String};
 
-/// Simple file picker with regex-based search
+/// Simple file picker with fuzzy matching
 pub struct FilePickerPlugin {
     /// Whether the picker is visible
     pub visible: bool,
@@ -21,8 +22,8 @@ pub struct FilePickerPlugin {
     pub query: String,
     /// All files in the working directory (thread-safe)
     all_files: Arc<RwLock<Vec<PathBuf>>>,
-    /// Filtered files based on query
-    filtered_files: Vec<PathBuf>,
+    /// Filtered files based on query (with scores)
+    filtered_files: Vec<(PathBuf, u32)>,
     /// Selected index in filtered list
     selected_index: usize,
     /// Working directory
@@ -33,12 +34,22 @@ pub struct FilePickerPlugin {
     bounds: Rect,
     /// Cached width to keep picker size consistent while filtering
     cached_width: Option<f32>,
+    /// Nucleo matcher for fuzzy matching
+    matcher: Nucleo<PathBuf>,
 }
 
 impl FilePickerPlugin {
     pub fn new() -> Self {
         let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let all_files = Arc::new(RwLock::new(Vec::new()));
+
+        // Create nucleo matcher with default config
+        let matcher = Nucleo::new(
+            Config::DEFAULT,
+            Arc::new(|| {}), // no-op callback for now
+            None, // no thread pool limit
+            1, // one column (file path)
+        );
 
         // Spawn background thread to scan directory
         let all_files_clone = all_files.clone();
@@ -58,6 +69,7 @@ impl FilePickerPlugin {
             scroll_position: Point::default(),
             bounds: Rect::default(),
             cached_width: None,
+            matcher,
         }
     }
 
@@ -119,29 +131,36 @@ impl FilePickerPlugin {
         self.update_filtered_files();
     }
 
-    /// Update filtered files based on current query
+    /// Update filtered files based on current query using fuzzy matching
     fn update_filtered_files(&mut self) {
         let all_files = self.all_files.read();
 
         if self.query.is_empty() {
-            self.filtered_files = all_files.clone();
+            // Show all files without scores when no query
+            self.filtered_files = all_files.iter().map(|p| (p.clone(), 0)).collect();
         } else {
-            // Simple regex-based filtering with .* appended
-            let pattern = format!("{}.*", regex::escape(&self.query));
-            if let Ok(re) = regex::Regex::new(&pattern) {
-                self.filtered_files = all_files
-                    .iter()
-                    .filter(|path| {
-                        path.to_str()
-                            .map(|s| re.is_match(s))
-                            .unwrap_or(false)
+            // Use simple substring matching (nucleo is overkill for file picker)
+            let query_lower = self.query.to_lowercase();
+            let mut results: Vec<(PathBuf, u32)> = all_files
+                .iter()
+                .filter_map(|path| {
+                    path.to_str().and_then(|s| {
+                        let s_lower = s.to_lowercase();
+                        if s_lower.contains(&query_lower) {
+                            // Simple score: earlier match is better
+                            let score = (1000 - s_lower.find(&query_lower).unwrap_or(999)) as u32;
+                            Some((path.clone(), score))
+                        } else {
+                            None
+                        }
                     })
-                    .cloned()
-                    .collect();
-            } else {
-                // If regex is invalid, show all files
-                self.filtered_files = all_files.clone();
-            }
+                })
+                .collect();
+
+            // Sort by score (higher is better)
+            results.sort_by(|a, b| b.1.cmp(&a.1));
+
+            self.filtered_files = results;
         }
 
         // Reset selection to first item
@@ -188,7 +207,7 @@ impl FilePickerPlugin {
 
     /// Get the selected file path
     pub fn selected_file(&self) -> Option<&Path> {
-        self.filtered_files.get(self.selected_index).map(|p| p.as_path())
+        self.filtered_files.get(self.selected_index).map(|(p, _)| p.as_path())
     }
 
     /// Get display name for a path (relative to working dir)
@@ -322,7 +341,7 @@ impl FilePickerPlugin {
 
         const MAX_GLYPHS: usize = 3000; // Hard cap to prevent buffer overflow
 
-        for (idx, path) in visible_files.enumerate() {
+        for (idx, (path, _score)) in visible_files.enumerate() {
             // Safety check: stop if we've generated too many glyphs
             if glyphs.len() >= MAX_GLYPHS {
                 break;
@@ -472,7 +491,7 @@ impl Scrollable for FilePickerPlugin {
 
         // Calculate max path width from all files
         let mut max_width = 300.0f32;
-        for path in &self.filtered_files {
+        for (path, _score) in &self.filtered_files {
             let display_name = self.display_name(path);
             let path_width = (display_name.len() as f32) * viewport.metrics.space_width + PADDING * 2.0;
             max_width = max_width.max(path_width);

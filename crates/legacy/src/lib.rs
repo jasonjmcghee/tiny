@@ -14,6 +14,7 @@ pub mod coordinates; // Coordinate system abstraction
 pub mod diagnostics_manager;
 pub mod editor_logic;
 pub mod file_picker_plugin;
+pub mod grep_plugin;
 pub mod history;
 pub mod input;
 pub mod input_types;

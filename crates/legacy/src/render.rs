@@ -115,6 +115,7 @@ pub struct Renderer {
     pub diagnostics_plugin: Option<*mut diagnostics_plugin::DiagnosticsPlugin>,
     pub tab_bar_plugin: Option<*mut crate::tab_bar_plugin::TabBarPlugin>,
     pub file_picker_plugin: Option<*mut crate::file_picker_plugin::FilePickerPlugin>,
+    pub grep_plugin: Option<*mut crate::grep_plugin::GrepPlugin>,
     /// Editor widget bounds (where main text renders)
     pub editor_bounds: tiny_sdk::types::LayoutRect,
     /// Accumulated glyphs for batched rendering
@@ -129,6 +130,10 @@ pub struct Renderer {
     file_picker_glyphs: Vec<GlyphInstance>,
     /// File picker background rectangle
     file_picker_rects: Vec<tiny_sdk::types::RectInstance>,
+    /// Grep glyphs (rendered separately)
+    grep_glyphs: Vec<GlyphInstance>,
+    /// Grep background rectangle
+    grep_rects: Vec<tiny_sdk::types::RectInstance>,
 
     /// Dirty flags to track what needs regeneration
     glyphs_dirty: bool,
@@ -168,6 +173,7 @@ impl Renderer {
             diagnostics_plugin: None,
             tab_bar_plugin: None,
             file_picker_plugin: None,
+            grep_plugin: None,
             // Default editor bounds - updated in update_viewport
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
@@ -176,6 +182,8 @@ impl Renderer {
             tab_bar_rects: Vec::new(),
             file_picker_glyphs: Vec::new(),
             file_picker_rects: Vec::new(),
+            grep_glyphs: Vec::new(),
+            grep_rects: Vec::new(),
             glyphs_dirty: true,
             line_numbers_dirty: true,
             ui_dirty: true,
@@ -456,6 +464,10 @@ impl Renderer {
         self.file_picker_plugin = Some(plugin as *mut _);
     }
 
+    pub fn set_grep_plugin(&mut self, plugin: &mut crate::grep_plugin::GrepPlugin) {
+        self.grep_plugin = Some(plugin as *mut _);
+    }
+
     /// Mark UI as dirty (call when tabs change, file picker opens, etc.)
     pub fn mark_ui_dirty(&mut self) {
         self.ui_dirty = true;
@@ -640,6 +652,10 @@ impl Renderer {
 
                 self.file_picker_glyphs.clear();
                 self.collect_file_picker_glyphs();
+
+                self.grep_glyphs.clear();
+                self.collect_grep_glyphs();
+
                 self.ui_dirty = false;
             }
 
@@ -721,6 +737,29 @@ impl Renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_line_number_glyphs(pass, &self.file_picker_glyphs);
+                    }
+                }
+            }
+
+            // === DRAW GREP OVERLAY (on top of everything) ===
+            // Render background first
+            if !self.grep_rects.is_empty() {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        gpu_renderer.draw_rects(pass, &self.grep_rects, scale);
+                    }
+                }
+            }
+
+            // Then render text on top of background
+            if !self.grep_glyphs.is_empty() {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
+                        gpu_renderer.draw_line_number_glyphs(pass, &self.grep_glyphs);
                     }
                 }
             }
@@ -947,7 +986,8 @@ impl Renderer {
             self.tab_bar_glyphs = collector.glyphs;
 
             // Collect background rectangles
-            let mut rects = plugin.collect_rects(tab_manager);
+            let viewport_width = self.viewport.logical_size.width.0;
+            let mut rects = plugin.collect_rects(tab_manager, viewport_width);
             // Transform rects to screen coordinates
             for rect in &mut rects {
                 rect.rect.x.0 += tab_bar_bounds.x.0;
@@ -994,6 +1034,46 @@ impl Renderer {
 
             plugin.collect_glyphs(&mut collector);
             self.file_picker_glyphs = collector.glyphs;
+        }
+    }
+
+    fn collect_grep_glyphs(&mut self) {
+        if let Some(plugin_ptr) = self.grep_plugin {
+            let plugin = unsafe { &*plugin_ptr };
+
+            if !plugin.visible {
+                self.grep_glyphs.clear();
+                self.grep_rects.clear();
+                return;
+            }
+
+            let bounds = plugin.get_bounds();
+
+            const GREP_BG: u32 = 0x1A1A1AF2;
+
+            let bg_rect = tiny_sdk::types::RectInstance {
+                rect: bounds,
+                color: GREP_BG,
+            };
+
+            self.grep_rects = vec![bg_rect];
+
+            let scroll = plugin.get_scroll();
+            let widget_viewport = tiny_sdk::types::WidgetViewport {
+                bounds,
+                scroll: tiny_sdk::types::LayoutPos::new(scroll.x.0, scroll.y.0),
+                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                widget_id: 12,
+            };
+
+            let mut collector = GlyphCollector::new(
+                self.viewport.to_viewport_info(),
+                &self.service_registry,
+                widget_viewport,
+            );
+
+            plugin.collect_glyphs(&mut collector);
+            self.grep_glyphs = collector.glyphs;
         }
     }
 

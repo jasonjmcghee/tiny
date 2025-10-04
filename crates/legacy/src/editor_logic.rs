@@ -1,5 +1,5 @@
 use crate::{
-    coordinates, file_picker_plugin, history,
+    coordinates, file_picker_plugin, grep_plugin, history,
     input::{self, InputAction},
     io, syntax, tab_bar_plugin, tab_manager,
     text_editor_plugin::TextEditorPlugin,
@@ -18,6 +18,8 @@ pub struct EditorLogic {
     pub tab_bar: tab_bar_plugin::TabBarPlugin,
     /// File picker plugin for opening files (global UI)
     pub file_picker: file_picker_plugin::FilePickerPlugin,
+    /// Grep plugin for full codebase search (global UI)
+    pub grep: grep_plugin::GrepPlugin,
     /// Flag to indicate widgets need updating
     widgets_dirty: bool,
     /// Extra text style providers (e.g., for effects)
@@ -82,7 +84,7 @@ impl EditorLogic {
         // Check close button
         else if let Some(tab_idx) =
             self.tab_bar
-                .hit_test_close_button(click_x, click_y, &self.tab_manager)
+                .hit_test_close_button(click_x, click_y, &self.tab_manager, viewport_width)
         {
             let was_last = self.tab_manager.close_tab(tab_idx);
             if was_last {
@@ -95,10 +97,14 @@ impl EditorLogic {
         // Check tab click
         else if let Some(tab_idx) = self
             .tab_bar
-            .hit_test_tab(click_x, click_y, &self.tab_manager)
+            .hit_test_tab(click_x, click_y, &self.tab_manager, viewport_width)
         {
             self.tab_manager.switch_to(tab_idx);
             self.tab_bar.close_dropdown();
+
+            // Ensure the active tab is visible
+            let num_tabs = self.tab_manager.tabs().len();
+            self.tab_bar.scroll_to_tab(tab_idx, viewport_width, num_tabs);
             self.ui_changed = true;
 
             // Trigger syntax highlighting for newly active tab
@@ -284,46 +290,14 @@ impl EditorLogic {
                     location.file_path, location.position.line, location.position.column
                 );
 
-                // Store location for conversion after file is opened
-                let location_utf16 = location.clone();
-
-                // Canonicalize path to ensure it matches existing tabs
-                let canonical_path = std::fs::canonicalize(&location.file_path)
-                    .unwrap_or_else(|_| location.file_path.clone());
-
-                // Open file first (will switch to existing tab if already open)
-                if let Ok(_) = self.tab_manager.open_file(canonical_path) {
-                    // Now convert UTF-16 position to byte-based DocPos using the opened file's Tree
-                    let (line, byte_column) = {
-                        let tab = self.tab_manager.active_tab().expect("No active tab");
-                        let tree = tab.plugin.doc.read();
-                        let utf16_point = tiny_tree::PointUtf16::new(
-                            location_utf16.position.line as u32,
-                            location_utf16.position.column as u32,
-                        );
-                        let result = tree.point_utf16_to_doc_pos(utf16_point);
-                        eprintln!(
-                            "DEBUG: Converted UTF-16 ({}, {}) to byte-based ({}, {})",
-                            location_utf16.position.line,
-                            location_utf16.position.column,
-                            result.0,
-                            result.1
-                        );
-                        result
-                    };
-
-                    // Set cursor to the converted position
-                    let plugin = self.active_plugin_mut();
-                    plugin.input.set_cursor(tiny_sdk::DocPos {
-                        line,
-                        column: byte_column,
-                        byte_offset: 0,
-                    });
-                    self.ui_changed = true;
-                    self.cursor_needs_centering = true;
+                // Use the unified jump_to_location_utf16 method
+                if self.jump_to_location_utf16(
+                    location.file_path.clone(),
+                    location.position.line as u32,
+                    location.position.column as u32,
+                    true, // center on screen
+                ) {
                     cursor_moved = true;
-                } else {
-                    eprintln!("DEBUG: Failed to open file!");
                 }
             }
         }
@@ -414,6 +388,78 @@ impl EditorLogic {
         let plugin = self.active_plugin_mut();
         plugin.input.set_cursor(location.position);
         self.ui_changed = true;
+        true
+    }
+
+    /// Jump to a specific location (file path + line + column in UTF-8)
+    /// This is the unified method for goto_definition, grep results, etc.
+    /// Returns true if successful, false if file couldn't be opened
+    pub fn jump_to_location(&mut self, file_path: PathBuf, line: usize, column: usize, center: bool) -> bool {
+        // Record current location before jumping
+        self.record_navigation();
+
+        // Canonicalize path to ensure it matches existing tabs
+        let canonical_path = std::fs::canonicalize(&file_path)
+            .unwrap_or_else(|_| file_path.clone());
+
+        // Open file (will switch to existing tab if already open)
+        if let Err(e) = self.tab_manager.open_file(canonical_path) {
+            eprintln!("Failed to open file for jump_to_location: {}", e);
+            return false;
+        }
+
+        // Set cursor to the position (already in UTF-8 doc coords)
+        let plugin = self.active_plugin_mut();
+        plugin.input.set_cursor(tiny_sdk::DocPos {
+            line: line as u32,
+            column: column as u32,
+            byte_offset: 0,
+        });
+
+        self.ui_changed = true;
+        if center {
+            self.cursor_needs_centering = true;
+        }
+
+        true
+    }
+
+    /// Jump to a location specified in UTF-16 coordinates (for LSP)
+    pub fn jump_to_location_utf16(&mut self, file_path: PathBuf, line_utf16: u32, column_utf16: u32, center: bool) -> bool {
+        // Record current location before jumping
+        self.record_navigation();
+
+        // Canonicalize path to ensure it matches existing tabs
+        let canonical_path = std::fs::canonicalize(&file_path)
+            .unwrap_or_else(|_| file_path.clone());
+
+        // Open file (will switch to existing tab if already open)
+        if let Err(e) = self.tab_manager.open_file(canonical_path) {
+            eprintln!("Failed to open file for jump_to_location_utf16: {}", e);
+            return false;
+        }
+
+        // Convert UTF-16 position to byte-based DocPos
+        let (line, byte_column) = {
+            let tab = self.tab_manager.active_tab().expect("No active tab");
+            let tree = tab.plugin.doc.read();
+            let utf16_point = tiny_tree::PointUtf16::new(line_utf16, column_utf16);
+            tree.point_utf16_to_doc_pos(utf16_point)
+        };
+
+        // Set cursor to the converted position
+        let plugin = self.active_plugin_mut();
+        plugin.input.set_cursor(tiny_sdk::DocPos {
+            line: line as u32,
+            column: byte_column as u32,
+            byte_offset: 0,
+        });
+
+        self.ui_changed = true;
+        if center {
+            self.cursor_needs_centering = true;
+        }
+
         true
     }
 
@@ -533,11 +579,13 @@ impl EditorLogic {
         // Create global UI plugins
         let tab_bar = tab_bar_plugin::TabBarPlugin::new();
         let file_picker = file_picker_plugin::FilePickerPlugin::new();
+        let grep = grep_plugin::GrepPlugin::new();
 
         Self {
             tab_manager,
             tab_bar,
             file_picker,
+            grep,
             widgets_dirty: true,
             extra_text_styles: Vec::new(),
             pending_scroll: None,

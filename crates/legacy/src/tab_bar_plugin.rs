@@ -1,6 +1,9 @@
 //! Tab bar plugin - renders tabs at the top of the screen
 
+use crate::scroll::Scrollable;
 use crate::tab_manager::TabManager;
+use crate::coordinates::Viewport;
+use tiny_core::tree::{Point, Rect};
 use tiny_font::{create_glyph_instances, SharedFontSystem};
 use tiny_sdk::{
     Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
@@ -10,6 +13,12 @@ use tiny_sdk::types::{LayoutRect, RectInstance};
 
 /// Tab bar height in logical pixels
 pub const TAB_BAR_HEIGHT: f32 = 30.0;
+/// Minimum tab width in logical pixels
+const MIN_TAB_WIDTH: f32 = 120.0;
+/// Dropdown menu width
+const DROPDOWN_WIDTH: f32 = 200.0;
+/// Maximum dropdown height
+const MAX_DROPDOWN_HEIGHT: f32 = 300.0;
 
 /// Tab bar plugin that renders tabs
 pub struct TabBarPlugin {
@@ -19,6 +28,8 @@ pub struct TabBarPlugin {
     scroll_offset: f32,
     /// Whether the dropdown menu is open
     dropdown_open: bool,
+    /// Dropdown scroll offset
+    dropdown_scroll_offset: f32,
 }
 
 impl TabBarPlugin {
@@ -27,12 +38,58 @@ impl TabBarPlugin {
             height: TAB_BAR_HEIGHT,
             scroll_offset: 0.0,
             dropdown_open: false,
+            dropdown_scroll_offset: 0.0,
         }
+    }
+
+    /// Calculate tab width based on viewport width and number of tabs
+    fn calculate_tab_width(&self, viewport_width: f32, num_tabs: usize) -> f32 {
+        if num_tabs == 0 {
+            return MIN_TAB_WIDTH;
+        }
+
+        // Reserve space for dropdown arrow (40px)
+        let available_width = viewport_width - 40.0;
+
+        // Calculate ideal width: 100%, 50%, 33%, 25% etc
+        let ideal_width = available_width / num_tabs as f32;
+
+        // Use minimum width if calculated width is too small
+        ideal_width.max(MIN_TAB_WIDTH)
+    }
+
+    /// Calculate total content width for all tabs
+    fn calculate_total_width(&self, viewport_width: f32, num_tabs: usize) -> f32 {
+        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
+        tab_width * num_tabs as f32 + 40.0 // Include dropdown arrow space
+    }
+
+    /// Ensure the active tab is visible by adjusting scroll offset
+    pub fn scroll_to_tab(&mut self, tab_index: usize, viewport_width: f32, num_tabs: usize) {
+        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
+        let tab_start = 10.0 + (tab_index as f32 * tab_width);
+        let tab_end = tab_start + tab_width;
+        let visible_width = viewport_width - 40.0; // Account for dropdown arrow
+
+        // If tab starts before visible area, scroll left to show it
+        if tab_start < self.scroll_offset {
+            self.scroll_offset = tab_start;
+        }
+        // If tab ends after visible area, scroll right to show it
+        else if tab_end > self.scroll_offset + visible_width {
+            self.scroll_offset = tab_end - visible_width;
+        }
+
+        // Clamp scroll offset
+        self.scroll_offset = self.scroll_offset.max(0.0);
     }
 
     /// Toggle dropdown menu
     pub fn toggle_dropdown(&mut self) {
         self.dropdown_open = !self.dropdown_open;
+        if self.dropdown_open {
+            self.dropdown_scroll_offset = 0.0;
+        }
     }
 
     /// Close dropdown menu
@@ -41,11 +98,12 @@ impl TabBarPlugin {
     }
 
     /// Collect background rectangles for tabs
-    pub fn collect_rects(&self, tab_manager: &TabManager) -> Vec<RectInstance> {
+    pub fn collect_rects(&self, tab_manager: &TabManager, viewport_width: f32) -> Vec<RectInstance> {
         let mut rects = Vec::new();
+        let num_tabs = tab_manager.tabs().len();
+        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
         let mut x_offset = 10.0 - self.scroll_offset;
 
-        const TAB_WIDTH: f32 = 150.0;
         const TAB_HEIGHT: f32 = 30.0;
 
         // Colors (RGBA as u32) - match main background: rgb(0.11, 0.12, 0.13)
@@ -57,12 +115,12 @@ impl TabBarPlugin {
             let is_active = idx == tab_manager.active_index();
 
             let tab_rect = RectInstance {
-                rect: LayoutRect::new(x_offset, 0.0, TAB_WIDTH, TAB_HEIGHT),
+                rect: LayoutRect::new(x_offset, 0.0, tab_width, TAB_HEIGHT),
                 color: if is_active { ACTIVE_TAB_BG } else { INACTIVE_TAB_BG },
             };
 
             rects.push(tab_rect);
-            x_offset += TAB_WIDTH;
+            x_offset += tab_width;
         }
 
         rects
@@ -99,10 +157,12 @@ impl TabBarPlugin {
         let bounds_y = collector.widget_viewport.as_ref().map(|w| w.bounds.y.0).unwrap_or(0.0);
         let viewport_width = collector.viewport.logical_size.width.0;
 
+        let num_tabs = tab_manager.tabs().len();
+        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
+
         let mut glyphs = Vec::new();
         let mut x_offset = 10.0 - self.scroll_offset;
 
-        const TAB_WIDTH: f32 = 150.0;
         const TAB_PADDING: f32 = 10.0;
         const CLOSE_BUTTON_WIDTH: f32 = 20.0;
 
@@ -110,27 +170,35 @@ impl TabBarPlugin {
         for (idx, tab) in tab_manager.tabs().iter().enumerate() {
             let is_active = idx == tab_manager.active_index();
 
+            // Calculate available space for text (tab width - padding - close button)
+            let text_width = tab_width - TAB_PADDING * 2.0 - CLOSE_BUTTON_WIDTH;
+            let max_chars = (text_width / (font_size * 0.6)) as usize; // Rough estimate
+
             // Tab text (truncate if too long)
             let mut display_name = tab.display_name.clone();
-            if display_name.len() > 18 {
-                display_name.truncate(15);
-                display_name.push_str("...");
-            }
 
             // Add modified indicator
             if tab.is_modified() {
                 display_name.push_str(" •");
             }
 
-            // Tab background indicator (using different token for active)
-            let tab_marker = if is_active { "▸" } else { " " };
-            let tab_text = format!("{} {}", tab_marker, display_name);
+            // Truncate if needed
+            if display_name.len() > max_chars {
+                let truncate_len = max_chars.saturating_sub(3);
+                display_name.truncate(truncate_len);
+                display_name.push_str("...");
+            }
 
-            let tab_pos = LayoutPos::new(x_offset + TAB_PADDING, 5.0); // Widget-local Y
+            // Calculate text width for centering (rough estimate: font_size * 0.6 per char)
+            let text_width = display_name.len() as f32 * font_size * 0.6;
+            let available_space = tab_width - CLOSE_BUTTON_WIDTH;
+            let text_x = x_offset + (available_space - text_width) / 2.0;
+
+            let tab_pos = LayoutPos::new(text_x, 5.0); // Widget-local Y
 
             let tab_glyphs = create_glyph_instances(
                 &font_service,
-                &tab_text,
+                &display_name,
                 tab_pos,
                 font_size,
                 scale_factor,
@@ -142,7 +210,7 @@ impl TabBarPlugin {
             glyphs.extend(tab_glyphs);
 
             // Close button "×" at the right side of each tab
-            let close_x = x_offset + TAB_WIDTH - CLOSE_BUTTON_WIDTH;
+            let close_x = x_offset + tab_width - CLOSE_BUTTON_WIDTH;
             let close_pos = LayoutPos::new(close_x, 5.0); // Widget-local Y
             let close_glyphs = create_glyph_instances(
                 &font_service,
@@ -157,7 +225,7 @@ impl TabBarPlugin {
 
             glyphs.extend(close_glyphs);
 
-            x_offset += TAB_WIDTH; // Move to next tab position
+            x_offset += tab_width; // Move to next tab position
         }
 
         // Dropdown arrow on the far right (always visible)
@@ -178,7 +246,16 @@ impl TabBarPlugin {
 
         // Render dropdown menu if open
         if self.dropdown_open {
+            let dropdown_start_y = self.height;
+
             for (idx, tab) in tab_manager.tabs().iter().enumerate() {
+                let item_y = dropdown_start_y + (idx as f32 * line_height) - self.dropdown_scroll_offset;
+
+                // Skip rendering if item is outside visible dropdown area
+                if item_y < dropdown_start_y || item_y > dropdown_start_y + MAX_DROPDOWN_HEIGHT {
+                    continue;
+                }
+
                 let is_active = idx == tab_manager.active_index();
 
                 let mut display_name = tab.display_name.clone();
@@ -189,8 +266,7 @@ impl TabBarPlugin {
                 let marker = if is_active { "▸ " } else { "  " };
                 let dropdown_text = format!("{}{}", marker, display_name);
 
-                let dropdown_item_y = self.height + (idx as f32 * line_height); // Widget-local Y
-                let dropdown_item_pos = LayoutPos::new(dropdown_x - 150.0, dropdown_item_y);
+                let dropdown_item_pos = LayoutPos::new(dropdown_x - DROPDOWN_WIDTH + 10.0, item_y);
 
                 let dropdown_item_glyphs = create_glyph_instances(
                     &font_service,
@@ -207,7 +283,7 @@ impl TabBarPlugin {
 
                 // Close button for dropdown items
                 let close_dropdown_x = dropdown_x - 20.0;
-                let close_dropdown_pos = LayoutPos::new(close_dropdown_x, dropdown_item_y);
+                let close_dropdown_pos = LayoutPos::new(close_dropdown_x, item_y);
                 let close_dropdown_glyphs = create_glyph_instances(
                     &font_service,
                     "×",
@@ -235,40 +311,42 @@ impl TabBarPlugin {
     }
 
     /// Check if a click at the given position hits a tab
-    pub fn hit_test_tab(&self, x: f32, y: f32, tab_manager: &TabManager) -> Option<usize> {
+    pub fn hit_test_tab(&self, x: f32, y: f32, tab_manager: &TabManager, viewport_width: f32) -> Option<usize> {
         if y > self.height {
             return None;
         }
 
-        const TAB_WIDTH: f32 = 150.0;
+        let num_tabs = tab_manager.tabs().len();
+        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
         let mut tab_x = 10.0 - self.scroll_offset;
 
-        for idx in 0..tab_manager.tabs().len() {
-            if x >= tab_x && x < tab_x + TAB_WIDTH {
+        for idx in 0..num_tabs {
+            if x >= tab_x && x < tab_x + tab_width {
                 return Some(idx);
             }
-            tab_x += TAB_WIDTH;
+            tab_x += tab_width;
         }
 
         None
     }
 
     /// Check if a click at the given position hits a close button
-    pub fn hit_test_close_button(&self, x: f32, y: f32, tab_manager: &TabManager) -> Option<usize> {
+    pub fn hit_test_close_button(&self, x: f32, y: f32, tab_manager: &TabManager, viewport_width: f32) -> Option<usize> {
         if y > self.height {
             return None;
         }
 
-        const TAB_WIDTH: f32 = 150.0;
+        let num_tabs = tab_manager.tabs().len();
+        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
         const CLOSE_BUTTON_WIDTH: f32 = 20.0;
         let mut tab_x = 10.0 - self.scroll_offset;
 
-        for idx in 0..tab_manager.tabs().len() {
-            let close_x = tab_x + TAB_WIDTH - CLOSE_BUTTON_WIDTH;
+        for idx in 0..num_tabs {
+            let close_x = tab_x + tab_width - CLOSE_BUTTON_WIDTH;
             if x >= close_x && x < close_x + CLOSE_BUTTON_WIDTH {
                 return Some(idx);
             }
-            tab_x += TAB_WIDTH;
+            tab_x += tab_width;
         }
 
         None
@@ -326,5 +404,32 @@ impl Paintable for TabBarPlugin {
 
     fn z_index(&self) -> i32 {
         500 // Render above editor content but below file picker
+    }
+}
+
+impl Scrollable for TabBarPlugin {
+    fn get_scroll(&self) -> Point {
+        LayoutPos::new(self.scroll_offset, 0.0)
+    }
+
+    fn set_scroll(&mut self, scroll: Point) {
+        self.scroll_offset = scroll.x.0.max(0.0);
+    }
+
+    fn handle_scroll(&mut self, delta: Point, _viewport: &Viewport, _widget_bounds: Rect) -> bool {
+        // For horizontal scrolling in tab bar
+        let new_offset = self.scroll_offset - delta.x.0;
+
+        // Clamp to positive values (max scroll will be handled by scroll_to_tab)
+        self.scroll_offset = new_offset.max(0.0);
+
+        true // Consumed the scroll event
+    }
+
+    fn get_content_bounds(&self, viewport: &Viewport) -> Rect {
+        let viewport_width = viewport.logical_size.width.0;
+        // Return bounds representing scrollable content
+        // This is approximate since we don't have tab count here
+        LayoutRect::new(0.0, 0.0, viewport_width * 2.0, self.height)
     }
 }

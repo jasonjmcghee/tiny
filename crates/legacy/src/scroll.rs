@@ -24,6 +24,7 @@ pub trait Scrollable {
 pub enum WidgetId {
     Editor,
     FilePicker,
+    Grep,
     TabBar,
     Diagnostics,
     // Add more as needed

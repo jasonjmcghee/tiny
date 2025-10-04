@@ -75,7 +75,18 @@ pub fn handle_window_event(
                 return false;
             }
 
-            // Convert key to trigger
+            // Get the original character for insertion (preserves case and symbols)
+            let original_char = if let Key::Character(ch) = &key_event.logical_key {
+                if ch.len() == 1 {
+                    Some(ch.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Convert key to trigger (normalized for shortcut matching)
             if let Some(trigger) = convert_key(&key_event.logical_key) {
                 // Try to match shortcut
                 let events = shortcuts.match_input(current_modifiers, &trigger);
@@ -89,16 +100,16 @@ pub fn handle_window_event(
                 }
 
                 // If no shortcut matched, check for plain character insertion
-                if let Trigger::Char(ch) = &trigger {
+                if let Some(original) = original_char {
                     if !current_modifiers.cmd
                         && !current_modifiers.ctrl
                         && !current_modifiers.alt
-                        && !ch.chars().any(|c| c.is_control())
+                        && !original.chars().any(|c| c.is_control())
                     {
-                        // Plain character - emit insert event
+                        // Plain character - emit insert event with ORIGINAL character (preserves shift)
                         bus.emit(
                             "editor.insert_char",
-                            json!({ "char": ch }),
+                            json!({ "char": original }),
                             10,
                             "winit",
                         );

@@ -219,6 +219,15 @@ impl TinyApp {
                 ));
             }
 
+            // Grep (overlay, high z-index)
+            if self.editor.grep.visible {
+                widget_bounds.push((
+                    WidgetId::Grep,
+                    self.editor.grep.get_bounds(),
+                    1000, // z-index
+                ));
+            }
+
             // Editor (full screen, low z-index)
             if let Some(cpu_renderer) = &self.cpu_renderer {
                 widget_bounds.push((WidgetId::Editor, cpu_renderer.editor_bounds, 0));
@@ -421,6 +430,13 @@ impl TinyApp {
                     self.editor
                         .file_picker
                         .handle_scroll(scroll_delta, viewport, picker_bounds);
+                }
+                Some(WidgetId::Grep) => {
+                    // Route to grep with its bounds
+                    let grep_bounds = self.editor.grep.get_bounds();
+                    self.editor
+                        .grep
+                        .handle_scroll(scroll_delta, viewport, grep_bounds);
                 }
                 Some(WidgetId::Editor) | None => {
                     // Route to active editor tab with editor bounds
@@ -784,6 +800,55 @@ impl TinyApp {
                     self.request_redraw();
                 }
 
+                // Grep events
+                "grep.open" => {
+                    // Start with empty search - user will type the query
+                    self.editor.grep.show(String::new());
+                    self.editor.ui_changed = true;
+                    self.shortcuts.set_context(ShortcutContext::Grep);
+                    self.scroll_focus.set_focus(crate::scroll::WidgetId::Grep);
+                    self.request_redraw();
+                }
+                "grep.close" => {
+                    self.editor.grep.hide();
+                    self.editor.ui_changed = true;
+                    self.shortcuts.set_context(ShortcutContext::Editor);
+                    self.scroll_focus.clear_focus();
+                    self.request_redraw();
+                }
+                "grep.select" => {
+                    if let Some(result) = self.editor.grep.selected_result() {
+                        let file_path = result.file_path.clone();
+                        let line = result.line_number.saturating_sub(1); // Convert to 0-indexed
+                        let column = result.column;
+
+                        self.editor.grep.hide();
+                        self.shortcuts.set_context(ShortcutContext::Editor);
+                        self.scroll_focus.clear_focus();
+
+                        // Jump to the location
+                        if self.editor.jump_to_location(file_path, line, column, true) {
+                            self.cursor_needs_scroll = true;
+                        }
+                        self.request_redraw();
+                    }
+                }
+                "grep.move_up" => {
+                    self.editor.grep.move_up();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                "grep.move_down" => {
+                    self.editor.grep.move_down();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                "grep.backspace" => {
+                    self.editor.grep.backspace();
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+
                 // Editor events - delegate to InputHandler
                 name if name.starts_with("editor.") => {
                     if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
@@ -916,6 +981,11 @@ impl TinyApp {
             self.editor
                 .file_picker
                 .calculate_bounds(&cpu_renderer.viewport);
+
+            // Update grep bounds based on viewport (overlay mode)
+            self.editor
+                .grep
+                .calculate_bounds(&cpu_renderer.viewport);
         }
 
         // Setup text styles
@@ -954,9 +1024,10 @@ impl TinyApp {
             // Set line numbers plugin with fresh document reference
             cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
 
-            // Set tab bar and file picker plugins (global UI)
+            // Set tab bar, file picker, and grep plugins (global UI)
             cpu_renderer.set_tab_bar_plugin(&mut self.editor.tab_bar);
             cpu_renderer.set_file_picker_plugin(&mut self.editor.file_picker);
+            cpu_renderer.set_grep_plugin(&mut self.editor.grep);
 
             // Mark renderer UI dirty if UI changed
             if self.editor.ui_changed {
@@ -1249,21 +1320,62 @@ impl ApplicationHandler for TinyApp {
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 use serde_json::json;
+                use winit::keyboard::Key;
 
-                // Only handle key presses
-                if key_event.state == ElementState::Pressed {
+                // Handle key releases for modifier sequences like "shift shift"
+                if key_event.state == ElementState::Released {
                     if let Some(trigger) = winit_adapter::convert_key(&key_event.logical_key) {
-                        // When the trigger itself is a modifier key, use empty modifiers
-                        // This allows sequences like "shift shift" to work correctly
-                        let effective_modifiers = match &trigger {
+                        let is_modifier_key = matches!(
+                            &trigger,
                             crate::accelerator::Trigger::Named(name)
-                                if name == "Shift" || name == "Ctrl" || name == "Alt" || name == "Cmd" => {
-                                Modifiers::default()
-                            }
-                            _ => self.modifiers.clone(),
-                        };
+                                if name == "Shift" || name == "Ctrl" || name == "Alt" || name == "Cmd"
+                        );
 
-                        let event_names = self.shortcuts.match_input(&effective_modifiers, &trigger);
+                        if is_modifier_key {
+                            // Feed modifier release to matcher for sequences like "shift shift"
+                            let event_names = self.shortcuts.match_input(&Modifiers::default(), &trigger);
+                            if !event_names.is_empty() {
+                                for event_name in event_names {
+                                    self.event_bus.emit(event_name, json!({}), 10, "shortcuts");
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Only handle key presses below
+                if key_event.state == ElementState::Pressed {
+                    // Capture original character BEFORE lowercasing (preserves shift for case/symbols)
+                    let original_char = if let Key::Character(ch) = &key_event.logical_key {
+                        if ch.len() == 1 {
+                            Some(ch.as_str())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(trigger) = winit_adapter::convert_key(&key_event.logical_key) {
+                        // Modifier keys as chords (for sequences like "shift shift") require
+                        // press+release. Only feed them to the matcher if this is a release event
+                        // (we'll track releases separately).
+                        // Regular keys with modifiers (like Cmd+Shift+F) are matched immediately.
+                        let is_modifier_key = matches!(
+                            &trigger,
+                            crate::accelerator::Trigger::Named(name)
+                                if name == "Shift" || name == "Ctrl" || name == "Alt" || name == "Cmd"
+                        );
+
+                        // For regular (non-modifier) keys, use current modifier state
+                        // For modifier keys themselves, we need to track release
+                        let event_names = if !is_modifier_key {
+                            self.shortcuts.match_input(&self.modifiers, &trigger)
+                        } else {
+                            // Skip modifier key presses - we'll handle them on release
+                            Vec::new()
+                        };
 
                         if !event_names.is_empty() {
                             // Shortcut matched - emit events
@@ -1272,22 +1384,30 @@ impl ApplicationHandler for TinyApp {
                             }
                         } else {
                             // No shortcut matched - check for plain character input
-                            match &trigger {
-                                crate::accelerator::Trigger::Char(ch) => {
-                                    // Plain character with no modifiers
-                                    if !self.modifiers.cmd
-                                        && !self.modifiers.ctrl
-                                        && !self.modifiers.alt
-                                    {
-                                        // Check context
-                                        if self.shortcuts.context() == ShortcutContext::FilePicker {
+                            if let Some(ch) = original_char {
+                                // Plain character with no cmd/ctrl/alt (shift is OK)
+                                if !self.modifiers.cmd
+                                    && !self.modifiers.ctrl
+                                    && !self.modifiers.alt
+                                {
+                                    // Check context
+                                    match self.shortcuts.context() {
+                                        ShortcutContext::FilePicker => {
                                             // Add character to file picker query
                                             if let Some(c) = ch.chars().next() {
                                                 self.editor.file_picker.add_char(c);
                                                 self.editor.ui_changed = true;
                                             }
-                                        } else {
-                                            // Insert character in editor
+                                        }
+                                        ShortcutContext::Grep => {
+                                            // Add character to grep filter query
+                                            if let Some(c) = ch.chars().next() {
+                                                self.editor.grep.add_char(c);
+                                                self.editor.ui_changed = true;
+                                            }
+                                        }
+                                        _ => {
+                                            // Insert character in editor (original preserves shift)
                                             self.event_bus.emit(
                                                 "editor.insert_char",
                                                 json!({ "char": ch }),
@@ -1297,7 +1417,6 @@ impl ApplicationHandler for TinyApp {
                                         }
                                     }
                                 }
-                                _ => {}
                             }
                         }
                     }
