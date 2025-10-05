@@ -341,9 +341,11 @@ impl DiagnosticsPlugin {
                 over_symbol: _,
                 line: prev_line,
                 column: prev_column,
-                ..
+                anchor_x: prev_anchor_x,
             } => {
-                if line != *prev_line || column != *prev_column {
+                let current_anchor_x = hovered_symbol.map(|s| s.start_x);
+                if line != *prev_line || column != *prev_column
+                    || current_anchor_x != Some(*prev_anchor_x) {
                     // Position changed, reset
                     if let Some(symbol) = hovered_symbol {
                         self.hover_state = HoverState::WaitingForDelay {
@@ -366,9 +368,11 @@ impl DiagnosticsPlugin {
             HoverState::RequestingHover {
                 line: prev_line,
                 column: prev_column,
-                ..
+                anchor_x: prev_anchor_x,
             } => {
-                if line != *prev_line || column != *prev_column || !over_symbol {
+                let current_anchor_x = hovered_symbol.map(|s| s.start_x);
+                if line != *prev_line || column != *prev_column || !over_symbol
+                    || current_anchor_x != Some(*prev_anchor_x) {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
@@ -386,9 +390,12 @@ impl DiagnosticsPlugin {
             HoverState::ShowingHover {
                 line: prev_line,
                 column: prev_column,
+                anchor_x: prev_anchor_x,
                 ..
             } => {
-                if line != *prev_line || column != *prev_column || !over_symbol {
+                let current_anchor_x = hovered_symbol.map(|s| s.start_x);
+                if line != *prev_line || column != *prev_column || !over_symbol
+                    || current_anchor_x != Some(*prev_anchor_x) {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
