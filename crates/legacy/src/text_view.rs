@@ -122,7 +122,7 @@ impl TextView {
     /// Update layout (shape text, build line cache)
     pub fn update_layout(&mut self, font_system: &SharedFontSystem) {
         let tree = self.doc.read();
-        self.renderer.update_layout(&tree, font_system, &self.viewport);
+        self.renderer.update_layout(&tree, font_system, &self.viewport, false);
         self.renderer.update_visible_range(&self.viewport, &tree);
     }
 

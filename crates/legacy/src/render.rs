@@ -740,7 +740,7 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
-                        let gpu_renderer = &*gpu;
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_rects(pass, &self.tab_bar_rects, scale);
                     }
                 }
@@ -768,7 +768,11 @@ impl Renderer {
                     if let Some(gpu) = self.gpu_renderer {
                         unsafe {
                             let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                            gpu_renderer.draw_ui_glyphs(pass, &self.line_number_glyphs, "line_numbers", Some((scissor_x, scissor_y, scissor_w, scissor_h)));
+                            gpu_renderer.draw_glyphs(pass, &self.line_number_glyphs, tiny_core::gpu::DrawConfig {
+                                buffer_name: "line_numbers",
+                                use_themed: true,
+                                scissor: Some((scissor_x, scissor_y, scissor_w, scissor_h)),
+                            });
                         }
                     }
                 }
@@ -793,7 +797,11 @@ impl Renderer {
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_ui_glyphs(pass, &self.tab_bar_glyphs, "tab_bar", Some((scissor_x, scissor_y, scissor_w, scissor_h)));
+                        gpu_renderer.draw_glyphs(pass, &self.tab_bar_glyphs, tiny_core::gpu::DrawConfig {
+                            buffer_name: "tab_bar",
+                            use_themed: true,
+                            scissor: Some((scissor_x, scissor_y, scissor_w, scissor_h)),
+                        });
                     }
                 }
             }
@@ -804,7 +812,7 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
-                        let gpu_renderer = &*gpu;
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_rounded_rects(pass, &[rounded_rect], scale);
                     }
                 }
@@ -814,7 +822,7 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
-                        let gpu_renderer = &*gpu;
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_rects(pass, &self.file_picker_rects, scale);
                     }
                 }
@@ -824,7 +832,7 @@ impl Renderer {
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_ui_glyphs_batched(pass, &self.file_picker_glyphs, "file_picker");
+                        gpu_renderer.draw_glyphs_batched(pass, &self.file_picker_glyphs, "file_picker", true);
                     }
                 }
             }
@@ -835,7 +843,7 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
-                        let gpu_renderer = &*gpu;
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_rounded_rects(pass, &[rounded_rect], scale);
                     }
                 }
@@ -845,7 +853,7 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
-                        let gpu_renderer = &*gpu;
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_rects(pass, &self.grep_rects, scale);
                     }
                 }
@@ -855,7 +863,7 @@ impl Renderer {
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_ui_glyphs_batched(pass, &self.grep_glyphs, "grep");
+                        gpu_renderer.draw_glyphs_batched(pass, &self.grep_glyphs, "grep", true);
                     }
                 }
             }
@@ -885,13 +893,8 @@ impl Renderer {
 
         if let Some(font_system) = &self.font_system {
             // Force layout update if layout is marked dirty (e.g., after font size change)
-            if self.layout_dirty {
-                self.text_renderer
-                    .update_layout_internal(tree, font_system, &self.viewport, true);
-            } else {
-                self.text_renderer
-                    .update_layout(tree, font_system, &self.viewport);
-            }
+            self.text_renderer
+                .update_layout(tree, font_system, &self.viewport, self.layout_dirty);
         }
 
         if let Some(ref highlighter) = self.syntax_highlighter {
@@ -1208,12 +1211,13 @@ impl Renderer {
                     gpu_mut.upload_style_buffer_u32(&style_buffer);
                 }
 
-                let use_styled =
-                    self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
-                // println!("Drawing ALL {} glyphs in one batch (styled={})",
-                // self.accumulated_glyphs.len(), use_styled);
+                let use_themed = self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
 
-                gpu_mut.draw_glyphs_styled(pass, &self.accumulated_glyphs, use_styled);
+                gpu_mut.draw_glyphs(pass, &self.accumulated_glyphs, tiny_core::gpu::DrawConfig {
+                    buffer_name: "main_text",
+                    use_themed,
+                    scissor: None, // Scissor already set by caller
+                });
             }
         }
     }

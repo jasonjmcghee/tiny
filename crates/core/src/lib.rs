@@ -3,6 +3,7 @@
 pub mod gpu;
 // pub mod gpu_core;
 pub mod gpu_ffi;
+pub mod gpu_resources;
 pub mod plugin_loader;
 // pub mod orchestrator;
 

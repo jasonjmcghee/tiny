@@ -79,11 +79,6 @@ pub struct TextRenderer {
     pub gpu_style_buffer: Option<wgpu::Buffer>,
     /// Palette texture (256 colors, RGBA8)
     pub palette_texture: Option<wgpu::Texture>,
-
-    // === CACHE ===
-    /// Cached flattened text to avoid re-flattening on every layout update
-    cached_text: Option<std::sync::Arc<String>>,
-    cached_text_version: u64,
 }
 
 impl TextRenderer {
@@ -102,23 +97,12 @@ impl TextRenderer {
             visible_chars: Vec::new(),
             gpu_style_buffer: None,
             palette_texture: None,
-            cached_text: None,
-            cached_text_version: 0,
         }
     }
 
     /// Update layout cache when text changes
     /// Outputs glyphs in canonical (0,0)-relative positions
     pub fn update_layout(
-        &mut self,
-        tree: &Tree,
-        font_system: &tiny_font::SharedFontSystem,
-        viewport: &crate::coordinates::Viewport,
-    ) {
-        self.update_layout_internal(tree, font_system, viewport, false);
-    }
-
-    pub fn update_layout_internal(
         &mut self,
         tree: &Tree,
         font_system: &tiny_font::SharedFontSystem,
@@ -165,17 +149,9 @@ impl TextRenderer {
         self.layout_cache.clear();
         self.line_cache.clear();
 
-        // Use cached text if available and version matches
-        let text_arc = if self.cached_text_version == tree.version && self.cached_text.is_some() {
-            self.cached_text.clone().unwrap()
-        } else {
-            let new_text = tree.flatten_to_string();
-            self.cached_text = Some(new_text.clone());
-            self.cached_text_version = tree.version;
-            new_text
-        };
-
-        let text = text_arc.as_str();
+        // Get text from tree (tree handles caching internally)
+        let text = tree.flatten_to_string();
+        let text = text.as_str();
         let lines: Vec<&str> = text.lines().collect();
 
         let mut char_index = 0;
