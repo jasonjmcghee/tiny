@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_core::tree::{Doc, Point};
 use tiny_sdk::{
-    Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin,
-    PluginError, SetupContext, Updatable, UpdateContext,
+    Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
+    SetupContext, Updatable, UpdateContext,
 };
 
 /// The main text editor plugin - handles everything

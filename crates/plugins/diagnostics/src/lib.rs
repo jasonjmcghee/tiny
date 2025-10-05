@@ -15,8 +15,8 @@ use tiny_sdk::{
         VertexFormat,
     },
     types::RoundedRectInstance,
-    Capability, Configurable, Initializable, LayoutPos, Library, PaintContext,
-    Paintable, Plugin, PluginError, SetupContext, ViewportInfo,
+    Capability, Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
+    PluginError, SetupContext, ViewportInfo,
 };
 use tiny_ui::{TextView, Viewport};
 
@@ -531,8 +531,10 @@ impl DiagnosticsPlugin {
         popup_x = popup_x.max(widget_bounds.x.0 + 10.0);
 
         // Create viewport for TextView with proper metrics
-        let mut popup_viewport = Viewport::new(popup_width, popup_height, self.viewport.scale_factor);
-        popup_viewport.bounds = tiny_sdk::types::LayoutRect::new(popup_x, popup_y, popup_width, popup_height);
+        let mut popup_viewport =
+            Viewport::new(popup_width, popup_height, self.viewport.scale_factor);
+        popup_viewport.bounds =
+            tiny_sdk::types::LayoutRect::new(popup_x, popup_y, popup_width, popup_height);
         popup_viewport.set_font_size(self.viewport.font_size);
 
         // Create TextView
@@ -919,7 +921,13 @@ impl Paintable for DiagnosticsPlugin {
             };
 
             // Update popup view (creates TextView with rounded rect)
-            self.update_popup_view(&popup_text, popup_line, popup_col, ctx.widget_viewport.as_ref(), services);
+            self.update_popup_view(
+                &popup_text,
+                popup_line,
+                popup_col,
+                ctx.widget_viewport.as_ref(),
+                services,
+            );
 
             // Render popup using TextView and rounded rect
             if let Some(popup_view) = self.popup_view.read().unwrap().as_ref() {
@@ -927,8 +935,13 @@ impl Paintable for DiagnosticsPlugin {
                 if let Some(frame) = self.get_popup_frame() {
                     unsafe {
                         if !ctx.gpu_renderer.is_null() {
-                            let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
-                            gpu_renderer.draw_rounded_rects(render_pass, &[frame], self.viewport.scale_factor);
+                            let gpu_renderer =
+                                &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
+                            gpu_renderer.draw_rounded_rects(
+                                render_pass,
+                                &[frame],
+                                self.viewport.scale_factor,
+                            );
                         }
                     }
                 }
@@ -940,7 +953,8 @@ impl Paintable for DiagnosticsPlugin {
                     if !glyphs.is_empty() {
                         unsafe {
                             if !ctx.gpu_renderer.is_null() {
-                                let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
+                                let gpu_renderer =
+                                    &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
                                 gpu_renderer.draw_glyphs(
                                     render_pass,
                                     &glyphs,

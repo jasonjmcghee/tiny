@@ -30,7 +30,7 @@ lazy_static = "1.4"  # For global statics
 arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
 
 # LSP support
-tower-lsp = "0.20"  # LSP server framework
+lsp-server = "0.7"  # LSP client (official reference impl)
 lsp-types = "0.97"
 url = "2.5"  # URL parsing for LSP
 

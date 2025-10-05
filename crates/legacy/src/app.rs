@@ -3,11 +3,11 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
-    accelerator::{MouseButton, Modifiers, Trigger, WheelDirection},
+    accelerator::{Modifiers, MouseButton, Trigger, WheelDirection},
     input::{self, EventBus, InputAction},
     lsp_manager::LspManager,
     render::Renderer,
-    scroll::{Scrollable, ScrollFocusManager, WidgetId},
+    scroll::{ScrollFocusManager, Scrollable, WidgetId},
     shortcuts::{ShortcutContext, ShortcutRegistry},
     tab_manager::TabManager,
     winit_adapter,
@@ -32,10 +32,7 @@ use winit::{
 };
 
 // Plugin orchestration support
-use tiny_core::{
-    tree::Point,
-    GpuRenderer, Uniforms,
-};
+use tiny_core::{tree::Point, GpuRenderer, Uniforms};
 use tiny_sdk::{Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,10 +157,7 @@ pub struct TinyApp {
 }
 
 impl TinyApp {
-    fn physical_to_logical_point(
-        &self,
-        position: PhysicalPosition<f64>,
-    ) -> Option<Point> {
+    fn physical_to_logical_point(&self, position: PhysicalPosition<f64>) -> Option<Point> {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor() as f32;
         let logical_x = position.x as f32 / scale;
@@ -641,223 +635,145 @@ impl TinyApp {
         self._shader_watcher = Some(watcher);
     }
 
-    fn process_event_queue(&mut self) {
-        // Get all events sorted by priority
-        let events = self.event_bus.drain_sorted();
+    /// Helper for simple overlay show (file picker, grep, etc.)
+    fn show_overlay(&mut self, show: impl FnOnce(&mut EditorLogic), ctx: ShortcutContext, focus: WidgetId) {
+        show(&mut self.editor);
+        self.editor.ui_changed = true;
+        self.shortcuts.set_context(ctx);
+        self.scroll_focus.set_focus(focus);
+        self.request_redraw();
+    }
 
-        for event in events {
-            // Dispatch to appropriate handler based on event name
+    /// Helper for overlay hide
+    fn hide_overlay(&mut self, hide: impl FnOnce(&mut EditorLogic)) {
+        hide(&mut self.editor);
+        self.editor.ui_changed = true;
+        self.shortcuts.set_context(ShortcutContext::Editor);
+        self.scroll_focus.clear_focus();
+        self.request_redraw();
+    }
+
+    /// Helper for simple overlay actions (move up/down, backspace)
+    fn overlay_action(&mut self, action: impl FnOnce(&mut EditorLogic)) {
+        action(&mut self.editor);
+        self.editor.ui_changed = true;
+        self.request_redraw();
+    }
+
+    /// Helper for navigation with optional redraw
+    fn navigate(&mut self, nav: impl FnOnce(&mut EditorLogic) -> bool) {
+        if nav(&mut self.editor) {
+            self.request_redraw();
+            self.cursor_needs_scroll = true;
+        }
+    }
+
+    fn process_event_queue(&mut self) {
+        for event in self.event_bus.drain_sorted() {
+            use ShortcutContext::{Editor, FilePicker, Grep};
+            use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
+
             match event.name.as_str() {
-                // App-level events
-                "app.font_increase" => {
-                    self.adjust_font_size(true);
-                }
-                "app.font_decrease" => {
-                    self.adjust_font_size(false);
-                }
+                // App-level
+                "app.font_increase" => self.adjust_font_size(true),
+                "app.font_decrease" => self.adjust_font_size(false),
                 "app.toggle_scroll_lock" => {
                     self.scroll_lock_enabled = !self.scroll_lock_enabled;
                     self.current_scroll_direction = None;
-                    println!(
-                        "Scroll lock: {}",
-                        if self.scroll_lock_enabled {
-                            "ENABLED"
-                        } else {
-                            "DISABLED"
-                        }
-                    );
+                    println!("Scroll lock: {}", if self.scroll_lock_enabled { "ENABLED" } else { "DISABLED" });
                 }
 
                 // Mouse events
                 "mouse.press" => {
                     if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
                         let plugin = self.editor.active_plugin_mut();
-                        let action = plugin.input.handle_event(&event, &plugin.doc, &viewport);
-
-                        if action == InputAction::Redraw {
+                        if plugin.input.handle_event(&event, &plugin.doc, &viewport) == InputAction::Redraw {
                             self.request_redraw();
                             self.cursor_needs_scroll = true;
                         }
                     }
                 }
-                "mouse.release" => {
-                    self.editor.on_mouse_release();
-                }
+                "mouse.release" => self.editor.on_mouse_release(),
                 "mouse.drag" => {
                     if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
                         let plugin = self.editor.active_plugin_mut();
                         plugin.input.handle_event(&event, &plugin.doc, &viewport);
-
-                        // Check if InputHandler wants to scroll
                         if let Some((dx, dy)) = plugin.input.pending_scroll_delta.take() {
-                            self.event_bus.emit(
-                                "app.drag.scroll",
-                                json!({ "delta_x": dx, "delta_y": dy }),
-                                15,
-                                "mouse_drag",
-                            );
+                            self.event_bus.emit("app.drag.scroll", json!({ "delta_x": dx, "delta_y": dy }), 15, "mouse_drag");
                         }
-
                         self.request_redraw();
                     }
                 }
                 "app.drag.scroll" => {
-                    if let (Some(dx), Some(dy)) = (
-                        event.data.get("delta_x").and_then(|v| v.as_f64()),
-                        event.data.get("delta_y").and_then(|v| v.as_f64()),
-                    ) {
+                    if let (Some(dx), Some(dy)) = (event.data.get("delta_x").and_then(|v| v.as_f64()), event.data.get("delta_y").and_then(|v| v.as_f64())) {
                         let tab = self.editor.tab_manager.active_tab_mut();
                         tab.scroll_position.x.0 += dx as f32;
                         tab.scroll_position.y.0 += dy as f32;
-
-                        let doc = &tab.plugin.doc;
-                        let tree = doc.read();
-
                         if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                            let editor_bounds = cpu_renderer.editor_bounds;
+                            let (doc, editor_bounds) = (&tab.plugin.doc, cpu_renderer.editor_bounds);
                             cpu_renderer.viewport.scroll = tab.scroll_position;
-                            cpu_renderer
-                                .viewport
-                                .clamp_scroll_to_bounds(&tree, editor_bounds);
+                            cpu_renderer.viewport.clamp_scroll_to_bounds(&doc.read(), editor_bounds);
                             tab.scroll_position = cpu_renderer.viewport.scroll;
                             self.request_redraw();
                         }
                     }
                 }
 
-                // Navigation events
-                "navigation.goto_definition" => {
-                    self.editor.goto_definition();
-                    self.cursor_needs_scroll = true;
-                }
-                "navigation.back" => {
-                    if self.editor.navigate_back() {
-                        self.request_redraw();
-                        self.cursor_needs_scroll = true;
-                    }
-                }
-                "navigation.forward" => {
-                    if self.editor.navigate_forward() {
-                        self.request_redraw();
-                        self.cursor_needs_scroll = true;
-                    }
-                }
+                // Navigation
+                "navigation.goto_definition" => { self.editor.goto_definition(); self.cursor_needs_scroll = true; }
+                "navigation.back" => self.navigate(|e| e.navigate_back()),
+                "navigation.forward" => self.navigate(|e| e.navigate_forward()),
 
-                // Tab events
-                "tabs.close" => {
-                    self.editor.tab_manager.close_active_tab();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
+                // Tabs
+                "tabs.close" => { self.editor.tab_manager.close_active_tab(); self.editor.ui_changed = true; self.request_redraw(); }
 
-                // File picker events
-                "file_picker.open" => {
-                    self.editor.file_picker.show();
-                    self.editor.ui_changed = true;
-                    self.shortcuts.set_context(ShortcutContext::FilePicker);
-                    self.scroll_focus.set_focus(WidgetId::FilePicker);
-                    self.request_redraw();
-                }
-                "file_picker.close" => {
-                    self.editor.file_picker.hide();
-                    self.editor.ui_changed = true;
-                    self.shortcuts.set_context(ShortcutContext::Editor);
-                    self.scroll_focus.clear_focus();
-                    self.request_redraw();
-                }
+                // File picker
+                "file_picker.open" => self.show_overlay(|e| e.file_picker.show(), FilePicker, FPWidget),
+                "file_picker.close" => self.hide_overlay(|e| e.file_picker.hide()),
+                "file_picker.move_up" => self.overlay_action(|e| e.file_picker.move_up()),
+                "file_picker.move_down" => self.overlay_action(|e| e.file_picker.move_down()),
+                "file_picker.backspace" => self.overlay_action(|e| e.file_picker.backspace()),
                 "file_picker.select" => {
-                    if let Some(path) = self.editor.file_picker.selected_file() {
-                        let path_buf = path.to_path_buf();
+                    if let Some(path) = self.editor.file_picker.selected_file().map(|p| p.to_path_buf()) {
                         self.editor.file_picker.hide();
-                        self.shortcuts.set_context(ShortcutContext::Editor);
+                        self.shortcuts.set_context(Editor);
                         self.scroll_focus.clear_focus();
-
                         self.editor.record_navigation();
-                        match self.editor.tab_manager.open_file(path_buf) {
-                            Ok(_) => {
-                                self.editor.ui_changed = true;
-                                self.request_redraw();
-                            }
-                            Err(e) => eprintln!("Failed to open file: {}", e),
+                        if self.editor.tab_manager.open_file(path).is_ok() {
+                            self.editor.ui_changed = true;
+                            self.request_redraw();
                         }
                     }
                 }
-                "file_picker.move_up" => {
-                    self.editor.file_picker.move_up();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
-                "file_picker.move_down" => {
-                    self.editor.file_picker.move_down();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
-                "file_picker.backspace" => {
-                    self.editor.file_picker.backspace();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
 
-                // Grep events
-                "grep.open" => {
-                    // Start with empty search - user will type the query
-                    self.editor.grep.show(String::new());
-                    self.editor.ui_changed = true;
-                    self.shortcuts.set_context(ShortcutContext::Grep);
-                    self.scroll_focus.set_focus(WidgetId::Grep);
-                    self.request_redraw();
-                }
-                "grep.close" => {
-                    self.editor.grep.hide();
-                    self.editor.ui_changed = true;
-                    self.shortcuts.set_context(ShortcutContext::Editor);
-                    self.scroll_focus.clear_focus();
-                    self.request_redraw();
-                }
+                // Grep
+                "grep.open" => self.show_overlay(|e| e.grep.show(String::new()), Grep, GrepWidget),
+                "grep.close" => self.hide_overlay(|e| e.grep.hide()),
+                "grep.move_up" => self.overlay_action(|e| e.grep.move_up()),
+                "grep.move_down" => self.overlay_action(|e| e.grep.move_down()),
+                "grep.backspace" => self.overlay_action(|e| e.grep.backspace()),
                 "grep.select" => {
                     if let Some(result) = self.editor.grep.selected_result() {
-                        let file_path = result.file_path.clone();
-                        let line = result.line_number.saturating_sub(1); // Convert to 0-indexed
-                        let column = result.column;
-
+                        let (file, line, col) = (result.file_path.clone(), result.line_number.saturating_sub(1), result.column);
                         self.editor.grep.hide();
-                        self.shortcuts.set_context(ShortcutContext::Editor);
+                        self.shortcuts.set_context(Editor);
                         self.scroll_focus.clear_focus();
-
-                        // Jump to the location
-                        if self.editor.jump_to_location(file_path, line, column, true) {
+                        if self.editor.jump_to_location(file, line, col, true) {
                             self.cursor_needs_scroll = true;
                         }
                         self.request_redraw();
                     }
                 }
-                "grep.move_up" => {
-                    self.editor.grep.move_up();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
-                "grep.move_down" => {
-                    self.editor.grep.move_down();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
-                "grep.backspace" => {
-                    self.editor.grep.backspace();
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
 
                 // Editor events - delegate to InputHandler
+                "editor.code_action" => self.editor.handle_code_action_request(),
                 name if name.starts_with("editor.") => {
                     if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
                         let plugin = self.editor.active_plugin_mut();
                         let action = plugin.input.handle_event(&event, &plugin.doc, &viewport);
-
                         match action {
                             InputAction::Save => {
-                                if let Err(e) = self.editor.save() {
-                                    eprintln!("Failed to save: {}", e);
-                                }
+                                let _ = self.editor.save().map_err(|e| eprintln!("Failed to save: {}", e));
                                 self.request_redraw();
                                 self.update_window_title();
                                 self.cursor_needs_scroll = true;
@@ -874,14 +790,7 @@ impl TinyApp {
                     }
                 }
 
-                // Code action
-                "editor.code_action" => {
-                    self.editor.handle_code_action_request();
-                }
-
-                _ => {
-                    // Unknown event - ignore
-                }
+                _ => {} // Unknown event
             }
         }
     }

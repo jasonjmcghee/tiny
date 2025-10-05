@@ -20,7 +20,7 @@ use tiny_sdk::{PaintContext, Paintable};
 const FILE_EXPLORER_WIDTH: f32 = 0.0;
 const STATUS_BAR_HEIGHT: f32 = 0.0;
 const TAB_BAR_HEIGHT: f32 = 30.0;
-const FOO:f32 = 0.0;
+const FOO: f32 = 0.0;
 
 // Plugin state synchronization
 #[derive(Clone, Debug)]
@@ -610,10 +610,12 @@ impl Renderer {
         tab_manager: Option<&crate::tab_manager::TabManager>,
     ) {
         // Auto-detect visibility changes and AGGRESSIVELY clear to prevent stale rendering
-        let file_picker_visible = self.file_picker_plugin
+        let file_picker_visible = self
+            .file_picker_plugin
             .map(|ptr| unsafe { (*ptr).visible })
             .unwrap_or(false);
-        let grep_visible = self.grep_plugin
+        let grep_visible = self
+            .grep_plugin
             .map(|ptr| unsafe { (*ptr).visible })
             .unwrap_or(false);
 
@@ -632,7 +634,8 @@ impl Renderer {
         }
 
         if file_picker_visible != self.last_file_picker_visible
-            || grep_visible != self.last_grep_visible {
+            || grep_visible != self.last_grep_visible
+        {
             self.ui_dirty = true;
             self.last_file_picker_visible = file_picker_visible;
             self.last_grep_visible = grep_visible;
@@ -710,10 +713,12 @@ impl Renderer {
             let scissor_y = ((self.editor_bounds.y.0 - scissor_margin) * scale)
                 .round()
                 .max(0.0) as u32;
-            let scissor_w =
-                ((self.editor_bounds.width.0 + scissor_margin * 2.0) * scale).round().max(1.0) as u32;
-            let scissor_h =
-                ((self.editor_bounds.height.0 + scissor_margin * 2.0) * scale).round().max(1.0) as u32;
+            let scissor_w = ((self.editor_bounds.width.0 + scissor_margin * 2.0) * scale)
+                .round()
+                .max(1.0) as u32;
+            let scissor_h = ((self.editor_bounds.height.0 + scissor_margin * 2.0) * scale)
+                .round()
+                .max(1.0) as u32;
 
             // Clamp scissor rect to render target bounds to prevent overflow
             let (target_w, target_h) = (
@@ -767,11 +772,15 @@ impl Renderer {
                     if let Some(gpu) = self.gpu_renderer {
                         unsafe {
                             let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                            gpu_renderer.draw_glyphs(pass, &self.line_number_glyphs, tiny_core::gpu::DrawConfig {
-                                buffer_name: "line_numbers",
-                                use_themed: true,
-                                scissor: Some((scissor_x, scissor_y, scissor_w, scissor_h)),
-                            });
+                            gpu_renderer.draw_glyphs(
+                                pass,
+                                &self.line_number_glyphs,
+                                tiny_core::gpu::DrawConfig {
+                                    buffer_name: "line_numbers",
+                                    use_themed: true,
+                                    scissor: Some((scissor_x, scissor_y, scissor_w, scissor_h)),
+                                },
+                            );
                         }
                     }
                 }
@@ -796,11 +805,15 @@ impl Renderer {
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_glyphs(pass, &self.tab_bar_glyphs, tiny_core::gpu::DrawConfig {
-                            buffer_name: "tab_bar",
-                            use_themed: true,
-                            scissor: Some((scissor_x, scissor_y, scissor_w, scissor_h)),
-                        });
+                        gpu_renderer.draw_glyphs(
+                            pass,
+                            &self.tab_bar_glyphs,
+                            tiny_core::gpu::DrawConfig {
+                                buffer_name: "tab_bar",
+                                use_themed: true,
+                                scissor: Some((scissor_x, scissor_y, scissor_w, scissor_h)),
+                            },
+                        );
                     }
                 }
             }
@@ -831,7 +844,12 @@ impl Renderer {
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_glyphs_batched(pass, &self.file_picker_glyphs, "file_picker", true);
+                        gpu_renderer.draw_glyphs_batched(
+                            pass,
+                            &self.file_picker_glyphs,
+                            "file_picker",
+                            true,
+                        );
                     }
                 }
             }
@@ -866,7 +884,6 @@ impl Renderer {
                     }
                 }
             }
-
         }
 
         // Update uniforms if needed
@@ -1119,7 +1136,9 @@ impl Renderer {
             self.file_picker_rects = plugin.collect_background_rects();
 
             // Get font system for glyph collection
-            let font_system = self.font_system.as_ref()
+            let font_system = self
+                .font_system
+                .as_ref()
                 .expect("Font system not initialized - call set_font_system first");
 
             // Collect glyphs with per-view scissor rects
@@ -1153,7 +1172,9 @@ impl Renderer {
             self.grep_rects = plugin.collect_background_rects();
 
             // Get font system for glyph collection
-            let font_system = self.font_system.as_ref()
+            let font_system = self
+                .font_system
+                .as_ref()
                 .expect("Font system not initialized - call set_font_system first");
 
             // Collect glyphs with per-view scissor rects
@@ -1210,13 +1231,18 @@ impl Renderer {
                     gpu_mut.upload_style_buffer_u32(&style_buffer);
                 }
 
-                let use_themed = self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
+                let use_themed =
+                    self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
 
-                gpu_mut.draw_glyphs(pass, &self.accumulated_glyphs, tiny_core::gpu::DrawConfig {
-                    buffer_name: "main_text",
-                    use_themed,
-                    scissor: None, // Scissor already set by caller
-                });
+                gpu_mut.draw_glyphs(
+                    pass,
+                    &self.accumulated_glyphs,
+                    tiny_core::gpu::DrawConfig {
+                        buffer_name: "main_text",
+                        use_themed,
+                        scissor: None, // Scissor already set by caller
+                    },
+                );
             }
         }
     }

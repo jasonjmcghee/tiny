@@ -18,6 +18,7 @@ pub mod text_effects;
 pub mod text_renderer;
 pub mod text_view;
 pub mod theme;
+pub mod widget;
 
 // Re-export common types
 pub use coordinates::Viewport;
@@ -26,3 +27,4 @@ pub use syntax::SyntaxHighlighter;
 pub use text_renderer::TextRenderer;
 pub use text_view::TextView;
 pub use theme::Theme;
+pub use widget::Widget;

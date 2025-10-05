@@ -14,6 +14,7 @@ pub mod diagnostics_manager;
 pub mod editor_logic;
 pub mod file_picker_plugin;
 pub mod filterable_dropdown;
+pub mod overlay_picker;
 pub mod grep_plugin;
 pub mod history;
 pub mod input;
@@ -24,7 +25,6 @@ pub mod lsp_manager;
 pub mod lsp_service;
 pub use diagnostics_plugin;
 pub mod editable_text_view;
-pub mod gpu_buffer_manager;
 pub mod render;
 pub mod shortcuts;
 pub mod tab_bar_plugin;
@@ -33,8 +33,8 @@ pub mod text_editor_plugin;
 
 // Import UI components from tiny-ui
 pub use tiny_ui::{
-    coordinates, scroll, syntax, text_effects, text_renderer, text_view, theme, Scrollable,
-    SyntaxHighlighter, TextRenderer, TextView, Theme, Viewport,
+    coordinates, scroll, syntax, text_effects, text_renderer, text_view, theme, widget, Scrollable,
+    SyntaxHighlighter, TextRenderer, TextView, Theme, Viewport, Widget,
 };
 #[cfg(feature = "winit")]
 pub mod winit_adapter;
