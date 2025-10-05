@@ -680,6 +680,39 @@ impl TextRenderer {
 
         self.palette_texture = Some(texture);
     }
+
+    // === Position Lookup Methods ===
+
+    /// Get the precise layout position (in logical pixels) for a byte offset
+    /// Returns None if the byte offset is out of bounds
+    pub fn get_position_at_byte(&self, byte_offset: usize) -> Option<LayoutPos> {
+        // Binary search for the glyph at or before this byte offset
+        match self.layout_cache.binary_search_by_key(&byte_offset, |g| g.char_byte_offset) {
+            Ok(idx) => self.layout_cache.get(idx).map(|g| g.layout_pos),
+            Err(idx) => {
+                // Not exact match - get the previous glyph if it exists
+                if idx > 0 {
+                    self.layout_cache.get(idx - 1).map(|g| g.layout_pos)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Get precise position at line/column (character index within line, not visual column)
+    /// Returns None if line or column is out of bounds
+    pub fn get_position_at_line_col(&self, line: u32, col: usize) -> Option<LayoutPos> {
+        let line_info = self.line_cache.get(line as usize)?;
+        let glyph_idx = line_info.char_range.start + col;
+        self.layout_cache.get(glyph_idx).map(|g| g.layout_pos)
+    }
+
+    /// Get precise X position for a column within a line
+    /// More efficient than get_position_at_line_col when you only need X
+    pub fn get_x_at_line_col(&self, line: u32, col: usize) -> Option<f32> {
+        self.get_position_at_line_col(line, col).map(|pos| pos.x.0)
+    }
 }
 
 /// Convert token type to ID for palette lookup

@@ -4,15 +4,18 @@ use crate::coordinates::Viewport;
 use crate::scroll::Scrollable;
 use crate::tab_manager::TabManager;
 use tiny_core::tree::{Point, Rect};
-use tiny_font::{create_glyph_instances, SharedFontSystem};
+use tiny_font::SharedFontSystem;
 use tiny_sdk::types::{LayoutRect, RectInstance};
 use tiny_sdk::{
     Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
     SetupContext,
 };
+use tiny_ui::text_view::{SizeConstraint, TextView};
 
-/// Tab bar height in logical pixels
+/// Default tab bar height in logical pixels (will be calculated dynamically)
 pub const TAB_BAR_HEIGHT: f32 = 30.0;
+/// Vertical padding for tab text (top + bottom)
+const TAB_VERTICAL_PADDING: f32 = 10.0;
 /// Minimum tab width in logical pixels
 const MIN_TAB_WIDTH: f32 = 120.0;
 /// Dropdown menu width
@@ -91,6 +94,11 @@ impl TabBarPlugin {
         self.dropdown_open = false;
     }
 
+    /// Calculate height based on line height (hug contents)
+    pub fn calculate_height(&mut self, line_height: f32) {
+        self.height = line_height + TAB_VERTICAL_PADDING;
+    }
+
     /// Collect background rectangles for tabs
     pub fn collect_rects(
         &self,
@@ -102,8 +110,6 @@ impl TabBarPlugin {
         let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
         let mut x_offset = 10.0 - self.scroll_offset;
 
-        const TAB_HEIGHT: f32 = 30.0;
-
         // Colors (RGBA as u32) - match main background: rgb(0.11, 0.12, 0.13)
         // Active tab matches background (invisible/flush), inactive tabs are slightly darker
         const ACTIVE_TAB_BG: u32 = 0x1C1F21FF; // Same as main background (28, 31, 33)
@@ -113,7 +119,7 @@ impl TabBarPlugin {
             let is_active = idx == tab_manager.active_index();
 
             let tab_rect = RectInstance {
-                rect: LayoutRect::new(x_offset, 0.0, tab_width, TAB_HEIGHT),
+                rect: LayoutRect::new(x_offset, 0.0, tab_width, self.height),
                 color: if is_active {
                     ACTIVE_TAB_BG
                 } else {
@@ -138,9 +144,9 @@ impl TabBarPlugin {
         self.scroll_offset = (self.scroll_offset + 100.0).min(max_offset);
     }
 
-    /// Collect glyphs for rendering tabs
+    /// Collect glyphs for rendering tabs using TextView
     pub fn collect_glyphs(
-        &self,
+        &mut self,
         collector: &mut crate::render::GlyphCollector,
         tab_manager: &TabManager,
     ) {
@@ -170,89 +176,99 @@ impl TabBarPlugin {
         let num_tabs = tab_manager.tabs().len();
         let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
 
-        let mut glyphs = Vec::new();
         let mut x_offset = 10.0 - self.scroll_offset;
 
         const TAB_PADDING: f32 = 10.0;
         const CLOSE_BUTTON_WIDTH: f32 = 20.0;
 
-        // Render each tab in widget-local coordinates
+        // Render each tab using TextView
         for (idx, tab) in tab_manager.tabs().iter().enumerate() {
             let is_active = idx == tab_manager.active_index();
 
-            // Calculate available space for text (tab width - padding - close button)
-            let text_width = tab_width - TAB_PADDING * 2.0 - CLOSE_BUTTON_WIDTH;
-            let max_chars = (text_width / (font_size * 0.6)) as usize; // Rough estimate
-
-            // Tab text (truncate if too long)
+            // Tab text
             let mut display_name = tab.display_name.clone();
-
-            // Add modified indicator
             if tab.is_modified() {
                 display_name.push_str(" •");
             }
 
-            // Truncate if needed
-            if display_name.len() > max_chars {
-                let truncate_len = max_chars.saturating_sub(3);
-                display_name.truncate(truncate_len);
-                display_name.push_str("...");
+            // Create viewport for this tab's text
+            let mut tab_viewport = Viewport::new(tab_width - CLOSE_BUTTON_WIDTH, self.height, scale_factor);
+            tab_viewport.metrics.font_size = font_size;
+            tab_viewport.metrics.line_height = line_height;
+            tab_viewport.bounds = Rect {
+                x: tiny_sdk::LogicalPixels(bounds_x + x_offset),
+                y: tiny_sdk::LogicalPixels(bounds_y),
+                width: tiny_sdk::LogicalPixels(tab_width - CLOSE_BUTTON_WIDTH),
+                height: tiny_sdk::LogicalPixels(self.height),
+            };
+
+            // Create TextView for tab text
+            let mut tab_text_view = TextView::from_text(&display_name, tab_viewport)
+                .with_padding_x(TAB_PADDING)
+                .with_padding_y((self.height - line_height) / 2.0) // Vertically center
+                .with_align(tiny_ui::text_view::TextAlign::Center); // Horizontally center
+
+            tab_text_view.update_layout(&font_service);
+            let mut tab_glyphs = tab_text_view.collect_glyphs(&font_service);
+
+            // Set token based on active state (0 = normal white text, 255 = dimmed)
+            for glyph in &mut tab_glyphs {
+                glyph.token_id = if is_active { 0 } else { 255 };
             }
 
-            // Calculate text width for centering (rough estimate: font_size * 0.6 per char)
-            let text_width = display_name.len() as f32 * font_size * 0.6;
-            let available_space = tab_width - CLOSE_BUTTON_WIDTH;
-            let text_x = x_offset + (available_space - text_width) / 2.0;
+            collector.add_glyphs(tab_glyphs);
 
-            let tab_pos = LayoutPos::new(text_x, 5.0); // Widget-local Y
-
-            let tab_glyphs = create_glyph_instances(
-                &font_service,
-                &display_name,
-                tab_pos,
-                font_size,
-                scale_factor,
-                line_height,
-                None,
-                if is_active { 2 } else { 255 }, // Active: token 2, Inactive: token 255 (dimmed like line numbers)
-            );
-
-            glyphs.extend(tab_glyphs);
-
-            // Close button "×" at the right side of each tab
+            // Close button "x"
             let close_x = x_offset + tab_width - CLOSE_BUTTON_WIDTH;
-            let close_pos = LayoutPos::new(close_x, 5.0); // Widget-local Y
-            let close_glyphs = create_glyph_instances(
-                &font_service,
-                "×",
-                close_pos,
-                font_size,
-                scale_factor,
-                line_height,
-                None,
-                3, // Different token for close button
-            );
 
-            glyphs.extend(close_glyphs);
+            let close_viewport = Viewport::new(CLOSE_BUTTON_WIDTH, self.height, scale_factor);
+            let close_bounds = Rect {
+                x: tiny_sdk::LogicalPixels(bounds_x + close_x),
+                y: tiny_sdk::LogicalPixels(bounds_y),
+                width: tiny_sdk::LogicalPixels(CLOSE_BUTTON_WIDTH),
+                height: tiny_sdk::LogicalPixels(self.height),
+            };
+
+            let mut close_view = TextView::from_text("×", close_viewport)
+                .with_align(tiny_ui::text_view::TextAlign::Center)
+                .with_padding_y((self.height - line_height) / 2.0);
+            close_view.viewport.bounds = close_bounds;
+            close_view.viewport.metrics.font_size = font_size;
+            close_view.viewport.metrics.line_height = line_height;
+            close_view.update_layout(&font_service);
+
+            let mut close_glyphs = close_view.collect_glyphs(&font_service);
+            for glyph in &mut close_glyphs {
+                glyph.token_id = 3; // Close button token
+            }
+            collector.add_glyphs(close_glyphs);
 
             x_offset += tab_width; // Move to next tab position
         }
 
         // Dropdown arrow on the far right (always visible)
         let dropdown_x = viewport_width - 30.0;
-        let dropdown_pos = LayoutPos::new(dropdown_x, 5.0); // Widget-local Y
-        let dropdown_glyphs = create_glyph_instances(
-            &font_service,
-            "▼",
-            dropdown_pos,
-            font_size,
-            scale_factor,
-            line_height,
-            None,
-            4, // Token for dropdown arrow
-        );
+        let dropdown_y = (self.height - line_height) / 2.0;
 
-        glyphs.extend(dropdown_glyphs);
+        let dropdown_viewport = Viewport::new(30.0, self.height, scale_factor);
+        let dropdown_bounds = Rect {
+            x: tiny_sdk::LogicalPixels(bounds_x + dropdown_x),
+            y: tiny_sdk::LogicalPixels(bounds_y + dropdown_y),
+            width: tiny_sdk::LogicalPixels(30.0),
+            height: tiny_sdk::LogicalPixels(line_height),
+        };
+
+        let mut dropdown_view = TextView::from_text("▼", dropdown_viewport);
+        dropdown_view.viewport.bounds = dropdown_bounds;
+        dropdown_view.viewport.metrics.font_size = font_size;
+        dropdown_view.viewport.metrics.line_height = line_height;
+        dropdown_view.update_layout(&font_service);
+
+        let mut dropdown_glyphs = dropdown_view.collect_glyphs(&font_service);
+        for glyph in &mut dropdown_glyphs {
+            glyph.token_id = 4; // Dropdown arrow token
+        }
+        collector.add_glyphs(dropdown_glyphs);
 
         // Render dropdown menu if open
         if self.dropdown_open {
@@ -277,47 +293,50 @@ impl TabBarPlugin {
                 let marker = if is_active { "▸ " } else { "  " };
                 let dropdown_text = format!("{}{}", marker, display_name);
 
-                let dropdown_item_pos = LayoutPos::new(dropdown_x - DROPDOWN_WIDTH + 10.0, item_y);
+                // Create TextView for dropdown item
+                let dropdown_item_x = dropdown_x - DROPDOWN_WIDTH + 10.0;
+                let dropdown_item_viewport = Viewport::new(DROPDOWN_WIDTH - 30.0, line_height, scale_factor);
+                let dropdown_item_bounds = Rect {
+                    x: tiny_sdk::LogicalPixels(bounds_x + dropdown_item_x),
+                    y: tiny_sdk::LogicalPixels(bounds_y + item_y),
+                    width: tiny_sdk::LogicalPixels(DROPDOWN_WIDTH - 30.0),
+                    height: tiny_sdk::LogicalPixels(line_height),
+                };
 
-                let dropdown_item_glyphs = create_glyph_instances(
-                    &font_service,
-                    &dropdown_text,
-                    dropdown_item_pos,
-                    font_size,
-                    scale_factor,
-                    line_height,
-                    None,
-                    if is_active { 2 } else { 255 }, // Match tab bar styling
-                );
+                let mut dropdown_item_view = TextView::from_text(&dropdown_text, dropdown_item_viewport);
+                dropdown_item_view.viewport.bounds = dropdown_item_bounds;
+                dropdown_item_view.viewport.metrics.font_size = font_size;
+                dropdown_item_view.viewport.metrics.line_height = line_height;
+                dropdown_item_view.update_layout(&font_service);
 
-                glyphs.extend(dropdown_item_glyphs);
+                let mut dropdown_item_glyphs = dropdown_item_view.collect_glyphs(&font_service);
+                for glyph in &mut dropdown_item_glyphs {
+                    glyph.token_id = if is_active { 0 } else { 255 };
+                }
+                collector.add_glyphs(dropdown_item_glyphs);
 
                 // Close button for dropdown items
                 let close_dropdown_x = dropdown_x - 20.0;
-                let close_dropdown_pos = LayoutPos::new(close_dropdown_x, item_y);
-                let close_dropdown_glyphs = create_glyph_instances(
-                    &font_service,
-                    "×",
-                    close_dropdown_pos,
-                    font_size,
-                    scale_factor,
-                    line_height,
-                    None,
-                    3,
-                );
+                let close_dropdown_viewport = Viewport::new(20.0, line_height, scale_factor);
+                let close_dropdown_bounds = Rect {
+                    x: tiny_sdk::LogicalPixels(bounds_x + close_dropdown_x),
+                    y: tiny_sdk::LogicalPixels(bounds_y + item_y),
+                    width: tiny_sdk::LogicalPixels(20.0),
+                    height: tiny_sdk::LogicalPixels(line_height),
+                };
 
-                glyphs.extend(close_dropdown_glyphs);
+                let mut close_dropdown_view = TextView::from_text("×", close_dropdown_viewport);
+                close_dropdown_view.viewport.bounds = close_dropdown_bounds;
+                close_dropdown_view.viewport.metrics.font_size = font_size;
+                close_dropdown_view.viewport.metrics.line_height = line_height;
+                close_dropdown_view.update_layout(&font_service);
+
+                let mut close_dropdown_glyphs = close_dropdown_view.collect_glyphs(&font_service);
+                for glyph in &mut close_dropdown_glyphs {
+                    glyph.token_id = 3;
+                }
+                collector.add_glyphs(close_dropdown_glyphs);
             }
-        }
-
-        // Convert to screen coordinates (like line numbers plugin does)
-        for mut g in glyphs {
-            // Transform from widget-local space to screen space
-            let screen_x = g.pos.x.0 + bounds_x;
-            let screen_y = g.pos.y.0 + bounds_y;
-            // Convert to physical coordinates
-            g.pos = LayoutPos::new(screen_x * scale_factor, screen_y * scale_factor);
-            collector.add_glyphs(vec![g]);
         }
     }
 

@@ -286,7 +286,8 @@ impl<T: Clone> FilterableDropdown<T> {
         self.input.view.viewport.scroll = tiny_sdk::types::LayoutPos::new(0.0, 0.0);
 
         // Set padding on the input view to inset text from edges
-        self.input.view.padding = input_vertical_padding;
+        self.input.view.padding_x = 0.0;
+        self.input.view.padding_y = input_vertical_padding;
 
         // Update results viewport bounds, scale, logical_size, and metrics (below input)
         let results_bounds_width = width - PADDING * 2.0 - BORDER_WIDTH * 2.0;

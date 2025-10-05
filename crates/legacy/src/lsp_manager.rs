@@ -327,6 +327,11 @@ impl LspManager {
             .unwrap_or_default()
     }
 
+    /// Cancel all pending LSP requests
+    pub fn cancel_pending_requests(&self) {
+        let _ = self.tx.send(LspRequest::CancelPendingRequests);
+    }
+
     /// Request hover information at position
     pub fn request_hover(&self, line: u32, character: u32) {
         let _ = self.tx.send(LspRequest::Hover { line, character });

@@ -933,18 +933,17 @@ impl TinyApp {
                 self.editor.ui_changed = false;
             }
 
-            // Update diagnostics manager (handles LSP polling, caching, plugin updates)
-            tab.diagnostics.update(&tab.plugin.doc);
-
-            // Set diagnostics plugin for rendering
+            // Set diagnostics plugin for rendering (will be updated after layout is computed)
             cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
 
-            // Initialize diagnostics plugin with GPU resources (first time only)
-            static mut DIAGNOSTICS_INITIALIZED: bool = false;
+            // Initialize diagnostics plugin with GPU resources if needed
+            // Check if THIS specific plugin instance needs initialization
             unsafe {
-                if !DIAGNOSTICS_INITIALIZED {
-                    if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
-                        let diagnostics = &mut *diagnostics_ptr;
+                if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
+                    let diagnostics = &mut *diagnostics_ptr;
+
+                    // Check if this plugin instance has GPU resources already
+                    if !diagnostics.is_initialized() {
                         if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
                             let gpu_renderer = &*gpu;
                             use tiny_sdk::Initializable;
@@ -956,7 +955,6 @@ impl TinyApp {
                             if let Err(e) = diagnostics.setup(&mut setup_ctx) {
                                 eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
                             } else {
-                                DIAGNOSTICS_INITIALIZED = true;
                                 eprintln!("Diagnostics plugin initialized successfully");
                             }
                         }
@@ -1063,9 +1061,15 @@ impl TinyApp {
             }
         }
 
-        // Swap the text_renderer back to the tab and save scroll position
+        // Update diagnostics AFTER rendering (layout cache is now populated)
         if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
             let tab = self.editor.tab_manager.active_tab_mut();
+
+            // Update diagnostics manager (handles LSP polling, caching, plugin updates)
+            // NOTE: cpu_renderer.text_renderer now has populated layout cache from rendering
+            tab.diagnostics.update(&tab.plugin.doc, &cpu_renderer.text_renderer);
+
+            // Swap the text_renderer back to the tab and save scroll position
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
             // Save any scroll changes back to the tab
             tab.scroll_position = cpu_renderer.viewport.scroll;

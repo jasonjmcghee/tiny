@@ -279,8 +279,8 @@ impl EditableTextView {
         let canonical_pos = self.view.viewport.doc_to_layout(cursor_doc);
         let local_x = canonical_pos.x.0 - self.view.viewport.scroll.x.0;
         let local_y = canonical_pos.y.0 - self.view.viewport.scroll.y.0;
-        let screen_x = self.view.viewport.bounds.x.0 + self.view.padding + local_x;
-        let screen_y = self.view.viewport.bounds.y.0 + self.view.padding + local_y;
+        let screen_x = self.view.viewport.bounds.x.0 + self.view.padding_x + local_x;
+        let screen_y = self.view.viewport.bounds.y.0 + self.view.padding_y + local_y;
 
         Some(Point {
             x: tiny_sdk::LogicalPixels(screen_x),
@@ -345,9 +345,9 @@ impl EditableTextView {
                 let sel_rects = sel.to_rectangles(&self.view.doc, &self.view.viewport);
                 for rect in sel_rects {
                     // Transform to screen coordinates (logical) with padding
-                    let screen_x = self.view.viewport.bounds.x.0 + self.view.padding + rect.x.0
+                    let screen_x = self.view.viewport.bounds.x.0 + self.view.padding_x + rect.x.0
                         - self.view.viewport.scroll.x.0;
-                    let screen_y = self.view.viewport.bounds.y.0 + self.view.padding + rect.y.0
+                    let screen_y = self.view.viewport.bounds.y.0 + self.view.padding_y + rect.y.0
                         - self.view.viewport.scroll.y.0;
 
                     // Convert to physical pixels

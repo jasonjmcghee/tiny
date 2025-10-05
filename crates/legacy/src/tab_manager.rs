@@ -30,18 +30,21 @@ impl Tab {
             "Untitled".to_string()
         };
 
+        // Create text renderer first (needed for precise diagnostic positions)
+        let text_renderer = TextRenderer::new();
+
         // Open file in diagnostics manager if we have a path
         let mut diagnostics = DiagnosticsManager::new();
         if let Some(ref path) = plugin.file_path {
             let content = plugin.doc.read().flatten_to_string();
-            diagnostics.open_file(path.clone(), (*content).clone());
+            diagnostics.open_file(path.clone(), (*content).clone(), &text_renderer);
         }
 
         Self {
             plugin,
             line_numbers: LineNumbersPlugin::new(),
             diagnostics,
-            text_renderer: TextRenderer::new(),
+            text_renderer,
             display_name,
             scroll_position: Point::default(),
         }

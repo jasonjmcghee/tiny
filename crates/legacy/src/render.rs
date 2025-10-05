@@ -117,6 +117,8 @@ pub struct Renderer {
     pub grep_plugin: Option<*mut crate::grep_plugin::GrepPlugin>,
     /// Title bar height (logical pixels, for macOS transparent titlebar)
     title_bar_height: f32,
+    /// Tab bar height (logical pixels, calculated dynamically based on font size)
+    tab_bar_height: f32,
     /// Editor widget bounds (where main text renders)
     pub editor_bounds: tiny_sdk::types::LayoutRect,
     /// Accumulated glyphs for batched rendering
@@ -182,6 +184,7 @@ impl Renderer {
             file_picker_plugin: None,
             grep_plugin: None,
             title_bar_height,
+            tab_bar_height: TAB_BAR_HEIGHT, // Will be updated dynamically
             // Default editor bounds - updated in update_viewport
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
@@ -530,8 +533,13 @@ impl Renderer {
             self.last_viewport_size = (width, height);
         }
 
+        self.update_editor_bounds(width, height);
+    }
+
+    /// Update editor bounds based on current line numbers width and other UI elements
+    fn update_editor_bounds(&mut self, width: f32, height: f32) {
         let mut offset_x = 0.0;
-        let offset_y = self.title_bar_height + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
+        let offset_y = self.title_bar_height + STATUS_BAR_HEIGHT + self.tab_bar_height;
 
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
@@ -679,11 +687,24 @@ impl Renderer {
             let scale = self.viewport.scale_factor;
 
             // === COLLECT GLYPHS ===
-            // Only regenerate line numbers if dirty
-            if self.line_numbers_dirty {
+            // Only regenerate line numbers if dirty (but scroll will still update every call)
+            if self.line_numbers_dirty || scroll_changed {
                 self.line_number_glyphs.clear();
+                let old_editor_bounds_x = self.editor_bounds.x.0;
                 self.collect_line_number_glyphs();
-                self.line_numbers_dirty = false;
+
+                // Only update editor bounds if content actually changed (not just scroll)
+                if self.line_numbers_dirty {
+                    // Update editor bounds in case line numbers width changed
+                    let (w, h) = (self.viewport.logical_size.width.0, self.viewport.logical_size.height.0);
+                    self.update_editor_bounds(w, h);
+                    // If editor X position changed (line numbers width changed), regenerate main text
+                    if (old_editor_bounds_x - self.editor_bounds.x.0).abs() > 0.01 {
+                        self.accumulated_glyphs.clear();
+                        self.collect_main_text_glyphs(tree, visible_range.clone());
+                    }
+                    self.line_numbers_dirty = false;
+                }
             }
 
             // Only regenerate UI if dirty
@@ -754,7 +775,7 @@ impl Renderer {
             if !self.line_number_glyphs.is_empty() {
                 if let Some(plugin_ptr) = self.line_numbers_plugin {
                     let plugin = unsafe { &*plugin_ptr };
-                    let line_numbers_y = self.title_bar_height + TAB_BAR_HEIGHT;
+                    let line_numbers_y = self.title_bar_height + self.tab_bar_height;
                     let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
                         FILE_EXPLORER_WIDTH,
                         line_numbers_y,
@@ -792,7 +813,7 @@ impl Renderer {
                     0.0,
                     self.title_bar_height,
                     self.viewport.logical_size.width.0,
-                    TAB_BAR_HEIGHT,
+                    self.tab_bar_height, // Use dynamically calculated height
                 );
 
                 let scissor_x = (tab_bar_bounds.x.0 * scale).round().max(0.0) as u32;
@@ -1045,9 +1066,9 @@ impl Renderer {
 
     fn collect_line_number_glyphs(&mut self) {
         if let Some(plugin_ptr) = self.line_numbers_plugin {
-            let plugin = unsafe { &*plugin_ptr };
+            let plugin = unsafe { &mut *plugin_ptr };
 
-            let line_numbers_y = self.title_bar_height + TAB_BAR_HEIGHT;
+            let line_numbers_y = self.title_bar_height + self.tab_bar_height;
 
             let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
                 FILE_EXPLORER_WIDTH,
@@ -1076,13 +1097,19 @@ impl Renderer {
 
     fn collect_tab_bar_glyphs(&mut self, tab_manager: &crate::tab_manager::TabManager) {
         if let Some(plugin_ptr) = self.tab_bar_plugin {
-            let plugin = unsafe { &*plugin_ptr };
+            let plugin = unsafe { &mut *plugin_ptr };
+
+            // Calculate height first (hug contents based on line height)
+            plugin.calculate_height(self.viewport.metrics.line_height);
+
+            // Store the calculated height for use in draw code
+            self.tab_bar_height = plugin.height;
 
             let tab_bar_bounds = tiny_sdk::types::LayoutRect::new(
                 0.0,
                 self.title_bar_height,
                 self.viewport.logical_size.width.0,
-                TAB_BAR_HEIGHT,
+                plugin.height,  // Use dynamic height from plugin
             );
 
             let widget_viewport = tiny_sdk::types::WidgetViewport {

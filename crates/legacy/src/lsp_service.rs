@@ -248,6 +248,13 @@ impl LspService {
         }
     }
 
+    /// Cancel all pending LSP requests
+    pub fn cancel_pending_requests(&self) {
+        if let Some(ref lsp) = self.lsp_manager {
+            lsp.cancel_pending_requests();
+        }
+    }
+
     /// Request go-to-definition at position
     pub fn request_goto_definition(&self, position: DocPosition) {
         if let Some(ref lsp) = self.lsp_manager {

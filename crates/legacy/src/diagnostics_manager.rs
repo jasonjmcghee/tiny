@@ -15,6 +15,10 @@ pub struct DiagnosticsManager {
     lsp_service: LspService,
     /// Pending go-to-definition result
     pending_goto_definition: Option<Vec<crate::lsp_service::LocationRef>>,
+    /// Position of user-requested goto definition (for caching)
+    user_requested_goto_position: Option<(usize, usize)>,
+    /// Flag indicating user wants to navigate with next goto definition result
+    user_navigation_pending: bool,
     /// Current hover position with Cmd held (for go-to-definition preview)
     cmd_hover_position: Option<(usize, usize)>,
     /// Pending text edits from code actions
@@ -36,6 +40,8 @@ impl DiagnosticsManager {
             plugin: diagnostics_plugin::DiagnosticsPlugin::new(),
             lsp_service: LspService::new(),
             pending_goto_definition: None,
+            user_requested_goto_position: None,
+            user_navigation_pending: false,
             cmd_hover_position: None,
             pending_text_edits: None,
             definition_cache: AHashMap::new(),
@@ -46,16 +52,23 @@ impl DiagnosticsManager {
     }
 
     /// Open a file and set up diagnostics (with instant cached results)
-    pub fn open_file(&mut self, file_path: PathBuf, content: String) {
-        // Clear caches for new file
+    pub fn open_file(
+        &mut self,
+        file_path: PathBuf,
+        content: String,
+        text_renderer: &crate::text_renderer::TextRenderer,
+    ) {
+        // Clear caches and pending state for new file
         self.definition_cache.clear();
         self.document_symbols.clear();
+        self.pending_goto_definition = None;
+        self.user_requested_goto_position = None;
+        self.user_navigation_pending = false;
+        self.pending_text_edits = None;
+        self.cmd_hover_position = None;
 
-        // Load cached diagnostics immediately
-        if let Some(cached_diagnostics) = LspManager::load_cached_diagnostics(&file_path, &content)
-        {
-            self.apply_diagnostics(&cached_diagnostics, &content);
-        }
+        // NOTE: We skip applying cached diagnostics here because layout isn't ready yet
+        // Diagnostics will be applied when LSP responds (which happens quickly after first render)
 
         // Load cached definitions immediately for instant go-to-definition
         if let Some(cached_defs) = LspManager::load_cached_definitions(&file_path, &content) {
@@ -77,6 +90,7 @@ impl DiagnosticsManager {
         }
 
         // Start LSP service (handles all LSP features)
+        eprintln!("DiagnosticsManager::open_file() starting LSP for {:?}", file_path);
         self.lsp_service.open_file(file_path, content);
 
         // Request document symbols for hover support
@@ -106,7 +120,7 @@ impl DiagnosticsManager {
     }
 
     /// Update diagnostics (call this every frame)
-    pub fn update(&mut self, doc: &Doc) {
+    pub fn update(&mut self, doc: &Doc, text_renderer: &crate::text_renderer::TextRenderer) {
         // Check if plugin needs hover info (500ms timer elapsed)
         if let Some((line, column)) = self.plugin.update() {
             self.lsp_service
@@ -131,8 +145,10 @@ impl DiagnosticsManager {
         for result in self.lsp_service.poll_results() {
             match result {
                 LspResult::Diagnostics(diagnostics) => {
+                    eprintln!("LSP returned {} diagnostics for {:?}",
+                              diagnostics.len(), self.lsp_service.current_file());
+                    self.apply_diagnostics(&diagnostics, text_renderer);
                     let content = doc.read().flatten_to_string();
-                    self.apply_diagnostics(&diagnostics, &content);
                     if let Some(file_path) = self.lsp_service.current_file() {
                         LspManager::cache_diagnostics(file_path, &content, &diagnostics);
                     }
@@ -148,14 +164,27 @@ impl DiagnosticsManager {
 
                     let plugin_symbols: Vec<_> = symbols
                         .iter()
-                        .map(|symbol| diagnostics_plugin::Symbol {
-                            name: symbol.name.clone(),
-                            line: symbol.range.start.line as usize,
-                            column_range: (
+                        .filter_map(|symbol| {
+                            let start_x = text_renderer.get_x_at_line_col(
+                                symbol.range.start.line,
                                 symbol.range.start.character as usize,
+                            )?;
+                            let end_x = text_renderer.get_x_at_line_col(
+                                symbol.range.end.line,
                                 symbol.range.end.character as usize,
-                            ),
-                            kind: format!("{:?}", symbol.kind),
+                            )?;
+
+                            Some(diagnostics_plugin::Symbol {
+                                name: symbol.name.clone(),
+                                line: symbol.range.start.line as usize,
+                                column_range: (
+                                    symbol.range.start.character as usize,
+                                    symbol.range.end.character as usize,
+                                ),
+                                start_x,
+                                end_x,
+                                kind: format!("{:?}", symbol.kind),
+                            })
                         })
                         .collect();
                     self.plugin.set_symbols(plugin_symbols);
@@ -164,12 +193,22 @@ impl DiagnosticsManager {
                     self.warm_definition_cache();
                 }
                 LspResult::GoToDefinition(locations) if !locations.is_empty() => {
-                    // Store in cache for instant future lookups
-                    if let Some((line, col)) = self.plugin.get_mouse_document_position() {
-                        self.definition_cache.insert((line, col), locations.clone());
-                        self.definition_cache_modified = Some(Instant::now());
+                    // Check if user wants to navigate (flag is set by request_goto_definition)
+                    if self.user_navigation_pending {
+                        // User-requested navigation - trigger it
+                        self.pending_goto_definition = Some(locations.clone());
+
+                        // Also cache at the requested position if we know it
+                        if let Some((line, col)) = self.user_requested_goto_position {
+                            self.definition_cache.insert((line, col), locations.clone());
+                            self.definition_cache_modified = Some(Instant::now());
+                            self.user_requested_goto_position = None;
+                        }
+                    } else {
+                        // Cache warming - just try to cache the result
+                        // We can't reliably determine the position, so skip caching
+                        // The warm_definition_cache results will naturally populate on user navigation
                     }
-                    self.pending_goto_definition = Some(locations);
                 }
                 LspResult::CodeActions(actions) => {
                     if let Some(action) = actions
@@ -206,20 +245,32 @@ impl DiagnosticsManager {
 
     /// Request go-to-definition at cursor position (checks cache first)
     pub fn request_goto_definition(&mut self, line: usize, column: usize) {
+        // Mark this as a user-requested goto definition
+        self.user_requested_goto_position = Some((line, column));
+        self.user_navigation_pending = true;
+
         // Check cache first for instant response
         if let Some(cached_locations) = self.definition_cache.get(&(line, column)) {
             self.pending_goto_definition = Some(cached_locations.clone());
+            // Keep the flag set - it will be cleared when navigation happens
             return;
         }
 
-        // Not in cache, request from LSP
+        // Cancel any pending cache warming requests to ensure the next response is ours
+        self.lsp_service.cancel_pending_requests();
+
+        // Request from LSP (flag will cause navigation when response arrives)
         self.lsp_service
             .request_goto_definition(crate::lsp_service::DocPosition { line, column });
     }
 
     /// Take pending go-to-definition result (consumes it)
     pub fn take_goto_definition(&mut self) -> Option<Vec<crate::lsp_service::LocationRef>> {
-        self.pending_goto_definition.take()
+        let result = self.pending_goto_definition.take();
+        if result.is_some() {
+            self.user_navigation_pending = false; // Clear flag after navigation
+        }
+        result
     }
 
     /// Take pending text edits (consumes them)
@@ -238,22 +289,55 @@ impl DiagnosticsManager {
     }
 
     /// Apply diagnostics to the plugin (internal helper)
-    fn apply_diagnostics(&mut self, diagnostics: &[ParsedDiagnostic], content: &str) {
+    /// REQUIRES: TextRenderer layout cache must be populated
+    fn apply_diagnostics(
+        &mut self,
+        diagnostics: &[ParsedDiagnostic],
+        text_renderer: &crate::text_renderer::TextRenderer,
+    ) {
+        // PANIC if layout isn't ready - this is a programming error
+        assert!(
+            !text_renderer.layout_cache.is_empty(),
+            "TextRenderer layout cache is empty! Layout must be computed before applying diagnostics. \
+             Call text_renderer.update_layout() first. \
+             Layout cache size: {}, line cache size: {}",
+            text_renderer.layout_cache.len(),
+            text_renderer.line_cache.len()
+        );
+
+        eprintln!("Applying {} diagnostics with layout cache size: {}",
+                  diagnostics.len(), text_renderer.layout_cache.len());
+
         self.plugin.clear_diagnostics();
-        let lines: Vec<&str> = content.lines().collect();
+
         for diag in diagnostics {
-            if let Some(&line_text) = lines.get(diag.line) {
-                self.plugin.add_diagnostic_with_line_text(
-                    diagnostics_plugin::Diagnostic {
-                        line: diag.line,
-                        column_range: (diag.column_start, diag.column_end),
-                        byte_range: None,
-                        message: diag.message.clone(),
-                        severity: diag.severity,
-                    },
-                    line_text.to_string(),
-                );
-            }
+            // Use precise positions from layout cache
+            let start_x = text_renderer
+                .get_x_at_line_col(diag.line as u32, diag.column_start)
+                .expect(&format!(
+                    "Failed to get X position for diagnostic at line {}, col {}. \
+                     Layout has {} lines in cache.",
+                    diag.line, diag.column_start, text_renderer.line_cache.len()
+                ));
+            let end_x = text_renderer
+                .get_x_at_line_col(diag.line as u32, diag.column_end)
+                .expect(&format!(
+                    "Failed to get X position for diagnostic at line {}, col {}. \
+                     Layout has {} lines in cache.",
+                    diag.line, diag.column_end, text_renderer.line_cache.len()
+                ));
+
+            eprintln!("  Diagnostic at line {}, cols {}-{}: x={}-{}",
+                      diag.line, diag.column_start, diag.column_end, start_x, end_x);
+
+            self.plugin.add_diagnostic_with_positions(
+                diag.line,
+                (diag.column_start, diag.column_end),
+                diag.message.clone(),
+                diag.severity,
+                start_x,
+                end_x,
+            );
         }
     }
 

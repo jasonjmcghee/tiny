@@ -523,8 +523,10 @@ impl Viewport {
     /// Get visible line range
     pub fn visible_lines(&self) -> std::ops::Range<u32> {
         let first_line = (self.scroll.y / self.metrics.line_height) as u32;
+        // Use bounds.height for the viewport height (works for both root and child viewports)
+        let viewport_height = self.bounds.height.0;
         let last_line =
-            ((self.scroll.y + self.logical_size.height) / self.metrics.line_height) as u32 + 1;
+            ((self.scroll.y + viewport_height) / self.metrics.line_height) as u32 + 1;
 
         first_line..last_line
     }

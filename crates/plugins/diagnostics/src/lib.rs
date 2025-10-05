@@ -35,8 +35,9 @@ pub struct Diagnostic {
     pub line: usize,
     /// Column range (start, end) - 0-indexed character positions
     pub column_range: (usize, usize),
-    /// Byte range in the line (if available for accurate positioning)
-    pub byte_range: Option<(usize, usize)>,
+    /// Precise measured X positions (in logical pixels from layout cache)
+    pub start_x: f32,
+    pub end_x: f32,
     /// Diagnostic message
     pub message: String,
     /// Severity level
@@ -52,6 +53,9 @@ pub struct Symbol {
     pub line: usize,
     /// Column range (start, end) - 0-indexed character positions
     pub column_range: (usize, usize),
+    /// Precise measured X positions (in logical pixels from layout cache)
+    pub start_x: f32,
+    pub end_x: f32,
     /// Symbol kind (function, struct, etc)
     pub kind: String,
 }
@@ -119,6 +123,9 @@ pub struct DiagnosticsPlugin {
     // Viewport info
     viewport: ViewportInfo,
 
+    // Cache tracking for invalidation
+    last_font_size: f32,
+
     // GPU resources (RwLock for interior mutability in paint())
     vertex_buffer: RwLock<Option<Buffer>>,
     vertex_buffer_id: RwLock<Option<BufferId>>,
@@ -136,16 +143,19 @@ enum HoverState {
         over_symbol: bool,
         line: usize,
         column: usize,
+        anchor_x: f32, // Precise X position of symbol
     },
     RequestingHover {
         line: usize,
         column: usize,
+        anchor_x: f32,
     },
     ShowingHover {
         #[allow(dead_code)]
         content: String,
         line: usize,
         column: usize,
+        anchor_x: f32,
     },
 }
 
@@ -155,12 +165,12 @@ enum PopupContent {
     Diagnostic {
         message: String,
         line: usize,
-        column: usize,
+        anchor_x: f32, // Precise X position in layout space
     },
     Hover {
         content: String,
         line: usize,
-        column: usize,
+        anchor_x: f32, // Precise X position in layout space
     },
 }
 
@@ -201,6 +211,7 @@ impl DiagnosticsPlugin {
                 margin: LayoutPos::new(60.0, 10.0),
                 global_margin: LayoutPos::new(0.0, 0.0),
             },
+            last_font_size: 14.0,
             vertex_buffer: RwLock::new(None),
             vertex_buffer_id: RwLock::new(None),
             custom_pipeline_id: None,
@@ -211,7 +222,19 @@ impl DiagnosticsPlugin {
 
     /// Update viewport information
     pub fn set_viewport_info(&mut self, viewport: ViewportInfo) {
+        // Invalidate cache if font size changed
+        if (viewport.font_size - self.last_font_size).abs() > 0.01 {
+            self.invalidate_position_cache();
+            self.last_font_size = viewport.font_size;
+        }
         self.viewport = viewport;
+    }
+
+    /// Invalidate cached positions when font size changes (host must re-provide positions)
+    pub fn invalidate_position_cache(&mut self) {
+        // Clear diagnostics when positions become invalid
+        // Host must re-add diagnostics with new positions from updated layout
+        self.diagnostics.clear();
     }
 
     /// Update mouse position for hover detection (in editor-local coordinates)
@@ -269,40 +292,45 @@ impl DiagnosticsPlugin {
         };
 
         // Check if we're over a diagnostic (show immediately)
+        // Use precise pixel positions instead of character column approximations
+        let mouse_x = self.mouse_position.0;
+
         for diagnostic in &self.diagnostics {
             if diagnostic.line == line
-                && column >= diagnostic.column_range.0
-                && column < diagnostic.column_range.1
+                && mouse_x >= diagnostic.start_x
+                && mouse_x < diagnostic.end_x
             {
                 self.current_popup = Some(PopupContent::Diagnostic {
                     message: diagnostic.message.clone(),
                     line: diagnostic.line,
-                    column: diagnostic.column_range.0,
+                    anchor_x: diagnostic.start_x,
                 });
                 return;
             }
         }
 
         // Check if we're over a symbol (only if we have symbols loaded)
-        let over_symbol = if self.symbols.is_empty() {
-            // No symbols loaded yet - don't trigger hover
-            false
+        // Use precise pixel positions for accurate hover detection
+        let hovered_symbol = if self.symbols.is_empty() {
+            None
         } else {
-            self.symbols.iter().any(|symbol| {
+            self.symbols.iter().find(|symbol| {
                 symbol.line == line
-                    && column >= symbol.column_range.0
-                    && column < symbol.column_range.1
+                    && mouse_x >= symbol.start_x
+                    && mouse_x < symbol.end_x
             })
         };
+        let over_symbol = hovered_symbol.is_some();
 
         // Update hover state machine
         match &self.hover_state {
             HoverState::None => {
-                if over_symbol {
+                if let Some(symbol) = hovered_symbol {
                     self.hover_state = HoverState::WaitingForDelay {
                         over_symbol: true,
                         line,
                         column,
+                        anchor_x: symbol.start_x,
                     };
                     self.hover_start_time = Some(Instant::now());
                 } else {
@@ -313,14 +341,16 @@ impl DiagnosticsPlugin {
                 over_symbol: _,
                 line: prev_line,
                 column: prev_column,
+                ..
             } => {
                 if line != *prev_line || column != *prev_column {
                     // Position changed, reset
-                    if over_symbol {
+                    if let Some(symbol) = hovered_symbol {
                         self.hover_state = HoverState::WaitingForDelay {
                             over_symbol: true,
                             line,
                             column,
+                            anchor_x: symbol.start_x,
                         };
                         self.hover_start_time = Some(Instant::now());
                     } else {
@@ -336,16 +366,18 @@ impl DiagnosticsPlugin {
             HoverState::RequestingHover {
                 line: prev_line,
                 column: prev_column,
+                ..
             } => {
                 if line != *prev_line || column != *prev_column || !over_symbol {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
-                    if over_symbol {
+                    if let Some(symbol) = hovered_symbol {
                         self.hover_state = HoverState::WaitingForDelay {
                             over_symbol: true,
                             line,
                             column,
+                            anchor_x: symbol.start_x,
                         };
                         self.hover_start_time = Some(Instant::now());
                     }
@@ -360,11 +392,12 @@ impl DiagnosticsPlugin {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
-                    if over_symbol {
+                    if let Some(symbol) = hovered_symbol {
                         self.hover_state = HoverState::WaitingForDelay {
                             over_symbol: true,
                             line,
                             column,
+                            anchor_x: symbol.start_x,
                         };
                         self.hover_start_time = Some(Instant::now());
                     }
@@ -377,19 +410,14 @@ impl DiagnosticsPlugin {
     fn create_squiggly_vertices(
         &self,
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
-        services: Option<&tiny_sdk::ServiceRegistry>,
+        _services: Option<&tiny_sdk::ServiceRegistry>,
     ) -> Vec<DiagnosticVertex> {
         let mut vertices = Vec::new();
         let scale = self.viewport.scale_factor;
 
-        // Get font service for accurate character width
-        let char_width = services
-            .and_then(|s| s.get::<SharedFontSystem>())
-            .map(|fs| fs.char_width_coef() * self.viewport.font_size)
-            .unwrap_or_else(|| {
-                eprintln!("Warning: Font service not available, using fallback character width");
-                self.viewport.font_size * 0.6
-            });
+        if !self.diagnostics.is_empty() {
+            eprintln!("Creating vertices for {} diagnostics", self.diagnostics.len());
+        }
 
         // Get widget bounds offset and scroll
         let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
@@ -401,33 +429,39 @@ impl DiagnosticsPlugin {
             .map(|w| w.scroll.y.0)
             .unwrap_or(self.viewport.scroll.y.0);
 
+        eprintln!("Scroll: ({}, {}), Offset: ({}, {}), Scale: {}, Line height: {}",
+                  widget_scroll_x, widget_scroll_y, widget_offset_x, widget_offset_y, scale,
+                  self.viewport.line_height);
+
         for diagnostic in &self.diagnostics {
-            // Calculate line position in document space (absolute position in the document)
-            let doc_y = diagnostic.line as f32 * self.viewport.line_height;
+            // Positions from layout cache are in layout space (0,0 origin)
+            // They already account for actual glyph positions, no approximation
+            let layout_start_x = diagnostic.start_x;
+            let layout_end_x = diagnostic.end_x;
+            let width = layout_end_x - layout_start_x;
+
+            // Y position from line number
+            let layout_y = diagnostic.line as f32 * self.viewport.line_height;
             // Position at bottom of line for squiggly effect
-            let line_y_doc = doc_y + self.viewport.line_height - 2.0;
+            let layout_line_y = layout_y + self.viewport.line_height - 2.0;
 
-            // Calculate X positions in document space
-            let start_x_doc = diagnostic.column_range.0 as f32 * char_width;
-            let end_x_doc = diagnostic.column_range.1 as f32 * char_width;
-            let width = end_x_doc - start_x_doc;
+            // Convert to view space (subtract scroll)
+            let view_x = layout_start_x - widget_scroll_x;
+            let view_y = layout_line_y - widget_scroll_y;
 
-            // Convert to view space (subtract scroll to get visible position)
-            let view_x = start_x_doc - widget_scroll_x;
-            let view_y = line_y_doc - widget_scroll_y;
-
-            // Transform to physical space: add widget offset first (in logical), then scale
-            let screen_x = view_x + widget_offset_x;
-            let screen_y = view_y + widget_offset_y;
-            let start_x = screen_x * scale;
-            let line_y = screen_y * scale;
+            // Transform to screen space: add widget offset and scale to physical pixels
+            let screen_x = (view_x + widget_offset_x) * scale;
+            let screen_y = (view_y + widget_offset_y) * scale;
             let width_scaled = width * scale;
+
+            eprintln!("  Line {}: x={}-{} -> screen ({}, {})",
+                      diagnostic.line, layout_start_x, layout_end_x, screen_x, screen_y);
 
             // Create a quad that covers the area where the squiggly line will be drawn
             let padding = 4.0 * scale; // Extra height for the wave amplitude
             let line_info = [
-                start_x,
-                line_y,
+                screen_x,
+                screen_y,
                 width_scaled,
                 diagnostic.severity as i32 as f32,
             ];
@@ -438,32 +472,32 @@ impl DiagnosticsPlugin {
             // Create quad vertices
             vertices.extend_from_slice(&[
                 DiagnosticVertex {
-                    position: [start_x, line_y - padding],
+                    position: [screen_x, screen_y - padding],
                     color,
                     line_info,
                 },
                 DiagnosticVertex {
-                    position: [start_x + width_scaled, line_y - padding],
+                    position: [screen_x + width_scaled, screen_y - padding],
                     color,
                     line_info,
                 },
                 DiagnosticVertex {
-                    position: [start_x, line_y + padding],
+                    position: [screen_x, screen_y + padding],
                     color,
                     line_info,
                 },
                 DiagnosticVertex {
-                    position: [start_x + width_scaled, line_y - padding],
+                    position: [screen_x + width_scaled, screen_y - padding],
                     color,
                     line_info,
                 },
                 DiagnosticVertex {
-                    position: [start_x + width_scaled, line_y + padding],
+                    position: [screen_x + width_scaled, screen_y + padding],
                     color,
                     line_info,
                 },
                 DiagnosticVertex {
-                    position: [start_x, line_y + padding],
+                    position: [screen_x, screen_y + padding],
                     color,
                     line_info,
                 },
@@ -478,18 +512,14 @@ impl DiagnosticsPlugin {
         &self,
         content: &str,
         anchor_line: usize,
-        anchor_col: usize,
+        anchor_x: f32, // Precise X position in layout space (REQUIRED)
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
         services: Option<&tiny_sdk::ServiceRegistry>,
     ) {
         // Get font service
-        let font_service = match services.and_then(|s| s.get::<SharedFontSystem>()) {
-            Some(fs) => fs,
-            None => {
-                eprintln!("Warning: Font service not available for popup");
-                return;
-            }
-        };
+        let font_service = services
+            .and_then(|s| s.get::<SharedFontSystem>())
+            .expect("Font service required for popup rendering");
 
         // Get widget bounds and scroll
         let widget_bounds = widget_viewport
@@ -498,14 +528,13 @@ impl DiagnosticsPlugin {
         let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(0.0);
         let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(0.0);
 
-        // Calculate anchor position in document space
-        let char_width = font_service.char_width_coef() * self.viewport.font_size;
-        let doc_x = anchor_col as f32 * char_width;
-        let doc_y = anchor_line as f32 * self.viewport.line_height;
+        // Use precise anchor position (no approximation)
+        let layout_x = anchor_x;
+        let layout_y = anchor_line as f32 * self.viewport.line_height;
 
         // Convert to view space
-        let view_x = doc_x - widget_scroll_x;
-        let view_y = doc_y - widget_scroll_y;
+        let view_x = layout_x - widget_scroll_x;
+        let view_y = layout_y - widget_scroll_y;
 
         // Calculate popup size
         let layout = font_service.layout_text(content, self.viewport.font_size);
@@ -539,7 +568,8 @@ impl DiagnosticsPlugin {
 
         // Create TextView
         let mut text_view = TextView::from_text(content, popup_viewport);
-        text_view.padding = self.config.popup_padding;
+        text_view.padding_x = self.config.popup_padding;
+        text_view.padding_y = self.config.popup_padding;
         text_view.update_layout(&font_service);
 
         *self.popup_view.write().unwrap() = Some(text_view);
@@ -672,31 +702,35 @@ impl Library for DiagnosticsPlugin {
                 Ok(Vec::new())
             }
             "add_diagnostic" => {
-                // Format: line (u32), col_start (u32), col_end (u32), severity (u8), message_len (u32), message (bytes)
-                if args.len() < 17 {
+                // Format: line (u32), col_start (u32), col_end (u32), severity (u8),
+                //         start_x (f32), end_x (f32), message_len (u32), message (bytes)
+                if args.len() < 25 {
                     return Err(PluginError::Other("Invalid diagnostic args".into()));
                 }
 
-                let line = u32::from_le_bytes(args[0..4].try_into().unwrap()) as usize;
-                let col_start = u32::from_le_bytes(args[4..8].try_into().unwrap()) as usize;
-                let col_end = u32::from_le_bytes(args[8..12].try_into().unwrap()) as usize;
+                let line: u32 = *bytemuck::from_bytes(&args[0..4]);
+                let col_start: u32 = *bytemuck::from_bytes(&args[4..8]);
+                let col_end: u32 = *bytemuck::from_bytes(&args[8..12]);
                 let severity = match args[12] {
                     0 => DiagnosticSeverity::Error,
                     1 => DiagnosticSeverity::Warning,
                     _ => DiagnosticSeverity::Info,
                 };
-                let message_len = u32::from_le_bytes(args[13..17].try_into().unwrap()) as usize;
+                let start_x: f32 = *bytemuck::from_bytes(&args[13..17]);
+                let end_x: f32 = *bytemuck::from_bytes(&args[17..21]);
+                let message_len: u32 = *bytemuck::from_bytes(&args[21..25]);
 
-                if args.len() < 17 + message_len {
+                if args.len() < 25 + message_len as usize {
                     return Err(PluginError::Other("Invalid message length".into()));
                 }
 
-                let message = String::from_utf8_lossy(&args[17..17 + message_len]).to_string();
+                let message = String::from_utf8_lossy(&args[25..25 + message_len as usize]).to_string();
 
                 self.diagnostics.push(Diagnostic {
-                    line,
-                    column_range: (col_start, col_end),
-                    byte_range: None,
+                    line: line as usize,
+                    column_range: (col_start as usize, col_end as usize),
+                    start_x,
+                    end_x,
                     message,
                     severity,
                 });
@@ -727,63 +761,61 @@ impl Library for DiagnosticsPlugin {
                 Ok(Vec::new())
             }
             "set_symbols" => {
-                // Format: count (u32), then for each symbol: line (u32), col_start (u32), col_end (u32), kind_len (u32), kind, name_len (u32), name
+                // Format: count (u32), then for each symbol:
+                //   line (u32), col_start (u32), col_end (u32), start_x (f32), end_x (f32),
+                //   kind_len (u32), kind, name_len (u32), name
                 if args.len() < 4 {
                     return Err(PluginError::Other("Invalid symbols args".into()));
                 }
 
-                let count = u32::from_le_bytes(args[0..4].try_into().unwrap()) as usize;
+                let count: u32 = *bytemuck::from_bytes(&args[0..4]);
                 self.symbols.clear();
-                self.symbols.reserve(count);
+                self.symbols.reserve(count as usize);
 
                 let mut offset = 4;
                 for _ in 0..count {
-                    if args.len() < offset + 16 {
+                    if args.len() < offset + 24 {
                         return Err(PluginError::Other("Invalid symbol data".into()));
                     }
 
-                    let line =
-                        u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
-                    let col_start =
-                        u32::from_le_bytes(args[offset + 4..offset + 8].try_into().unwrap())
-                            as usize;
-                    let col_end =
-                        u32::from_le_bytes(args[offset + 8..offset + 12].try_into().unwrap())
-                            as usize;
-                    let kind_len =
-                        u32::from_le_bytes(args[offset + 12..offset + 16].try_into().unwrap())
-                            as usize;
+                    let line: u32 = *bytemuck::from_bytes(&args[offset..offset + 4]);
+                    let col_start: u32 = *bytemuck::from_bytes(&args[offset + 4..offset + 8]);
+                    let col_end: u32 = *bytemuck::from_bytes(&args[offset + 8..offset + 12]);
+                    let start_x: f32 = *bytemuck::from_bytes(&args[offset + 12..offset + 16]);
+                    let end_x: f32 = *bytemuck::from_bytes(&args[offset + 16..offset + 20]);
+                    let kind_len: u32 = *bytemuck::from_bytes(&args[offset + 20..offset + 24]);
 
-                    offset += 16;
-                    if args.len() < offset + kind_len {
+                    offset += 24;
+                    if args.len() < offset + kind_len as usize {
                         return Err(PluginError::Other("Invalid symbol kind length".into()));
                     }
 
                     let kind =
-                        String::from_utf8_lossy(&args[offset..offset + kind_len]).to_string();
-                    offset += kind_len;
+                        String::from_utf8_lossy(&args[offset..offset + kind_len as usize]).to_string();
+                    offset += kind_len as usize;
 
                     if args.len() < offset + 4 {
                         return Err(PluginError::Other(
                             "Invalid symbol name length header".into(),
                         ));
                     }
-                    let name_len =
-                        u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap()) as usize;
+                    let name_len: u32 = *bytemuck::from_bytes(&args[offset..offset + 4]);
                     offset += 4;
 
-                    if args.len() < offset + name_len {
+                    if args.len() < offset + name_len as usize {
                         return Err(PluginError::Other("Invalid symbol name length".into()));
                     }
 
                     let name =
-                        String::from_utf8_lossy(&args[offset..offset + name_len]).to_string();
-                    offset += name_len;
+                        String::from_utf8_lossy(&args[offset..offset + name_len as usize]).to_string();
+                    offset += name_len as usize;
 
                     self.symbols.push(Symbol {
                         name,
-                        line,
-                        column_range: (col_start, col_end),
+                        line: line as usize,
+                        column_range: (col_start as usize, col_end as usize),
+                        start_x,
+                        end_x,
                         kind,
                     });
                 }
@@ -869,38 +901,52 @@ impl Paintable for DiagnosticsPlugin {
 
                 if let Some(ref gpu_ctx) = ctx.gpu_context {
                     if let Some(pipeline_id) = self.custom_pipeline_id {
+                        eprintln!("DRAWING {} vertices for diagnostics", vertex_count);
                         gpu_ctx.set_pipeline(render_pass, pipeline_id);
                         gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
                         gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
                         gpu_ctx.draw(render_pass, vertex_count, 1);
+                    } else {
+                        eprintln!("No custom_pipeline_id set!");
                     }
+                } else {
+                    eprintln!("No gpu_context!");
                 }
+            } else {
+                eprintln!("No vertex_buffer_id!");
             }
         }
 
         // Show popup if we have one
         if let Some(ref popup_content) = self.current_popup {
-            let (popup_text, popup_line, popup_col) = match popup_content {
+            match popup_content {
                 PopupContent::Diagnostic {
                     message,
                     line,
-                    column,
-                } => (message.clone(), *line, *column),
+                    anchor_x,
+                } => {
+                    self.update_popup_view(
+                        message,
+                        *line,
+                        *anchor_x,
+                        ctx.widget_viewport.as_ref(),
+                        services,
+                    );
+                }
                 PopupContent::Hover {
                     content,
                     line,
-                    column,
-                } => (content.clone(), *line, *column),
-            };
-
-            // Update popup view (creates TextView with rounded rect)
-            self.update_popup_view(
-                &popup_text,
-                popup_line,
-                popup_col,
-                ctx.widget_viewport.as_ref(),
-                services,
-            );
+                    anchor_x,
+                } => {
+                    self.update_popup_view(
+                        content,
+                        *line,
+                        *anchor_x,
+                        ctx.widget_viewport.as_ref(),
+                        services,
+                    );
+                }
+            }
 
             // Render popup using TextView and rounded rect
             if let Some(popup_view) = self.popup_view.read().unwrap().as_ref() {
@@ -1010,16 +1056,29 @@ pub extern "C" fn diagnostics_plugin_create() -> Box<dyn Plugin> {
 // === Public API ===
 
 impl DiagnosticsPlugin {
-    /// Add a diagnostic
+    /// Add a diagnostic (host must call set_diagnostic_positions after this)
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
     }
 
-    /// Add a diagnostic with line text for accurate positioning
-    pub fn add_diagnostic_with_line_text(&mut self, diagnostic: Diagnostic, line_text: String) {
-        let line = diagnostic.line;
-        self.diagnostics.push(diagnostic);
-        self.line_texts.insert(line, line_text);
+    /// Add a diagnostic with precise positions from layout cache
+    pub fn add_diagnostic_with_positions(
+        &mut self,
+        line: usize,
+        column_range: (usize, usize),
+        message: String,
+        severity: DiagnosticSeverity,
+        start_x: f32,
+        end_x: f32,
+    ) {
+        self.diagnostics.push(Diagnostic {
+            line,
+            column_range,
+            start_x,
+            end_x,
+            message,
+            severity,
+        });
     }
 
     /// Set line text for accurate width calculation
@@ -1036,11 +1095,11 @@ impl DiagnosticsPlugin {
         }
 
         // Check if we need to transition hover state based on timing
-        if let HoverState::WaitingForDelay { line, column, .. } = self.hover_state {
+        if let HoverState::WaitingForDelay { line, column, anchor_x, .. } = self.hover_state {
             if let Some(start_time) = self.hover_start_time {
                 if start_time.elapsed().as_millis() >= 500 {
                     // 500ms elapsed, request hover info
-                    self.hover_state = HoverState::RequestingHover { line, column };
+                    self.hover_state = HoverState::RequestingHover { line, column, anchor_x };
                     self.last_hover_request = Some((line, column));
                     return Some((line, column));
                 }
@@ -1054,6 +1113,7 @@ impl DiagnosticsPlugin {
         if let HoverState::RequestingHover {
             line: req_line,
             column: req_column,
+            anchor_x,
         } = self.hover_state
         {
             if line == req_line && column == req_column {
@@ -1061,11 +1121,12 @@ impl DiagnosticsPlugin {
                     content: content.clone(),
                     line,
                     column,
+                    anchor_x,
                 };
                 self.current_popup = Some(PopupContent::Hover {
                     content,
                     line,
-                    column,
+                    anchor_x,
                 });
             }
         }
@@ -1099,5 +1160,10 @@ impl DiagnosticsPlugin {
     /// Get diagnostics count
     pub fn diagnostic_count(&self) -> usize {
         self.diagnostics.len()
+    }
+
+    /// Check if GPU resources have been initialized
+    pub fn is_initialized(&self) -> bool {
+        self.device.is_some()
     }
 }
