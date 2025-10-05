@@ -3,20 +3,18 @@
 //! Eliminates boilerplate across examples - focus on rendering logic
 
 use crate::{
-    accelerator::Modifiers,
+    accelerator::{MouseButton, Modifiers, Trigger, WheelDirection},
     input::{self, EventBus, InputAction},
     lsp_manager::LspManager,
     render::Renderer,
-    scroll::ScrollFocusManager,
+    scroll::{Scrollable, ScrollFocusManager, WidgetId},
     shortcuts::{ShortcutContext, ShortcutRegistry},
-    text_effects::TextStyleProvider,
+    tab_manager::TabManager,
     winit_adapter,
 };
 
 pub use crate::editor_logic::EditorLogic;
-use std::hash::Hasher;
-#[allow(unused)]
-use std::io::BufRead;
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -25,15 +23,17 @@ use std::sync::{
 use tiny_font::SharedFontSystem;
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, WindowEvent},
+    dpi::PhysicalPosition,
+    event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::Key,
     platform::macos::WindowAttributesExtMacOS,
     window::{Window, WindowId},
 };
 
 // Plugin orchestration support
 use tiny_core::{
-    tree::{Point, Rect},
+    tree::Point,
     GpuRenderer, Uniforms,
 };
 use tiny_sdk::{Hook, LogicalPixels, Paintable as SdkPaint, Updatable as SdkUpdate};
@@ -137,14 +137,14 @@ pub struct TinyApp {
     current_scroll_direction: Option<ScrollDirection>, // which direction is currently locked
 
     // Track cursor position for clicks
-    cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
+    cursor_position: Option<PhysicalPosition<f64>>,
 
     // Track modifier keys (accelerator format)
     modifiers: Modifiers,
 
     // Track mouse drag
     mouse_pressed: bool,
-    drag_start: Option<winit::dpi::PhysicalPosition<f64>>,
+    drag_start: Option<PhysicalPosition<f64>>,
 
     // Track if cursor moved for scrolling
     cursor_needs_scroll: bool,
@@ -162,7 +162,7 @@ pub struct TinyApp {
 impl TinyApp {
     fn physical_to_logical_point(
         &self,
-        position: winit::dpi::PhysicalPosition<f64>,
+        position: PhysicalPosition<f64>,
     ) -> Option<Point> {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor() as f32;
@@ -187,7 +187,7 @@ impl TinyApp {
     }
 
     /// Handle cursor movement (mouse move)
-    fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+    fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = Some(position);
 
         // Pre-compute logical positions to avoid borrow issues
@@ -207,7 +207,6 @@ impl TinyApp {
             }
 
             // Update scroll focus based on mouse position and actual widget bounds
-            use crate::scroll::WidgetId;
             let mut widget_bounds = vec![];
 
             // File picker (overlay, high z-index)
@@ -327,7 +326,6 @@ impl TinyApp {
                     if !drag_started_in_titlebar {
                         if let (Some(from_local), to_local) = (editor_local_from, editor_local_to) {
                             // Emit drag event
-                            use serde_json::json;
                             self.event_bus.emit(
                                 "mouse.drag",
                                 json!({
@@ -348,14 +346,11 @@ impl TinyApp {
     }
 
     /// Handle mouse wheel scrolling - routes to focused widget
-    fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
         // Emit mouse wheel event to the event bus
-        use crate::scroll::{Scrollable, WidgetId};
-        use serde_json::json;
-
         let (delta_x, delta_y) = match delta {
-            winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
-            winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+            MouseScrollDelta::LineDelta(x, y) => (x, y),
+            MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
         };
 
         self.event_bus.emit(
@@ -364,8 +359,8 @@ impl TinyApp {
                 "delta_x": delta_x,
                 "delta_y": delta_y,
                 "type": match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, _) => "line",
-                    winit::event::MouseScrollDelta::PixelDelta(_) => "pixel",
+                    MouseScrollDelta::LineDelta(_, _) => "line",
+                    MouseScrollDelta::PixelDelta(_) => "pixel",
                 }
             }),
             15, // Slightly lower priority than direct input
@@ -378,11 +373,11 @@ impl TinyApp {
         // Convert scroll delta to logical units
         let (scroll_x, scroll_y) = if let Some(cpu_renderer) = &self.cpu_renderer {
             match delta {
-                winit::event::MouseScrollDelta::LineDelta(x, y) => (
+                MouseScrollDelta::LineDelta(x, y) => (
                     x * cpu_renderer.viewport.metrics.space_width,
                     y * cpu_renderer.viewport.metrics.line_height,
                 ),
-                winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
             }
         } else {
             return;
@@ -647,8 +642,6 @@ impl TinyApp {
     }
 
     fn process_event_queue(&mut self) {
-        use serde_json::json;
-
         // Get all events sorted by priority
         let events = self.event_bus.drain_sorted();
 
@@ -762,8 +755,7 @@ impl TinyApp {
                     self.editor.file_picker.show();
                     self.editor.ui_changed = true;
                     self.shortcuts.set_context(ShortcutContext::FilePicker);
-                    self.scroll_focus
-                        .set_focus(crate::scroll::WidgetId::FilePicker);
+                    self.scroll_focus.set_focus(WidgetId::FilePicker);
                     self.request_redraw();
                 }
                 "file_picker.close" => {
@@ -812,7 +804,7 @@ impl TinyApp {
                     self.editor.grep.show(String::new());
                     self.editor.ui_changed = true;
                     self.shortcuts.set_context(ShortcutContext::Grep);
-                    self.scroll_focus.set_focus(crate::scroll::WidgetId::Grep);
+                    self.scroll_focus.set_focus(WidgetId::Grep);
                     self.request_redraw();
                 }
                 "grep.close" => {
@@ -1005,13 +997,6 @@ impl TinyApp {
             }
         }
 
-        let viewport = Rect {
-            x: LogicalPixels(0.0),
-            y: LogicalPixels(0.0),
-            width: LogicalPixels(logical_width),
-            height: LogicalPixels(logical_height),
-        };
-
         // Update plugins for editor
         if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
             let tab = self.editor.tab_manager.active_tab_mut();
@@ -1071,7 +1056,6 @@ impl TinyApp {
             }
 
             // Set up global margin (only once)
-            let title_bar_height = self.title_bar_height;
             static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
             unsafe {
                 if !GLOBAL_MARGIN_INITIALIZED {
@@ -1140,8 +1124,7 @@ impl TinyApp {
         }
 
         // Get tab_manager reference
-        let tab_manager: Option<*const crate::tab_manager::TabManager> =
-            Some(&self.editor.tab_manager as *const _);
+        let tab_manager: Option<*const TabManager> = Some(&self.editor.tab_manager as *const _);
 
         // Prepare uniforms for GPU rendering
         let uniforms = Uniforms {
@@ -1193,14 +1176,12 @@ impl ApplicationHandler for TinyApp {
                 ))
                 .with_theme(Some(winit::window::Theme::Dark));
 
-            let mut global_margin_y = 0.0;
             // Apply macOS-specific transparent titlebar
             #[cfg(target_os = "macos")]
             {
                 window_attributes = window_attributes
                     .with_titlebar_transparent(true)
                     .with_fullsize_content_view(true);
-                global_margin_y = self.title_bar_height;
             }
 
             let window = Arc::new(
@@ -1324,15 +1305,12 @@ impl ApplicationHandler for TinyApp {
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
-                use serde_json::json;
-                use winit::keyboard::Key;
-
                 // Handle key releases for modifier sequences like "shift shift"
                 if key_event.state == ElementState::Released {
                     if let Some(trigger) = winit_adapter::convert_key(&key_event.logical_key) {
                         let is_modifier_key = matches!(
                             &trigger,
-                            crate::accelerator::Trigger::Named(name)
+                            Trigger::Named(name)
                                 if name == "Shift" || name == "Ctrl" || name == "Alt" || name == "Cmd"
                         );
 
@@ -1370,7 +1348,7 @@ impl ApplicationHandler for TinyApp {
                         // Regular keys with modifiers (like Cmd+Shift+F) are matched immediately.
                         let is_modifier_key = matches!(
                             &trigger,
-                            crate::accelerator::Trigger::Named(name)
+                            Trigger::Named(name)
                                 if name == "Shift" || name == "Ctrl" || name == "Alt" || name == "Cmd"
                         );
 
@@ -1442,19 +1420,11 @@ impl ApplicationHandler for TinyApp {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                use serde_json::json;
-
                 // Convert button to trigger
                 let trigger = match button {
-                    winit::event::MouseButton::Left => crate::accelerator::Trigger::MouseButton(
-                        crate::accelerator::MouseButton::Left,
-                    ),
-                    winit::event::MouseButton::Right => crate::accelerator::Trigger::MouseButton(
-                        crate::accelerator::MouseButton::Right,
-                    ),
-                    winit::event::MouseButton::Middle => crate::accelerator::Trigger::MouseButton(
-                        crate::accelerator::MouseButton::Middle,
-                    ),
+                    WinitMouseButton::Left => Trigger::MouseButton(MouseButton::Left),
+                    WinitMouseButton::Right => Trigger::MouseButton(MouseButton::Right),
+                    WinitMouseButton::Middle => Trigger::MouseButton(MouseButton::Middle),
                     _ => return, // Ignore other buttons
                 };
 
@@ -1513,9 +1483,9 @@ impl ApplicationHandler for TinyApp {
                                                 };
 
                                             let button_name = match button {
-                                                winit::event::MouseButton::Left => "Left",
-                                                winit::event::MouseButton::Right => "Right",
-                                                winit::event::MouseButton::Middle => "Middle",
+                                                WinitMouseButton::Left => "Left",
+                                                WinitMouseButton::Right => "Right",
+                                                WinitMouseButton::Middle => "Middle",
                                                 _ => "Unknown",
                                             };
 
@@ -1554,33 +1524,23 @@ impl ApplicationHandler for TinyApp {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                use serde_json::json;
-
                 // Determine wheel direction for accelerator matching
                 let (delta_x, delta_y) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                    MouseScrollDelta::LineDelta(x, y) => (x, y),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
                 };
 
                 // Determine primary direction
                 let trigger = if delta_y.abs() > delta_x.abs() {
                     if delta_y > 0.0 {
-                        crate::accelerator::Trigger::MouseWheel(
-                            crate::accelerator::WheelDirection::Up,
-                        )
+                        Trigger::MouseWheel(WheelDirection::Up)
                     } else {
-                        crate::accelerator::Trigger::MouseWheel(
-                            crate::accelerator::WheelDirection::Down,
-                        )
+                        Trigger::MouseWheel(WheelDirection::Down)
                     }
                 } else if delta_x > 0.0 {
-                    crate::accelerator::Trigger::MouseWheel(
-                        crate::accelerator::WheelDirection::Right,
-                    )
+                    Trigger::MouseWheel(WheelDirection::Right)
                 } else if delta_x < 0.0 {
-                    crate::accelerator::Trigger::MouseWheel(
-                        crate::accelerator::WheelDirection::Left,
-                    )
+                    Trigger::MouseWheel(WheelDirection::Left)
                 } else {
                     return; // No scroll
                 };

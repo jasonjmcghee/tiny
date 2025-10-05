@@ -66,22 +66,3 @@ winit = ["dep:winit"]
 criterion = "0.7"  # Benchmarking
 pollster = "0.3"   # Async executor for examples
 
-[[example]]
-name = "minimal_typing"
-path = "examples/minimal_typing.rs"
-
-[[example]]
-name = "debug_font"
-path = "examples/debug_font.rs"
-
-[[example]]
-name = "debug_gpu"
-path = "examples/debug_gpu.rs"
-
-[[example]]
-name = "debug_coordinates"
-path = "examples/debug_coordinates.rs"
-
-[[example]]
-name = "single_char"
-path = "examples/single_char.rs"

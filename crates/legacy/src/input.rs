@@ -9,7 +9,7 @@ use crate::lsp_manager::TextChange;
 use crate::syntax::SyntaxHighlighter;
 use crate::text_editor_plugin::TextEditorPlugin;
 use arboard::Clipboard;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

@@ -8,11 +8,11 @@
 
 use crate::{
     coordinates::Viewport,
-    input::{InputAction, InputHandler, Selection},
+    input::{InputHandler, Selection},
     text_view::TextView,
 };
-use tiny_core::tree::{Doc, Point};
-use tiny_sdk::{DocPos, LayoutPos};
+use tiny_core::tree::Point;
+use tiny_sdk::LayoutPos;
 
 /// Edit mode for text view
 #[derive(Clone, Copy, PartialEq, Debug)]

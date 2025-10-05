@@ -1,6 +1,6 @@
 use crate::{
     coordinates, file_picker_plugin, grep_plugin, history,
-    input::{self, InputAction},
+    input::{self},
     io, syntax, tab_bar_plugin, tab_manager,
     text_editor_plugin::TextEditorPlugin,
     text_effects::TextStyleProvider,
@@ -607,33 +607,6 @@ impl EditorLogic {
             cursor_needs_centering: false,
         }
     }
-}
-
-/// Find the start of an identifier at the given column position
-/// Returns the column where the identifier starts (handles cursor anywhere in identifier)
-fn find_identifier_start(line_text: &str, column: usize) -> usize {
-    let chars: Vec<char> = line_text.chars().collect();
-
-    // If past end of line, return column as-is
-    if column >= chars.len() {
-        return column;
-    }
-
-    // Standard identifier: alphanumeric and underscore only
-    let is_identifier_char = |c: char| c.is_alphanumeric() || c == '_';
-
-    // If not on an identifier, return column as-is
-    if !is_identifier_char(chars[column]) {
-        return column;
-    }
-
-    // Find start of identifier (go backwards)
-    let mut start = column;
-    while start > 0 && is_identifier_char(chars[start - 1]) {
-        start -= 1;
-    }
-
-    start
 }
 
 /// Find word boundaries at the given column position in a line of text

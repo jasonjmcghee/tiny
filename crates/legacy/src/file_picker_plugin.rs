@@ -21,9 +21,6 @@ pub struct FilePickerPlugin {
     /// All files in working directory (thread-safe)
     all_files: Arc<RwLock<Vec<PathBuf>>>,
 
-    /// Working directory
-    working_dir: PathBuf,
-
     /// Whether filtering is in progress
     filtering: bool,
 
@@ -60,7 +57,6 @@ impl FilePickerPlugin {
         Self {
             dropdown: FilterableDropdown::new(format_fn),
             all_files,
-            working_dir,
             filtering: false,
             on_select: None,
             visible: false,

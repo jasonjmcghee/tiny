@@ -710,7 +710,7 @@ impl GpuRenderer {
     /// Initialize themed pipeline with interpolation between two themes
     pub fn init_themed_interpolation(&mut self, texture_data: &[u8], max_colors: u32) {
         let theme_texture = self.create_theme_texture(
-            &texture_data,
+            texture_data,
             256,
             max_colors * 2,
             "Theme Texture (Interpolated)",
@@ -721,7 +721,7 @@ impl GpuRenderer {
     /// Initialize themed pipeline with a single theme
     pub fn init_themed_pipeline(&mut self, texture_data: &[u8], max_colors: u32) {
         let theme_texture =
-            self.create_theme_texture(&texture_data, 256, max_colors, "Theme Texture");
+            self.create_theme_texture(texture_data, 256, max_colors, "Theme Texture");
         self.complete_themed_pipeline_setup(theme_texture);
     }
 

@@ -162,6 +162,12 @@ enum PopupContent {
     },
 }
 
+impl Default for DiagnosticsPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiagnosticsPlugin {
     /// Create a new diagnostics plugin
     pub fn new() -> Self {
@@ -1188,7 +1194,7 @@ impl Paintable for DiagnosticsPlugin {
                     let services = &*(services as *const _ as *const tiny_sdk::ServiceRegistry);
                     let glyphs = self.collect_popup_glyphs(services, ctx.widget_viewport.as_ref());
 
-                    if !glyphs.is_empty() && ctx.gpu_renderer != std::ptr::null_mut() {
+                    if !glyphs.is_empty() && !ctx.gpu_renderer.is_null() {
                         let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
                         // Use dedicated buffer for diagnostics to avoid conflicts
                         gpu_renderer.draw_glyphs(

@@ -4,25 +4,22 @@
 
 use ahash::AHasher;
 use lsp_types::{
-    notification::{Notification, PublishDiagnostics},
-    request::{DocumentSymbolRequest, Initialize, Request, Shutdown},
     ClientCapabilities, Diagnostic as LspDiagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, HoverParams, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, NumberOrString, Position,
-    PublishDiagnosticsParams, Range, ServerCapabilities, SymbolKind,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, InitializeParams,
+    InitializeResult, InitializedParams, Position,
+    PublishDiagnosticsParams, Range,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -34,7 +31,6 @@ const CHANGE_DEBOUNCE_MS: u64 = 200;
 const REQUEST_POLL_TIMEOUT_MS: u64 = 50;
 const REQUEST_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 10;
-const REQUEST_SLOW_WARNING_MS: u64 = 500;
 const STATE_LOG_INTERVAL_SECS: u64 = 2;
 
 /// Unified error type for LSP operations
@@ -249,8 +245,6 @@ pub struct LspManager {
     tx: mpsc::Sender<LspRequest>,
     response_rx: Arc<Mutex<mpsc::Receiver<LspResponse>>>,
     current_diagnostics: Arc<RwLock<Vec<LspDiagnostic>>>,
-    /// Current document tree for UTF-16 conversions
-    document_tree: Arc<RwLock<Option<tree::Tree>>>,
     /// Current document info (URI and version)
     document_info: Arc<RwLock<Option<DocumentInfo>>>,
     workspace_root: Option<PathBuf>,
@@ -299,7 +293,6 @@ impl LspManager {
             tx: request_tx,
             response_rx,
             current_diagnostics,
-            document_tree,
             document_info,
             workspace_root,
         })
@@ -764,28 +757,6 @@ impl ChangeDebouncer {
     }
 }
 
-/// Stored server capabilities for capability checking
-#[derive(Debug, Clone, Default)]
-struct StoredCapabilities {
-    hover_provider: bool,
-    definition_provider: bool,
-    document_symbol_provider: bool,
-    code_action_provider: bool,
-    execute_command_provider: bool,
-}
-
-impl StoredCapabilities {
-    fn from_server_capabilities(caps: &ServerCapabilities) -> Self {
-        Self {
-            hover_provider: caps.hover_provider.is_some(),
-            definition_provider: caps.definition_provider.is_some(),
-            document_symbol_provider: caps.document_symbol_provider.is_some(),
-            code_action_provider: caps.code_action_provider.is_some(),
-            execute_command_provider: caps.execute_command_provider.is_some(),
-        }
-    }
-}
-
 // Helper functions for common operations
 
 /// Convert UTF-8 position to UTF-16 for LSP using Tree
@@ -923,9 +894,6 @@ fn run_lsp_client(
     // Queue documents to open after initialization
     let queued_document = Arc::new(Mutex::new(None::<QueuedDocument>));
 
-    // Store server capabilities
-    let server_capabilities = Arc::new(RwLock::new(None::<StoredCapabilities>));
-
     // Channel for response handler to signal initialization complete
     let (init_complete_tx, init_complete_rx) = mpsc::channel::<InternalSignal>();
 
@@ -936,8 +904,6 @@ fn run_lsp_client(
     let current_diagnostics_clone = current_diagnostics.clone();
     let pending_requests_clone = pending_requests.clone();
     let init_state_clone = init_state.clone();
-    let queued_document_clone = queued_document.clone();
-    let server_capabilities_clone = server_capabilities.clone();
     let response_handle = thread::spawn(move || {
         handle_lsp_responses(
             reader,
@@ -947,11 +913,9 @@ fn run_lsp_client(
             current_diagnostics_clone,
             pending_requests_clone,
             init_state_clone,
-            server_capabilities_clone,
             init_complete_tx,
         );
     });
-    let mut last_text = String::new();
     let mut debouncer = ChangeDebouncer::new(CHANGE_DEBOUNCE_MS);
     let mut last_timeout_check = std::time::Instant::now();
     let mut last_state_log = std::time::Instant::now();
@@ -960,14 +924,6 @@ fn run_lsp_client(
     loop {
         // Log state periodically
         if last_state_log.elapsed() > Duration::from_secs(STATE_LOG_INTERVAL_SECS) {
-            let state = init_state.load(Ordering::SeqCst);
-            let has_queued = queued_document.lock().unwrap().is_some();
-            let state_name = match state {
-                INIT_NOT_STARTED => "NotStarted",
-                INIT_SENT => "InitializeSent",
-                INIT_COMPLETE => "Initialized",
-                _ => "Unknown",
-            };
             last_state_log = Instant::now();
         }
 
@@ -978,7 +934,6 @@ fn run_lsp_client(
                     if let Some(doc) = queued.take() {
                         send_initialized(&mut stdin)?;
                         *current_file.write().unwrap() = Some(doc.uri.clone());
-                        last_text = doc.text.clone();
                         *document_tree.write().unwrap() = Some(tree::Tree::from_str(&doc.text));
                         *document_info.write().unwrap() = Some(DocumentInfo {
                             uri: doc.uri.clone(),
@@ -1030,7 +985,6 @@ fn run_lsp_client(
                                     && (changes[0].range.end.line == u32::MAX
                                         || changes[0].range.end.character == u32::MAX)
                                 {
-                                    last_text = changes[0].text.clone();
                                     *document_tree.write().unwrap() =
                                         Some(tree::Tree::from_str(&changes[0].text));
                                     if let Ok(mut info_guard) = document_info.write() {
@@ -1092,7 +1046,6 @@ fn run_lsp_client(
                             }
                             INIT_COMPLETE => {
                                 *current_file.write().unwrap() = Some(file_uri.clone());
-                                last_text = text.clone();
                                 let new_version = document_info
                                     .read()
                                     .ok()
@@ -1363,7 +1316,6 @@ fn handle_lsp_responses(
     current_diagnostics: Arc<RwLock<Vec<LspDiagnostic>>>,
     pending_requests: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
     init_state: Arc<AtomicU8>,
-    server_capabilities: Arc<RwLock<Option<StoredCapabilities>>>,
     init_complete_tx: mpsc::Sender<InternalSignal>,
 ) {
     use std::io::{BufRead, Read};
@@ -1416,7 +1368,6 @@ fn handle_lsp_responses(
                             &current_diagnostics,
                             &pending_requests,
                             &init_state,
-                            &server_capabilities,
                             &init_complete_tx,
                         );
                     }
@@ -1439,7 +1390,6 @@ fn handle_lsp_message(
     current_diagnostics: &Arc<RwLock<Vec<LspDiagnostic>>>,
     pending_requests: &Arc<Mutex<HashMap<u64, TrackedRequest>>>,
     init_state: &Arc<AtomicU8>,
-    server_capabilities: &Arc<RwLock<Option<StoredCapabilities>>>,
     init_complete_tx: &mpsc::Sender<InternalSignal>,
 ) {
     // Handle notifications (messages without an ID)
@@ -1513,13 +1463,7 @@ fn handle_lsp_message(
             Some(PendingRequest::Initialize) => {
                 if let Some(result) = msg.result {
                     match serde_json::from_value::<InitializeResult>(result) {
-                        Ok(init_result) => {
-                            let caps = StoredCapabilities::from_server_capabilities(
-                                &init_result.capabilities,
-                            );
-                            if let Ok(mut stored_caps) = server_capabilities.write() {
-                                *stored_caps = Some(caps);
-                            }
+                        Ok(_init_result) => {
                             init_state.store(INIT_COMPLETE, Ordering::SeqCst);
                             let _ = init_complete_tx.send(InternalSignal::InitializeCompleted);
                         }

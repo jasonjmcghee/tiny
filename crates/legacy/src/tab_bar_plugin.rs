@@ -58,12 +58,6 @@ impl TabBarPlugin {
         ideal_width.max(MIN_TAB_WIDTH)
     }
 
-    /// Calculate total content width for all tabs
-    fn calculate_total_width(&self, viewport_width: f32, num_tabs: usize) -> f32 {
-        let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
-        tab_width * num_tabs as f32 + 40.0 // Include dropdown arrow space
-    }
-
     /// Ensure the active tab is visible by adjusting scroll offset
     pub fn scroll_to_tab(&mut self, tab_index: usize, viewport_width: f32, num_tabs: usize) {
         let tab_width = self.calculate_tab_width(viewport_width, num_tabs);

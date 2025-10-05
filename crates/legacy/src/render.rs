@@ -3,7 +3,6 @@
 use crate::{
     coordinates::Viewport,
     input, syntax,
-    scroll::Scrollable,
     text_effects::{self, TextStyleProvider},
     text_renderer::{self, TextRenderer},
 };
@@ -21,7 +20,6 @@ use tiny_sdk::{PaintContext, Paintable};
 const FILE_EXPLORER_WIDTH: f32 = 0.0;
 const STATUS_BAR_HEIGHT: f32 = 0.0;
 const TAB_BAR_HEIGHT: f32 = 30.0;
-const FILE_PICKER_HEIGHT: f32 = 300.0; // Height when file picker is visible
 
 // Plugin state synchronization
 #[derive(Clone, Debug)]
@@ -532,7 +530,7 @@ impl Renderer {
         }
 
         let mut offset_x = 0.0;
-        let mut offset_y = self.title_bar_height + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
+        let offset_y = self.title_bar_height + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
 
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };

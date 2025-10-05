@@ -4,7 +4,6 @@
 
 use crate::{
     coordinates::Viewport,
-    history::DocumentHistory,
     input::{InputAction, InputHandler, Selection},
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
@@ -12,9 +11,8 @@ use crate::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_core::tree::{Doc, Point};
-use tiny_font::{create_glyph_instances, SharedFontSystem};
 use tiny_sdk::{
-    Capability, Initializable, LayoutPos, LogicalSize, PaintContext, Paintable, Plugin,
+    Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin,
     PluginError, SetupContext, Updatable, UpdateContext,
 };
 

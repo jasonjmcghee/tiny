@@ -233,8 +233,8 @@ impl TextView {
 
     /// Collect background rectangles (selection highlights, current line, etc.)
     pub fn collect_background_rects(&self) -> Vec<tiny_sdk::types::RectInstance> {
-        use tiny_sdk::types::RectInstance;
-        let mut rects = Vec::new();
+        
+        let rects = Vec::new();
 
         if !self.visible {
             return rects;

@@ -1,6 +1,6 @@
 use tiny_editor::syntax::*;
 use tiny_editor::text_effects::TextStyleProvider;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, WasmStore};
+use tree_sitter::{StreamingIterator, WasmStore};
 
 #[test]
 fn test_rust_highlighting() {

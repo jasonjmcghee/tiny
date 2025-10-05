@@ -3,13 +3,9 @@
 //! Supports diagnostics, hover, go-to-definition, find references, etc.
 
 use crate::lsp_manager::{LspManager, ParsedDiagnostic};
-use lsp_types::{
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, Position, Range,
-    ReferenceParams, TextDocumentIdentifier, TextDocumentPositionParams,
-};
+use lsp_types::Position;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tiny_tree::Doc;
 
 /// Position in a document (line, column in UTF-16 code units for LSP compatibility)
 #[derive(Debug, Clone, Copy)]
