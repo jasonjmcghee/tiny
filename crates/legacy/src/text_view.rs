@@ -9,9 +9,7 @@
 //! TextView transforms them to screen coordinates in one step.
 
 use crate::{
-    coordinates::Viewport,
-    scroll::Scrollable,
-    syntax::SyntaxHighlighter,
+    coordinates::Viewport, scroll::Scrollable, syntax::SyntaxHighlighter,
     text_renderer::TextRenderer,
 };
 use std::sync::Arc;
@@ -122,7 +120,8 @@ impl TextView {
     /// Update layout (shape text, build line cache)
     pub fn update_layout(&mut self, font_system: &SharedFontSystem) {
         let tree = self.doc.read();
-        self.renderer.update_layout(&tree, font_system, &self.viewport, false);
+        self.renderer
+            .update_layout(&tree, font_system, &self.viewport, false);
         self.renderer.update_visible_range(&self.viewport, &tree);
     }
 
@@ -206,7 +205,8 @@ impl TextView {
             // This prevents edge cases where glyphs at boundaries get incorrectly culled
             let line_top = screen_y;
             let line_bottom = screen_y + line_height;
-            if line_bottom < viewport_top - cull_margin || line_top > viewport_bottom + cull_margin {
+            if line_bottom < viewport_top - cull_margin || line_top > viewport_bottom + cull_margin
+            {
                 continue;
             }
 

@@ -520,7 +520,11 @@ mod new_tree_tests {
         for _c in text.chars() {
             let utf16 = tree.offset_to_offset_utf16(byte_offset);
             let back = tree.offset_utf16_to_offset(utf16);
-            assert_eq!(back, byte_offset, "Round-trip failed for offset {}", byte_offset);
+            assert_eq!(
+                back, byte_offset,
+                "Round-trip failed for offset {}",
+                byte_offset
+            );
             byte_offset += _c.len_utf8();
         }
         // Test final offset (end of string)
@@ -534,27 +538,18 @@ mod new_tree_tests {
         let tree = Tree::from_str("Hello\nWörld 🌍\nTest");
 
         // Test line 0 (ASCII)
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(0, 0),
-            PointUtf16::new(0, 0)
-        );
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(0, 5),
-            PointUtf16::new(0, 5)
-        );
+        assert_eq!(tree.doc_pos_to_point_utf16(0, 0), PointUtf16::new(0, 0));
+        assert_eq!(tree.doc_pos_to_point_utf16(0, 5), PointUtf16::new(0, 5));
 
         // Test line 1 (with multibyte chars)
-        assert_eq!(
-            tree.doc_pos_to_point_utf16(1, 0),
-            PointUtf16::new(1, 0)
-        );
+        assert_eq!(tree.doc_pos_to_point_utf16(1, 0), PointUtf16::new(1, 0));
         assert_eq!(
             tree.doc_pos_to_point_utf16(1, 3), // After 'ö' (W=1 + ö=2 = 3 bytes)
-            PointUtf16::new(1, 2)  // W=1 + ö=1 = 2 UTF-16 units
+            PointUtf16::new(1, 2)              // W=1 + ö=1 = 2 UTF-16 units
         );
         assert_eq!(
             tree.doc_pos_to_point_utf16(1, 11), // After emoji (Wörld =7 + emoji=4 = 11 bytes)
-            PointUtf16::new(1, 8)  // Wörld =6 + emoji=2 = 8 UTF-16 units
+            PointUtf16::new(1, 8)               // Wörld =6 + emoji=2 = 8 UTF-16 units
         );
 
         // Test round-trip conversions (only at valid character boundaries)
@@ -615,8 +610,8 @@ mod new_tree_tests {
         assert_eq!(tree.len_utf16(), OffsetUtf16(10)); // 5 × 2 UTF-16 units
 
         assert_eq!(tree.offset_to_offset_utf16(0), OffsetUtf16(0));
-        assert_eq!(tree.offset_to_offset_utf16(4), OffsetUtf16(2));  // After first emoji
-        assert_eq!(tree.offset_to_offset_utf16(8), OffsetUtf16(4));  // After second emoji
+        assert_eq!(tree.offset_to_offset_utf16(4), OffsetUtf16(2)); // After first emoji
+        assert_eq!(tree.offset_to_offset_utf16(8), OffsetUtf16(4)); // After second emoji
         assert_eq!(tree.offset_to_offset_utf16(20), OffsetUtf16(10)); // End
 
         // Round-trip
@@ -661,9 +656,15 @@ mod new_tree_tests {
         match &tree.root {
             Node::Leaf { spans, .. } => {
                 for span in spans {
-                    if let Span::Text { bytes, metadata, .. } = span {
+                    if let Span::Text {
+                        bytes, metadata, ..
+                    } = span
+                    {
                         if bytes.len() <= 128 {
-                            assert!(metadata.is_some(), "Small text spans should have bitmap metadata");
+                            assert!(
+                                metadata.is_some(),
+                                "Small text spans should have bitmap metadata"
+                            );
                         }
                     }
                 }
@@ -699,8 +700,15 @@ mod new_tree_tests {
             }
         }
 
-        count_spans(&tree.root, &mut spans_with_metadata, &mut spans_without_metadata);
-        eprintln!("Spans with metadata: {}, without: {}", spans_with_metadata, spans_without_metadata);
+        count_spans(
+            &tree.root,
+            &mut spans_with_metadata,
+            &mut spans_without_metadata,
+        );
+        eprintln!(
+            "Spans with metadata: {}, without: {}",
+            spans_with_metadata, spans_without_metadata
+        );
         eprintln!("Note: Spans >128 bytes won't have metadata, but that's expected");
         // With 256+ byte chunks, we may have fewer or no spans with metadata, which is OK
         // The important thing is that the infrastructure is in place

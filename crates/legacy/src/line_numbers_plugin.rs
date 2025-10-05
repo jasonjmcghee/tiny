@@ -163,8 +163,10 @@ impl LineNumbersPlugin {
                     if width > 0.0001 && height > 0.0001 {
                         // Transform from widget-local space to screen space
                         // Add the widget bounds offset to position on screen
-                        let screen_x = g.pos.x.0 + widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
-                        let screen_y = g.pos.y.0 + widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
+                        let screen_x =
+                            g.pos.x.0 + widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
+                        let screen_y =
+                            g.pos.y.0 + widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
                         // Convert to physical coordinates
                         g.pos = LayoutPos::new(screen_x * scale_factor, screen_y * scale_factor);
 

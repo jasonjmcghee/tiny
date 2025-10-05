@@ -8,6 +8,7 @@ members = [
 ]
 exclude = [
     "crates/plugins/cursor",  # Built separately as dynamic plugin
+    "crates/plugins/selection",  # Built separately as dynamic plugin
 ]
 resolver = "2"
 

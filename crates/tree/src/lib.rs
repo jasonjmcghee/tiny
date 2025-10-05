@@ -1001,7 +1001,7 @@ impl Tree {
                     break;
                 }
                 byte_offset += ch.len_utf8();
-                char_count += 1;  // Each character (including tab) counts as 1
+                char_count += 1; // Each character (including tab) counts as 1
             }
 
             line_start + byte_offset
@@ -1067,7 +1067,12 @@ impl Tree {
         byte_offset
     }
 
-    fn walk_byte_to_utf16(node: &Node, target: usize, byte_pos: &mut usize, utf16_count: &mut usize) -> bool {
+    fn walk_byte_to_utf16(
+        node: &Node,
+        target: usize,
+        byte_pos: &mut usize,
+        utf16_count: &mut usize,
+    ) -> bool {
         match node {
             Node::Leaf { spans, .. } => {
                 for span in spans {
@@ -1075,7 +1080,10 @@ impl Tree {
                         return true;
                     }
 
-                    if let Span::Text { bytes, metadata, .. } = span {
+                    if let Span::Text {
+                        bytes, metadata, ..
+                    } = span
+                    {
                         let span_len = bytes.len();
                         if *byte_pos + span_len <= target {
                             if let Some(meta) = metadata {
@@ -1116,7 +1124,12 @@ impl Tree {
         }
     }
 
-    fn walk_utf16_to_byte(node: &Node, target: usize, byte_pos: &mut usize, utf16_pos: &mut usize) -> bool {
+    fn walk_utf16_to_byte(
+        node: &Node,
+        target: usize,
+        byte_pos: &mut usize,
+        utf16_pos: &mut usize,
+    ) -> bool {
         match node {
             Node::Leaf { spans, .. } => {
                 for span in spans {
@@ -1124,7 +1137,10 @@ impl Tree {
                         return true;
                     }
 
-                    if let Span::Text { bytes, metadata, .. } = span {
+                    if let Span::Text {
+                        bytes, metadata, ..
+                    } = span
+                    {
                         let span_len = bytes.len();
 
                         if let Some(meta) = metadata {
@@ -1522,7 +1538,8 @@ impl<'a> TreeCursor<'a> {
                     for (i, &(byte_off, line_off)) in frame.children_offsets.iter().enumerate() {
                         let child_lines = node_metrics(&children[i]).1;
                         if line_off + child_lines > target_line {
-                            self.stack.push(CursorFrame::new(&children[i], byte_off, line_off));
+                            self.stack
+                                .push(CursorFrame::new(&children[i], byte_off, line_off));
                             break;
                         }
                     }
@@ -1725,7 +1742,11 @@ fn compute_sums(spans: &[Span]) -> Sums {
 
     for span in spans {
         match span {
-            Span::Text { bytes, lines, metadata } => {
+            Span::Text {
+                bytes,
+                lines,
+                metadata,
+            } => {
                 sums.bytes += bytes.len();
                 sums.lines += lines;
 
@@ -1854,4 +1875,3 @@ fn validate_tree_structure(node: &Node) -> bool {
 fn validate_tree_structure(_node: &Node) -> bool {
     true // No-op in release builds
 }
-

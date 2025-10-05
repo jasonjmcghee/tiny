@@ -123,10 +123,7 @@ pub mod paint_cache {
 
     /// Hash common viewport properties that affect rendering
     /// Returns a hasher that can be extended with plugin-specific state
-    pub fn hash_viewport_base<H: Hasher>(
-        hasher: &mut H,
-        viewport: &crate::types::ViewportInfo,
-    ) {
+    pub fn hash_viewport_base<H: Hasher>(hasher: &mut H, viewport: &crate::types::ViewportInfo) {
         viewport.scale_factor.to_bits().hash(hasher);
         viewport.line_height.to_bits().hash(hasher);
         viewport.font_size.to_bits().hash(hasher);

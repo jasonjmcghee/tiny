@@ -4,7 +4,9 @@ use crate::accelerator::{Modifiers, Trigger};
 use crate::input::EventBus;
 use crate::shortcuts::ShortcutRegistry;
 use serde_json::json;
-use winit::event::{ElementState, Modifiers as WinitModifiers, MouseButton as WinitMouseButton, WindowEvent};
+use winit::event::{
+    ElementState, Modifiers as WinitModifiers, MouseButton as WinitMouseButton, WindowEvent,
+};
 use winit::keyboard::{Key, NamedKey};
 
 /// Convert winit modifiers to our Modifiers

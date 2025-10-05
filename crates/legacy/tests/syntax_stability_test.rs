@@ -3,10 +3,10 @@
 //! This test demonstrates the bug where typing between syntax highlights
 //! causes text to lose color temporarily until tree-sitter catches up.
 
-use tiny_core::tree::{Doc, Edit, Content};
+use tiny_core::tree::{Content, Doc, Edit};
 use tiny_editor::{
-    text_renderer::{TextRenderer, TokenRange},
     coordinates::Viewport,
+    text_renderer::{TextRenderer, TokenRange},
 };
 use tiny_font::SharedFontSystem;
 
@@ -32,11 +32,11 @@ fn test_syntax_stability_when_typing_between_highlights() {
     let initial_tokens = vec![
         TokenRange {
             byte_range: 0..2,
-            token_id: 1,  // keyword
+            token_id: 1, // keyword
         },
         TokenRange {
             byte_range: 3..7,
-            token_id: 2,  // function
+            token_id: 2, // function
         },
     ];
 
@@ -44,13 +44,25 @@ fn test_syntax_stability_when_typing_between_highlights() {
 
     // Verify initial highlighting is correct
     assert_eq!(renderer.layout_cache[0].char, 'f');
-    assert_eq!(renderer.layout_cache[0].token_id, 1, "Initial 'f' should be keyword (1)");
+    assert_eq!(
+        renderer.layout_cache[0].token_id, 1,
+        "Initial 'f' should be keyword (1)"
+    );
     assert_eq!(renderer.layout_cache[1].char, 'n');
-    assert_eq!(renderer.layout_cache[1].token_id, 1, "Initial 'n' should be keyword (1)");
+    assert_eq!(
+        renderer.layout_cache[1].token_id, 1,
+        "Initial 'n' should be keyword (1)"
+    );
     assert_eq!(renderer.layout_cache[2].char, ' ');
-    assert_eq!(renderer.layout_cache[2].token_id, 0, "Space should be unstyled (0)");
+    assert_eq!(
+        renderer.layout_cache[2].token_id, 0,
+        "Space should be unstyled (0)"
+    );
     assert_eq!(renderer.layout_cache[3].char, 'm');
-    assert_eq!(renderer.layout_cache[3].token_id, 2, "Initial 'm' should be function (2)");
+    assert_eq!(
+        renderer.layout_cache[3].token_id, 2,
+        "Initial 'm' should be function (2)"
+    );
 
     // Simulate user typing 'x' at position 1: "fn main" -> "fxn main"
     drop(tree);
@@ -68,7 +80,10 @@ fn test_syntax_stability_when_typing_between_highlights() {
 
     // Verify layout cleared tokens
     assert_eq!(renderer.layout_cache[0].char, 'f');
-    assert_eq!(renderer.layout_cache[0].token_id, 0, "After layout rebuild, tokens are cleared");
+    assert_eq!(
+        renderer.layout_cache[0].token_id, 0,
+        "After layout rebuild, tokens are cleared"
+    );
 
     // Simulate that an edit happened - track it in the renderer
     // In real code, apply_incremental_edit would be called during flush_pending_edits
@@ -103,23 +118,41 @@ fn test_syntax_stability_when_typing_between_highlights() {
 
     println!("After applying old tokens to shifted text:");
     for (i, glyph) in renderer.layout_cache.iter().enumerate() {
-        println!("  [{}] char={:?} byte={} token_id={}", i, glyph.char, glyph.char_byte_offset, glyph.token_id);
+        println!(
+            "  [{}] char={:?} byte={} token_id={}",
+            i, glyph.char, glyph.char_byte_offset, glyph.token_id
+        );
     }
 
     // The test that SHOULD pass but currently FAILS:
     // We want stable highlighting where colors don't flicker
     assert_eq!(renderer.layout_cache[0].char, 'f');
-    assert_eq!(renderer.layout_cache[0].token_id, 1, "'f' should keep keyword color");
+    assert_eq!(
+        renderer.layout_cache[0].token_id, 1,
+        "'f' should keep keyword color"
+    );
 
     assert_eq!(renderer.layout_cache[1].char, 'x');
-    assert_eq!(renderer.layout_cache[1].token_id, 1, "'x' should infer keyword color from context");
+    assert_eq!(
+        renderer.layout_cache[1].token_id, 1,
+        "'x' should infer keyword color from context"
+    );
 
     assert_eq!(renderer.layout_cache[2].char, 'n');
-    assert_eq!(renderer.layout_cache[2].token_id, 1, "'n' should keep keyword color - THIS FAILS!");
+    assert_eq!(
+        renderer.layout_cache[2].token_id, 1,
+        "'n' should keep keyword color - THIS FAILS!"
+    );
 
     assert_eq!(renderer.layout_cache[3].char, ' ');
-    assert_eq!(renderer.layout_cache[3].token_id, 0, "space should stay unstyled");
+    assert_eq!(
+        renderer.layout_cache[3].token_id, 0,
+        "space should stay unstyled"
+    );
 
     assert_eq!(renderer.layout_cache[4].char, 'm');
-    assert_eq!(renderer.layout_cache[4].token_id, 2, "'m' should keep function color");
+    assert_eq!(
+        renderer.layout_cache[4].token_id, 2,
+        "'m' should keep function color"
+    );
 }

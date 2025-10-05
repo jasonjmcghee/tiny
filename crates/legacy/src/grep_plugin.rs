@@ -1,18 +1,17 @@
 //! Grep plugin - full codebase search with fuzzy filtering
 
+use crate::coordinates::Viewport;
+use crate::filterable_dropdown::{DropdownAction, FilterableDropdown};
+use crate::input_types::{Key, Modifiers};
+use crate::scroll::Scrollable;
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::RwLock;
+use tiny_core::tree::{Point, Rect};
 use tiny_font::SharedFontSystem;
 use tiny_sdk::{
-    Capability, Initializable, PaintContext, Paintable, Plugin,
-    PluginError, SetupContext,
+    Capability, Initializable, PaintContext, Paintable, Plugin, PluginError, SetupContext,
 };
-use tiny_core::tree::{Point, Rect};
-use crate::scroll::Scrollable;
-use crate::coordinates::Viewport;
-use crate::filterable_dropdown::{FilterableDropdown, DropdownAction};
-use crate::input_types::{Key, Modifiers};
 
 /// A single grep result
 #[derive(Clone, Debug)]
@@ -51,11 +50,15 @@ impl GrepPlugin {
 
         // Format function for displaying grep results
         let format_fn = |result: &GrepResult| {
-            let relative_path = result.file_path
+            let relative_path = result
+                .file_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("???");
-            format!("{}:{}  {}", relative_path, result.line_number, result.line_content)
+            format!(
+                "{}:{}  {}",
+                relative_path, result.line_number, result.line_content
+            )
         };
 
         Self {
@@ -183,7 +186,10 @@ impl GrepPlugin {
             // Skip binary files (heuristic: check extension)
             if let Some(ext) = path.extension() {
                 let ext_str = ext.to_str().unwrap_or("");
-                if matches!(ext_str, "png" | "jpg" | "jpeg" | "gif" | "ico" | "pdf" | "zip" | "tar" | "gz") {
+                if matches!(
+                    ext_str,
+                    "png" | "jpg" | "jpeg" | "gif" | "ico" | "pdf" | "zip" | "tar" | "gz"
+                ) {
                     continue;
                 }
             }
@@ -325,7 +331,11 @@ impl GrepPlugin {
         if self.dropdown.selected_index() > 0 {
             let viewport = Viewport::new(1920.0, 1080.0, 1.0);
             let modifiers = Modifiers::new();
-            self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowUp), &modifiers, &viewport);
+            self.dropdown.handle_key(
+                &Key::Named(crate::input_types::NamedKey::ArrowUp),
+                &modifiers,
+                &viewport,
+            );
         }
     }
 
@@ -333,7 +343,11 @@ impl GrepPlugin {
     pub fn move_down(&mut self) {
         let viewport = Viewport::new(1920.0, 1080.0, 1.0);
         let modifiers = Modifiers::new();
-        self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowDown), &modifiers, &viewport);
+        self.dropdown.handle_key(
+            &Key::Named(crate::input_types::NamedKey::ArrowDown),
+            &modifiers,
+            &viewport,
+        );
     }
 
     /// Get selected result
@@ -376,8 +390,7 @@ impl Initializable for GrepPlugin {
 }
 
 impl Paintable for GrepPlugin {
-    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {
-    }
+    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {}
 
     fn z_index(&self) -> i32 {
         1000
@@ -394,7 +407,9 @@ impl Scrollable for GrepPlugin {
     }
 
     fn handle_scroll(&mut self, delta: Point, viewport: &Viewport, widget_bounds: Rect) -> bool {
-        self.dropdown.results.handle_scroll(delta, viewport, widget_bounds)
+        self.dropdown
+            .results
+            .handle_scroll(delta, viewport, widget_bounds)
     }
 
     fn get_content_bounds(&self, viewport: &Viewport) -> Rect {

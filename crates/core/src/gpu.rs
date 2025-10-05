@@ -8,21 +8,23 @@ use bytemuck::{Pod, Zeroable};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tiny_sdk::{types::{RectInstance, RoundedRectInstance}, GlyphInstance, PhysicalSize};
+use tiny_sdk::{
+    types::{RectInstance, RoundedRectInstance},
+    GlyphInstance, PhysicalSize,
+};
 use wgpu::{
     naga, AddressMode, Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
-    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType,
-    Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferUsages, Color,
-    CommandEncoderDescriptor, Device, DeviceDescriptor, Extent3d,
-    Features, FilterMode, Instance, InstanceDescriptor, Limits, LoadOp,
-    Operations, Origin3d, PollType, PowerPreference, Queue, RenderPass,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
+    BufferAddress, BufferBindingType, BufferDescriptor, BufferUsages, Color,
+    CommandEncoderDescriptor, Device, DeviceDescriptor, Extent3d, Features, FilterMode, Instance,
+    InstanceDescriptor, Limits, LoadOp, Operations, Origin3d, PollType, PowerPreference, Queue,
+    RenderPass, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
     RequestAdapterOptions, Sampler, SamplerBindingType, SamplerDescriptor, ShaderModule,
     ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Surface, SurfaceConfiguration,
     SurfaceTarget, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
     TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureView, TextureViewDescriptor, TextureViewDimension, VertexAttribute,
-    VertexFormat, VertexStepMode,
+    TextureView, TextureViewDescriptor, TextureViewDimension, VertexAttribute, VertexFormat,
+    VertexStepMode,
 };
 
 // Constants
@@ -80,7 +82,6 @@ pub struct Uniforms {
     pub theme_mode: u32,
     pub _padding: [f32; 3],
 }
-
 
 /// GPU renderer that executes batched draw commands
 pub struct GpuRenderer {
@@ -362,7 +363,7 @@ impl GpuRenderer {
         }
     }
 
-// Pipeline creation helpers removed - using PipelineBuilder directly
+    // Pipeline creation helpers removed - using PipelineBuilder directly
 
     /// Get device for custom widget rendering
     pub fn device(&self) -> &Device {
@@ -386,7 +387,9 @@ impl GpuRenderer {
 
     /// Get uniform bind group for viewport transforms
     pub fn uniform_bind_group(&self) -> &BindGroup {
-        self.uniforms.bind_group("uniform").expect("uniform bind group not initialized")
+        self.uniforms
+            .bind_group("uniform")
+            .expect("uniform bind group not initialized")
     }
 
     /// Get surface for custom rendering
@@ -396,7 +399,9 @@ impl GpuRenderer {
 
     /// Get uniform buffer for custom rendering
     pub fn uniform_buffer(&self) -> &Buffer {
-        self.uniforms.buffer("uniform").expect("uniform buffer not initialized")
+        self.uniforms
+            .buffer("uniform")
+            .expect("uniform buffer not initialized")
     }
 
     /// Get rect pipeline for widget backgrounds
@@ -406,7 +411,9 @@ impl GpuRenderer {
 
     /// Get rect vertex buffer for widget backgrounds
     pub fn rect_vertex_buffer(&self) -> &Buffer {
-        self.buffers.get("rect_vertex").expect("rect vertex buffer not initialized")
+        self.buffers
+            .get("rect_vertex")
+            .expect("rect vertex buffer not initialized")
     }
 
     /// Get FFI context for plugins (with IDs for rect pipeline and bind group)
@@ -420,7 +427,10 @@ impl GpuRenderer {
 
     /// Test method to write to rect buffer directly
     pub fn test_write_rect_buffer(&self, data: &[u8]) {
-        let buffer = self.buffers.get("rect_vertex").expect("rect vertex buffer not initialized");
+        let buffer = self
+            .buffers
+            .get("rect_vertex")
+            .expect("rect vertex buffer not initialized");
         self.queue.write_buffer(buffer, 0, data);
     }
 
@@ -431,8 +441,14 @@ impl GpuRenderer {
         vertex_data: &[u8],
         vertex_count: u32,
     ) {
-        let rect_buffer = self.buffers.get("rect_vertex").expect("rect vertex buffer not initialized");
-        let rect_uniform_bg = self.uniforms.bind_group("rect_uniform").expect("rect uniform not initialized");
+        let rect_buffer = self
+            .buffers
+            .get("rect_vertex")
+            .expect("rect vertex buffer not initialized");
+        let rect_uniform_bg = self
+            .uniforms
+            .bind_group("rect_uniform")
+            .expect("rect uniform not initialized");
 
         self.queue.write_buffer(rect_buffer, 0, vertex_data);
 
@@ -546,7 +562,8 @@ impl GpuRenderer {
 
         // Write data (GPU driver handles caching)
         if let Some(buffer) = &self.style_buffer {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(style_data));
         }
 
         // Recreate bind group when buffer was recreated or it doesn't exist
@@ -839,13 +856,24 @@ impl GpuRenderer {
             ),
             "Rect",
         ) {
-            let rect_uniform_layout = self.uniforms.layout("rect_uniform").expect("rect_uniform layout not found");
+            let rect_uniform_layout = self
+                .uniforms
+                .layout("rect_uniform")
+                .expect("rect_uniform layout not found");
             self.rect_pipeline = PipelineBuilder::new(&self.device, self.config.format)
                 .label("Rect Pipeline (Instanced)")
                 .shader(&shader)
                 .bind_group_layout(rect_uniform_layout)
-                .vertex_buffer(std::mem::size_of::<RectVertex>() as BufferAddress, VertexStepMode::Vertex, &rect_vertex_attributes())
-                .vertex_buffer(std::mem::size_of::<RectInstanceData>() as BufferAddress, VertexStepMode::Instance, &rect_instance_attributes())
+                .vertex_buffer(
+                    std::mem::size_of::<RectVertex>() as BufferAddress,
+                    VertexStepMode::Vertex,
+                    &rect_vertex_attributes(),
+                )
+                .vertex_buffer(
+                    std::mem::size_of::<RectInstanceData>() as BufferAddress,
+                    VertexStepMode::Instance,
+                    &rect_instance_attributes(),
+                )
                 .build();
             any_success = true;
         }
@@ -859,13 +887,20 @@ impl GpuRenderer {
             ),
             "Glyph",
         ) {
-            let rect_uniform_layout = self.uniforms.layout("rect_uniform").expect("rect_uniform layout not found");
+            let rect_uniform_layout = self
+                .uniforms
+                .layout("rect_uniform")
+                .expect("rect_uniform layout not found");
             self.glyph_pipeline = PipelineBuilder::new(&self.device, self.config.format)
                 .label("Glyph Pipeline")
                 .shader(&shader)
                 .bind_group_layout(rect_uniform_layout)
                 .bind_group_layout(&self.glyph_bind_group_layout)
-                .vertex_buffer(std::mem::size_of::<GlyphVertex>() as BufferAddress, VertexStepMode::Vertex, &glyph_vertex_attributes())
+                .vertex_buffer(
+                    std::mem::size_of::<GlyphVertex>() as BufferAddress,
+                    VertexStepMode::Vertex,
+                    &glyph_vertex_attributes(),
+                )
                 .build();
             any_success = true;
         }
@@ -948,7 +983,10 @@ impl GpuRenderer {
         };
 
         let rect_shader = create_shader("Rectangle Shader", include_str!("shaders/rect.wgsl"));
-        let rounded_rect_shader = create_shader("Rounded Rectangle Shader", include_str!("shaders/rounded_rect.wgsl"));
+        let rounded_rect_shader = create_shader(
+            "Rounded Rectangle Shader",
+            include_str!("shaders/rounded_rect.wgsl"),
+        );
         let glyph_shader = create_shader("Glyph Shader", include_str!("shaders/glyph.wgsl"));
 
         let glyph_texture = device.create_texture(&TextureDescriptor {
@@ -979,8 +1017,16 @@ impl GpuRenderer {
 
         // Create uniform manager and initialize uniforms
         let mut uniforms = UniformManager::new(device.clone());
-        uniforms.create("uniform", std::mem::size_of::<Uniforms>() as u64, ShaderStages::VERTEX | ShaderStages::FRAGMENT);
-        uniforms.create("rect_uniform", std::mem::size_of::<Uniforms>() as u64, ShaderStages::VERTEX | ShaderStages::FRAGMENT);
+        uniforms.create(
+            "uniform",
+            std::mem::size_of::<Uniforms>() as u64,
+            ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+        );
+        uniforms.create(
+            "rect_uniform",
+            std::mem::size_of::<Uniforms>() as u64,
+            ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+        );
 
         let rect_uniform_bind_group_layout = uniforms.layout("rect_uniform").unwrap().clone();
 
@@ -1017,9 +1063,14 @@ impl GpuRenderer {
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
-        rect_vertex_buffer.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&unit_quad));
+        rect_vertex_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&unit_quad));
         rect_vertex_buffer.unmap();
-        buffers.buffers.insert("rect_vertex".to_string(), rect_vertex_buffer);
+        buffers
+            .buffers
+            .insert("rect_vertex".to_string(), rect_vertex_buffer);
 
         // All other buffers are created on-demand when first used
 
@@ -1028,16 +1079,32 @@ impl GpuRenderer {
             .label("Rect Pipeline (Instanced)")
             .shader(&rect_shader)
             .bind_group_layout(&rect_uniform_bind_group_layout)
-            .vertex_buffer(std::mem::size_of::<RectVertex>() as BufferAddress, VertexStepMode::Vertex, &rect_vertex_attributes())
-            .vertex_buffer(std::mem::size_of::<RectInstanceData>() as BufferAddress, VertexStepMode::Instance, &rect_instance_attributes())
+            .vertex_buffer(
+                std::mem::size_of::<RectVertex>() as BufferAddress,
+                VertexStepMode::Vertex,
+                &rect_vertex_attributes(),
+            )
+            .vertex_buffer(
+                std::mem::size_of::<RectInstanceData>() as BufferAddress,
+                VertexStepMode::Instance,
+                &rect_instance_attributes(),
+            )
             .build();
 
         let rounded_rect_pipeline = PipelineBuilder::new(&device, config.format)
             .label("Rounded Rect Pipeline (Instanced)")
             .shader(&rounded_rect_shader)
             .bind_group_layout(&rect_uniform_bind_group_layout)
-            .vertex_buffer(std::mem::size_of::<RectVertex>() as BufferAddress, VertexStepMode::Vertex, &rect_vertex_attributes())
-            .vertex_buffer(std::mem::size_of::<RoundedRectInstanceData>() as BufferAddress, VertexStepMode::Instance, &rounded_rect_instance_attributes())
+            .vertex_buffer(
+                std::mem::size_of::<RectVertex>() as BufferAddress,
+                VertexStepMode::Vertex,
+                &rect_vertex_attributes(),
+            )
+            .vertex_buffer(
+                std::mem::size_of::<RoundedRectInstanceData>() as BufferAddress,
+                VertexStepMode::Instance,
+                &rounded_rect_instance_attributes(),
+            )
             .build();
 
         let glyph_pipeline = PipelineBuilder::new(&device, config.format)
@@ -1045,7 +1112,11 @@ impl GpuRenderer {
             .shader(&glyph_shader)
             .bind_group_layout(&rect_uniform_bind_group_layout)
             .bind_group_layout(&glyph_bind_group_layout)
-            .vertex_buffer(std::mem::size_of::<GlyphVertex>() as BufferAddress, VertexStepMode::Vertex, &glyph_vertex_attributes())
+            .vertex_buffer(
+                std::mem::size_of::<GlyphVertex>() as BufferAddress,
+                VertexStepMode::Vertex,
+                &glyph_vertex_attributes(),
+            )
             .build();
 
         // Initialize the FFI registry for plugins
@@ -1055,7 +1126,8 @@ impl GpuRenderer {
         // Register existing resources so plugins can use them and store IDs
         let (rect_pipeline_id, uniform_bind_group_id) = if let Some(ref registry) = ffi_registry {
             let pipeline_id = registry.register_pipeline(rect_pipeline.clone());
-            let bind_group_id = registry.register_bind_group(uniforms.bind_group("rect_uniform").unwrap().clone());
+            let bind_group_id =
+                registry.register_bind_group(uniforms.bind_group("rect_uniform").unwrap().clone());
             eprintln!(
                 "Registered rect pipeline with ID: {:?}, bind group with ID: {:?}",
                 pipeline_id, bind_group_id
@@ -1117,16 +1189,19 @@ impl GpuRenderer {
             _padding: [0.0, 0.0, 0.0],
         };
         if let Some(buffer) = self.uniforms.buffer("rect_uniform") {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[rect_uniforms]));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[rect_uniforms]));
         }
 
         if let Some(buffer) = self.uniforms.buffer("themed_uniform") {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[rect_uniforms]));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[rect_uniforms]));
         }
 
         // Legacy uniform buffer update
         if let Some(buffer) = self.uniforms.buffer("uniform") {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
 
         let Ok(output) = self.surface.get_current_texture() else {
@@ -1204,12 +1279,22 @@ impl GpuRenderer {
         );
 
         // Get buffers (after create_or_get to avoid borrow issues)
-        let rect_instance_buf = self.buffers.get("rect_instance").expect("rect_instance buffer not found");
-        let rect_vertex_buf = self.buffers.get("rect_vertex").expect("rect_vertex buffer not found");
-        let rect_uniform_bg = self.uniforms.bind_group("rect_uniform").expect("rect_uniform not found");
+        let rect_instance_buf = self
+            .buffers
+            .get("rect_instance")
+            .expect("rect_instance buffer not found");
+        let rect_vertex_buf = self
+            .buffers
+            .get("rect_vertex")
+            .expect("rect_vertex buffer not found");
+        let rect_uniform_bg = self
+            .uniforms
+            .bind_group("rect_uniform")
+            .expect("rect_uniform not found");
 
         // Write instance data
-        self.queue.write_buffer(rect_instance_buf, 0, bytemuck::cast_slice(&instance_data));
+        self.queue
+            .write_buffer(rect_instance_buf, 0, bytemuck::cast_slice(&instance_data));
 
         // Draw
         render_pass.set_pipeline(&self.rect_pipeline);
@@ -1253,12 +1338,25 @@ impl GpuRenderer {
         );
 
         // Get buffers
-        let rounded_instance_buf = self.buffers.get("rounded_rect_instance").expect("rounded_rect_instance buffer not found");
-        let rect_vertex_buf = self.buffers.get("rect_vertex").expect("rect_vertex buffer not found");
-        let rect_uniform_bg = self.uniforms.bind_group("rect_uniform").expect("rect_uniform not found");
+        let rounded_instance_buf = self
+            .buffers
+            .get("rounded_rect_instance")
+            .expect("rounded_rect_instance buffer not found");
+        let rect_vertex_buf = self
+            .buffers
+            .get("rect_vertex")
+            .expect("rect_vertex buffer not found");
+        let rect_uniform_bg = self
+            .uniforms
+            .bind_group("rect_uniform")
+            .expect("rect_uniform not found");
 
         // Write instance data
-        self.queue.write_buffer(rounded_instance_buf, 0, bytemuck::cast_slice(&instance_data));
+        self.queue.write_buffer(
+            rounded_instance_buf,
+            0,
+            bytemuck::cast_slice(&instance_data),
+        );
 
         // Draw
         render_pass.set_pipeline(&self.rounded_rect_pipeline);
@@ -1289,7 +1387,8 @@ impl GpuRenderer {
 
         // Generate and write vertices (no caching - GPU driver handles this)
         let vertices = instances_to_vertices(instances);
-        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vertices));
+        self.queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(&vertices));
 
         // Set scissor if provided
         if let Some((x, y, w, h)) = config.scissor {
@@ -1308,7 +1407,10 @@ impl GpuRenderer {
             render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
             render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
         } else {
-            let rect_uniform_bg = self.uniforms.bind_group("rect_uniform").expect("rect_uniform not found");
+            let rect_uniform_bg = self
+                .uniforms
+                .bind_group("rect_uniform")
+                .expect("rect_uniform not found");
             render_pass.set_pipeline(&self.glyph_pipeline);
             render_pass.set_bind_group(0, rect_uniform_bg, &[]);
             render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
@@ -1356,7 +1458,8 @@ impl GpuRenderer {
             GLYPH_BUFFER_SIZE,
             BufferUsages::VERTEX | BufferUsages::COPY_DST,
         );
-        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&all_vertices));
+        self.queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(&all_vertices));
 
         // Draw each batch with its own scissor
         let has_themed = self.themed_glyph_pipeline.is_some()
@@ -1373,7 +1476,10 @@ impl GpuRenderer {
                 render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
                 render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
             } else {
-                let rect_uniform_bg = self.uniforms.bind_group("rect_uniform").expect("rect_uniform not found");
+                let rect_uniform_bg = self
+                    .uniforms
+                    .bind_group("rect_uniform")
+                    .expect("rect_uniform not found");
                 render_pass.set_pipeline(&self.glyph_pipeline);
                 render_pass.set_bind_group(0, rect_uniform_bg, &[]);
                 render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
@@ -1399,7 +1505,8 @@ impl GpuRenderer {
             _padding: [0.0, 0.0, 0.0],
         };
         if let Some(buffer) = self.uniforms.buffer("rect_uniform") {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
     }
 

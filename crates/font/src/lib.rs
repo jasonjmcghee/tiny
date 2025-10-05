@@ -623,11 +623,7 @@ impl FontSystem {
 }
 
 /// Measure the width of text in logical pixels
-pub fn measure_text_width(
-    font_system: &SharedFontSystem,
-    text: &str,
-    font_size: f32,
-) -> f32 {
+pub fn measure_text_width(font_system: &SharedFontSystem, text: &str, font_size: f32) -> f32 {
     let layout = font_system.layout_text(text, font_size);
     layout.width
 }

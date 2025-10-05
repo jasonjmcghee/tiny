@@ -185,7 +185,7 @@ impl Viewport {
             0.0,
             0.0,
             info.logical_size.width.0,
-            info.logical_size.height.0
+            info.logical_size.height.0,
         );
 
         Self {
@@ -241,7 +241,7 @@ impl Viewport {
         Self {
             bounds,
             scroll: LayoutPos::new(0.0, 0.0), // Child starts unscrolled
-            logical_size: self.logical_size, // Inherit from parent
+            logical_size: self.logical_size,  // Inherit from parent
             physical_size: self.physical_size, // Inherit from parent
             scale_factor: self.scale_factor,
             metrics: self.metrics.clone(),
@@ -339,10 +339,7 @@ impl Viewport {
         };
 
         // Just convert to logical pixels - NO positioning
-        LayoutPos::new(
-            x,
-            pos.line as f32 * self.metrics.line_height,
-        )
+        LayoutPos::new(x, pos.line as f32 * self.metrics.line_height)
     }
 
     /// Layout position to view position (apply scroll)

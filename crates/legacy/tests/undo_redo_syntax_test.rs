@@ -1,14 +1,14 @@
 //! Test undo/redo with actual InputHandler to verify syntax updates
 
-use tiny_core::tree::{Doc, Edit, Content};
+use std::sync::Arc;
+use tiny_core::tree::{Content, Doc, Edit};
 use tiny_editor::{
-    text_renderer::{TextRenderer, TokenRange},
     coordinates::Viewport,
     input::InputHandler,
     syntax::SyntaxHighlighter,
+    text_renderer::{TextRenderer, TokenRange},
 };
 use tiny_font::SharedFontSystem;
-use std::sync::Arc;
 
 #[test]
 fn test_undo_triggers_syntax_reparse() {
@@ -31,19 +31,33 @@ fn test_undo_triggers_syntax_reparse() {
     println!("Initial cached_version: {}", version_before);
 
     // Make an edit through input_handler (saves to history)
-    input_handler.set_cursor_for_test(tiny_sdk::DocPos { line: 0, column: 0, byte_offset: 0 });
+    input_handler.set_cursor_for_test(tiny_sdk::DocPos {
+        line: 0,
+        column: 0,
+        byte_offset: 0,
+    });
     use tiny_editor::input::Selection;
     input_handler.selections_mut_for_test().clear();
     input_handler.selections_mut_for_test().push(Selection {
-        cursor: tiny_sdk::DocPos { line: 0, column: 0, byte_offset: 0 },
-        anchor: tiny_sdk::DocPos { line: 0, column: 0, byte_offset: 0 },
+        cursor: tiny_sdk::DocPos {
+            line: 0,
+            column: 0,
+            byte_offset: 0,
+        },
+        anchor: tiny_sdk::DocPos {
+            line: 0,
+            column: 0,
+            byte_offset: 0,
+        },
         id: 0,
     });
 
-    input_handler.pending_edits_mut_for_test().push(Edit::Insert {
-        pos: 0,
-        content: Content::Text("x".to_string()),
-    });
+    input_handler
+        .pending_edits_mut_for_test()
+        .push(Edit::Insert {
+            pos: 0,
+            content: Content::Text("x".to_string()),
+        });
 
     input_handler.flush_pending_edits(&doc);
 
@@ -55,7 +69,10 @@ fn test_undo_triggers_syntax_reparse() {
 
     println!("Undo result: {}", undo_result);
     println!("Doc version after undo: {}", doc.version());
-    println!("Doc text after undo: {:?}", doc.read().flatten_to_string().as_str());
+    println!(
+        "Doc text after undo: {:?}",
+        doc.read().flatten_to_string().as_str()
+    );
 
     assert!(undo_result, "Undo should succeed");
 
@@ -67,8 +84,10 @@ fn test_undo_triggers_syntax_reparse() {
 
     // This is the BUG: cached_version should update after undo triggers reparse
     // If it doesn't change, tree-sitter never reparsed!
-    assert_ne!(version_after_undo, version_before,
-        "Syntax cached_version should update after undo triggers reparse");
+    assert_ne!(
+        version_after_undo, version_before,
+        "Syntax cached_version should update after undo triggers reparse"
+    );
 }
 
 #[test]
@@ -84,8 +103,14 @@ fn test_token_adjustment_with_edit_deltas() {
     drop(tree);
 
     let initial_tokens = vec![
-        TokenRange { byte_range: 0..2, token_id: 1 },   // "fn"
-        TokenRange { byte_range: 3..7, token_id: 2 },   // "main"
+        TokenRange {
+            byte_range: 0..2,
+            token_id: 1,
+        }, // "fn"
+        TokenRange {
+            byte_range: 3..7,
+            token_id: 2,
+        }, // "main"
     ];
     renderer.update_syntax(&initial_tokens, true);
 
@@ -96,7 +121,10 @@ fn test_token_adjustment_with_edit_deltas() {
     });
 
     // Apply the edit to doc
-    doc.edit(Edit::Insert { pos: 1, content: Content::Text("x".to_string()) });
+    doc.edit(Edit::Insert {
+        pos: 1,
+        content: Content::Text("x".to_string()),
+    });
     doc.flush();
 
     // Update layout
@@ -105,9 +133,14 @@ fn test_token_adjustment_with_edit_deltas() {
     drop(tree);
 
     // Apply stable tokens with adjustment (fresh_parse=false)
-    let stable_copy: Vec<_> = renderer.syntax_state.stable_tokens
+    let stable_copy: Vec<_> = renderer
+        .syntax_state
+        .stable_tokens
         .iter()
-        .map(|t| TokenRange { byte_range: t.byte_range.clone(), token_id: t.token_id })
+        .map(|t| TokenRange {
+            byte_range: t.byte_range.clone(),
+            token_id: t.token_id,
+        })
         .collect();
 
     renderer.update_syntax(&stable_copy, false);
@@ -116,11 +149,23 @@ fn test_token_adjustment_with_edit_deltas() {
     // Token 0..2 becomes 0..3 (insert at 1 expands it)
     // Token 3..7 becomes 4..8 (insert before it shifts it)
     assert_eq!(renderer.layout_cache[0].char, 'f');
-    assert_eq!(renderer.layout_cache[0].token_id, 1, "'f' should keep keyword");
+    assert_eq!(
+        renderer.layout_cache[0].token_id, 1,
+        "'f' should keep keyword"
+    );
     assert_eq!(renderer.layout_cache[1].char, 'x');
-    assert_eq!(renderer.layout_cache[1].token_id, 1, "'x' should get keyword (expanded range)");
+    assert_eq!(
+        renderer.layout_cache[1].token_id, 1,
+        "'x' should get keyword (expanded range)"
+    );
     assert_eq!(renderer.layout_cache[2].char, 'n');
-    assert_eq!(renderer.layout_cache[2].token_id, 1, "'n' should keep keyword (expanded range)");
+    assert_eq!(
+        renderer.layout_cache[2].token_id, 1,
+        "'n' should keep keyword (expanded range)"
+    );
     assert_eq!(renderer.layout_cache[4].char, 'm');
-    assert_eq!(renderer.layout_cache[4].token_id, 2, "'m' should keep function (shifted range)");
+    assert_eq!(
+        renderer.layout_cache[4].token_id, 2,
+        "'m' should keep function (shifted range)"
+    );
 }

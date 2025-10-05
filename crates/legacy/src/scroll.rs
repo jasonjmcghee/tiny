@@ -1,7 +1,7 @@
 //! Scroll management for widgets
 
-use tiny_core::tree::{Point, Rect};
 use crate::coordinates::Viewport;
+use tiny_core::tree::{Point, Rect};
 
 /// Widget that can be scrolled
 pub trait Scrollable {
@@ -49,7 +49,8 @@ impl ScrollFocusManager {
         sorted.sort_by(|a, b| b.2.cmp(&a.2));
 
         // Find first widget that contains mouse position
-        self.focused_widget = sorted.iter()
+        self.focused_widget = sorted
+            .iter()
             .find(|(_, bounds, _)| Self::point_in_rect(mouse_pos, *bounds))
             .map(|(id, _, _)| *id);
     }

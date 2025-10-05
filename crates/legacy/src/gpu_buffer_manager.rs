@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BufferType {
-    MainText,      // Editor text content
-    LineNumbers,   // Line numbers + UI overlays
-    Diagnostics,   // Error/warning underlines
+    MainText,    // Editor text content
+    LineNumbers, // Line numbers + UI overlays
+    Diagnostics, // Error/warning underlines
 }
 
 /// Manages GPU buffer allocation and prevents overflows
@@ -22,14 +22,14 @@ pub struct GpuBufferManager {
 impl GpuBufferManager {
     pub fn new() -> Self {
         let mut capacities = HashMap::new();
-        capacities.insert(BufferType::MainText, 4 * 1024 * 1024);      // 4MB
-        capacities.insert(BufferType::LineNumbers, 1024 * 1024);       // 1MB
-        capacities.insert(BufferType::Diagnostics, 512 * 1024);        // 512KB
+        capacities.insert(BufferType::MainText, 4 * 1024 * 1024); // 4MB
+        capacities.insert(BufferType::LineNumbers, 1024 * 1024); // 1MB
+        capacities.insert(BufferType::Diagnostics, 512 * 1024); // 512KB
 
         let mut widget_limits = HashMap::new();
-        widget_limits.insert("file_picker".to_string(), 100_000);      // 100KB max
-        widget_limits.insert("line_numbers".to_string(), 500_000);     // 500KB max
-        widget_limits.insert("diagnostics".to_string(), 200_000);      // 200KB max
+        widget_limits.insert("file_picker".to_string(), 100_000); // 100KB max
+        widget_limits.insert("line_numbers".to_string(), 500_000); // 500KB max
+        widget_limits.insert("diagnostics".to_string(), 200_000); // 200KB max
 
         Self {
             capacities,
@@ -116,13 +116,28 @@ pub enum BufferError {
 impl std::fmt::Display for BufferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BufferError::WidgetBudgetExceeded { widget, requested, limit } => {
-                write!(f, "Widget '{}' exceeded budget: requested {} bytes, limit {} bytes",
-                    widget, requested, limit)
+            BufferError::WidgetBudgetExceeded {
+                widget,
+                requested,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "Widget '{}' exceeded budget: requested {} bytes, limit {} bytes",
+                    widget, requested, limit
+                )
             }
-            BufferError::BufferFull { buffer, current, requested, capacity } => {
-                write!(f, "Buffer {:?} full: {} bytes used + {} bytes requested > {} bytes capacity",
-                    buffer, current, requested, capacity)
+            BufferError::BufferFull {
+                buffer,
+                current,
+                requested,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "Buffer {:?} full: {} bytes used + {} bytes requested > {} bytes capacity",
+                    buffer, current, requested, capacity
+                )
             }
         }
     }

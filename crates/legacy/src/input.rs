@@ -45,7 +45,6 @@ impl Default for InputMode {
     }
 }
 
-
 /// Selection with cursor and anchor in document coordinates
 #[derive(Clone)]
 pub struct Selection {
@@ -437,7 +436,6 @@ impl InputHandler {
         }
     }
 
-
     /// Handle mouse press events
     fn handle_mouse_press(&mut self, event: &Event, doc: &Doc, viewport: &Viewport) -> InputAction {
         let (x, y) = match (
@@ -492,7 +490,11 @@ impl InputHandler {
             _ => return InputAction::None,
         };
 
-        let alt_held = event.data.get("alt").and_then(|a| a.as_bool()).unwrap_or(false);
+        let alt_held = event
+            .data
+            .get("alt")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
 
         let from = Point {
             x: tiny_sdk::LogicalPixels(from_x as f32),
@@ -928,7 +930,6 @@ impl InputHandler {
         // Return true to indicate redraw needed
         true
     }
-
 
     /// Handle mouse click
     pub fn on_mouse_click(

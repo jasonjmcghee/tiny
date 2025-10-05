@@ -82,11 +82,7 @@ impl ShortcutRegistry {
 
     /// Try to match an input against registered shortcuts
     /// Returns list of event names to emit
-    pub fn match_input(
-        &mut self,
-        modifiers: &Modifiers,
-        trigger: &Trigger,
-    ) -> Vec<String> {
+    pub fn match_input(&mut self, modifiers: &Modifiers, trigger: &Trigger) -> Vec<String> {
         // Collect all candidates from current context and global
         let mut candidates = Vec::new();
 
@@ -148,7 +144,11 @@ impl ShortcutRegistry {
         self.register(ShortcutContext::Editor, "cmd+x", "editor.cut");
         self.register(ShortcutContext::Editor, "cmd+v", "editor.paste");
         self.register(ShortcutContext::Editor, "cmd+a", "editor.select_all");
-        self.register(ShortcutContext::Editor, "cmd+b", "navigation.goto_definition");
+        self.register(
+            ShortcutContext::Editor,
+            "cmd+b",
+            "navigation.goto_definition",
+        );
         self.register(ShortcutContext::Editor, "cmd+[", "navigation.back");
         self.register(ShortcutContext::Editor, "cmd+]", "navigation.forward");
         self.register(ShortcutContext::Editor, "cmd+w", "tabs.close");
@@ -158,7 +158,11 @@ impl ShortcutRegistry {
         self.register(ShortcutContext::Editor, "enter", "editor.insert_newline");
         self.register(ShortcutContext::Editor, "tab", "editor.insert_tab");
         self.register(ShortcutContext::Editor, "space", "editor.insert_space");
-        self.register(ShortcutContext::Editor, "backspace", "editor.delete_backward");
+        self.register(
+            ShortcutContext::Editor,
+            "backspace",
+            "editor.delete_backward",
+        );
         self.register(ShortcutContext::Editor, "delete", "editor.delete_forward");
 
         // Navigation
@@ -167,17 +171,37 @@ impl ShortcutRegistry {
         self.register(ShortcutContext::Editor, "up", "editor.move_up");
         self.register(ShortcutContext::Editor, "down", "editor.move_down");
         self.register(ShortcutContext::Editor, "shift+left", "editor.extend_left");
-        self.register(ShortcutContext::Editor, "shift+right", "editor.extend_right");
+        self.register(
+            ShortcutContext::Editor,
+            "shift+right",
+            "editor.extend_right",
+        );
         self.register(ShortcutContext::Editor, "shift+up", "editor.extend_up");
         self.register(ShortcutContext::Editor, "shift+down", "editor.extend_down");
         self.register(ShortcutContext::Editor, "home", "editor.move_line_start");
         self.register(ShortcutContext::Editor, "end", "editor.move_line_end");
-        self.register(ShortcutContext::Editor, "shift+home", "editor.extend_line_start");
-        self.register(ShortcutContext::Editor, "shift+end", "editor.extend_line_end");
+        self.register(
+            ShortcutContext::Editor,
+            "shift+home",
+            "editor.extend_line_start",
+        );
+        self.register(
+            ShortcutContext::Editor,
+            "shift+end",
+            "editor.extend_line_end",
+        );
         self.register(ShortcutContext::Editor, "pageup", "editor.page_up");
         self.register(ShortcutContext::Editor, "pagedown", "editor.page_down");
-        self.register(ShortcutContext::Editor, "shift+pageup", "editor.extend_page_up");
-        self.register(ShortcutContext::Editor, "shift+pagedown", "editor.extend_page_down");
+        self.register(
+            ShortcutContext::Editor,
+            "shift+pageup",
+            "editor.extend_page_up",
+        );
+        self.register(
+            ShortcutContext::Editor,
+            "shift+pagedown",
+            "editor.extend_page_down",
+        );
 
         // Double-shift for file picker
         self.register(ShortcutContext::Editor, "shift shift", "file_picker.open");
@@ -190,7 +214,11 @@ impl ShortcutRegistry {
         self.register(ShortcutContext::FilePicker, "enter", "file_picker.select");
         self.register(ShortcutContext::FilePicker, "up", "file_picker.move_up");
         self.register(ShortcutContext::FilePicker, "down", "file_picker.move_down");
-        self.register(ShortcutContext::FilePicker, "backspace", "file_picker.backspace");
+        self.register(
+            ShortcutContext::FilePicker,
+            "backspace",
+            "file_picker.backspace",
+        );
 
         // Grep shortcuts
         self.register(ShortcutContext::Grep, "escape", "grep.close");
@@ -232,12 +260,14 @@ mod tests {
 
         // In editor context
         registry.set_context(ShortcutContext::Editor);
-        let events = registry.match_input(&Modifiers::default(), &Trigger::Named("Enter".to_string()));
+        let events =
+            registry.match_input(&Modifiers::default(), &Trigger::Named("Enter".to_string()));
         assert_eq!(events, vec!["editor.insert_newline".to_string()]); // From defaults
 
         // In file picker context
         registry.set_context(ShortcutContext::FilePicker);
-        let events = registry.match_input(&Modifiers::default(), &Trigger::Named("Enter".to_string()));
+        let events =
+            registry.match_input(&Modifiers::default(), &Trigger::Named("Enter".to_string()));
         assert_eq!(events, vec!["file_picker.select".to_string()]);
     }
 }

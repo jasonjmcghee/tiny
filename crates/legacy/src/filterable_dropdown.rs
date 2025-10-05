@@ -6,12 +6,12 @@
 //!
 //! Used by: grep, file picker, command palette, etc.
 
-use crate::editable_text_view::EditableTextView;
-use crate::text_view::TextView;
 use crate::coordinates::Viewport;
-use crate::input_types::{Modifiers, NamedKey, Key};
+use crate::editable_text_view::EditableTextView;
+use crate::input_types::{Key, Modifiers, NamedKey};
+use crate::text_view::TextView;
 use tiny_core::tree::Rect;
-use tiny_sdk::{LogicalPixels, types::RoundedRectInstance};
+use tiny_sdk::{types::RoundedRectInstance, LogicalPixels};
 
 /// Action returned by FilterableDropdown after handling input
 #[derive(Debug, Clone)]
@@ -143,7 +143,12 @@ impl<T: Clone> FilterableDropdown<T> {
     }
 
     /// Handle keyboard input with dual-focus logic
-    pub fn handle_key(&mut self, key: &Key, modifiers: &Modifiers, viewport: &Viewport) -> DropdownAction<T> {
+    pub fn handle_key(
+        &mut self,
+        key: &Key,
+        modifiers: &Modifiers,
+        viewport: &Viewport,
+    ) -> DropdownAction<T> {
         match key {
             // Escape → cancel
             Key::Named(NamedKey::Escape) => DropdownAction::Cancelled,
@@ -222,8 +227,13 @@ impl<T: Clone> FilterableDropdown<T> {
 
         // Total height: title + input + results + padding + border
         let has_title = !self.title_view.text().is_empty();
-        let title_space = if has_title { dropdown_title_height } else { 0.0 };
-        let total_height = title_space + input_height + results_height + PADDING * 2.0 + BORDER_WIDTH * 2.0;
+        let title_space = if has_title {
+            dropdown_title_height
+        } else {
+            0.0
+        };
+        let total_height =
+            title_space + input_height + results_height + PADDING * 2.0 + BORDER_WIDTH * 2.0;
         let width = (viewport.logical_size.width.0 * 0.9).min(1200.0);
 
         let x = (viewport.logical_size.width.0 - width) / 2.0;
@@ -250,10 +260,8 @@ impl<T: Clone> FilterableDropdown<T> {
                 title_bounds_height,
             );
             // Update logical_size to match bounds for correct visible range calculation
-            self.title_view.viewport.logical_size = tiny_sdk::LogicalSize::new(
-                title_bounds_width,
-                title_bounds_height,
-            );
+            self.title_view.viewport.logical_size =
+                tiny_sdk::LogicalSize::new(title_bounds_width, title_bounds_height);
             self.title_view.viewport.scale_factor = viewport.scale_factor;
             self.title_view.viewport.metrics = viewport.metrics.clone();
             // Ensure scroll is at origin
@@ -271,10 +279,8 @@ impl<T: Clone> FilterableDropdown<T> {
             input_height,
         );
         // Update logical_size to match bounds
-        self.input.view.viewport.logical_size = tiny_sdk::LogicalSize::new(
-            input_bounds_width,
-            input_height,
-        );
+        self.input.view.viewport.logical_size =
+            tiny_sdk::LogicalSize::new(input_bounds_width, input_height);
         self.input.view.viewport.scale_factor = viewport.scale_factor;
         self.input.view.viewport.metrics = viewport.metrics.clone();
         self.input.view.viewport.scroll = tiny_sdk::types::LayoutPos::new(0.0, 0.0);
@@ -292,10 +298,8 @@ impl<T: Clone> FilterableDropdown<T> {
             results_height,
         );
         // Update logical_size to match bounds
-        self.results.viewport.logical_size = tiny_sdk::LogicalSize::new(
-            results_bounds_width,
-            results_height,
-        );
+        self.results.viewport.logical_size =
+            tiny_sdk::LogicalSize::new(results_bounds_width, results_height);
         self.results.viewport.scale_factor = viewport.scale_factor;
         self.results.viewport.metrics = viewport.metrics.clone();
         // Results can scroll, so don't reset scroll here
@@ -345,8 +349,8 @@ impl<T: Clone> FilterableDropdown<T> {
         }
 
         // Subtle color scheme - slightly differentiated from core bg
-        const INPUT_BG: u32 = 0x232629FF;      // Input field background - lighter
-        const RESULTS_BG: u32 = 0x1C1F21FF;    // Results area background (matches core bg)
+        const INPUT_BG: u32 = 0x232629FF; // Input field background - lighter
+        const RESULTS_BG: u32 = 0x1C1F21FF; // Results area background (matches core bg)
 
         // Use viewport bounds directly (already calculated in calculate_bounds)
         // Input field background - use full input viewport bounds including padding
@@ -385,10 +389,10 @@ impl<T: Clone> FilterableDropdown<T> {
         }
 
         // Subtle color scheme
-        const FRAME_BG: u32 = 0x1A1D1FFF;      // Frame background (RGBA) - slightly darker
-        const BORDER_COLOR: u32 = 0x30343AFF;  // Border color - subtle contrast
-        const CORNER_RADIUS: f32 = 4.0;        // Rounded corners
-        const BORDER_WIDTH: f32 = 1.0;         // Border width
+        const FRAME_BG: u32 = 0x1A1D1FFF; // Frame background (RGBA) - slightly darker
+        const BORDER_COLOR: u32 = 0x30343AFF; // Border color - subtle contrast
+        const CORNER_RADIUS: f32 = 4.0; // Rounded corners
+        const BORDER_WIDTH: f32 = 1.0; // Border width
 
         Some(RoundedRectInstance {
             rect: tiny_sdk::types::LayoutRect {
@@ -404,7 +408,6 @@ impl<T: Clone> FilterableDropdown<T> {
         })
     }
 
-
     /// Handle mouse wheel scroll
     pub fn handle_scroll(&mut self, delta_y: f32) {
         self.results.viewport.scroll.y.0 = (self.results.viewport.scroll.y.0 - delta_y).max(0.0);
@@ -414,8 +417,11 @@ impl<T: Clone> FilterableDropdown<T> {
     pub fn handle_click(&mut self, x: f32, y: f32, shift: bool) -> DropdownAction<T> {
         // Check if click is in input area
         let input_bounds = &self.input.view.viewport.bounds;
-        if x >= input_bounds.x.0 && x < input_bounds.x.0 + input_bounds.width.0
-            && y >= input_bounds.y.0 && y < input_bounds.y.0 + input_bounds.height.0 {
+        if x >= input_bounds.x.0
+            && x < input_bounds.x.0 + input_bounds.width.0
+            && y >= input_bounds.y.0
+            && y < input_bounds.y.0 + input_bounds.height.0
+        {
             // Let input handle the click for cursor positioning
             let screen_pos = tiny_core::tree::Point {
                 x: tiny_sdk::LogicalPixels(x),
@@ -427,9 +433,11 @@ impl<T: Clone> FilterableDropdown<T> {
 
         // Check if click is in results area
         let results_bounds = &self.results.viewport.bounds;
-        if x >= results_bounds.x.0 && x < results_bounds.x.0 + results_bounds.width.0
-            && y >= results_bounds.y.0 && y < results_bounds.y.0 + results_bounds.height.0 {
-
+        if x >= results_bounds.x.0
+            && x < results_bounds.x.0 + results_bounds.width.0
+            && y >= results_bounds.y.0
+            && y < results_bounds.y.0 + results_bounds.height.0
+        {
             // Convert y to line index
             let relative_y = y - results_bounds.y.0 + self.results.viewport.scroll.y.0;
             let line_height = self.results.viewport.metrics.line_height;

@@ -282,7 +282,9 @@ impl DiagnosticsPlugin {
             false
         } else {
             self.symbols.iter().any(|symbol| {
-                symbol.line == line && column >= symbol.column_range.0 && column < symbol.column_range.1
+                symbol.line == line
+                    && column >= symbol.column_range.0
+                    && column < symbol.column_range.1
             })
         };
 

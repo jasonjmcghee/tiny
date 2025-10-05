@@ -70,19 +70,21 @@ impl UniformManager {
             mapped_at_creation: false,
         });
 
-        let layout = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some(&format!("{} Layout", name)),
-            entries: &[BindGroupLayoutEntry {
-                binding: 0,
-                visibility,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let layout = self
+            .device
+            .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some(&format!("{} Layout", name)),
+                entries: &[BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
         let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some(&format!("{} Bind Group", name)),
@@ -122,7 +124,6 @@ impl UniformManager {
         self.entries.get(name).map(|e| &e.layout)
     }
 }
-
 
 /// Helper to create bind group layouts with less boilerplate
 pub struct BindGroupLayoutBuilder<'a> {
@@ -203,10 +204,11 @@ impl<'a> BindGroupLayoutBuilder<'a> {
     }
 
     pub fn build(self) -> BindGroupLayout {
-        self.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: self.label.as_deref(),
-            entries: &self.entries,
-        })
+        self.device
+            .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: self.label.as_deref(),
+                entries: &self.entries,
+            })
     }
 }
 
@@ -264,45 +266,52 @@ impl<'a> PipelineBuilder<'a> {
     pub fn build(self) -> RenderPipeline {
         let shader = self.shader.expect("Shader not set");
 
-        let layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: self.label.as_ref().map(|l| format!("{} Layout", l)).as_deref(),
-            bind_group_layouts: &self.bind_group_layouts,
-            push_constant_ranges: &[],
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: self
+                    .label
+                    .as_ref()
+                    .map(|l| format!("{} Layout", l))
+                    .as_deref(),
+                bind_group_layouts: &self.bind_group_layouts,
+                push_constant_ranges: &[],
+            });
 
-        self.device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: self.label.as_deref(),
-            layout: Some(&layout),
-            vertex: VertexState {
-                module: shader,
-                entry_point: Some("vs_main"),
-                buffers: &self.vertex_buffers,
-                compilation_options: PipelineCompilationOptions::default(),
-            },
-            fragment: Some(FragmentState {
-                module: shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(ColorTargetState {
-                    format: self.format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
-                compilation_options: PipelineCompilationOptions::default(),
-            }),
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        })
+        self.device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: self.label.as_deref(),
+                layout: Some(&layout),
+                vertex: VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &self.vertex_buffers,
+                    compilation_options: PipelineCompilationOptions::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(ColorTargetState {
+                        format: self.format,
+                        blend: Some(BlendState::ALPHA_BLENDING),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: PipelineCompilationOptions::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
     }
 }
 

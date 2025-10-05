@@ -85,7 +85,3 @@ path = "examples/debug_coordinates.rs"
 [[example]]
 name = "single_char"
 path = "examples/single_char.rs"
-
-[[example]]
-name = "rect_test"
-path = "examples/rect_test.rs"

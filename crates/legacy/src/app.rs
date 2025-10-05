@@ -347,7 +347,6 @@ impl TinyApp {
         }
     }
 
-
     /// Handle mouse wheel scrolling - routes to focused widget
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         // Emit mouse wheel event to the event bus
@@ -668,7 +667,11 @@ impl TinyApp {
                     self.current_scroll_direction = None;
                     println!(
                         "Scroll lock: {}",
-                        if self.scroll_lock_enabled { "ENABLED" } else { "DISABLED" }
+                        if self.scroll_lock_enabled {
+                            "ENABLED"
+                        } else {
+                            "DISABLED"
+                        }
                     );
                 }
 
@@ -720,7 +723,9 @@ impl TinyApp {
                         if let Some(cpu_renderer) = &mut self.cpu_renderer {
                             let editor_bounds = cpu_renderer.editor_bounds;
                             cpu_renderer.viewport.scroll = tab.scroll_position;
-                            cpu_renderer.viewport.clamp_scroll_to_bounds(&tree, editor_bounds);
+                            cpu_renderer
+                                .viewport
+                                .clamp_scroll_to_bounds(&tree, editor_bounds);
                             tab.scroll_position = cpu_renderer.viewport.scroll;
                             self.request_redraw();
                         }
@@ -757,7 +762,8 @@ impl TinyApp {
                     self.editor.file_picker.show();
                     self.editor.ui_changed = true;
                     self.shortcuts.set_context(ShortcutContext::FilePicker);
-                    self.scroll_focus.set_focus(crate::scroll::WidgetId::FilePicker);
+                    self.scroll_focus
+                        .set_focus(crate::scroll::WidgetId::FilePicker);
                     self.request_redraw();
                 }
                 "file_picker.close" => {
@@ -983,9 +989,7 @@ impl TinyApp {
                 .calculate_bounds(&cpu_renderer.viewport);
 
             // Update grep bounds based on viewport (overlay mode)
-            self.editor
-                .grep
-                .calculate_bounds(&cpu_renderer.viewport);
+            self.editor.grep.calculate_bounds(&cpu_renderer.viewport);
         }
 
         // Setup text styles
@@ -1265,7 +1269,8 @@ impl ApplicationHandler for TinyApp {
             font_system.prerasterize_ascii(self.font_size * scale_factor);
 
             // Setup CPU renderer
-            let mut cpu_renderer = Renderer::new(self.window_size, scale_factor, self.title_bar_height);
+            let mut cpu_renderer =
+                Renderer::new(self.window_size, scale_factor, self.title_bar_height);
             cpu_renderer.set_font_size(self.font_size);
             cpu_renderer.set_font_system(font_system.clone());
 
@@ -1316,7 +1321,9 @@ impl ApplicationHandler for TinyApp {
                 event_loop.exit();
             }
 
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 use serde_json::json;
                 use winit::keyboard::Key;
 
@@ -1331,7 +1338,8 @@ impl ApplicationHandler for TinyApp {
 
                         if is_modifier_key {
                             // Feed modifier release to matcher for sequences like "shift shift"
-                            let event_names = self.shortcuts.match_input(&Modifiers::default(), &trigger);
+                            let event_names =
+                                self.shortcuts.match_input(&Modifiers::default(), &trigger);
                             if !event_names.is_empty() {
                                 for event_name in event_names {
                                     self.event_bus.emit(event_name, json!({}), 10, "shortcuts");
@@ -1438,15 +1446,15 @@ impl ApplicationHandler for TinyApp {
 
                 // Convert button to trigger
                 let trigger = match button {
-                    winit::event::MouseButton::Left => {
-                        crate::accelerator::Trigger::MouseButton(crate::accelerator::MouseButton::Left)
-                    }
-                    winit::event::MouseButton::Right => {
-                        crate::accelerator::Trigger::MouseButton(crate::accelerator::MouseButton::Right)
-                    }
-                    winit::event::MouseButton::Middle => {
-                        crate::accelerator::Trigger::MouseButton(crate::accelerator::MouseButton::Middle)
-                    }
+                    winit::event::MouseButton::Left => crate::accelerator::Trigger::MouseButton(
+                        crate::accelerator::MouseButton::Left,
+                    ),
+                    winit::event::MouseButton::Right => crate::accelerator::Trigger::MouseButton(
+                        crate::accelerator::MouseButton::Right,
+                    ),
+                    winit::event::MouseButton::Middle => crate::accelerator::Trigger::MouseButton(
+                        crate::accelerator::MouseButton::Middle,
+                    ),
                     _ => return, // Ignore other buttons
                 };
 
@@ -1473,14 +1481,22 @@ impl ApplicationHandler for TinyApp {
                                     if !is_in_titlebar {
                                         let tab_bar_start = self.title_bar_height;
                                         let tab_bar_end = tab_bar_start + 30.0;
-                                        let in_tab_bar = point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
+                                        let in_tab_bar =
+                                            point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
 
                                         if in_tab_bar {
-                                            let viewport_width = self.cpu_renderer.as_ref().map(|r| r.viewport.logical_size.width.0);
+                                            let viewport_width = self
+                                                .cpu_renderer
+                                                .as_ref()
+                                                .map(|r| r.viewport.logical_size.width.0);
                                             if let Some(viewport_width) = viewport_width {
                                                 let click_x = point.x.0;
                                                 let click_y = point.y.0 - tab_bar_start;
-                                                if self.editor.handle_tab_bar_click(click_x, click_y, viewport_width) {
+                                                if self.editor.handle_tab_bar_click(
+                                                    click_x,
+                                                    click_y,
+                                                    viewport_width,
+                                                ) {
                                                     self.request_redraw();
                                                 }
                                             }
@@ -1489,11 +1505,12 @@ impl ApplicationHandler for TinyApp {
                                             self.mouse_pressed = true;
                                             self.drag_start = Some(position);
 
-                                            let editor_local = if let Some(cpu_renderer) = &self.cpu_renderer {
-                                                cpu_renderer.screen_to_editor_local(point)
-                                            } else {
-                                                point
-                                            };
+                                            let editor_local =
+                                                if let Some(cpu_renderer) = &self.cpu_renderer {
+                                                    cpu_renderer.screen_to_editor_local(point)
+                                                } else {
+                                                    point
+                                                };
 
                                             let button_name = match button {
                                                 winit::event::MouseButton::Left => "Left",
@@ -1548,14 +1565,22 @@ impl ApplicationHandler for TinyApp {
                 // Determine primary direction
                 let trigger = if delta_y.abs() > delta_x.abs() {
                     if delta_y > 0.0 {
-                        crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Up)
+                        crate::accelerator::Trigger::MouseWheel(
+                            crate::accelerator::WheelDirection::Up,
+                        )
                     } else {
-                        crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Down)
+                        crate::accelerator::Trigger::MouseWheel(
+                            crate::accelerator::WheelDirection::Down,
+                        )
                     }
                 } else if delta_x > 0.0 {
-                    crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Right)
+                    crate::accelerator::Trigger::MouseWheel(
+                        crate::accelerator::WheelDirection::Right,
+                    )
                 } else if delta_x < 0.0 {
-                    crate::accelerator::Trigger::MouseWheel(crate::accelerator::WheelDirection::Left)
+                    crate::accelerator::Trigger::MouseWheel(
+                        crate::accelerator::WheelDirection::Left,
+                    )
                 } else {
                     return; // No scroll
                 };

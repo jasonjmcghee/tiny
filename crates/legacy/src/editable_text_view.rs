@@ -231,9 +231,12 @@ impl EditableTextView {
     /// InputHandler only needs metrics, not bounds/scroll (we handle coordinate transform)
     fn create_minimal_viewport(&self) -> Viewport {
         let mut minimal = self.view.viewport.clone();
-        minimal.bounds = tiny_sdk::types::LayoutRect::new(0.0, 0.0,
+        minimal.bounds = tiny_sdk::types::LayoutRect::new(
+            0.0,
+            0.0,
             self.view.viewport.bounds.width.0,
-            self.view.viewport.bounds.height.0);
+            self.view.viewport.bounds.height.0,
+        );
         minimal.scroll = LayoutPos::new(0.0, 0.0);
         minimal
     }
@@ -342,15 +345,21 @@ impl EditableTextView {
                 let sel_rects = sel.to_rectangles(&self.view.doc, &self.view.viewport);
                 for rect in sel_rects {
                     // Transform to screen coordinates (logical) with padding
-                    let screen_x = self.view.viewport.bounds.x.0 + self.view.padding + rect.x.0 - self.view.viewport.scroll.x.0;
-                    let screen_y = self.view.viewport.bounds.y.0 + self.view.padding + rect.y.0 - self.view.viewport.scroll.y.0;
+                    let screen_x = self.view.viewport.bounds.x.0 + self.view.padding + rect.x.0
+                        - self.view.viewport.scroll.x.0;
+                    let screen_y = self.view.viewport.bounds.y.0 + self.view.padding + rect.y.0
+                        - self.view.viewport.scroll.y.0;
 
                     // Convert to physical pixels
                     let physical_rect = tiny_core::tree::Rect {
                         x: tiny_sdk::LogicalPixels(screen_x * self.view.viewport.scale_factor),
                         y: tiny_sdk::LogicalPixels(screen_y * self.view.viewport.scale_factor),
-                        width: tiny_sdk::LogicalPixels(rect.width.0 * self.view.viewport.scale_factor),
-                        height: tiny_sdk::LogicalPixels(rect.height.0 * self.view.viewport.scale_factor),
+                        width: tiny_sdk::LogicalPixels(
+                            rect.width.0 * self.view.viewport.scale_factor,
+                        ),
+                        height: tiny_sdk::LogicalPixels(
+                            rect.height.0 * self.view.viewport.scale_factor,
+                        ),
                     };
 
                     rects.push(RectInstance {

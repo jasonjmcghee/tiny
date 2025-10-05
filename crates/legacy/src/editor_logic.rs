@@ -95,16 +95,17 @@ impl EditorLogic {
             return true;
         }
         // Check tab click
-        else if let Some(tab_idx) = self
-            .tab_bar
-            .hit_test_tab(click_x, click_y, &self.tab_manager, viewport_width)
+        else if let Some(tab_idx) =
+            self.tab_bar
+                .hit_test_tab(click_x, click_y, &self.tab_manager, viewport_width)
         {
             self.tab_manager.switch_to(tab_idx);
             self.tab_bar.close_dropdown();
 
             // Ensure the active tab is visible
             let num_tabs = self.tab_manager.tabs().len();
-            self.tab_bar.scroll_to_tab(tab_idx, viewport_width, num_tabs);
+            self.tab_bar
+                .scroll_to_tab(tab_idx, viewport_width, num_tabs);
             self.ui_changed = true;
 
             // Trigger syntax highlighting for newly active tab
@@ -394,13 +395,19 @@ impl EditorLogic {
     /// Jump to a specific location (file path + line + column in UTF-8)
     /// This is the unified method for goto_definition, grep results, etc.
     /// Returns true if successful, false if file couldn't be opened
-    pub fn jump_to_location(&mut self, file_path: PathBuf, line: usize, column: usize, center: bool) -> bool {
+    pub fn jump_to_location(
+        &mut self,
+        file_path: PathBuf,
+        line: usize,
+        column: usize,
+        center: bool,
+    ) -> bool {
         // Record current location before jumping
         self.record_navigation();
 
         // Canonicalize path to ensure it matches existing tabs
-        let canonical_path = std::fs::canonicalize(&file_path)
-            .unwrap_or_else(|_| file_path.clone());
+        let canonical_path =
+            std::fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
 
         // Open file (will switch to existing tab if already open)
         if let Err(e) = self.tab_manager.open_file(canonical_path) {
@@ -425,13 +432,19 @@ impl EditorLogic {
     }
 
     /// Jump to a location specified in UTF-16 coordinates (for LSP)
-    pub fn jump_to_location_utf16(&mut self, file_path: PathBuf, line_utf16: u32, column_utf16: u32, center: bool) -> bool {
+    pub fn jump_to_location_utf16(
+        &mut self,
+        file_path: PathBuf,
+        line_utf16: u32,
+        column_utf16: u32,
+        center: bool,
+    ) -> bool {
         // Record current location before jumping
         self.record_navigation();
 
         // Canonicalize path to ensure it matches existing tabs
-        let canonical_path = std::fs::canonicalize(&file_path)
-            .unwrap_or_else(|_| file_path.clone());
+        let canonical_path =
+            std::fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
 
         // Open file (will switch to existing tab if already open)
         if let Err(e) = self.tab_manager.open_file(canonical_path) {

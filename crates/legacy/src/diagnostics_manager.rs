@@ -1,7 +1,7 @@
 //! High-level diagnostics manager that encapsulates LSP, caching, and plugin integration
 
 use crate::lsp_manager::{LspManager, ParsedDiagnostic};
-use crate::lsp_service::{LspService, LspResult};
+use crate::lsp_service::{LspResult, LspService};
 use ahash::AHashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -52,7 +52,8 @@ impl DiagnosticsManager {
         self.document_symbols.clear();
 
         // Load cached diagnostics immediately
-        if let Some(cached_diagnostics) = LspManager::load_cached_diagnostics(&file_path, &content) {
+        if let Some(cached_diagnostics) = LspManager::load_cached_diagnostics(&file_path, &content)
+        {
             self.apply_diagnostics(&cached_diagnostics, &content);
         }
 
@@ -108,16 +109,20 @@ impl DiagnosticsManager {
     pub fn update(&mut self, doc: &Doc) {
         // Check if plugin needs hover info (500ms timer elapsed)
         if let Some((line, column)) = self.plugin.update() {
-            self.lsp_service.request_hover(crate::lsp_service::DocPosition { line, column });
+            self.lsp_service
+                .request_hover(crate::lsp_service::DocPosition { line, column });
         }
 
         // Check if we should save definition cache (debounced)
         if let Some(modified_time) = self.definition_cache_modified {
-            let should_save = self.definition_cache_last_saved
+            let should_save = self
+                .definition_cache_last_saved
                 .map(|saved_time| modified_time > saved_time)
                 .unwrap_or(true);
 
-            if should_save && modified_time.elapsed().as_secs() >= DEFINITION_CACHE_SAVE_DEBOUNCE_SECS {
+            if should_save
+                && modified_time.elapsed().as_secs() >= DEFINITION_CACHE_SAVE_DEBOUNCE_SECS
+            {
                 self.save_definition_cache();
                 self.definition_cache_last_saved = Some(Instant::now());
             }
@@ -141,8 +146,9 @@ impl DiagnosticsManager {
                     // Store symbols for proactive definition requests
                     self.document_symbols = symbols.clone();
 
-                    let plugin_symbols: Vec<_> = symbols.iter().map(|symbol| {
-                        diagnostics_plugin::Symbol {
+                    let plugin_symbols: Vec<_> = symbols
+                        .iter()
+                        .map(|symbol| diagnostics_plugin::Symbol {
                             name: symbol.name.clone(),
                             line: symbol.range.start.line as usize,
                             column_range: (
@@ -150,8 +156,8 @@ impl DiagnosticsManager {
                                 symbol.range.end.character as usize,
                             ),
                             kind: format!("{:?}", symbol.kind),
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     self.plugin.set_symbols(plugin_symbols);
 
                     // Proactively request definitions for top-level symbols to warm cache
@@ -166,7 +172,11 @@ impl DiagnosticsManager {
                     self.pending_goto_definition = Some(locations);
                 }
                 LspResult::CodeActions(actions) => {
-                    if let Some(action) = actions.iter().find(|a| a.is_preferred).or_else(|| actions.first()) {
+                    if let Some(action) = actions
+                        .iter()
+                        .find(|a| a.is_preferred)
+                        .or_else(|| actions.first())
+                    {
                         self.lsp_service.execute_code_action(action);
                     }
                 }
@@ -203,7 +213,8 @@ impl DiagnosticsManager {
         }
 
         // Not in cache, request from LSP
-        self.lsp_service.request_goto_definition(crate::lsp_service::DocPosition { line, column });
+        self.lsp_service
+            .request_goto_definition(crate::lsp_service::DocPosition { line, column });
     }
 
     /// Take pending go-to-definition result (consumes it)
@@ -263,7 +274,8 @@ impl DiagnosticsManager {
             let column = symbol.selection_range.start.character as usize;
 
             if !self.definition_cache.contains_key(&(line, column)) {
-                self.lsp_service.request_goto_definition(crate::lsp_service::DocPosition { line, column });
+                self.lsp_service
+                    .request_goto_definition(crate::lsp_service::DocPosition { line, column });
             }
         }
     }

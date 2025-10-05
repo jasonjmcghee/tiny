@@ -1,12 +1,12 @@
 //! Tab Manager - manages multiple open files
 
-use std::path::PathBuf;
-use crate::text_editor_plugin::TextEditorPlugin;
-use crate::line_numbers_plugin::LineNumbersPlugin;
-use crate::diagnostics_manager::DiagnosticsManager;
-use crate::text_renderer::TextRenderer;
-use crate::scroll::Scrollable;
 use crate::coordinates::Viewport;
+use crate::diagnostics_manager::DiagnosticsManager;
+use crate::line_numbers_plugin::LineNumbersPlugin;
+use crate::scroll::Scrollable;
+use crate::text_editor_plugin::TextEditorPlugin;
+use crate::text_renderer::TextRenderer;
+use std::path::PathBuf;
 use tiny_core::tree::{Point, Rect};
 use tiny_sdk::LogicalPixels;
 
@@ -125,7 +125,9 @@ impl TabManager {
             let tab = &mut self.tabs[index];
             if let Some(ref path) = tab.plugin.file_path {
                 let content = tab.plugin.doc.read().flatten_to_string();
-                tab.diagnostics.lsp_service_mut().open_file(path.clone(), (*content).clone());
+                tab.diagnostics
+                    .lsp_service_mut()
+                    .open_file(path.clone(), (*content).clone());
             }
 
             true
@@ -164,9 +166,7 @@ impl TabManager {
 
     /// Check if a file is already open
     pub fn find_tab_by_path(&self, path: &PathBuf) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.path() == Some(path))
+        self.tabs.iter().position(|tab| tab.path() == Some(path))
     }
 
     /// Open a file (or switch to it if already open)

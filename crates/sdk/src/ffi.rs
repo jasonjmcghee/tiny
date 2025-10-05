@@ -56,10 +56,7 @@ extern "C" {
         entries: *const u8,
         entries_len: usize,
     ) -> BindGroupLayoutId;
-    pub fn gpu_create_bind_group(
-        layout: BindGroupLayoutId,
-        buffer: BufferId,
-    ) -> BindGroupId;
+    pub fn gpu_create_bind_group(layout: BindGroupLayoutId, buffer: BufferId) -> BindGroupId;
     pub fn gpu_create_render_pipeline_with_layout(
         vertex_shader: ShaderModuleId,
         fragment_shader: ShaderModuleId,

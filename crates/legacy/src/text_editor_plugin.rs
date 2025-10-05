@@ -14,8 +14,8 @@ use std::sync::Arc;
 use tiny_core::tree::{Doc, Point};
 use tiny_font::{create_glyph_instances, SharedFontSystem};
 use tiny_sdk::{
-    Capability, Initializable, LayoutPos, LogicalSize, Paintable, PaintContext, Plugin,
-    PluginError, SetupContext, UpdateContext, Updatable,
+    Capability, Initializable, LayoutPos, LogicalSize, PaintContext, Paintable, Plugin,
+    PluginError, SetupContext, Updatable, UpdateContext,
 };
 
 /// The main text editor plugin - handles everything
@@ -51,8 +51,8 @@ impl TextEditorPlugin {
 
     /// Check if document has unsaved changes
     pub fn is_modified(&self) -> bool {
-        use std::hash::{Hash, Hasher};
         use ahash::AHasher;
+        use std::hash::{Hash, Hasher};
         let current_text = self.doc.read().flatten_to_string();
         let mut hasher = AHasher::default();
         current_text.hash(&mut hasher);
@@ -67,8 +67,8 @@ impl TextEditorPlugin {
         editor.file_path = Some(path.clone());
 
         // Calculate saved content hash (file was just loaded)
-        use std::hash::{Hash, Hasher};
         use ahash::AHasher;
+        use std::hash::{Hash, Hasher};
         let mut hasher = AHasher::default();
         content.hash(&mut hasher);
         editor.last_saved_content_hash = hasher.finish();
@@ -94,7 +94,6 @@ impl TextEditorPlugin {
 
         Ok(editor)
     }
-
 
     /// Handle mouse click
     pub fn on_click(
@@ -123,13 +122,9 @@ impl TextEditorPlugin {
         viewport: &Viewport,
         modifiers: &crate::input_types::Modifiers,
     ) -> bool {
-        let (_redraw, _scroll) = self.input.on_mouse_drag(
-            &self.doc,
-            viewport,
-            from,
-            to,
-            modifiers.state().alt_key(),
-        );
+        let (_redraw, _scroll) =
+            self.input
+                .on_mouse_drag(&self.doc, viewport, from, to, modifiers.state().alt_key());
         true
     }
 
@@ -139,8 +134,8 @@ impl TextEditorPlugin {
             std::fs::write(path, content.as_bytes())?;
 
             // Update saved content hash
-            use std::hash::{Hash, Hasher};
             use ahash::AHasher;
+            use std::hash::{Hash, Hasher};
             let mut hasher = AHasher::default();
             content.hash(&mut hasher);
             self.last_saved_content_hash = hasher.finish();
@@ -170,10 +165,15 @@ impl TextEditorPlugin {
     }
 
     /// Get primary cursor layout position for rendering
-    pub fn get_primary_cursor_layout_pos(&self, doc: &Doc, viewport: &crate::coordinates::Viewport) -> Option<LayoutPos> {
-        self.input.selections().first().map(|sel| {
-            viewport.doc_to_layout(sel.cursor)
-        })
+    pub fn get_primary_cursor_layout_pos(
+        &self,
+        doc: &Doc,
+        viewport: &crate::coordinates::Viewport,
+    ) -> Option<LayoutPos> {
+        self.input
+            .selections()
+            .first()
+            .map(|sel| viewport.doc_to_layout(sel.cursor))
     }
 
     /// Get selections for rendering
@@ -218,9 +218,7 @@ impl Initializable for TextEditorPlugin {
     fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> {
         // Initialize syntax highlighter if needed
         if let Some(ref mut highlighter) = self.syntax_highlighter {
-            if let Some(syntax_hl) = highlighter.as_any()
-                .downcast_ref::<SyntaxHighlighter>()
-            {
+            if let Some(syntax_hl) = highlighter.as_any().downcast_ref::<SyntaxHighlighter>() {
                 let text = self.doc.read().flatten_to_string();
                 syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
             }

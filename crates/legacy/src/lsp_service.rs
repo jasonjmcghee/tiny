@@ -84,8 +84,7 @@ impl LspService {
             return;
         }
 
-        let abs_path = std::fs::canonicalize(&file_path)
-            .unwrap_or_else(|_| file_path.clone());
+        let abs_path = std::fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
 
         // Skip LSP for dependency/library files (read-only, not part of current workspace)
         let path_str = abs_path.to_string_lossy();
@@ -99,22 +98,20 @@ impl LspService {
 
         self.current_file = Some(abs_path.clone());
 
-        let workspace_root = abs_path
-            .parent()
-            .and_then(|p| {
-                let mut current = p;
-                let mut found_cargo_toml = None;
-                loop {
-                    if current.join("Cargo.toml").exists() {
-                        found_cargo_toml = Some(current.to_path_buf());
-                    }
-                    match current.parent() {
-                        Some(parent) => current = parent,
-                        None => break,
-                    }
+        let workspace_root = abs_path.parent().and_then(|p| {
+            let mut current = p;
+            let mut found_cargo_toml = None;
+            loop {
+                if current.join("Cargo.toml").exists() {
+                    found_cargo_toml = Some(current.to_path_buf());
                 }
-                found_cargo_toml
-            });
+                match current.parent() {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+            found_cargo_toml
+        });
 
         // Get or create LSP manager
         match LspManager::get_or_create_global(workspace_root) {
@@ -202,13 +199,11 @@ impl LspService {
                                     lsp_types::CodeActionOrCommand::Command(cmd) => {
                                         (cmd.title.clone(), None, false)
                                     }
-                                    lsp_types::CodeActionOrCommand::CodeAction(ca) => {
-                                        (
-                                            ca.title.clone(),
-                                            ca.kind.as_ref().map(|k| k.as_str().to_string()),
-                                            ca.is_preferred.unwrap_or(false),
-                                        )
-                                    }
+                                    lsp_types::CodeActionOrCommand::CodeAction(ca) => (
+                                        ca.title.clone(),
+                                        ca.kind.as_ref().map(|k| k.as_str().to_string()),
+                                        ca.is_preferred.unwrap_or(false),
+                                    ),
                                 };
                                 CodeAction {
                                     title,

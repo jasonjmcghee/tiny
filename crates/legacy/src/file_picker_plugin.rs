@@ -1,18 +1,17 @@
 //! File picker plugin - searchable file list with fuzzy filtering
 
+use crate::coordinates::Viewport;
+use crate::filterable_dropdown::{DropdownAction, FilterableDropdown};
+use crate::input_types::{Key, Modifiers};
+use crate::scroll::Scrollable;
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::RwLock;
+use tiny_core::tree::{Point, Rect};
 use tiny_font::SharedFontSystem;
 use tiny_sdk::{
-    Capability, Initializable, PaintContext, Paintable, Plugin,
-    PluginError, SetupContext,
+    Capability, Initializable, PaintContext, Paintable, Plugin, PluginError, SetupContext,
 };
-use tiny_core::tree::{Point, Rect};
-use crate::scroll::Scrollable;
-use crate::coordinates::Viewport;
-use crate::filterable_dropdown::{FilterableDropdown, DropdownAction};
-use crate::input_types::{Key, Modifiers};
 
 /// File picker plugin for finding and opening files
 pub struct FilePickerPlugin {
@@ -78,12 +77,7 @@ impl FilePickerPlugin {
             .git_exclude(true)
             .build()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_type()
-                    .map(|ft| ft.is_file())
-                    .unwrap_or(false)
-            })
+            .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .map(|entry| entry.into_path())
             .collect();
 
@@ -286,7 +280,11 @@ impl FilePickerPlugin {
         if self.dropdown.selected_index() > 0 {
             let viewport = Viewport::new(1920.0, 1080.0, 1.0);
             let modifiers = Modifiers::new();
-            self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowUp), &modifiers, &viewport);
+            self.dropdown.handle_key(
+                &Key::Named(crate::input_types::NamedKey::ArrowUp),
+                &modifiers,
+                &viewport,
+            );
         }
     }
 
@@ -294,7 +292,11 @@ impl FilePickerPlugin {
     pub fn move_down(&mut self) {
         let viewport = Viewport::new(1920.0, 1080.0, 1.0);
         let modifiers = Modifiers::new();
-        self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowDown), &modifiers, &viewport);
+        self.dropdown.handle_key(
+            &Key::Named(crate::input_types::NamedKey::ArrowDown),
+            &modifiers,
+            &viewport,
+        );
     }
 
     /// Get selected file
@@ -343,8 +345,7 @@ impl Initializable for FilePickerPlugin {
 }
 
 impl Paintable for FilePickerPlugin {
-    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {
-    }
+    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {}
 
     fn z_index(&self) -> i32 {
         1000
@@ -361,7 +362,9 @@ impl Scrollable for FilePickerPlugin {
     }
 
     fn handle_scroll(&mut self, delta: Point, viewport: &Viewport, widget_bounds: Rect) -> bool {
-        self.dropdown.results.handle_scroll(delta, viewport, widget_bounds)
+        self.dropdown
+            .results
+            .handle_scroll(delta, viewport, widget_bounds)
     }
 
     fn get_content_bounds(&self, viewport: &Viewport) -> Rect {

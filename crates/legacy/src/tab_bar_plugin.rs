@@ -1,15 +1,15 @@
 //! Tab bar plugin - renders tabs at the top of the screen
 
+use crate::coordinates::Viewport;
 use crate::scroll::Scrollable;
 use crate::tab_manager::TabManager;
-use crate::coordinates::Viewport;
 use tiny_core::tree::{Point, Rect};
 use tiny_font::{create_glyph_instances, SharedFontSystem};
+use tiny_sdk::types::{LayoutRect, RectInstance};
 use tiny_sdk::{
     Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
     SetupContext,
 };
-use tiny_sdk::types::{LayoutRect, RectInstance};
 
 /// Tab bar height in logical pixels
 pub const TAB_BAR_HEIGHT: f32 = 30.0;
@@ -98,7 +98,11 @@ impl TabBarPlugin {
     }
 
     /// Collect background rectangles for tabs
-    pub fn collect_rects(&self, tab_manager: &TabManager, viewport_width: f32) -> Vec<RectInstance> {
+    pub fn collect_rects(
+        &self,
+        tab_manager: &TabManager,
+        viewport_width: f32,
+    ) -> Vec<RectInstance> {
         let mut rects = Vec::new();
         let num_tabs = tab_manager.tabs().len();
         let tab_width = self.calculate_tab_width(viewport_width, num_tabs);
@@ -108,7 +112,7 @@ impl TabBarPlugin {
 
         // Colors (RGBA as u32) - match main background: rgb(0.11, 0.12, 0.13)
         // Active tab matches background (invisible/flush), inactive tabs are slightly darker
-        const ACTIVE_TAB_BG: u32 = 0x1C1F21FF;   // Same as main background (28, 31, 33)
+        const ACTIVE_TAB_BG: u32 = 0x1C1F21FF; // Same as main background (28, 31, 33)
         const INACTIVE_TAB_BG: u32 = 0x16191BFF; // Slightly darker than background (22, 25, 27)
 
         for (idx, _tab) in tab_manager.tabs().iter().enumerate() {
@@ -116,7 +120,11 @@ impl TabBarPlugin {
 
             let tab_rect = RectInstance {
                 rect: LayoutRect::new(x_offset, 0.0, tab_width, TAB_HEIGHT),
-                color: if is_active { ACTIVE_TAB_BG } else { INACTIVE_TAB_BG },
+                color: if is_active {
+                    ACTIVE_TAB_BG
+                } else {
+                    INACTIVE_TAB_BG
+                },
             };
 
             rects.push(tab_rect);
@@ -153,8 +161,16 @@ impl TabBarPlugin {
         let line_height = collector.viewport.line_height;
 
         // Extract widget bounds before loop to avoid borrow issues
-        let bounds_x = collector.widget_viewport.as_ref().map(|w| w.bounds.x.0).unwrap_or(0.0);
-        let bounds_y = collector.widget_viewport.as_ref().map(|w| w.bounds.y.0).unwrap_or(0.0);
+        let bounds_x = collector
+            .widget_viewport
+            .as_ref()
+            .map(|w| w.bounds.x.0)
+            .unwrap_or(0.0);
+        let bounds_y = collector
+            .widget_viewport
+            .as_ref()
+            .map(|w| w.bounds.y.0)
+            .unwrap_or(0.0);
         let viewport_width = collector.viewport.logical_size.width.0;
 
         let num_tabs = tab_manager.tabs().len();
@@ -249,7 +265,8 @@ impl TabBarPlugin {
             let dropdown_start_y = self.height;
 
             for (idx, tab) in tab_manager.tabs().iter().enumerate() {
-                let item_y = dropdown_start_y + (idx as f32 * line_height) - self.dropdown_scroll_offset;
+                let item_y =
+                    dropdown_start_y + (idx as f32 * line_height) - self.dropdown_scroll_offset;
 
                 // Skip rendering if item is outside visible dropdown area
                 if item_y < dropdown_start_y || item_y > dropdown_start_y + MAX_DROPDOWN_HEIGHT {
@@ -311,7 +328,13 @@ impl TabBarPlugin {
     }
 
     /// Check if a click at the given position hits a tab
-    pub fn hit_test_tab(&self, x: f32, y: f32, tab_manager: &TabManager, viewport_width: f32) -> Option<usize> {
+    pub fn hit_test_tab(
+        &self,
+        x: f32,
+        y: f32,
+        tab_manager: &TabManager,
+        viewport_width: f32,
+    ) -> Option<usize> {
         if y > self.height {
             return None;
         }
@@ -331,7 +354,13 @@ impl TabBarPlugin {
     }
 
     /// Check if a click at the given position hits a close button
-    pub fn hit_test_close_button(&self, x: f32, y: f32, tab_manager: &TabManager, viewport_width: f32) -> Option<usize> {
+    pub fn hit_test_close_button(
+        &self,
+        x: f32,
+        y: f32,
+        tab_manager: &TabManager,
+        viewport_width: f32,
+    ) -> Option<usize> {
         if y > self.height {
             return None;
         }
