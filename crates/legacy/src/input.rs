@@ -114,7 +114,7 @@ impl Selection {
         } else {
             let start_layout = viewport.doc_to_layout(start);
             let end_layout = viewport.doc_to_layout(end);
-            let viewport_right = viewport.logical_size.width.0 - viewport.margin.x.0;
+            let viewport_right = viewport.bounds.width.0;
 
             // First line
             rects.push(LayoutRect::new(
@@ -127,18 +127,18 @@ impl Selection {
             // Middle lines
             if end.line > start.line + 1 {
                 rects.push(LayoutRect::new(
-                    viewport.margin.x.0,
+                    0.0,
                     start_layout.y.0 + line_height,
-                    viewport.logical_size.width.0 - (viewport.margin.x.0 * 2.0),
+                    viewport.bounds.width.0,
                     (end.line - start.line - 1) as f32 * line_height,
                 ));
             }
 
             // Last line
             rects.push(LayoutRect::new(
-                viewport.margin.x.0,
+                0.0,
                 end_layout.y.0,
-                end_layout.x.0 - viewport.margin.x.0 - 2.0,
+                end_layout.x.0 - 2.0,
                 line_height,
             ));
         }
@@ -544,7 +544,7 @@ impl InputHandler {
     }
 
     /// Unified cursor movement
-    fn move_cursor(
+    pub fn move_cursor(
         &mut self,
         doc: &Doc,
         dx: i32,
@@ -613,7 +613,7 @@ impl InputHandler {
     }
 
     /// Delete at cursor position (forward or backward)
-    fn delete_at_cursor(&mut self, doc: &Doc, forward: bool) -> InputAction {
+    pub fn delete_at_cursor(&mut self, doc: &Doc, forward: bool) -> InputAction {
         self.save_snapshot_to_history(doc);
 
         if forward {
@@ -697,7 +697,7 @@ impl InputHandler {
     }
 
     /// Insert text at cursor positions
-    fn insert_text(&mut self, doc: &Doc, text: &str) -> InputAction {
+    pub fn insert_text(&mut self, doc: &Doc, text: &str) -> InputAction {
         self.save_snapshot_to_history(doc);
 
         for sel in &self.selections {
@@ -1101,8 +1101,7 @@ impl InputHandler {
         let mut scroll_delta = (0.0, 0.0);
 
         // Check if mouse is outside viewport boundaries for scrolling
-        let margin_x = viewport.margin.x.0;
-        let text_area_right = viewport.logical_size.width.0 - margin_x;
+        let text_area_right = viewport.bounds.width.0;
 
         // Vertical scrolling - only when mouse is outside viewport vertically
         if to.y.0 < 0.0 {
@@ -1114,7 +1113,7 @@ impl InputHandler {
         }
 
         // Horizontal scrolling - only when mouse is outside text area horizontally
-        if to.x.0 < margin_x {
+        if to.x.0 < 0.0 {
             // Left of text area - scroll left
             scroll_delta.0 = -3.0; // Fixed scroll speed
         } else if to.x.0 > text_area_right {

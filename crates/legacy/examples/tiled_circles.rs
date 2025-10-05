@@ -674,6 +674,7 @@ impl DocumentEditorWidget {
         let renderer = Rc::new(RefCell::new(Renderer::new(
             (bounds.width.0, bounds.height.0),
             viewport.scale_factor,
+            0.0, // No title bar for this example
         )));
 
         // Don't set text effects on renderer - we'll pass them per-frame

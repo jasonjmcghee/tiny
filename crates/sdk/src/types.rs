@@ -329,12 +329,22 @@ pub struct GlyphInstance {
 
 // === Rect ===
 
-#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct RectInstance {
     pub rect: LayoutRect,
     pub color: u32,
+}
+
+/// Rounded rectangle instance with border support (for SDF rendering)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct RoundedRectInstance {
+    pub rect: LayoutRect,
+    pub color: u32,
+    pub border_color: u32,
+    pub corner_radius: f32,
+    pub border_width: f32,
 }
 
 // === Text Data ===

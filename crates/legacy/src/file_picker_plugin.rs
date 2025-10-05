@@ -1,41 +1,38 @@
-//! File picker plugin - shows a searchable list of files
+//! File picker plugin - searchable file list with fuzzy filtering
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tiny_font::{create_glyph_instances, SharedFontSystem};
+use tiny_font::SharedFontSystem;
 use tiny_sdk::{
-    Capability, GlyphInstance, Initializable, LayoutPos, PaintContext, Paintable, Plugin,
+    Capability, Initializable, PaintContext, Paintable, Plugin,
     PluginError, SetupContext,
 };
 use tiny_core::tree::{Point, Rect};
 use crate::scroll::Scrollable;
 use crate::coordinates::Viewport;
-use tiny_sdk::LogicalPixels;
-use nucleo::{Config, Nucleo, Utf32String};
+use crate::filterable_dropdown::{FilterableDropdown, DropdownAction};
+use crate::input_types::{Key, Modifiers};
 
-/// Simple file picker with fuzzy matching
+/// File picker plugin for finding and opening files
 pub struct FilePickerPlugin {
-    /// Whether the picker is visible
-    pub visible: bool,
-    /// Current search query
-    pub query: String,
-    /// All files in the working directory (thread-safe)
+    /// Filterable dropdown for search + results
+    dropdown: FilterableDropdown<PathBuf>,
+
+    /// All files in working directory (thread-safe)
     all_files: Arc<RwLock<Vec<PathBuf>>>,
-    /// Filtered files based on query (with scores)
-    filtered_files: Vec<(PathBuf, u32)>,
-    /// Selected index in filtered list
-    selected_index: usize,
+
     /// Working directory
     working_dir: PathBuf,
-    /// Scroll position for long file lists
-    scroll_position: Point,
-    /// Bounds for overlay rendering (calculated based on viewport)
-    bounds: Rect,
-    /// Cached width to keep picker size consistent while filtering
-    cached_width: Option<f32>,
-    /// Nucleo matcher for fuzzy matching
-    matcher: Nucleo<PathBuf>,
+
+    /// Whether filtering is in progress
+    filtering: bool,
+
+    /// Callback when file is selected
+    on_select: Option<Box<dyn Fn(&Path) + Send + Sync>>,
+
+    /// Public visibility field for backwards compatibility
+    pub visible: bool,
 }
 
 impl FilePickerPlugin {
@@ -43,13 +40,15 @@ impl FilePickerPlugin {
         let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let all_files = Arc::new(RwLock::new(Vec::new()));
 
-        // Create nucleo matcher with default config
-        let matcher = Nucleo::new(
-            Config::DEFAULT,
-            Arc::new(|| {}), // no-op callback for now
-            None, // no thread pool limit
-            1, // one column (file path)
-        );
+        // Format function for displaying file paths
+        let working_dir_for_format = working_dir.clone();
+        let format_fn = move |path: &PathBuf| {
+            path.strip_prefix(&working_dir_for_format)
+                .ok()
+                .and_then(|p| p.to_str())
+                .unwrap_or_else(|| path.to_str().unwrap_or("???"))
+                .to_string()
+        };
 
         // Spawn background thread to scan directory
         let all_files_clone = all_files.clone();
@@ -60,16 +59,12 @@ impl FilePickerPlugin {
         });
 
         Self {
-            visible: false,
-            query: String::new(),
+            dropdown: FilterableDropdown::new(format_fn),
             all_files,
-            filtered_files: Vec::new(),
-            selected_index: 0,
             working_dir,
-            scroll_position: Point::default(),
-            bounds: Rect::default(),
-            cached_width: None,
-            matcher,
+            filtering: false,
+            on_select: None,
+            visible: false,
         }
     }
 
@@ -78,9 +73,9 @@ impl FilePickerPlugin {
         use ignore::WalkBuilder;
 
         let mut files: Vec<PathBuf> = WalkBuilder::new(dir)
-            .hidden(true) // Skip hidden files/directories
-            .git_ignore(true) // Respect .gitignore
-            .git_exclude(true) // Respect .git/info/exclude
+            .hidden(true)
+            .git_ignore(true)
+            .git_exclude(true)
             .build()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -92,324 +87,230 @@ impl FilePickerPlugin {
             .map(|entry| entry.into_path())
             .collect();
 
-        // Sort files for consistent ordering
         files.sort();
         files
     }
 
-    /// Show the file picker (bounds must be calculated before rendering)
+    /// Set callback for when file is selected
+    pub fn set_on_select<F>(&mut self, callback: F)
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        self.on_select = Some(Box::new(callback));
+    }
+
+    /// Show the file picker
     pub fn show(&mut self) {
         self.visible = true;
-        self.query.clear();
-        self.scroll_position = Point::default();
-        self.bounds = Rect::default();
-        self.cached_width = None; // Reset cached width so it recalculates
-        self.update_filtered_files();
+        self.filtering = false;
+
+        // Show dropdown with all files (unfiltered initially)
+        let files = self.all_files.read().clone();
+        self.dropdown.show_with_title(files, "Open File");
     }
 
     /// Hide the file picker
     pub fn hide(&mut self) {
         self.visible = false;
-        self.query.clear();
+        self.dropdown.hide();
+        self.filtering = false;
     }
 
-    /// Update search query
-    pub fn set_query(&mut self, query: String) {
-        self.query = query;
-        self.update_filtered_files();
+    /// Check if picker is visible
+    pub fn is_visible(&self) -> bool {
+        self.dropdown.visible
     }
+
+    /// Trigger filtering based on query
+    fn trigger_filter(&mut self, query: String) {
+        if query.is_empty() {
+            // Show all files when no query
+            self.filtering = false;
+            let files = self.all_files.read().clone();
+            self.dropdown.set_items(files);
+            return;
+        }
+
+        self.filtering = true;
+
+        // Simple substring filtering with scoring
+        let all_files = self.all_files.read();
+        let query_lower = query.to_lowercase();
+
+        let mut results: Vec<(PathBuf, u32)> = all_files
+            .iter()
+            .filter_map(|path| {
+                path.to_str().and_then(|s| {
+                    let s_lower = s.to_lowercase();
+                    if s_lower.contains(&query_lower) {
+                        // Score: earlier match is better
+                        let score = (1000 - s_lower.find(&query_lower).unwrap_or(999)) as u32;
+                        Some((path.clone(), score))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        // Sort by score (higher is better)
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Extract just the paths
+        let filtered: Vec<PathBuf> = results.into_iter().map(|(path, _)| path).collect();
+
+        self.dropdown.set_items(filtered);
+        self.filtering = false;
+    }
+
+    /// Handle keyboard input
+    pub fn handle_key(&mut self, key: &Key, modifiers: &Modifiers, viewport: &Viewport) -> bool {
+        let action = self.dropdown.handle_key(key, modifiers, viewport);
+
+        match action {
+            DropdownAction::Continue => true,
+            DropdownAction::Selected(path) => {
+                if let Some(callback) = &self.on_select {
+                    callback(path.as_path());
+                }
+                self.hide();
+                true
+            }
+            DropdownAction::Cancelled => {
+                self.hide();
+                true
+            }
+            DropdownAction::FilterChanged(new_filter) => {
+                self.trigger_filter(new_filter);
+                true
+            }
+        }
+    }
+
+    /// Calculate bounds based on viewport
+    pub fn calculate_bounds(&mut self, viewport: &Viewport) {
+        self.dropdown.calculate_bounds(viewport);
+    }
+
+    /// Get current bounds
+    pub fn get_bounds(&self) -> Rect {
+        self.dropdown.bounds()
+    }
+
+    /// Collect glyphs for rendering (with scissor rects for each view)
+    pub fn collect_glyphs(
+        &mut self,
+        font_system: &Arc<SharedFontSystem>,
+    ) -> Vec<(Vec<tiny_sdk::GlyphInstance>, (u32, u32, u32, u32))> {
+        let mut result = Vec::new();
+
+        if !self.dropdown.visible {
+            return result;
+        }
+
+        // Update layout for all views (bounds already set by calculate_bounds)
+        self.dropdown.title_view.update_layout(font_system);
+        self.dropdown.input.view.update_layout(font_system);
+        self.dropdown.results.update_layout(font_system);
+
+        // Collect glyphs from title with its scissor rect
+        if !self.dropdown.title_view.text().is_empty() {
+            let title_glyphs = self.dropdown.title_view.collect_glyphs(font_system);
+            let scissor = self.dropdown.title_view.get_scissor_rect();
+            if !title_glyphs.is_empty() {
+                result.push((title_glyphs, scissor));
+            }
+        }
+
+        // Collect glyphs from input with its scissor rect
+        let input_glyphs = self.dropdown.input.view.collect_glyphs(font_system);
+        let input_scissor = self.dropdown.input.view.get_scissor_rect();
+        if !input_glyphs.is_empty() {
+            result.push((input_glyphs, input_scissor));
+        }
+
+        // Collect glyphs from results with its scissor rect
+        let results_glyphs = self.dropdown.results.collect_glyphs(font_system);
+        let results_scissor = self.dropdown.results.get_scissor_rect();
+        if !results_glyphs.is_empty() {
+            result.push((results_glyphs, results_scissor));
+        }
+
+        result
+    }
+
+    /// Collect background rects for rendering (includes line highlight)
+    pub fn collect_background_rects(&self) -> Vec<tiny_sdk::types::RectInstance> {
+        let mut rects = Vec::new();
+
+        if !self.dropdown.visible {
+            return rects;
+        }
+
+        // Collect background chrome (input and results backgrounds)
+        let chrome_rects = self.dropdown.get_chrome_rects();
+        rects.extend(chrome_rects);
+
+        // Collect input background rects (cursor)
+        let input_rects = self.dropdown.input.collect_background_rects();
+        rects.extend(input_rects);
+
+        // Collect results background rects (selection highlight)
+        let results_rects = self.dropdown.results.collect_background_rects();
+        rects.extend(results_rects);
+
+        rects
+    }
+
+    /// Get rounded rect for frame with border (SDF rendering)
+    pub fn get_frame_rounded_rect(&self) -> Option<tiny_sdk::types::RoundedRectInstance> {
+        self.dropdown.get_frame_rounded_rect()
+    }
+
+    // === Legacy API compatibility ===
 
     /// Add character to query
     pub fn add_char(&mut self, ch: char) {
-        self.query.push(ch);
-        self.update_filtered_files();
+        self.dropdown.input.handle_char(ch);
+        self.trigger_filter(self.dropdown.filter_text());
     }
 
-    /// Remove last character from query
+    /// Handle backspace
     pub fn backspace(&mut self) {
-        self.query.pop();
-        self.update_filtered_files();
+        self.dropdown.input.handle_backspace();
+        self.trigger_filter(self.dropdown.filter_text());
     }
 
-    /// Update filtered files based on current query using fuzzy matching
-    fn update_filtered_files(&mut self) {
-        let all_files = self.all_files.read();
-
-        if self.query.is_empty() {
-            // Show all files without scores when no query
-            self.filtered_files = all_files.iter().map(|p| (p.clone(), 0)).collect();
-        } else {
-            // Use simple substring matching (nucleo is overkill for file picker)
-            let query_lower = self.query.to_lowercase();
-            let mut results: Vec<(PathBuf, u32)> = all_files
-                .iter()
-                .filter_map(|path| {
-                    path.to_str().and_then(|s| {
-                        let s_lower = s.to_lowercase();
-                        if s_lower.contains(&query_lower) {
-                            // Simple score: earlier match is better
-                            let score = (1000 - s_lower.find(&query_lower).unwrap_or(999)) as u32;
-                            Some((path.clone(), score))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
-            // Sort by score (higher is better)
-            results.sort_by(|a, b| b.1.cmp(&a.1));
-
-            self.filtered_files = results;
-        }
-
-        // Reset selection to first item
-        self.selected_index = 0;
-    }
-
-    /// Move selection up and ensure visible
+    /// Move selection up
     pub fn move_up(&mut self) {
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
-            self.ensure_selected_visible();
+        if self.dropdown.selected_index() > 0 {
+            let viewport = Viewport::new(1920.0, 1080.0, 1.0);
+            let modifiers = Modifiers::new();
+            self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowUp), &modifiers, &viewport);
         }
     }
 
-    /// Move selection down and ensure visible
+    /// Move selection down
     pub fn move_down(&mut self) {
-        if self.selected_index < self.filtered_files.len().saturating_sub(1) {
-            self.selected_index += 1;
-            self.ensure_selected_visible();
-        }
+        let viewport = Viewport::new(1920.0, 1080.0, 1.0);
+        let modifiers = Modifiers::new();
+        self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowDown), &modifiers, &viewport);
     }
 
-    /// Ensure selected item is visible (scroll if needed)
-    fn ensure_selected_visible(&mut self) {
-        // Approximate line height - will be properly calculated when we have viewport
-        const APPROX_LINE_HEIGHT: f32 = 20.0;
-        const PADDING: f32 = 10.0;
-
-        let content_start_y = PADDING + APPROX_LINE_HEIGHT * 1.5;
-        let visible_height = self.bounds.height.0 - content_start_y - PADDING;
-
-        let item_y = self.selected_index as f32 * APPROX_LINE_HEIGHT;
-        let item_bottom = item_y + APPROX_LINE_HEIGHT;
-
-        // Scroll up if item is above visible area
-        if item_y < self.scroll_position.y.0 {
-            self.scroll_position.y.0 = item_y;
-        }
-        // Scroll down if item is below visible area
-        else if item_bottom > self.scroll_position.y.0 + visible_height {
-            self.scroll_position.y.0 = item_bottom - visible_height;
-        }
-    }
-
-    /// Get the selected file path
+    /// Get selected file
     pub fn selected_file(&self) -> Option<&Path> {
-        self.filtered_files.get(self.selected_index).map(|(p, _)| p.as_path())
+        let idx = self.dropdown.selected_index();
+        self.dropdown.items().get(idx).map(|p| p.as_path())
     }
 
-    /// Get display name for a path (relative to working dir)
-    fn display_name(&self, path: &Path) -> String {
-        path.strip_prefix(&self.working_dir)
-            .ok()
-            .and_then(|p| p.to_str())
-            .unwrap_or_else(|| path.to_str().unwrap_or("???"))
-            .to_string()
-    }
-
-    /// Calculate bounds based on content and viewport (positioned at top)
-    pub fn calculate_bounds(&mut self, viewport: &Viewport) {
-        const MAX_VISIBLE_FILES: usize = 12;
-        const PADDING: f32 = 20.0;
-        const TOP_MARGIN: f32 = 40.0;
-
-        let line_height = viewport.metrics.line_height;
-
-        // Calculate dimensions based on actual content
-        let visible_count = self.filtered_files.len().min(MAX_VISIBLE_FILES);
-        let content_height = line_height * (visible_count as f32 + 2.0) + PADDING * 2.0; // +2 for search input
-
-        // Calculate or use cached width to keep size consistent while filtering
-        let picker_width = if let Some(cached) = self.cached_width {
-            cached
-        } else {
-            // First time - calculate max width from ALL files (not just filtered)
-            let all_files = self.all_files.read();
-            let mut max_path_width = 300.0f32; // Minimum width
-
-            for path in all_files.iter().take(100) { // Sample first 100 files for performance
-                let display_name = self.display_name(path);
-                let path_width = (display_name.len() as f32) * viewport.metrics.space_width + PADDING * 2.0;
-                max_path_width = max_path_width.max(path_width);
-            }
-
-            // Clamp to reasonable size
-            let width = max_path_width.min(viewport.logical_size.width.0 * 0.8f32);
-            self.cached_width = Some(width);
-            width
-        };
-
-        let picker_height = content_height.min(viewport.logical_size.height.0 * 0.8f32);
-
-        // Horizontal center, positioned at top
-        let x = (viewport.logical_size.width.0 - picker_width) / 2.0;
-        let y = TOP_MARGIN;
-
-        self.bounds = Rect {
-            x: LogicalPixels(x),
-            y: LogicalPixels(y),
-            width: LogicalPixels(picker_width),
-            height: LogicalPixels(picker_height),
-        };
-    }
-
-    /// Get current bounds for hit testing
-    pub fn get_bounds(&self) -> Rect {
-        self.bounds
-    }
-
-    /// Collect glyphs for overlay rendering with scroll support
-    pub fn collect_glyphs(&self, collector: &mut crate::render::GlyphCollector) {
-        if !self.visible {
-            return;
-        }
-
-        // Check if bounds are valid (not default/uninitialized)
-        if self.bounds.width.0 <= 1.0 || self.bounds.height.0 <= 1.0 {
-            return; // Bounds not calculated yet
-        }
-
-        // Check if we have too many files
-        if self.filtered_files.len() > 10000 {
-            return;
-        }
-
-        // Get font service from service registry
-        let font_service = match collector.services().get::<SharedFontSystem>() {
-            Some(fs) => fs,
-            None => return,
-        };
-
-        let scale_factor = collector.viewport.scale_factor;
-        let font_size = collector.viewport.font_size;
-        let line_height = collector.viewport.line_height;
-
-        // Guard against invalid metrics
-        if line_height <= 0.0 || scale_factor <= 0.0 || font_size <= 0.0 {
-            return;
-        }
-
-        let overlay_x = self.bounds.x.0;
-        let overlay_y = self.bounds.y.0;
-        const PADDING: f32 = 10.0;
-
-        let mut glyphs = Vec::new();
-
-        // Render search input on first line (with horizontal scroll)
-        let input_text = format!("> {}", self.query);
-        let input_pos = LayoutPos::new(PADDING - self.scroll_position.x.0, PADDING);
-        let input_glyphs = create_glyph_instances(
-            &font_service,
-            &input_text,
-            input_pos,
-            font_size,
-            scale_factor,
-            line_height,
-            None,
-            0,
-        );
-        glyphs.extend(input_glyphs);
-
-        // Calculate visible range based on scroll and bounds
-        let content_start_y = PADDING + line_height * 1.5; // After input line
-        let visible_height = self.bounds.height.0 - content_start_y - PADDING;
-
-        // Guard against invalid bounds
-        if visible_height <= 0.0 || line_height <= 0.0 {
-            return;
-        }
-
-        let first_visible_line = (self.scroll_position.y.0 / line_height).floor() as usize;
-        let visible_line_count = ((visible_height / line_height).ceil() as usize + 1).min(20); // Cap at 20 lines max
-
-        // Render only visible filtered files based on scroll
-        let visible_files = self.filtered_files.iter()
-            .skip(first_visible_line)
-            .take(visible_line_count);
-
-        const MAX_GLYPHS: usize = 3000; // Hard cap to prevent buffer overflow
-
-        for (idx, (path, _score)) in visible_files.enumerate() {
-            // Safety check: stop if we've generated too many glyphs
-            if glyphs.len() >= MAX_GLYPHS {
-                break;
-            }
-
-            let actual_idx = first_visible_line + idx;
-            let mut display_name = self.display_name(path);
-
-            // Truncate very long paths to prevent buffer overflow
-            if display_name.len() > 150 {
-                display_name.truncate(147);
-                display_name.push_str("...");
-            }
-
-            let is_selected = actual_idx == self.selected_index;
-
-            // Add selection indicator
-            let line_text = if is_selected {
-                format!("→ {}", display_name)
-            } else {
-                format!("  {}", display_name)
-            };
-
-            // Position relative to scroll (both X and Y)
-            let x_offset = PADDING - self.scroll_position.x.0;
-            let y_offset = content_start_y + (actual_idx as f32 * line_height) - self.scroll_position.y.0;
-            let file_pos = LayoutPos::new(x_offset, y_offset);
-
-            let file_glyphs = create_glyph_instances(
-                &font_service,
-                &line_text,
-                file_pos,
-                font_size,
-                scale_factor,
-                line_height,
-                None,
-                if is_selected { 1 } else { 0 },
-            );
-
-            glyphs.extend(file_glyphs);
-        }
-
-        // Safety check before sending to GPU
-        if glyphs.len() > 5000 {
-            glyphs.truncate(5000);
-        }
-
-        // Transform to screen coordinates and clip to bounds
-        for mut g in glyphs {
-            let screen_x = g.pos.x.0 + overlay_x;
-            let screen_y = g.pos.y.0 + overlay_y;
-
-            // Clip glyphs outside bounds (simple bounds check)
-            if screen_x < self.bounds.x.0 || screen_x > self.bounds.x.0 + self.bounds.width.0
-                || screen_y < self.bounds.y.0 || screen_y > self.bounds.y.0 + self.bounds.height.0
-            {
-                continue; // Skip glyphs outside bounds
-            }
-
-            // Convert to physical coordinates
-            g.pos = LayoutPos::new(screen_x * scale_factor, screen_y * scale_factor);
-            collector.add_glyphs(vec![g]);
-        }
+    /// Set query (for testing/compatibility)
+    pub fn set_query(&mut self, query: String) {
+        self.dropdown.input.set_text(&query);
+        self.trigger_filter(query);
     }
 }
 
-// === Plugin Trait Implementation ===
-
+// Plugin trait implementations
 impl Plugin for FilePickerPlugin {
     fn name(&self) -> &str {
         "file_picker"
@@ -446,62 +347,24 @@ impl Paintable for FilePickerPlugin {
     }
 
     fn z_index(&self) -> i32 {
-        1000 // Render above everything else
+        1000
     }
 }
 
-// === Scrollable Implementation ===
-
 impl Scrollable for FilePickerPlugin {
     fn get_scroll(&self) -> Point {
-        self.scroll_position
+        self.dropdown.results.get_scroll()
     }
 
     fn set_scroll(&mut self, scroll: Point) {
-        self.scroll_position = scroll;
+        self.dropdown.results.set_scroll(scroll);
     }
 
     fn handle_scroll(&mut self, delta: Point, viewport: &Viewport, widget_bounds: Rect) -> bool {
-        if !self.visible {
-            return false;
-        }
-
-        // Apply scroll delta (inverted for natural scrolling)
-        self.scroll_position.y.0 -= delta.y.0;
-        self.scroll_position.x.0 -= delta.x.0;
-
-        // Clamp to content bounds using actual widget bounds
-        let content_bounds = self.get_content_bounds(viewport);
-        let visible_height = widget_bounds.height.0;
-        let max_scroll_y = (content_bounds.height.0 - visible_height).max(0.0);
-
-        self.scroll_position.y.0 = self.scroll_position.y.0.max(0.0).min(max_scroll_y);
-        self.scroll_position.x.0 = self.scroll_position.x.0.max(0.0);
-
-        true // Handled
+        self.dropdown.results.handle_scroll(delta, viewport, widget_bounds)
     }
 
     fn get_content_bounds(&self, viewport: &Viewport) -> Rect {
-        // Calculate total content size (not just visible)
-        const PADDING: f32 = 20.0;
-        let line_height = viewport.metrics.line_height;
-
-        // All filtered files (not just visible ones)
-        let total_height = line_height * (self.filtered_files.len() as f32 + 2.0) + PADDING * 2.0;
-
-        // Calculate max path width from all files
-        let mut max_width = 300.0f32;
-        for (path, _score) in &self.filtered_files {
-            let display_name = self.display_name(path);
-            let path_width = (display_name.len() as f32) * viewport.metrics.space_width + PADDING * 2.0;
-            max_width = max_width.max(path_width);
-        }
-
-        Rect {
-            x: LogicalPixels(0.0),
-            y: LogicalPixels(0.0),
-            width: LogicalPixels(max_width),
-            height: LogicalPixels(total_height),
-        }
+        self.dropdown.results.get_content_bounds(viewport)
     }
 }

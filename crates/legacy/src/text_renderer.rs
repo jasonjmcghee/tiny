@@ -80,10 +80,6 @@ pub struct TextRenderer {
     /// Palette texture (256 colors, RGBA8)
     pub palette_texture: Option<wgpu::Texture>,
 
-    // === WIDGET BOUNDS ===
-    /// Editor widget bounds (where text should render)
-    pub editor_bounds: Option<tiny_sdk::types::LayoutRect>,
-
     // === CACHE ===
     /// Cached flattened text to avoid re-flattening on every layout update
     cached_text: Option<std::sync::Arc<String>>,
@@ -106,18 +102,13 @@ impl TextRenderer {
             visible_chars: Vec::new(),
             gpu_style_buffer: None,
             palette_texture: None,
-            editor_bounds: None,
             cached_text: None,
             cached_text_version: 0,
         }
     }
 
-    /// Set the editor bounds for this renderer
-    pub fn set_editor_bounds(&mut self, bounds: tiny_sdk::types::LayoutRect) {
-        self.editor_bounds = Some(bounds);
-    }
-
     /// Update layout cache when text changes
+    /// Outputs glyphs in canonical (0,0)-relative positions
     pub fn update_layout(
         &mut self,
         tree: &Tree,
@@ -190,15 +181,10 @@ impl TextRenderer {
         let mut char_index = 0;
         let mut byte_offset = 0;
 
-        // Use editor bounds if available, otherwise fall back to margins
-        let (x_offset, mut y_pos) = if let Some(bounds) = &self.editor_bounds {
-            (0.0, 0.0) // Local coordinates within bounds
-        } else {
-            (
-                viewport.margin.x.0,
-                viewport.global_margin.y.0 + viewport.margin.y.0,
-            )
-        };
+        // Always start at (0, 0) - canonical positions only
+        // TextView will apply bounds offset and scroll when rendering
+        let x_offset = 0.0;
+        let mut y_pos = 0.0;
 
         let text_len = text.len();
 
@@ -551,7 +537,15 @@ impl TextRenderer {
             }
         }
 
-        self.visible_lines = start_line.unwrap_or(0)..end_line.unwrap_or(0);
+        // Handle empty documents and fallback for edge cases
+        if self.line_cache.is_empty() {
+            self.visible_lines = 0..0;
+        } else if start_line.is_none() && end_line.is_none() {
+            // No lines found in visible range - fallback to showing all
+            self.visible_lines = 0..self.line_cache.len() as u32;
+        } else {
+            self.visible_lines = start_line.unwrap_or(0)..end_line.unwrap_or(0);
+        }
 
         // Find visible characters
         self.visible_chars.clear();

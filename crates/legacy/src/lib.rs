@@ -13,6 +13,7 @@ pub mod config;
 pub mod coordinates; // Coordinate system abstraction
 pub mod diagnostics_manager;
 pub mod editor_logic;
+pub mod filterable_dropdown;
 pub mod file_picker_plugin;
 pub mod grep_plugin;
 pub mod history;
@@ -30,9 +31,11 @@ pub mod shortcuts;
 pub mod syntax;
 pub mod tab_bar_plugin;
 pub mod tab_manager;
+pub mod editable_text_view;
 pub mod text_editor_plugin;
 pub mod text_effects;
 pub mod text_renderer;
+pub mod text_view;
 pub mod theme;
 #[cfg(feature = "winit")]
 pub mod winit_adapter;

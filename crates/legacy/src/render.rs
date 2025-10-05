@@ -116,6 +116,8 @@ pub struct Renderer {
     pub tab_bar_plugin: Option<*mut crate::tab_bar_plugin::TabBarPlugin>,
     pub file_picker_plugin: Option<*mut crate::file_picker_plugin::FilePickerPlugin>,
     pub grep_plugin: Option<*mut crate::grep_plugin::GrepPlugin>,
+    /// Title bar height (logical pixels, for macOS transparent titlebar)
+    title_bar_height: f32,
     /// Editor widget bounds (where main text renders)
     pub editor_bounds: tiny_sdk::types::LayoutRect,
     /// Accumulated glyphs for batched rendering
@@ -126,14 +128,18 @@ pub struct Renderer {
     tab_bar_glyphs: Vec<GlyphInstance>,
     /// Tab bar background rectangles
     tab_bar_rects: Vec<tiny_sdk::types::RectInstance>,
-    /// File picker glyphs (rendered separately)
-    file_picker_glyphs: Vec<GlyphInstance>,
+    /// File picker glyphs with their scissor rects
+    file_picker_glyphs: Vec<(Vec<GlyphInstance>, (u32, u32, u32, u32))>,
     /// File picker background rectangle
     file_picker_rects: Vec<tiny_sdk::types::RectInstance>,
-    /// Grep glyphs (rendered separately)
-    grep_glyphs: Vec<GlyphInstance>,
+    /// File picker rounded rect frame
+    file_picker_rounded_rect: Option<tiny_sdk::types::RoundedRectInstance>,
+    /// Grep glyphs with their scissor rects
+    grep_glyphs: Vec<(Vec<GlyphInstance>, (u32, u32, u32, u32))>,
     /// Grep background rectangle
     grep_rects: Vec<tiny_sdk::types::RectInstance>,
+    /// Grep rounded rect frame
+    grep_rounded_rect: Option<tiny_sdk::types::RoundedRectInstance>,
 
     /// Dirty flags to track what needs regeneration
     glyphs_dirty: bool,
@@ -141,16 +147,18 @@ pub struct Renderer {
     ui_dirty: bool,
     last_scroll: (f32, f32),
     last_viewport_size: (f32, f32),
+
+    /// Track visibility changes to auto-set ui_dirty (prevents stale rendering)
+    last_file_picker_visible: bool,
+    last_grep_visible: bool,
 }
 
 unsafe impl Send for Renderer {}
 unsafe impl Sync for Renderer {}
 
 impl Renderer {
-    pub fn new(size: (f32, f32), scale_factor: f32) -> Self {
-        let mut viewport = Viewport::new(size.0, size.1, scale_factor);
-        // Ensure margin is 0 - we use editor bounds instead
-        viewport.margin = LayoutPos::new(0.0, 0.0);
+    pub fn new(size: (f32, f32), scale_factor: f32, title_bar_height: f32) -> Self {
+        let viewport = Viewport::new(size.0, size.1, scale_factor);
 
         Self {
             syntax_highlighter: None,
@@ -174,21 +182,26 @@ impl Renderer {
             tab_bar_plugin: None,
             file_picker_plugin: None,
             grep_plugin: None,
+            title_bar_height,
             // Default editor bounds - updated in update_viewport
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
             line_number_glyphs: Vec::new(),
             tab_bar_glyphs: Vec::new(),
             tab_bar_rects: Vec::new(),
-            file_picker_glyphs: Vec::new(),
+            file_picker_glyphs: Vec::new(), // Vec of (glyphs, scissor_rect) tuples
             file_picker_rects: Vec::new(),
-            grep_glyphs: Vec::new(),
+            file_picker_rounded_rect: None,
+            grep_glyphs: Vec::new(), // Vec of (glyphs, scissor_rect) tuples
             grep_rects: Vec::new(),
+            grep_rounded_rect: None,
             glyphs_dirty: true,
             line_numbers_dirty: true,
             ui_dirty: true,
             last_scroll: (0.0, 0.0),
             last_viewport_size: (0.0, 0.0),
+            last_file_picker_visible: false,
+            last_grep_visible: false,
         }
     }
 
@@ -519,7 +532,7 @@ impl Renderer {
         }
 
         let mut offset_x = 0.0;
-        let mut offset_y = self.viewport.global_margin.y.0 + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
+        let mut offset_y = self.title_bar_height + STATUS_BAR_HEIGHT + TAB_BAR_HEIGHT;
 
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
@@ -597,6 +610,35 @@ impl Renderer {
         mut render_pass: Option<&mut wgpu::RenderPass>,
         tab_manager: Option<&crate::tab_manager::TabManager>,
     ) {
+        // Auto-detect visibility changes and AGGRESSIVELY clear to prevent stale rendering
+        let file_picker_visible = self.file_picker_plugin
+            .map(|ptr| unsafe { (*ptr).visible })
+            .unwrap_or(false);
+        let grep_visible = self.grep_plugin
+            .map(|ptr| unsafe { (*ptr).visible })
+            .unwrap_or(false);
+
+        // When file picker becomes hidden, immediately clear all its render data
+        if self.last_file_picker_visible && !file_picker_visible {
+            self.file_picker_glyphs.clear();
+            self.file_picker_rects.clear();
+            self.file_picker_rounded_rect = None;
+        }
+
+        // When grep becomes hidden, immediately clear all its render data
+        if self.last_grep_visible && !grep_visible {
+            self.grep_glyphs.clear();
+            self.grep_rects.clear();
+            self.grep_rounded_rect = None;
+        }
+
+        if file_picker_visible != self.last_file_picker_visible
+            || grep_visible != self.last_grep_visible {
+            self.ui_dirty = true;
+            self.last_file_picker_visible = file_picker_visible;
+            self.last_grep_visible = grep_visible;
+        }
+
         // Check if scroll changed
         let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
         let scroll_changed = current_scroll != self.last_scroll;
@@ -660,20 +702,21 @@ impl Renderer {
             }
 
             // === DRAW EDITOR CONTENT FIRST ===
-            // Set scissor rect with small margin to avoid edge clipping
+            // Set scissor rect - using consistent rounding to avoid off-by-one errors
+            // Small margin helps catch glyphs at edges (GPU handles final clipping)
             let scissor_margin = 2.0;
             let scissor_x = ((self.editor_bounds.x.0 - scissor_margin) * scale)
-                .floor()
+                .round()
                 .max(0.0) as u32;
             let scissor_y = ((self.editor_bounds.y.0 - scissor_margin) * scale)
-                .floor()
+                .round()
                 .max(0.0) as u32;
             let scissor_w =
-                ((self.editor_bounds.width.0 + scissor_margin * 2.0) * scale).ceil() as u32;
+                ((self.editor_bounds.width.0 + scissor_margin * 2.0) * scale).round().max(1.0) as u32;
             let scissor_h =
-                ((self.editor_bounds.height.0 + scissor_margin * 2.0) * scale).ceil() as u32;
+                ((self.editor_bounds.height.0 + scissor_margin * 2.0) * scale).round().max(1.0) as u32;
 
-            // Clamp scissor rect to render target bounds
+            // Clamp scissor rect to render target bounds to prevent overflow
             let (target_w, target_h) = (
                 self.viewport.physical_size.width,
                 self.viewport.physical_size.height,
@@ -703,23 +746,70 @@ impl Renderer {
                 }
             }
 
-            // === DRAW UI TEXT ELEMENTS (line numbers, tab bar) ===
-            let mut ui_glyphs = Vec::new();
-            ui_glyphs.extend_from_slice(&self.line_number_glyphs);
-            ui_glyphs.extend_from_slice(&self.tab_bar_glyphs);
+            // === DRAW LINE NUMBERS ===
+            if !self.line_number_glyphs.is_empty() {
+                if let Some(plugin_ptr) = self.line_numbers_plugin {
+                    let plugin = unsafe { &*plugin_ptr };
+                    let line_numbers_y = self.title_bar_height + TAB_BAR_HEIGHT;
+                    let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
+                        FILE_EXPLORER_WIDTH,
+                        line_numbers_y,
+                        plugin.width,
+                        self.viewport.logical_size.height.0 - line_numbers_y,
+                    );
 
-            if !ui_glyphs.is_empty() {
-                pass.set_scissor_rect(0, 0, target_w, target_h);
+                    let scissor_x = (line_numbers_bounds.x.0 * scale).round().max(0.0) as u32;
+                    let scissor_y = (line_numbers_bounds.y.0 * scale).round().max(0.0) as u32;
+                    let scissor_w = (line_numbers_bounds.width.0 * scale).round().max(1.0) as u32;
+                    let scissor_h = (line_numbers_bounds.height.0 * scale).round().max(1.0) as u32;
+
+                    pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
+
+                    if let Some(gpu) = self.gpu_renderer {
+                        unsafe {
+                            let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
+                            gpu_renderer.draw_ui_glyphs(pass, &self.line_number_glyphs, "line_numbers", Some((scissor_x, scissor_y, scissor_w, scissor_h)));
+                        }
+                    }
+                }
+            }
+
+            // === DRAW TAB BAR ===
+            if !self.tab_bar_glyphs.is_empty() {
+                let tab_bar_bounds = tiny_sdk::types::LayoutRect::new(
+                    0.0,
+                    self.title_bar_height,
+                    self.viewport.logical_size.width.0,
+                    TAB_BAR_HEIGHT,
+                );
+
+                let scissor_x = (tab_bar_bounds.x.0 * scale).round().max(0.0) as u32;
+                let scissor_y = (tab_bar_bounds.y.0 * scale).round().max(0.0) as u32;
+                let scissor_w = (tab_bar_bounds.width.0 * scale).round().max(1.0) as u32;
+                let scissor_h = (tab_bar_bounds.height.0 * scale).round().max(1.0) as u32;
+
+                pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
+
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_line_number_glyphs(pass, &ui_glyphs);
+                        gpu_renderer.draw_ui_glyphs(pass, &self.tab_bar_glyphs, "tab_bar", Some((scissor_x, scissor_y, scissor_w, scissor_h)));
                     }
                 }
             }
 
             // === DRAW FILE PICKER OVERLAY (on top of everything) ===
-            // Render background first
+            // Render rounded frame with border first
+            if let Some(rounded_rect) = self.file_picker_rounded_rect {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        gpu_renderer.draw_rounded_rects(pass, &[rounded_rect], scale);
+                    }
+                }
+            }
+            // Render background rects (input/results backgrounds)
             if !self.file_picker_rects.is_empty() {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
@@ -729,20 +819,28 @@ impl Renderer {
                     }
                 }
             }
-
-            // Then render text on top of background
+            // Draw file picker text with proper scissor rects for each view
             if !self.file_picker_glyphs.is_empty() {
-                pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_line_number_glyphs(pass, &self.file_picker_glyphs);
+                        gpu_renderer.draw_ui_glyphs_batched(pass, &self.file_picker_glyphs, "file_picker");
                     }
                 }
             }
 
             // === DRAW GREP OVERLAY (on top of everything) ===
-            // Render background first
+            // Render rounded frame with border first
+            if let Some(rounded_rect) = self.grep_rounded_rect {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &*gpu;
+                        gpu_renderer.draw_rounded_rects(pass, &[rounded_rect], scale);
+                    }
+                }
+            }
+            // Render background rects (input/results backgrounds)
             if !self.grep_rects.is_empty() {
                 pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
@@ -752,17 +850,16 @@ impl Renderer {
                     }
                 }
             }
-
-            // Then render text on top of background
+            // Draw grep text with proper scissor rects for each view
             if !self.grep_glyphs.is_empty() {
-                pass.set_scissor_rect(0, 0, target_w, target_h);
                 if let Some(gpu) = self.gpu_renderer {
                     unsafe {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
-                        gpu_renderer.draw_line_number_glyphs(pass, &self.grep_glyphs);
+                        gpu_renderer.draw_ui_glyphs_batched(pass, &self.grep_glyphs, "grep");
                     }
                 }
             }
+
         }
 
         // Update uniforms if needed
@@ -783,8 +880,8 @@ impl Renderer {
     }
 
     fn prepare_render(&mut self, tree: &Tree) {
-        // Set editor bounds on text_renderer
-        self.text_renderer.set_editor_bounds(self.editor_bounds);
+        // TextRenderer now outputs canonical (0,0)-relative glyphs
+        // Bounds are applied when collecting glyphs for rendering
 
         if let Some(font_system) = &self.font_system {
             // Force layout update if layout is marked dirty (e.g., after font size change)
@@ -931,10 +1028,10 @@ impl Renderer {
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &*plugin_ptr };
 
-            let line_numbers_y = self.viewport.global_margin.y.0 + TAB_BAR_HEIGHT;
+            let line_numbers_y = self.title_bar_height + TAB_BAR_HEIGHT;
 
             let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
-                self.viewport.global_margin.x.0 + FILE_EXPLORER_WIDTH,
+                FILE_EXPLORER_WIDTH,
                 line_numbers_y,
                 plugin.width,
                 self.viewport.logical_size.height.0 - line_numbers_y,
@@ -964,7 +1061,7 @@ impl Renderer {
 
             let tab_bar_bounds = tiny_sdk::types::LayoutRect::new(
                 0.0,
-                self.viewport.global_margin.y.0,
+                self.title_bar_height,
                 self.viewport.logical_size.width.0,
                 TAB_BAR_HEIGHT,
             );
@@ -999,81 +1096,66 @@ impl Renderer {
 
     fn collect_file_picker_glyphs(&mut self) {
         if let Some(plugin_ptr) = self.file_picker_plugin {
-            let plugin = unsafe { &*plugin_ptr };
+            let plugin = unsafe { &mut *plugin_ptr };
 
             if !plugin.visible {
                 self.file_picker_glyphs.clear();
                 self.file_picker_rects.clear();
+                self.file_picker_rounded_rect = None;
                 return;
             }
 
+            // Calculate bounds before collecting glyphs
+            plugin.calculate_bounds(&self.viewport);
+
             let bounds = plugin.get_bounds();
 
-            const FILE_PICKER_BG: u32 = 0x1A1A1AF2;
+            // Get rounded rect frame with border
+            self.file_picker_rounded_rect = plugin.get_frame_rounded_rect();
 
-            let bg_rect = tiny_sdk::types::RectInstance {
-                rect: bounds,
-                color: FILE_PICKER_BG,
-            };
+            // Collect text buffer background rects (includes highlight)
+            self.file_picker_rects = plugin.collect_background_rects();
 
-            self.file_picker_rects = vec![bg_rect];
+            // Get font system for glyph collection
+            let font_system = self.font_system.as_ref()
+                .expect("Font system not initialized - call set_font_system first");
 
-            let scroll = plugin.get_scroll();
-            let widget_viewport = tiny_sdk::types::WidgetViewport {
-                bounds,
-                scroll: tiny_sdk::types::LayoutPos::new(scroll.x.0, scroll.y.0),
-                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                widget_id: 11,
-            };
-
-            let mut collector = GlyphCollector::new(
-                self.viewport.to_viewport_info(),
-                &self.service_registry,
-                widget_viewport,
-            );
-
-            plugin.collect_glyphs(&mut collector);
-            self.file_picker_glyphs = collector.glyphs;
+            // Collect glyphs with per-view scissor rects
+            self.file_picker_glyphs = plugin.collect_glyphs(font_system);
         }
     }
 
     fn collect_grep_glyphs(&mut self) {
         if let Some(plugin_ptr) = self.grep_plugin {
-            let plugin = unsafe { &*plugin_ptr };
+            let plugin = unsafe { &mut *plugin_ptr };
 
             if !plugin.visible {
                 self.grep_glyphs.clear();
                 self.grep_rects.clear();
+                self.grep_rounded_rect = None;
                 return;
             }
 
+            // Poll for async search results
+            plugin.poll_results();
+
+            // Calculate bounds before collecting glyphs
+            plugin.calculate_bounds(&self.viewport);
+
             let bounds = plugin.get_bounds();
 
-            const GREP_BG: u32 = 0x1A1A1AF2;
+            // Get rounded rect frame with border
+            self.grep_rounded_rect = plugin.get_frame_rounded_rect();
 
-            let bg_rect = tiny_sdk::types::RectInstance {
-                rect: bounds,
-                color: GREP_BG,
-            };
+            // Collect text buffer background rects (includes highlight)
+            self.grep_rects = plugin.collect_background_rects();
 
-            self.grep_rects = vec![bg_rect];
+            // Get font system for glyph collection
+            let font_system = self.font_system.as_ref()
+                .expect("Font system not initialized - call set_font_system first");
 
-            let scroll = plugin.get_scroll();
-            let widget_viewport = tiny_sdk::types::WidgetViewport {
-                bounds,
-                scroll: tiny_sdk::types::LayoutPos::new(scroll.x.0, scroll.y.0),
-                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                widget_id: 12,
-            };
-
-            let mut collector = GlyphCollector::new(
-                self.viewport.to_viewport_info(),
-                &self.service_registry,
-                widget_viewport,
-            );
-
-            plugin.collect_glyphs(&mut collector);
-            self.grep_glyphs = collector.glyphs;
+            // Collect glyphs with per-view scissor rects
+            self.grep_glyphs = plugin.collect_glyphs(font_system);
         }
     }
 

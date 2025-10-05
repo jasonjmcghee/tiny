@@ -1072,9 +1072,7 @@ impl TinyApp {
             unsafe {
                 if !GLOBAL_MARGIN_INITIALIZED {
                     GLOBAL_MARGIN_INITIALIZED = true;
-                    cpu_renderer
-                        .viewport
-                        .set_global_margin(0.0, title_bar_height);
+                    // Title bar height is now handled by bounds calculation
                 }
             }
         }
@@ -1267,7 +1265,7 @@ impl ApplicationHandler for TinyApp {
             font_system.prerasterize_ascii(self.font_size * scale_factor);
 
             // Setup CPU renderer
-            let mut cpu_renderer = Renderer::new(self.window_size, scale_factor);
+            let mut cpu_renderer = Renderer::new(self.window_size, scale_factor, self.title_bar_height);
             cpu_renderer.set_font_size(self.font_size);
             cpu_renderer.set_font_system(font_system.clone());
 

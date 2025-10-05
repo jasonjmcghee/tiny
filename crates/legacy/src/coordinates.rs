@@ -134,30 +134,32 @@ impl TextMetrics {
 // === THE Viewport - Central transformation hub ===
 
 /// Manages all coordinate transformations
+///
+/// Each text view has its own Viewport with:
+/// - `bounds`: WHERE to render (screen position + size)
+/// - `scroll`: WHAT content to show (offset within document)
+/// - `metrics`: HOW to measure text (font size, line height, etc.)
 #[derive(Clone)]
 pub struct Viewport {
+    // === Rendering bounds ===
+    /// WHERE to render: screen position and size
+    /// All text is rendered relative to bounds.x, bounds.y
+    pub bounds: LayoutRect,
+
     // === Scroll state ===
-    /// Current scroll position in layout space
+    /// WHAT to show: content offset within the document
     pub scroll: LayoutPos,
 
-    // === Window dimensions ===
-    /// Logical size (DPI-independent)
+    // === Window dimensions (for root viewport only) ===
+    /// Logical size (DPI-independent) - typically only used for root viewport
     pub logical_size: LogicalSize,
-    /// Physical size (device pixels)
+    /// Physical size (device pixels) - typically only used for root viewport
     pub physical_size: PhysicalSize,
     /// HiDPI scale factor
     pub scale_factor: f32,
 
     // === Text metrics ===
     pub metrics: TextMetrics,
-
-    // === Global margin ===
-    /// Global margin for UI chrome (tabs, toolbar, etc.)
-    pub global_margin: LayoutPos,
-
-    // === Document margin ===
-    /// Margin for document content (left, top) - DEPRECATED: use widget viewports instead
-    pub margin: LayoutPos,
 
     // === Line rendering mode ===
     /// How to render lines (with horizontal scroll or soft wrap)
@@ -176,9 +178,18 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    /// Create from SDK ViewportInfo
+    /// Create from SDK ViewportInfo (for root viewport)
     pub fn from_viewport_info(info: &tiny_sdk::types::ViewportInfo) -> Self {
+        // Root viewport fills entire window by default
+        let bounds = LayoutRect::new(
+            0.0,
+            0.0,
+            info.logical_size.width.0,
+            info.logical_size.height.0
+        );
+
         Self {
+            bounds,
             scroll: LayoutPos::new(info.scroll.x.0, info.scroll.y.0),
             logical_size: LogicalSize::new(info.logical_size.width.0, info.logical_size.height.0),
             physical_size: PhysicalSize {
@@ -187,8 +198,6 @@ impl Viewport {
             },
             scale_factor: info.scale_factor,
             metrics: TextMetrics::with_line_height(info.line_height),
-            global_margin: LayoutPos::new(info.global_margin.x.0, info.global_margin.y.0),
-            margin: LayoutPos::new(info.margin.x.0, info.margin.y.0),
             line_mode: LineMode::default(),
             cached_doc_bounds: None,
             cached_bounds_version: 0,
@@ -197,21 +206,23 @@ impl Viewport {
         }
     }
 
-    /// Create new viewport with metrics
+    /// Create new viewport with metrics (for root viewport)
     pub fn new(logical_width: f32, logical_height: f32, scale_factor: f32) -> Self {
         let physical_size = PhysicalSize {
             width: (logical_width * scale_factor) as u32,
             height: (logical_height * scale_factor) as u32,
         };
 
+        // Default bounds fill entire window
+        let bounds = LayoutRect::new(0.0, 0.0, logical_width, logical_height);
+
         Self {
+            bounds,
             scroll: LayoutPos::new(0.0, 0.0), // Start at origin
             logical_size: LogicalSize::new(logical_width, logical_height),
             physical_size,
             scale_factor,
             metrics: TextMetrics::new(13.0), // Default 14pt font
-            global_margin: LayoutPos::new(0.0, 0.0), // No global margin by default
-            margin: LayoutPos::new(16.0, 16.0), // 4px margin left and top
             line_mode: LineMode::default(),  // Default to no wrap
             cached_doc_bounds: None,
             cached_bounds_version: 0,
@@ -224,9 +235,22 @@ impl Viewport {
         self.metrics = TextMetrics::new(font_size);
     }
 
-    /// Set global margin for UI chrome (tabs, toolbar, etc.)
-    pub fn set_global_margin(&mut self, x: f32, y: f32) {
-        self.global_margin = LayoutPos::new(x, y);
+    /// Create a child viewport with custom bounds (for widgets/overlays)
+    /// Inherits metrics from parent, but has independent bounds + scroll
+    pub fn child(&self, bounds: LayoutRect) -> Self {
+        Self {
+            bounds,
+            scroll: LayoutPos::new(0.0, 0.0), // Child starts unscrolled
+            logical_size: self.logical_size, // Inherit from parent
+            physical_size: self.physical_size, // Inherit from parent
+            scale_factor: self.scale_factor,
+            metrics: self.metrics.clone(),
+            line_mode: self.line_mode.clone(),
+            cached_doc_bounds: None,
+            cached_bounds_version: 0,
+            cached_longest_line_chars: 0,
+            font_system: self.font_system.clone(),
+        }
     }
 
     /// Set font system for accurate text measurement
@@ -257,17 +281,19 @@ impl Viewport {
 
     // === Forward Transformations (Doc → Layout → View → Physical) ===
 
-    /// Document position to layout position
+    /// Document position to layout position (relative to document origin, no bounds offset)
+    /// This outputs canonical positions starting at (0, 0).
+    /// To get screen position, add viewport.bounds offset and subtract viewport.scroll.
     pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
-        // Use cached metrics (updated from font system if available)
-        // Only add document margins (not global UI margins)
+        // Just convert doc coords to logical pixels - NO positioning
         LayoutPos::new(
-            self.margin.x.0 + self.metrics.column_to_x(pos.column),
-            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
+            self.metrics.column_to_x(pos.column),
+            pos.line as f32 * self.metrics.line_height,
         )
     }
 
     /// Document position to layout with actual text (more accurate)
+    /// Outputs canonical position starting at (0, 0) - no bounds offset
     pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
         let x = if let Some(font_system) = &self.font_system {
             // Build the text up to the cursor position (pos.column is character index)
@@ -312,10 +338,10 @@ impl Viewport {
             self.metrics.column_to_x(pos.column)
         };
 
-        // Only add document margins (not global UI margins)
+        // Just convert to logical pixels - NO positioning
         LayoutPos::new(
-            self.margin.x.0 + x,
-            self.margin.y.0 + pos.line as f32 * self.metrics.line_height,
+            x,
+            pos.line as f32 * self.metrics.line_height,
         )
     }
 
@@ -357,10 +383,11 @@ impl Viewport {
     }
 
     /// Layout position to document position (approximate)
+    /// Expects canonical layout position (0,0)-relative
     pub fn layout_to_doc(&self, pos: LayoutPos) -> DocPos {
-        // Subtract only document margins (matching doc_to_layout)
-        let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
-        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
+        // Direct conversion from logical pixels to doc coords - NO margin subtraction
+        let doc_x = pos.x.0.max(0.0);
+        let doc_y = pos.y.0.max(0.0);
 
         let line = (doc_y / self.metrics.line_height) as u32;
         let column = (doc_x / self.metrics.space_width) as u32;
@@ -373,10 +400,11 @@ impl Viewport {
     }
 
     /// Layout position to document position using font system's binary search hit testing
+    /// Expects canonical layout position (0,0)-relative
     pub fn layout_to_doc_with_tree(&self, pos: LayoutPos, tree: &DocTree) -> DocPos {
-        // Subtract only document margins (matching doc_to_layout)
-        let doc_x = (pos.x.0 - self.margin.x.0).max(0.0);
-        let doc_y = (pos.y.0 - self.margin.y.0).max(0.0);
+        // Direct conversion - NO margin subtraction
+        let doc_x = pos.x.0.max(0.0);
+        let doc_y = pos.y.0.max(0.0);
 
         let line = (doc_y / self.metrics.line_height) as u32;
 
@@ -642,8 +670,9 @@ impl Viewport {
             scale_factor: self.scale_factor,
             line_height: self.metrics.line_height,
             font_size: self.metrics.font_size,
-            margin: self.margin.clone(),
-            global_margin: self.global_margin.clone(),
+            // Margins removed - positioning now handled by viewport.bounds
+            margin: LayoutPos::new(0.0, 0.0),
+            global_margin: LayoutPos::new(0.0, 0.0),
         }
     }
 
@@ -724,7 +753,8 @@ impl Viewport {
             None => return (0, line_text.len(), 0.0),
         };
 
-        let viewport_width = self.logical_size.width.0 - self.margin.x.0 * 2.0;
+        // Use bounds width (margins are now handled by bounds)
+        let viewport_width = self.bounds.width.0;
         let buffer_width = viewport_width * 0.5;
 
         // Calculate visible pixel range
