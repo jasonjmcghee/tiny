@@ -182,39 +182,18 @@ impl TextEditorPlugin {
 
 // === Plugin Trait Implementations ===
 
-impl Plugin for TextEditorPlugin {
-    fn name(&self) -> &str {
-        "text_editor"
-    }
-
-    fn version(&self) -> &str {
-        "1.0.0"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Initializable,
-            Capability::Updatable,
-            Capability::Paintable("text_editor".to_string()),
-        ]
-    }
-
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
-        Some(self)
-    }
-
-    fn as_updatable(&mut self) -> Option<&mut dyn Updatable> {
-        Some(self)
-    }
-
-    fn as_paintable(&self) -> Option<&dyn Paintable> {
-        Some(self)
+tiny_sdk::plugin! {
+    TextEditorPlugin {
+        name: "text_editor",
+        version: "1.0.0",
+        z_index: 0,
+        traits: [Init, Update, Paint],
+        defaults: [Paint],  // Custom impl for Init and Update
     }
 }
 
 impl Initializable for TextEditorPlugin {
     fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> {
-        // Initialize syntax highlighter if needed
         if let Some(ref mut highlighter) = self.syntax_highlighter {
             if let Some(syntax_hl) = highlighter.as_any().downcast_ref::<SyntaxHighlighter>() {
                 let text = self.doc.read().flatten_to_string();
@@ -227,20 +206,6 @@ impl Initializable for TextEditorPlugin {
 
 impl Updatable for TextEditorPlugin {
     fn update(&mut self, _dt: f32, _ctx: &mut UpdateContext) -> Result<(), PluginError> {
-        // Nothing to update - cursor and selection handled by plugins
         Ok(())
-    }
-}
-
-impl Paintable for TextEditorPlugin {
-    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {
-        // TextEditorPlugin no longer renders anything directly!
-        // The main renderer handles document text rendering through text_renderer
-        // Line numbers will be handled by a separate LineNumbersPlugin
-        // This plugin only manages the document and handles input
-    }
-
-    fn z_index(&self) -> i32 {
-        0 // Main editor renders at base layer
     }
 }

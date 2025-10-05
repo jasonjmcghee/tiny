@@ -235,45 +235,13 @@ struct CursorUniforms {
 
 // === Plugin Trait Implementation ===
 
-impl Plugin for CursorPlugin {
-    fn name(&self) -> &str {
-        "cursor"
-    }
-
-    fn version(&self) -> &str {
-        "0.1.0"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Initializable,
-            Capability::Updatable,
-            Capability::Paintable("cursor".to_string()),
-        ]
-    }
-
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
-        Some(self)
-    }
-
-    fn as_updatable(&mut self) -> Option<&mut dyn Updatable> {
-        Some(self)
-    }
-
-    fn as_paintable(&self) -> Option<&dyn Paintable> {
-        Some(self)
-    }
-
-    fn as_library(&self) -> Option<&dyn Library> {
-        Some(self)
-    }
-
-    fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
-        Some(self)
-    }
-
-    fn as_configurable(&mut self) -> Option<&mut dyn Configurable> {
-        Some(self)
+tiny_sdk::plugin! {
+    CursorPlugin {
+        name: "cursor",
+        version: "0.1.0",
+        z_index: 10,
+        traits: [Init, Update, Paint, Library, Config],
+        defaults: [],  // All custom implementations
     }
 }
 

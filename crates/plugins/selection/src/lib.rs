@@ -252,40 +252,13 @@ struct SelectionVertex {
 
 // === Plugin Trait Implementation ===
 
-impl Plugin for SelectionPlugin {
-    fn name(&self) -> &str {
-        "selection"
-    }
-
-    fn version(&self) -> &str {
-        "0.1.0"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Initializable,
-            Capability::Paintable("selection".to_string()),
-        ]
-    }
-
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
-        Some(self)
-    }
-
-    fn as_paintable(&self) -> Option<&dyn Paintable> {
-        Some(self)
-    }
-
-    fn as_library(&self) -> Option<&dyn Library> {
-        Some(self)
-    }
-
-    fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
-        Some(self)
-    }
-
-    fn as_configurable(&mut self) -> Option<&mut dyn Configurable> {
-        Some(self)
+tiny_sdk::plugin! {
+    SelectionPlugin {
+        name: "selection",
+        version: "0.1.0",
+        z_index: -10,
+        traits: [Init, Paint, Library, Config],
+        defaults: [],  // All custom implementations
     }
 }
 

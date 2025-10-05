@@ -388,45 +388,13 @@ impl TabBarPlugin {
 
 // === Plugin Trait Implementation ===
 
-impl Plugin for TabBarPlugin {
-    fn name(&self) -> &str {
-        "tab_bar"
-    }
-
-    fn version(&self) -> &str {
-        "1.0.0"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Initializable,
-            Capability::Paintable("tab_bar".to_string()),
-        ]
-    }
-
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
-        Some(self)
-    }
-
-    fn as_paintable(&self) -> Option<&dyn Paintable> {
-        Some(self)
-    }
-}
-
-impl Initializable for TabBarPlugin {
-    fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> {
-        Ok(())
-    }
-}
-
-impl Paintable for TabBarPlugin {
-    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {
-        // Tab bar uses collect_glyphs for batched rendering
-        // This method is kept for plugin trait compatibility
-    }
-
-    fn z_index(&self) -> i32 {
-        500 // Render above editor content but below file picker
+tiny_sdk::plugin! {
+    TabBarPlugin {
+        name: "tab_bar",
+        version: "1.0.0",
+        z_index: 500,
+        traits: [Init, Paint],
+        defaults: [Init, Paint],
     }
 }
 

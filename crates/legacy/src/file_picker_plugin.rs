@@ -96,23 +96,14 @@ impl FilePickerPlugin {
     }
 }
 
-impl Plugin for FilePickerPlugin {
-    fn name(&self) -> &str { "file_picker" }
-    fn version(&self) -> &str { "1.0.0" }
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Initializable, Capability::Paintable("file_picker".to_string())]
+tiny_sdk::plugin! {
+    FilePickerPlugin {
+        name: "file_picker",
+        version: "1.0.0",
+        z_index: 1000,
+        traits: [Init, Paint],
+        defaults: [Init, Paint],
     }
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> { Some(self) }
-    fn as_paintable(&self) -> Option<&dyn Paintable> { Some(self) }
-}
-
-impl Initializable for FilePickerPlugin {
-    fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> { Ok(()) }
-}
-
-impl Paintable for FilePickerPlugin {
-    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {}
-    fn z_index(&self) -> i32 { 1000 }
 }
 
 impl Scrollable for FilePickerPlugin {

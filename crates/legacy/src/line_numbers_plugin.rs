@@ -191,44 +191,12 @@ impl LineNumbersPlugin {
 
 // === Plugin Trait Implementation ===
 
-impl Plugin for LineNumbersPlugin {
-    fn name(&self) -> &str {
-        "line_numbers"
-    }
-
-    fn version(&self) -> &str {
-        "1.0.0"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Initializable,
-            Capability::Paintable("line_numbers".to_string()),
-        ]
-    }
-
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
-        Some(self)
-    }
-
-    fn as_paintable(&self) -> Option<&dyn Paintable> {
-        Some(self)
-    }
-}
-
-impl Initializable for LineNumbersPlugin {
-    fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> {
-        Ok(())
-    }
-}
-
-impl Paintable for LineNumbersPlugin {
-    fn paint(&self, ctx: &PaintContext, pass: &mut wgpu::RenderPass) {
-        // No-op: We use collect_glyphs() for batched rendering in render.rs
-        // This prevents double-rendering when the plugin is also loaded via plugin_loader
-    }
-
-    fn z_index(&self) -> i32 {
-        100
+tiny_sdk::plugin! {
+    LineNumbersPlugin {
+        name: "line_numbers",
+        version: "1.0.0",
+        z_index: 100,
+        traits: [Init, Paint],
+        defaults: [Init, Paint],
     }
 }

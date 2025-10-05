@@ -563,40 +563,13 @@ impl DiagnosticsPlugin {
 
 // === Plugin Trait Implementation ===
 
-impl Plugin for DiagnosticsPlugin {
-    fn name(&self) -> &str {
-        "diagnostics"
-    }
-
-    fn version(&self) -> &str {
-        "0.1.0"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Initializable,
-            Capability::Paintable("diagnostics".to_string()),
-        ]
-    }
-
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> {
-        Some(self)
-    }
-
-    fn as_paintable(&self) -> Option<&dyn Paintable> {
-        Some(self)
-    }
-
-    fn as_library(&self) -> Option<&dyn Library> {
-        Some(self)
-    }
-
-    fn as_library_mut(&mut self) -> Option<&mut dyn Library> {
-        Some(self)
-    }
-
-    fn as_configurable(&mut self) -> Option<&mut dyn Configurable> {
-        Some(self)
+tiny_sdk::plugin! {
+    DiagnosticsPlugin {
+        name: "diagnostics",
+        version: "0.1.0",
+        z_index: 50,
+        traits: [Init, Paint, Library, Config],
+        defaults: [],  // All custom implementations
     }
 }
 

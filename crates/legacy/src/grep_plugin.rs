@@ -166,23 +166,14 @@ impl GrepPlugin {
     pub fn selected_result(&self) -> Option<&GrepResult> { self.picker.selected_item() }
 }
 
-impl Plugin for GrepPlugin {
-    fn name(&self) -> &str { "grep" }
-    fn version(&self) -> &str { "1.0.0" }
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Initializable, Capability::Paintable("grep".to_string())]
+tiny_sdk::plugin! {
+    GrepPlugin {
+        name: "grep",
+        version: "1.0.0",
+        z_index: 1000,
+        traits: [Init, Paint],
+        defaults: [Init, Paint],
     }
-    fn as_initializable(&mut self) -> Option<&mut dyn Initializable> { Some(self) }
-    fn as_paintable(&self) -> Option<&dyn Paintable> { Some(self) }
-}
-
-impl Initializable for GrepPlugin {
-    fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> { Ok(()) }
-}
-
-impl Paintable for GrepPlugin {
-    fn paint(&self, _ctx: &PaintContext, _pass: &mut wgpu::RenderPass) {}
-    fn z_index(&self) -> i32 { 1000 }
 }
 
 impl Scrollable for GrepPlugin {
