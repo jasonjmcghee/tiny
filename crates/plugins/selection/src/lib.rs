@@ -1,22 +1,18 @@
 //! Selection Plugin - Visual highlight for selected text
 
+use ahash::AHasher;
 use serde::Deserialize;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
-use tiny_sdk::wgpu::Buffer;
 use tiny_sdk::{
-    ffi::{
-        BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId, VertexAttributeDescriptor,
-        VertexFormat,
-    },
-    Capability, Configurable, Initializable, LayoutRect, Library, PaintContext, Paintable, Plugin,
-    PluginError, SetupContext, ViewPos, ViewportInfo,
+    ffi::{BindGroupLayoutId, PipelineId, ShaderModuleId, VertexAttributeDescriptor, VertexFormat},
+    CachedBuffer, Capability, Configurable, Initializable, LayoutRect, Library,
+    PaintContext, Paintable, Plugin, PluginError, SetupContext, ViewPos,
+    ViewportInfo,
 };
-use ahash::AHasher;
-use std::hash::{Hash, Hasher};
 
 /// Single selection with start and end positions
 #[derive(Debug, Clone)]
@@ -61,14 +57,8 @@ pub struct SelectionPlugin {
     viewport: ViewportInfo,
 
     // GPU resources (created during setup)
-    vertex_buffer: Option<Buffer>,
-    vertex_buffer_id: Option<BufferId>,
+    vertex_buffer: Option<CachedBuffer>,
     custom_pipeline_id: Option<PipelineId>,
-    device: Option<Arc<wgpu::Device>>,
-    queue: Option<Arc<wgpu::Queue>>,
-
-    // Vertex cache to avoid redundant writes (0 = uninitialized)
-    last_vertex_hash: AtomicU64,
 }
 
 impl SelectionPlugin {
@@ -93,11 +83,7 @@ impl SelectionPlugin {
                 global_margin: LayoutPos::new(0.0, 0.0),
             },
             vertex_buffer: None,
-            vertex_buffer_id: None,
             custom_pipeline_id: None,
-            device: None,
-            queue: None,
-            last_vertex_hash: AtomicU64::new(0),
         }
     }
 
@@ -163,11 +149,6 @@ impl SelectionPlugin {
 
             Some(LayoutRect::new(left, start_y, width, height))
         }
-    }
-
-    /// Create vertex data for all selection rectangles
-    fn create_vertices(&self, viewport: &tiny_sdk::ViewportInfo) -> Vec<SelectionVertex> {
-        self.create_vertices_for_selections(viewport, &self.selections)
     }
 
     /// Create vertex data for given selections
@@ -311,91 +292,37 @@ impl Plugin for SelectionPlugin {
 // === Initializable Trait Implementation ===
 
 impl Initializable for SelectionPlugin {
-    fn setup(&mut self, ctx: &mut SetupContext) -> Result<(), PluginError> {
-        // Store device and queue for later use
-        self.device = Some(ctx.device.clone());
-        self.queue = Some(ctx.queue.clone());
-
-        // Create vertex buffer with reasonable initial size
+    fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> {
+        // Create vertex buffer with caching built-in
         // Estimate: avg 2 selections * 3 rects each * 6 vertices per rect
         let vertex_size = std::mem::size_of::<SelectionVertex>();
         let buffer_size = (vertex_size * 36) as u64;
-
-        let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Selection Plugin Vertex Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        self.vertex_buffer = Some(vertex_buffer);
-
-        // Also create an FFI buffer ID for reuse
-        let buffer_id = BufferId::create(
+        self.vertex_buffer = Some(CachedBuffer::new(
             buffer_size,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        );
-        self.vertex_buffer_id = Some(buffer_id);
+        ));
 
-        // Create custom shader for selection rendering
+        // Create pipeline
         let shader_source = include_str!("shader.wgsl");
+        let shader = ShaderModuleId::create_from_wgsl(shader_source);
+        let pipeline_layout = BindGroupLayoutId::create_uniform();
+        self.custom_pipeline_id = Some(PipelineId::create_with_layout(
+            shader,
+            shader,
+            pipeline_layout,
+            44, // stride: position (8) + color (4) + selection_data (32)
+            &[
+                VertexAttributeDescriptor { offset: 0, location: 0, format: VertexFormat::Float32x2 }, // position
+                VertexAttributeDescriptor { offset: 8, location: 1, format: VertexFormat::Uint32 },     // color
+                VertexAttributeDescriptor { offset: 12, location: 2, format: VertexFormat::Float32x2 }, // start_pos
+                VertexAttributeDescriptor { offset: 20, location: 3, format: VertexFormat::Float32x2 }, // end_pos
+                VertexAttributeDescriptor { offset: 28, location: 4, format: VertexFormat::Float32 },   // line_height
+                VertexAttributeDescriptor { offset: 32, location: 5, format: VertexFormat::Float32 },   // margin_left
+                VertexAttributeDescriptor { offset: 36, location: 6, format: VertexFormat::Float32 },   // margin_right
+            ],
+        ));
 
-        // Create shader modules
-        let shader_id = ShaderModuleId::create_from_wgsl(shader_source);
-
-        // Create bind group layout for uniforms
-        let bind_group_layout = BindGroupLayoutId::create_uniform();
-
-        // Define vertex attributes for our SelectionVertex layout
-        let attributes = vec![
-            VertexAttributeDescriptor {
-                offset: 0,
-                location: 0,
-                format: VertexFormat::Float32x2, // position
-            },
-            VertexAttributeDescriptor {
-                offset: 8,
-                location: 1,
-                format: VertexFormat::Uint32, // color
-            },
-            VertexAttributeDescriptor {
-                offset: 12,
-                location: 2,
-                format: VertexFormat::Float32x2, // start_pos
-            },
-            VertexAttributeDescriptor {
-                offset: 20,
-                location: 3,
-                format: VertexFormat::Float32x2, // end_pos
-            },
-            VertexAttributeDescriptor {
-                offset: 28,
-                location: 4,
-                format: VertexFormat::Float32, // line_height
-            },
-            VertexAttributeDescriptor {
-                offset: 32,
-                location: 5,
-                format: VertexFormat::Float32, // margin_left
-            },
-            VertexAttributeDescriptor {
-                offset: 36,
-                location: 6,
-                format: VertexFormat::Float32, // margin_right
-            },
-        ];
-
-        // Create pipeline with custom vertex layout
-        let pipeline_id = PipelineId::create_with_layout(
-            shader_id,
-            shader_id,
-            bind_group_layout,
-            44, // vertex stride: position (8) + color (4) + selection_data (32) = 44 bytes
-            &attributes,
-        );
-        self.custom_pipeline_id = Some(pipeline_id);
-
-        eprintln!("Selection plugin created custom pipeline with proper vertex layout");
+        eprintln!("Selection plugin setup complete");
 
         Ok(())
     }
@@ -475,79 +402,46 @@ impl Paintable for SelectionPlugin {
     }
 
     fn paint(&self, ctx: &PaintContext, render_pass: &mut wgpu::RenderPass) {
-        // Compute hash of all relevant state (viewport + plugin-specific state)
+        // Transform selections to screen coordinates if we have widget viewport
+        let transformed_selections = if let Some(ref widget_viewport) = ctx.widget_viewport {
+            let offset_x = widget_viewport.bounds.x.0;
+            let offset_y = widget_viewport.bounds.y.0;
+
+            self.selections
+                .iter()
+                .map(|sel| Selection {
+                    start: ViewPos::new(sel.start.x.0 + offset_x, sel.start.y.0 + offset_y),
+                    end: ViewPos::new(sel.end.x.0 + offset_x, sel.end.y.0 + offset_y),
+                })
+                .collect()
+        } else {
+            self.selections.clone()
+        };
+
+        // Create cache key from all relevant state
         let mut hasher = AHasher::default();
         tiny_sdk::paint_cache::hash_viewport_base(&mut hasher, &ctx.viewport);
         tiny_sdk::paint_cache::hash_widget_viewport(&mut hasher, &ctx.widget_viewport);
-
-        // Hash selection-specific state
-        for sel in &self.selections {
+        for sel in &transformed_selections {
             sel.start.x.0.to_bits().hash(&mut hasher);
             sel.start.y.0.to_bits().hash(&mut hasher);
             sel.end.x.0.to_bits().hash(&mut hasher);
             sel.end.y.0.to_bits().hash(&mut hasher);
         }
         self.config.style.color.hash(&mut hasher);
+        let cache_key = hasher.finish();
 
-        let state_hash = hasher.finish();
-
-        // Check if we need to update the vertex buffer
-        let cached_hash = self.last_vertex_hash.load(Ordering::Relaxed);
-        let needs_update = cached_hash != state_hash;
-
-        let vertex_count = if needs_update {
-            // Transform selections to screen coordinates if we have widget viewport
-            let transformed_selections = if let Some(ref widget_viewport) = ctx.widget_viewport {
-                let offset_x = widget_viewport.bounds.x.0;
-                let offset_y = widget_viewport.bounds.y.0;
-
-                self.selections.iter().map(|sel| {
-                    Selection {
-                        start: ViewPos::new(
-                            sel.start.x.0 + offset_x,
-                            sel.start.y.0 + offset_y,
-                        ),
-                        end: ViewPos::new(
-                            sel.end.x.0 + offset_x,
-                            sel.end.y.0 + offset_y,
-                        ),
-                    }
-                }).collect()
-            } else {
-                self.selections.clone()
-            };
-
-            // Create vertices for current frame with transformed selections
+        // Write vertices only if state changed - simplified to one line!
+        if let Some(ref vertex_buffer) = self.vertex_buffer {
             let vertices = self.create_vertices_for_selections(&ctx.viewport, &transformed_selections);
             if vertices.is_empty() {
                 return;
             }
+            vertex_buffer.write_if_changed(bytemuck::cast_slice(&vertices), &cache_key);
 
-            let vertex_data = bytemuck::cast_slice(&vertices);
+            // Always draw
             let vertex_count = vertices.len() as u32;
 
-            // Write to buffer
-            if let Some(buffer_id) = self.vertex_buffer_id {
-                buffer_id.write(0, vertex_data);
-                self.last_vertex_hash.store(state_hash, Ordering::Relaxed);
-            } else {
-                eprintln!("  ERROR: No vertex buffer ID!");
-                return;
-            }
-
-            vertex_count
-        } else {
-            // Use cached vertex count (selections.len() * 6 vertices per selection)
-            (self.selections.len() * 6) as u32
-        };
-
-        if vertex_count == 0 {
-            return;
-        }
-
-        // Always draw, even if we didn't update the buffer
-        if let Some(buffer_id) = self.vertex_buffer_id {
-            // Use atomic render operations with our custom pipeline
             if let Some(ref gpu_ctx) = ctx.gpu_context {
                 if let Some(pipeline_id) = self.custom_pipeline_id {
                     // Use our custom pipeline
@@ -555,16 +449,14 @@ impl Paintable for SelectionPlugin {
                     // Use the host's uniform bind group for viewport transforms
                     gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
                     // Set our vertex buffer
-                    gpu_ctx.set_vertex_buffer(render_pass, 0, buffer_id);
+                    gpu_ctx.set_vertex_buffer(render_pass, 0, vertex_buffer.buffer_id());
                     // Draw!
                     gpu_ctx.draw(render_pass, vertex_count, 1);
                 } else {
-                    eprintln!("  Fallback to draw_vertices");
-                    // Fallback to old method if custom pipeline not available
-                    gpu_ctx.draw_vertices(render_pass, buffer_id, vertex_count);
+                    eprintln!("Selection pipeline not available");
                 }
             } else {
-                eprintln!("  ERROR: No GPU context available!");
+                eprintln!("No GPU context available");
             }
         }
     }

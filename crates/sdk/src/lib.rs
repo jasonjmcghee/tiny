@@ -34,9 +34,13 @@ pub use bytemuck::{Pod, Zeroable};
 pub use wgpu;
 
 pub mod ffi;
+pub mod gpu_helpers;
 pub mod services;
 mod traits;
 pub mod types;
+
+// Re-export GPU helpers for convenience
+pub use crate::gpu_helpers::CachedBuffer;
 
 /// Macro to simplify plugin declaration
 ///
