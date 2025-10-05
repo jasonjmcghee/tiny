@@ -218,20 +218,20 @@ pub struct CachedLocation {
 }
 
 
-/// Document state for tracking URI and version
-#[derive(Debug, Clone)]
-struct DocumentInfo {
-    uri: Uri,
-    version: u64,
+/// Consolidated LSP state (single lock instead of multiple)
+#[derive(Default)]
+struct LspState {
+    diagnostics: Vec<LspDiagnostic>,
+    current_uri: Option<Uri>,
+    current_version: u64,
+    document_tree: Option<tree::Tree>,
 }
 
 /// Main LSP manager
 pub struct LspManager {
     tx: mpsc::Sender<LspRequest>,
     response_rx: Arc<Mutex<mpsc::Receiver<LspResponse>>>,
-    current_diagnostics: Arc<RwLock<Vec<LspDiagnostic>>>,
-    /// Current document info (URI and version)
-    document_info: Arc<RwLock<Option<DocumentInfo>>>,
+    state: Arc<RwLock<LspState>>,
     workspace_root: Option<PathBuf>,
 }
 
@@ -250,25 +250,19 @@ impl LspManager {
         let (request_tx, request_rx) = mpsc::channel::<LspRequest>();
         let (response_tx, response_rx) = mpsc::channel::<LspResponse>();
         let response_rx = Arc::new(Mutex::new(response_rx));
-        let current_diagnostics = Arc::new(RwLock::new(Vec::new()));
-        let document_tree = Arc::new(RwLock::new(None));
-        let document_info = Arc::new(RwLock::new(None));
+        let state = Arc::new(RwLock::new(LspState::default()));
 
         // Clone before moving into thread
         let workspace_root_clone = workspace_root.clone();
+        let state_clone = state.clone();
 
         // Spawn background thread for LSP communication
-        let diagnostics_clone = current_diagnostics.clone();
-        let document_tree_clone = document_tree.clone();
-        let document_info_clone = document_info.clone();
         thread::spawn(move || {
             if let Err(e) = run_lsp_client(
                 request_rx,
                 response_tx,
                 workspace_root_clone,
-                diagnostics_clone,
-                document_tree_clone,
-                document_info_clone,
+                state_clone,
             ) {
                 eprintln!("LSP client error: {}", e);
             }
@@ -277,8 +271,7 @@ impl LspManager {
         Ok(Self {
             tx: request_tx,
             response_rx,
-            current_diagnostics,
-            document_info,
+            state,
             workspace_root,
         })
     }
@@ -291,25 +284,17 @@ impl LspManager {
     /// Notify LSP of document changes with incremental updates
     pub fn document_changed(&self, changes: Vec<TextChange>) {
         let _ = self.tx.send(LspRequest::CancelPendingRequests);
-        let version = self
-            .document_info
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.version + 1))
+        let version = self.state.read().ok()
+            .map(|s| s.current_version + 1)
             .unwrap_or(1);
-        let _ = self
-            .tx
-            .send(LspRequest::DocumentChanged { changes, version });
+        let _ = self.tx.send(LspRequest::DocumentChanged { changes, version });
     }
 
     /// Notify LSP of document changes with full text (legacy)
     pub fn document_changed_full(&self, text: String) {
         let _ = self.tx.send(LspRequest::CancelPendingRequests);
-        let version = self
-            .document_info
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.version + 1))
+        let version = self.state.read().ok()
+            .map(|s| s.current_version + 1)
             .unwrap_or(1);
         let changes = vec![TextChange {
             range: Range {
@@ -324,9 +309,7 @@ impl LspManager {
             },
             text,
         }];
-        let _ = self
-            .tx
-            .send(LspRequest::DocumentChanged { changes, version });
+        let _ = self.tx.send(LspRequest::DocumentChanged { changes, version });
     }
 
     /// Notify LSP of document save
@@ -361,12 +344,9 @@ impl LspManager {
 
     /// Request code actions at position
     pub fn request_code_action(&self, line: u32, character: u32) {
-        let diagnostics = self
-            .current_diagnostics
-            .read()
-            .ok()
-            .map(|diags| {
-                diags
+        let diagnostics = self.state.read().ok()
+            .map(|state| {
+                state.diagnostics
                     .iter()
                     .filter(|d| d.range.start.line <= line && line <= d.range.end.line)
                     .cloned()
@@ -670,12 +650,6 @@ const INIT_NOT_STARTED: u8 = 0;
 const INIT_SENT: u8 = 1;
 const INIT_COMPLETE: u8 = 2;
 
-/// Queued document to open after initialization completes
-#[derive(Debug, Clone)]
-struct QueuedDocument {
-    uri: Uri,
-    text: String,
-}
 
 /// Internal signal to main loop that initialize completed
 ///
@@ -757,27 +731,22 @@ impl ChangeDebouncer {
 
 /// Convert UTF-8 position to UTF-16 for LSP using Tree
 fn utf8_to_utf16_position(
-    document_tree: &Arc<RwLock<Option<tree::Tree>>>,
+    state: &Arc<RwLock<LspState>>,
     line: u32,
     character: u32,
 ) -> u32 {
-    document_tree
-        .read()
-        .ok()
-        .and_then(|guard| {
-            guard
-                .as_ref()
+    state.read().ok()
+        .and_then(|s| {
+            s.document_tree.as_ref()
                 .map(|tree| tree.doc_pos_to_point_utf16(line, character).column)
         })
         .unwrap_or(character)
 }
 
 /// Get current document version
-fn get_document_version(document_info: &Arc<RwLock<Option<DocumentInfo>>>) -> u64 {
-    document_info
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|d| d.version))
+fn get_document_version(state: &Arc<RwLock<LspState>>) -> u64 {
+    state.read().ok()
+        .map(|s| s.current_version)
         .unwrap_or(0)
 }
 
@@ -859,9 +828,7 @@ fn run_lsp_client(
     request_rx: mpsc::Receiver<LspRequest>,
     response_tx: mpsc::Sender<LspResponse>,
     workspace_root: Option<PathBuf>,
-    current_diagnostics: Arc<RwLock<Vec<LspDiagnostic>>>,
-    document_tree: Arc<RwLock<Option<tree::Tree>>>,
-    document_info: Arc<RwLock<Option<DocumentInfo>>>,
+    state: Arc<RwLock<LspState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Start rust-analyzer process
     eprintln!("LSP: Starting rust-analyzer process...");
@@ -888,7 +855,7 @@ fn run_lsp_client(
     let pending_requests = Arc::new(Mutex::new(HashMap::<u64, TrackedRequest>::new()));
 
     // Queue documents to open after initialization
-    let queued_document = Arc::new(Mutex::new(None::<QueuedDocument>));
+    let queued_document = Arc::new(Mutex::new(None::<(Uri, String)>));
 
     // Channel for response handler to signal initialization complete
     let (init_complete_tx, init_complete_rx) = mpsc::channel::<InternalSignal>();
@@ -896,8 +863,7 @@ fn run_lsp_client(
     // Spawn thread to handle LSP responses
     let response_tx_clone = response_tx.clone();
     let current_file_clone = current_file.clone();
-    let document_info_clone = document_info.clone();
-    let current_diagnostics_clone = current_diagnostics.clone();
+    let state_clone = state.clone();
     let pending_requests_clone = pending_requests.clone();
     let init_state_clone = init_state.clone();
     let response_handle = thread::spawn(move || {
@@ -905,8 +871,7 @@ fn run_lsp_client(
             reader,
             response_tx_clone,
             current_file_clone,
-            document_info_clone,
-            current_diagnostics_clone,
+            state_clone,
             pending_requests_clone,
             init_state_clone,
             init_complete_tx,
@@ -926,16 +891,16 @@ fn run_lsp_client(
         // Check for internal signals (initialization complete, retry requests)
         match init_complete_rx.try_recv() {
             Ok(InternalSignal::InitializeCompleted) => {
-                if let Some(doc) = queued_document.lock().ok().and_then(|mut q| q.take()) {
+                if let Some((uri, text)) = queued_document.lock().ok().and_then(|mut q| q.take()) {
                     send_initialized(&mut stdin)?;
-                    *current_file.write().unwrap() = Some(doc.uri.clone());
-                    *document_tree.write().unwrap() = Some(tree::Tree::from_str(&doc.text));
-                    *document_info.write().unwrap() = Some(DocumentInfo {
-                        uri: doc.uri.clone(),
-                        version: 1,
-                    });
-                    send_did_open(&mut stdin, &doc.uri, &doc.text)?;
-                    send_did_save(&mut stdin, &doc.uri, Some(&doc.text))?;
+                    *current_file.write().unwrap() = Some(uri.clone());
+                    if let Ok(mut s) = state.write() {
+                        s.current_uri = Some(uri.clone());
+                        s.current_version = 1;
+                        s.document_tree = Some(tree::Tree::from_str(&text));
+                    }
+                    send_did_open(&mut stdin, &uri, &text)?;
+                    send_did_save(&mut stdin, &uri, Some(&text))?;
                 }
             }
             Ok(InternalSignal::RetryRequest(request_type)) => {
@@ -970,10 +935,9 @@ fn run_lsp_client(
                             && (changes[0].range.end.line == u32::MAX
                                 || changes[0].range.end.character == u32::MAX)
                         {
-                            *document_tree.write().unwrap() =
-                                Some(tree::Tree::from_str(&changes[0].text));
-                            if let Some(info) = document_info.write().ok().as_mut().and_then(|g| g.as_mut()) {
-                                info.version = version;
+                            if let Ok(mut s) = state.write() {
+                                s.document_tree = Some(tree::Tree::from_str(&changes[0].text));
+                                s.current_version = version;
                             }
                         }
                     }
@@ -986,7 +950,7 @@ fn run_lsp_client(
             Ok(request) => {
                 match request {
                     LspRequest::Initialize { file_path, text } => {
-                        let state = init_state.load(Ordering::SeqCst);
+                        let init_status = init_state.load(Ordering::SeqCst);
                         if debouncer.has_pending() {
                             debouncer.clear();
                         }
@@ -995,7 +959,7 @@ fn run_lsp_client(
                             Url::from_file_path(&file_path).map_err(|_| "Invalid file path")?;
                         let file_uri = Uri::from_str(file_url.as_str()).unwrap();
 
-                        match state {
+                        match init_status {
                             INIT_NOT_STARTED => {
                                 let root_uri = workspace_root
                                     .as_ref()
@@ -1014,29 +978,21 @@ fn run_lsp_client(
                                     0,
                                 );
                                 init_state.store(INIT_SENT, Ordering::SeqCst);
-                                *queued_document.lock().unwrap() = Some(QueuedDocument {
-                                    uri: file_uri,
-                                    text,
-                                });
+                                *queued_document.lock().unwrap() = Some((file_uri, text));
                             }
                             INIT_SENT => {
-                                *queued_document.lock().unwrap() = Some(QueuedDocument {
-                                    uri: file_uri,
-                                    text,
-                                });
+                                *queued_document.lock().unwrap() = Some((file_uri, text));
                             }
                             INIT_COMPLETE => {
                                 *current_file.write().unwrap() = Some(file_uri.clone());
-                                let new_version = document_info
-                                    .read()
-                                    .ok()
-                                    .and_then(|d| d.as_ref().map(|d| d.version + 1))
+                                let new_version = state.read().ok()
+                                    .map(|s| s.current_version + 1)
                                     .unwrap_or(1);
-                                *document_tree.write().unwrap() = Some(tree::Tree::from_str(&text));
-                                *document_info.write().unwrap() = Some(DocumentInfo {
-                                    uri: file_uri.clone(),
-                                    version: new_version,
-                                });
+                                if let Ok(mut s) = state.write() {
+                                    s.document_tree = Some(tree::Tree::from_str(&text));
+                                    s.current_uri = Some(file_uri.clone());
+                                    s.current_version = new_version;
+                                }
                                 send_did_open(&mut stdin, &file_uri, &text)?;
                                 send_did_save(&mut stdin, &file_uri, Some(&text))?;
                             }
@@ -1056,7 +1012,7 @@ fn run_lsp_client(
                         if init_state.load(Ordering::SeqCst) == INIT_COMPLETE {
                             if let Some(current_uri) = current_file.read().ok().and_then(|g| g.clone()) {
                                 let utf16_character =
-                                    utf8_to_utf16_position(&document_tree, line, character);
+                                    utf8_to_utf16_position(&state, line, character);
                                 let request_id = send_hover(
                                     &mut stdin,
                                     &mut next_id,
@@ -1097,7 +1053,7 @@ fn run_lsp_client(
                         if init_state.load(Ordering::SeqCst) == INIT_COMPLETE {
                             if let Some(current_uri) = current_file.read().ok().and_then(|g| g.clone()) {
                                 let utf16_character =
-                                    utf8_to_utf16_position(&document_tree, line, character);
+                                    utf8_to_utf16_position(&state, line, character);
                                 let request_id = send_goto_definition(
                                     &mut stdin,
                                     &mut next_id,
@@ -1125,7 +1081,7 @@ fn run_lsp_client(
                         if init_state.load(Ordering::SeqCst) == INIT_COMPLETE {
                             if let Some(current_uri) = current_file.read().ok().and_then(|g| g.clone()) {
                                 let utf16_character =
-                                    utf8_to_utf16_position(&document_tree, line, character);
+                                    utf8_to_utf16_position(&state, line, character);
                                 let request_id = send_code_action(
                                     &mut stdin,
                                     &mut next_id,
@@ -1173,12 +1129,12 @@ fn run_lsp_client(
                     }
                     LspRequest::ApplyWorkspaceEdit { edit } => {
                         if let Some(ref changes) = edit.changes {
-                            if let Ok(doc_info_guard) = document_info.read() {
-                                if let Some(ref doc_info) = *doc_info_guard {
-                                    if let Some(edits) = changes.get(&doc_info.uri) {
+                            if let Ok(s) = state.read() {
+                                if let Some(ref uri) = s.current_uri {
+                                    if let Some(edits) = changes.get(uri) {
                                         let _ = response_tx.send(LspResponse::TextEdit(
                                             TextEditUpdate {
-                                                uri: doc_info.uri.clone(),
+                                                uri: uri.clone(),
                                                 edits: edits.clone(),
                                             },
                                         ));
@@ -1285,8 +1241,7 @@ fn handle_lsp_responses(
     mut reader: BufReader<std::process::ChildStdout>,
     response_tx: mpsc::Sender<LspResponse>,
     current_file: Arc<RwLock<Option<Uri>>>,
-    document_info: Arc<RwLock<Option<DocumentInfo>>>,
-    current_diagnostics: Arc<RwLock<Vec<LspDiagnostic>>>,
+    state: Arc<RwLock<LspState>>,
     pending_requests: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
     init_state: Arc<AtomicU8>,
     init_complete_tx: mpsc::Sender<InternalSignal>,
@@ -1298,8 +1253,7 @@ fn handle_lsp_responses(
                     msg,
                     &response_tx,
                     &current_file,
-                    &document_info,
-                    &current_diagnostics,
+                    &state,
                     &pending_requests,
                     &init_state,
                     &init_complete_tx,
@@ -1322,8 +1276,7 @@ fn handle_lsp_message(
     msg: lsp_server::Message,
     response_tx: &mpsc::Sender<LspResponse>,
     current_file: &Arc<RwLock<Option<Uri>>>,
-    document_info: &Arc<RwLock<Option<DocumentInfo>>>,
-    current_diagnostics: &Arc<RwLock<Vec<LspDiagnostic>>>,
+    state: &Arc<RwLock<LspState>>,
     pending_requests: &Arc<Mutex<HashMap<u64, TrackedRequest>>>,
     init_state: &Arc<AtomicU8>,
     init_complete_tx: &mpsc::Sender<InternalSignal>,
@@ -1341,11 +1294,11 @@ fn handle_lsp_message(
                         .unwrap_or(false);
 
                     if should_process {
-                        if let Ok(mut diags) = current_diagnostics.write() {
-                            *diags = publish_params.diagnostics.clone();
+                        if let Ok(mut s) = state.write() {
+                            s.diagnostics = publish_params.diagnostics.clone();
                         }
                         let diagnostics = parse_diagnostics(publish_params.diagnostics);
-                        let current_version = get_document_version(document_info);
+                        let current_version = get_document_version(state);
                         let _ = response_tx.send(LspResponse::Diagnostics(DiagnosticUpdate {
                             diagnostics,
                             version: current_version,
