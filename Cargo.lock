@@ -873,6 +873,7 @@ dependencies = [
  "tiny-core",
  "tiny-font",
  "tiny-sdk",
+ "tiny-ui",
  "toml",
 ]
 
@@ -3196,16 +3197,14 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "swash",
  "tiny-core",
  "tiny-font",
  "tiny-sdk",
  "tiny-tree",
+ "tiny-ui",
  "tokio",
  "toml",
  "tower-lsp",
- "tree-sitter",
- "tree-sitter-rust",
  "url",
  "wgpu",
  "winit",
@@ -3269,6 +3268,28 @@ dependencies = [
  "regex",
  "simdutf8",
  "tiny-sdk",
+]
+
+[[package]]
+name = "tiny-ui"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arboard",
+ "arc-swap",
+ "bytemuck",
+ "lazy_static",
+ "lsp-types 0.97.0",
+ "parking_lot",
+ "serde_json",
+ "swash",
+ "tiny-core",
+ "tiny-font",
+ "tiny-sdk",
+ "tiny-tree",
+ "tree-sitter",
+ "tree-sitter-rust",
+ "wgpu",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@ use tiny_sdk::{PaintContext, Paintable};
 const FILE_EXPLORER_WIDTH: f32 = 0.0;
 const STATUS_BAR_HEIGHT: f32 = 0.0;
 const TAB_BAR_HEIGHT: f32 = 30.0;
+const FOO:f32 = 0.0;
 
 // Plugin state synchronization
 #[derive(Clone, Debug)]

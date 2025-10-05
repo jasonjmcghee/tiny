@@ -1,9 +1,8 @@
-// Vertex shader for squiggly lines and popup backgrounds
+// Vertex shader for diagnostic squiggly lines
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) color: u32,
     @location(2) line_info: vec4<f32>, // x, y, width, severity
-    @location(3) is_popup: u32,
 }
 
 struct VertexOutput {
@@ -11,7 +10,6 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) pixel_pos: vec2<f32>,
     @location(2) line_info: vec4<f32>,
-    @location(3) is_popup: f32,
 }
 
 struct Uniforms {
@@ -40,7 +38,6 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.color = vec4<f32>(r, g, b, a);
 
     out.line_info = input.line_info;
-    out.is_popup = f32(input.is_popup);
 
     return out;
 }
@@ -51,13 +48,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let px = input.pixel_pos.x;
     let py = input.pixel_pos.y;
 
-    // Check if this is a popup background
-    if input.is_popup > 0.5 {
-        // Render solid color with slight transparency for popup
-        return vec4<f32>(input.color.rgb, 0.95);
-    }
-
-    // Otherwise, render squiggly line
+    // Render squiggly line
     let line_x = input.line_info.x;
     let line_y = input.line_info.y;
     let line_width = input.line_info.z;

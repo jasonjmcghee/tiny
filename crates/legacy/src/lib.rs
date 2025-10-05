@@ -10,7 +10,6 @@ pub mod accelerator;
 #[cfg(feature = "winit")]
 pub mod app;
 pub mod config;
-pub mod coordinates; // Coordinate system abstraction
 pub mod diagnostics_manager;
 pub mod editor_logic;
 pub mod file_picker_plugin;
@@ -27,16 +26,16 @@ pub use diagnostics_plugin;
 pub mod editable_text_view;
 pub mod gpu_buffer_manager;
 pub mod render;
-pub mod scroll;
 pub mod shortcuts;
-pub mod syntax;
 pub mod tab_bar_plugin;
 pub mod tab_manager;
 pub mod text_editor_plugin;
-pub mod text_effects;
-pub mod text_renderer;
-pub mod text_view;
-pub mod theme;
+
+// Import UI components from tiny-ui
+pub use tiny_ui::{
+    coordinates, scroll, syntax, text_effects, text_renderer, text_view, theme, Scrollable,
+    SyntaxHighlighter, TextRenderer, TextView, Theme, Viewport,
+};
 #[cfg(feature = "winit")]
 pub mod winit_adapter;
 
@@ -44,5 +43,4 @@ pub mod winit_adapter;
 pub use history::History;
 pub use input::{InputHandler, Selection};
 pub use render::Renderer;
-pub use syntax::SyntaxHighlighter;
 pub use tiny_tree::{Content, Doc, Edit, Point, Rect, Span, Tree as DocTree};

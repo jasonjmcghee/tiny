@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/tree",
+    "crates/font",
+    "crates/ui",
     "crates/legacy",
     "crates/sdk",
     "crates/core",

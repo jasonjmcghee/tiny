@@ -4,7 +4,7 @@ use ahash::AHashMap as HashMap;
 use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tiny_font::{create_glyph_instances, SharedFontSystem};
+use tiny_font::SharedFontSystem;
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
@@ -14,9 +14,11 @@ use tiny_sdk::{
         BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId, VertexAttributeDescriptor,
         VertexFormat,
     },
-    Capability, Configurable, GlyphInstance, Initializable, LayoutPos, Library, PaintContext,
+    types::RoundedRectInstance,
+    Capability, Configurable, Initializable, LayoutPos, Library, PaintContext,
     Paintable, Plugin, PluginError, SetupContext, ViewportInfo,
 };
+use tiny_ui::{TextView, Viewport};
 
 /// Diagnostic severity levels
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -74,7 +76,7 @@ impl Default for DiagnosticsConfig {
     }
 }
 
-/// Vertex data for squiggly lines and popups
+/// Vertex data for squiggly lines
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[bytemuck(crate = "self::bytemuck")]
@@ -82,7 +84,6 @@ struct DiagnosticVertex {
     position: [f32; 2],
     color: u32,
     line_info: [f32; 4], // x, y, width, severity
-    is_popup: u32,
 }
 
 /// Main diagnostics plugin struct
@@ -112,14 +113,15 @@ pub struct DiagnosticsPlugin {
     // Current popup content to show
     current_popup: Option<PopupContent>,
 
+    // Popup TextView for rendering popup content (RwLock for interior mutability in paint)
+    popup_view: RwLock<Option<TextView>>,
+
     // Viewport info
     viewport: ViewportInfo,
 
     // GPU resources (RwLock for interior mutability in paint())
     vertex_buffer: RwLock<Option<Buffer>>,
     vertex_buffer_id: RwLock<Option<BufferId>>,
-    popup_vertex_buffer: RwLock<Option<Buffer>>,
-    popup_vertex_buffer_id: RwLock<Option<BufferId>>,
     custom_pipeline_id: Option<PipelineId>,
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
@@ -185,6 +187,7 @@ impl DiagnosticsPlugin {
             mouse_line: None,
             mouse_column: None,
             current_popup: None,
+            popup_view: RwLock::new(None),
             viewport: ViewportInfo {
                 scroll: LayoutPos::new(0.0, 0.0),
                 logical_size: LogicalSize::new(800.0, 600.0),
@@ -200,8 +203,6 @@ impl DiagnosticsPlugin {
             },
             vertex_buffer: RwLock::new(None),
             vertex_buffer_id: RwLock::new(None),
-            popup_vertex_buffer: RwLock::new(None),
-            popup_vertex_buffer_id: RwLock::new(None),
             custom_pipeline_id: None,
             device: None,
             queue: None,
@@ -440,37 +441,31 @@ impl DiagnosticsPlugin {
                     position: [start_x, line_y - padding],
                     color,
                     line_info,
-                    is_popup: 0,
                 },
                 DiagnosticVertex {
                     position: [start_x + width_scaled, line_y - padding],
                     color,
                     line_info,
-                    is_popup: 0,
                 },
                 DiagnosticVertex {
                     position: [start_x, line_y + padding],
                     color,
                     line_info,
-                    is_popup: 0,
                 },
                 DiagnosticVertex {
                     position: [start_x + width_scaled, line_y - padding],
                     color,
                     line_info,
-                    is_popup: 0,
                 },
                 DiagnosticVertex {
                     position: [start_x + width_scaled, line_y + padding],
                     color,
                     line_info,
-                    is_popup: 0,
                 },
                 DiagnosticVertex {
                     position: [start_x, line_y + padding],
                     color,
                     line_info,
-                    is_popup: 0,
                 },
             ]);
         }
@@ -478,270 +473,89 @@ impl DiagnosticsPlugin {
         vertices
     }
 
-    /// Create vertices for popup background
-    fn create_popup_vertices(
+    /// Update or create popup TextView with content
+    fn update_popup_view(
         &self,
-        diagnostic: &Diagnostic,
+        content: &str,
+        anchor_line: usize,
+        anchor_col: usize,
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
         services: Option<&tiny_sdk::ServiceRegistry>,
-    ) -> Vec<DiagnosticVertex> {
-        let mut vertices = Vec::new();
-        let scale = self.viewport.scale_factor;
-        // Get font service for accurate character width
-        let char_width = services
-            .and_then(|s| s.get::<SharedFontSystem>())
-            .map(|fs| fs.char_width_coef() * self.viewport.font_size)
-            .unwrap_or_else(|| {
-                eprintln!("Warning: Font service not available, using fallback character width");
-                self.viewport.font_size * 0.6
-            });
+    ) {
+        // Get font service
+        let font_service = match services.and_then(|s| s.get::<SharedFontSystem>()) {
+            Some(fs) => fs,
+            None => {
+                eprintln!("Warning: Font service not available for popup");
+                return;
+            }
+        };
 
-        // Get widget bounds offset and scroll
-        let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
-        let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-        let widget_scroll_x = widget_viewport
-            .map(|w| w.scroll.x.0)
-            .unwrap_or(self.viewport.scroll.x.0);
-        let widget_scroll_y = widget_viewport
-            .map(|w| w.scroll.y.0)
-            .unwrap_or(self.viewport.scroll.y.0);
-
-        // Calculate popup size using font system's layout for accurate multi-line text dimensions
-        let font_service = services
-            .and_then(|s| s.get::<SharedFontSystem>())
-            .expect("Font service is required for popup rendering");
-
-        let layout = font_service.layout_text(&diagnostic.message, self.viewport.font_size);
-        let (text_width, text_height) = (layout.width, layout.height);
-
-        let message_width_logical = text_width + self.config.popup_padding * 2.0;
-        let popup_height_logical = text_height + self.config.popup_padding * 2.0;
-
-        // Position popup above the diagnostic in document space
-        let doc_y = diagnostic.line as f32 * self.viewport.line_height;
-        let doc_x = diagnostic.column_range.0 as f32 * char_width;
-
-        // Convert to view space (subtract scroll)
-        let view_x = doc_x - widget_scroll_x;
-        let view_y = doc_y - widget_scroll_y;
-
-        // Smart positioning within editor bounds
+        // Get widget bounds and scroll
         let widget_bounds = widget_viewport
             .map(|w| w.bounds)
             .unwrap_or_else(|| tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0));
+        let widget_scroll_x = widget_viewport.map(|w| w.scroll.x.0).unwrap_or(0.0);
+        let widget_scroll_y = widget_viewport.map(|w| w.scroll.y.0).unwrap_or(0.0);
 
-        // Try above first, then below if not enough space
-        let mut popup_x_view = view_x;
-        let mut popup_y_view = view_y - popup_height_logical - 10.0; // 10px above the line
+        // Calculate anchor position in document space
+        let char_width = font_service.char_width_coef() * self.viewport.font_size;
+        let doc_x = anchor_col as f32 * char_width;
+        let doc_y = anchor_line as f32 * self.viewport.line_height;
+
+        // Convert to view space
+        let view_x = doc_x - widget_scroll_x;
+        let view_y = doc_y - widget_scroll_y;
+
+        // Calculate popup size
+        let layout = font_service.layout_text(content, self.viewport.font_size);
+        let max_width = 600.0;
+        let max_height = 400.0;
+        let popup_width = (layout.width + self.config.popup_padding * 2.0).min(max_width);
+        let popup_height = (layout.height + self.config.popup_padding * 2.0).min(max_height);
+
+        // Smart positioning: try above first, then below
+        let mut popup_x = view_x + widget_bounds.x.0;
+        let mut popup_y = view_y + widget_bounds.y.0 - popup_height - 10.0; // 10px above
 
         // Check if popup fits above
-        if popup_y_view < 0.0 {
+        if popup_y < widget_bounds.y.0 {
             // Not enough space above, position below
-            popup_y_view = view_y + self.viewport.line_height + 10.0;
+            popup_y = view_y + widget_bounds.y.0 + self.viewport.line_height + 10.0;
         }
 
-        // Check if popup fits within horizontal bounds
-        if popup_x_view + message_width_logical > widget_bounds.width.0 {
-            // Move left to fit
-            popup_x_view = widget_bounds.width.0 - message_width_logical - 10.0;
+        // Check if popup fits horizontally
+        if popup_x + popup_width > widget_bounds.x.0 + widget_bounds.width.0 {
+            popup_x = widget_bounds.x.0 + widget_bounds.width.0 - popup_width - 10.0;
         }
-        if popup_x_view < 0.0 {
-            popup_x_view = 10.0; // Min margin from left edge
-        }
+        popup_x = popup_x.max(widget_bounds.x.0 + 10.0);
 
-        // Constrain popup height to fit in editor
-        let max_popup_height = if popup_y_view > 0.0 {
-            widget_bounds.height.0 - popup_y_view - 10.0
-        } else {
-            widget_bounds.height.0 - 20.0
-        };
+        // Create viewport for TextView with proper metrics
+        let mut popup_viewport = Viewport::new(popup_width, popup_height, self.viewport.scale_factor);
+        popup_viewport.bounds = tiny_sdk::types::LayoutRect::new(popup_x, popup_y, popup_width, popup_height);
+        popup_viewport.set_font_size(self.viewport.font_size);
 
-        let constrained_popup_height = popup_height_logical.min(max_popup_height);
+        // Create TextView
+        let mut text_view = TextView::from_text(content, popup_viewport);
+        text_view.padding = self.config.popup_padding;
+        text_view.update_layout(&font_service);
 
-        // Transform to screen space: add widget offset, then scale to physical
-        let popup_x = (popup_x_view + widget_offset_x) * scale;
-        let popup_y = (popup_y_view + widget_offset_y) * scale;
-        let message_width = message_width_logical * scale;
-        let popup_height = constrained_popup_height * scale;
-
-        let color = self.config.popup_background_color;
-        let line_info = [0.0, 0.0, 0.0, 0.0]; // Not used for popups
-
-        // Create quad for popup background
-        vertices.extend_from_slice(&[
-            DiagnosticVertex {
-                position: [popup_x, popup_y],
-                color,
-                line_info,
-                is_popup: 1,
-            },
-            DiagnosticVertex {
-                position: [popup_x + message_width, popup_y],
-                color,
-                line_info,
-                is_popup: 1,
-            },
-            DiagnosticVertex {
-                position: [popup_x, popup_y + popup_height],
-                color,
-                line_info,
-                is_popup: 1,
-            },
-            DiagnosticVertex {
-                position: [popup_x + message_width, popup_y],
-                color,
-                line_info,
-                is_popup: 1,
-            },
-            DiagnosticVertex {
-                position: [popup_x + message_width, popup_y + popup_height],
-                color,
-                line_info,
-                is_popup: 1,
-            },
-            DiagnosticVertex {
-                position: [popup_x, popup_y + popup_height],
-                color,
-                line_info,
-                is_popup: 1,
-            },
-        ]);
-
-        vertices
+        *self.popup_view.write().unwrap() = Some(text_view);
     }
 
-    /// Collect glyphs for popup text
-    pub fn collect_popup_glyphs(
-        &self,
-        services: &tiny_sdk::ServiceRegistry,
-        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
-    ) -> Vec<GlyphInstance> {
-        // Get popup content from current popup
-        let popup_content = match &self.current_popup {
-            Some(PopupContent::Diagnostic { message, .. }) => Some(message.clone()),
-            Some(PopupContent::Hover { content, .. }) => Some(content.clone()),
-            None => None,
-        };
+    /// Get rounded rect for popup frame
+    fn get_popup_frame(&self) -> Option<RoundedRectInstance> {
+        let popup_view = self.popup_view.read().unwrap();
+        let popup_view = popup_view.as_ref()?;
+        let bounds = popup_view.viewport.bounds;
 
-        if let Some(content) = popup_content {
-            // Get font service - required for text rendering
-            let font_service = services
-                .get::<SharedFontSystem>()
-                .expect("Font service is required for popup text rendering");
-
-            let scale = self.viewport.scale_factor;
-            // Use actual font metrics for popup text positioning
-            let char_width = font_service.char_width_coef() * self.viewport.font_size;
-
-            // Get widget bounds offset and scroll
-            let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
-            let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
-            let widget_scroll_x = widget_viewport
-                .map(|w| w.scroll.x.0)
-                .unwrap_or(self.viewport.scroll.x.0);
-            let widget_scroll_y = widget_viewport
-                .map(|w| w.scroll.y.0)
-                .unwrap_or(self.viewport.scroll.y.0);
-
-            // Calculate popup position based on popup content
-            let (doc_x, doc_y) = match &self.current_popup {
-                Some(PopupContent::Diagnostic { line, column, .. })
-                | Some(PopupContent::Hover { line, column, .. }) => {
-                    let doc_y = *line as f32 * self.viewport.line_height;
-                    let doc_x = *column as f32 * char_width;
-                    (doc_x, doc_y)
-                }
-                None => (0.0, 0.0),
-            };
-
-            // Convert to view space (subtract scroll)
-            let view_x = doc_x - widget_scroll_x;
-            let view_y = doc_y - widget_scroll_y;
-
-            // Get the actual text layout to know the exact height
-            let layout = font_service.layout_text(&content, self.viewport.font_size);
-
-            // Constrain content if it's too long for available space
-            let widget_bounds = widget_viewport
-                .map(|w| w.bounds)
-                .unwrap_or_else(|| tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0));
-
-            let max_popup_height = widget_bounds.height.0 * 0.6; // Max 60% of editor height
-            let max_lines = (max_popup_height / self.viewport.line_height) as usize;
-
-            let final_content = if layout.height > max_popup_height {
-                // Truncate content to fit
-                let lines: Vec<&str> = content.lines().collect();
-                if lines.len() > max_lines {
-                    let truncated_lines = &lines[0..max_lines.saturating_sub(1)];
-                    format!("{}\n... (content truncated)", truncated_lines.join("\n"))
-                } else {
-                    content
-                }
-            } else {
-                content
-            };
-
-            let final_layout = font_service.layout_text(&final_content, self.viewport.font_size);
-
-            // Smart positioning within editor bounds
-            let max_popup_height_view = widget_bounds.height.0 * 0.6; // Max 60% of editor height
-            let popup_height_logical =
-                final_layout.height.min(max_popup_height_view) + self.config.popup_padding * 2.0;
-
-            // Try above first, then below if not enough space
-            let mut popup_x_view = view_x;
-            let mut popup_y_view = view_y - popup_height_logical - 10.0; // 10px above the line
-
-            // Check if popup fits above
-            if popup_y_view < 0.0 {
-                // Not enough space above, position below
-                popup_y_view = view_y + self.viewport.line_height + 10.0;
-            }
-
-            // Check if popup fits within horizontal bounds
-            let message_width_logical = final_layout.width + self.config.popup_padding * 2.0;
-            if popup_x_view + message_width_logical > widget_bounds.width.0 {
-                // Move left to fit
-                popup_x_view = widget_bounds.width.0 - message_width_logical - 10.0;
-            }
-            if popup_x_view < 0.0 {
-                popup_x_view = 10.0; // Min margin from left edge
-            }
-
-            // Position text inside popup with padding from the top of the popup
-            let text_x = popup_x_view + self.config.popup_padding;
-            let text_y = popup_y_view + self.config.popup_padding;
-
-            // The position for create_glyph_instances should be in logical pixels
-            // relative to where the text will be rendered (already includes widget offset)
-            let pos = LayoutPos::new(text_x + widget_offset_x, text_y + widget_offset_y);
-
-            let glyphs = create_glyph_instances(
-                &font_service,
-                &final_content,
-                pos,
-                self.viewport.font_size,
-                scale,
-                self.viewport.line_height,
-                None,
-                0,
-            );
-
-            // The glyphs are already in logical coordinates with the correct position
-            // We need to scale them to physical coordinates
-            glyphs
-                .into_iter()
-                .map(|mut g| {
-                    // Scale position from logical to physical
-                    g.pos = LayoutPos::new(g.pos.x.0 * scale, g.pos.y.0 * scale);
-                    g.token_id = 254; // Special token for popup text
-                    g
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
+        Some(RoundedRectInstance {
+            rect: bounds,
+            color: self.config.popup_background_color,
+            border_color: self.config.popup_border_color,
+            corner_radius: 4.0,
+            border_width: 1.0,
+        })
     }
 }
 
@@ -811,21 +625,6 @@ impl Initializable for DiagnosticsPlugin {
         );
         *self.vertex_buffer_id.write().unwrap() = Some(buffer_id);
 
-        // Buffer for popup backgrounds
-        let popup_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Diagnostics Popup Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        *self.popup_vertex_buffer.write().unwrap() = Some(popup_buffer);
-
-        let popup_buffer_id = BufferId::create(
-            buffer_size,
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        );
-        *self.popup_vertex_buffer_id.write().unwrap() = Some(popup_buffer_id);
-
         // Create shader and pipeline
         let shader_source = include_str!("shader.wgsl");
         let shader_id = ShaderModuleId::create_from_wgsl(shader_source);
@@ -848,18 +647,13 @@ impl Initializable for DiagnosticsPlugin {
                 location: 2,
                 format: VertexFormat::Float32x4, // line_info
             },
-            VertexAttributeDescriptor {
-                offset: 28,
-                location: 3,
-                format: VertexFormat::Uint32, // is_popup
-            },
         ];
 
         let pipeline_id = PipelineId::create_with_layout(
             shader_id,
             shader_id,
             bind_group_layout,
-            32, // vertex stride: position (8) + color (4) + line_info (16) + is_popup (4) = 32
+            28, // vertex stride: position (8) + color (4) + line_info (16) = 28
             &attributes,
         );
         self.custom_pipeline_id = Some(pipeline_id);
@@ -1124,88 +918,40 @@ impl Paintable for DiagnosticsPlugin {
                 } => (content.clone(), *line, *column),
             };
 
-            // Create a temporary diagnostic for popup positioning
-            let temp_diagnostic = Diagnostic {
-                line: popup_line,
-                column_range: (popup_col, popup_col + 1),
-                byte_range: None,
-                message: popup_text.clone(),
-                severity: DiagnosticSeverity::Info,
-            };
+            // Update popup view (creates TextView with rounded rect)
+            self.update_popup_view(&popup_text, popup_line, popup_col, ctx.widget_viewport.as_ref(), services);
 
-            // Draw popup background
-            let popup_vertices = self.create_popup_vertices(
-                &temp_diagnostic,
-                ctx.widget_viewport.as_ref(),
-                services,
-            );
-            if !popup_vertices.is_empty() {
-                let vertex_data = bytemuck::cast_slice(&popup_vertices);
-                let vertex_count = popup_vertices.len() as u32;
-                let required_size = vertex_data.len() as u64;
-
-                // Recreate popup buffer if needed
-                if let Some(device) = &self.device {
-                    let needs_new_buffer = {
-                        let buffer = self.popup_vertex_buffer.read().unwrap();
-                        buffer.is_none()
-                            || buffer
-                                .as_ref()
-                                .map(|b| b.size() < required_size)
-                                .unwrap_or(true)
-                    };
-
-                    if needs_new_buffer {
-                        let buffer_size = (required_size + 512).max(required_size * 2);
-                        let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("Diagnostics Popup Buffer (Dynamic)"),
-                            size: buffer_size,
-                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
-                        *self.popup_vertex_buffer.write().unwrap() = Some(new_buffer);
-
-                        let new_buffer_id = BufferId::create(
-                            buffer_size,
-                            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        );
-                        *self.popup_vertex_buffer_id.write().unwrap() = Some(new_buffer_id);
-                    }
-                }
-
-                if let Some(buffer_id) = self.popup_vertex_buffer_id.read().unwrap().as_ref() {
-                    buffer_id.write(0, vertex_data);
-
-                    if let Some(ref gpu_ctx) = ctx.gpu_context {
-                        if let Some(pipeline_id) = self.custom_pipeline_id {
-                            gpu_ctx.set_pipeline(render_pass, pipeline_id);
-                            gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
-                            gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
-                            gpu_ctx.draw(render_pass, vertex_count, 1);
+            // Render popup using TextView and rounded rect
+            if let Some(popup_view) = self.popup_view.read().unwrap().as_ref() {
+                // Draw rounded rect frame using the core rounded rect renderer
+                if let Some(frame) = self.get_popup_frame() {
+                    unsafe {
+                        if !ctx.gpu_renderer.is_null() {
+                            let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
+                            gpu_renderer.draw_rounded_rects(render_pass, &[frame], self.viewport.scale_factor);
                         }
                     }
                 }
-            }
 
-            // Draw popup text using glyph rendering with a separate buffer offset
-            // to avoid interfering with main text rendering
-            unsafe {
-                if let Some(services) = ctx.context_data.as_ref() {
-                    let services = &*(services as *const _ as *const tiny_sdk::ServiceRegistry);
-                    let glyphs = self.collect_popup_glyphs(services, ctx.widget_viewport.as_ref());
+                // Draw popup text using TextView
+                if let Some(font_service) = services.and_then(|s| s.get::<SharedFontSystem>()) {
+                    let glyphs = popup_view.collect_glyphs(&font_service);
 
-                    if !glyphs.is_empty() && !ctx.gpu_renderer.is_null() {
-                        let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
-                        // Use dedicated buffer for diagnostics to avoid conflicts
-                        gpu_renderer.draw_glyphs(
-                            render_pass,
-                            &glyphs,
-                            tiny_core::gpu::DrawConfig {
-                                buffer_name: "diagnostics",
-                                use_themed: false,
-                                scissor: None,
-                            },
-                        );
+                    if !glyphs.is_empty() {
+                        unsafe {
+                            if !ctx.gpu_renderer.is_null() {
+                                let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
+                                gpu_renderer.draw_glyphs(
+                                    render_pass,
+                                    &glyphs,
+                                    tiny_core::gpu::DrawConfig {
+                                        buffer_name: "diagnostics",
+                                        use_themed: true,
+                                        scissor: Some(popup_view.get_scissor_rect()),
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
             }

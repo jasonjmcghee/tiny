@@ -14,26 +14,20 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 ahash = { workspace = true }
 
-# Plugin SDK
+# Plugin SDK and UI
 tiny-sdk = { path = "../sdk" }
 tiny-core = { path = "../core" }
 tiny-tree = { path = "../tree" }
 tiny-font = { path = "../font" }
+tiny-ui = { path = "../ui" }
 diagnostics-plugin = { path = "../plugins/diagnostics" }
 
 winit = { version = "0.30", optional = true }
-
-# Text rendering (swash for advanced text features)
-swash = "0.2.5"
 
 # Core data structures
 parking_lot = "0.12"
 lazy_static = "1.4"  # For global statics
 arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
-
-# Syntax highlighting
-tree-sitter = { version = "0.25", features = ["wasm"] }
-tree-sitter-rust = "0.24"
 
 # LSP support
 tower-lsp = "0.20"  # LSP server framework
