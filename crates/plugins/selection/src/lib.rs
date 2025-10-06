@@ -9,9 +9,8 @@ use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::{
     ffi::{BindGroupLayoutId, PipelineId, ShaderModuleId, VertexAttributeDescriptor, VertexFormat},
-    CachedBuffer, Capability, Configurable, Initializable, LayoutRect, Library,
-    PaintContext, Paintable, Plugin, PluginError, SetupContext, ViewPos,
-    ViewportInfo,
+    CachedBuffer, Capability, Configurable, Initializable, LayoutRect, Library, PaintContext,
+    Paintable, Plugin, PluginError, SetupContext, ViewPos, ViewportInfo,
 };
 
 /// Single selection with start and end positions
@@ -170,7 +169,9 @@ impl SelectionPlugin {
         let color = self.config.style.color;
 
         for selection in selections {
-            if let Some(rect) = self.selection_to_bounding_rect(selection, line_height, widget_viewport) {
+            if let Some(rect) =
+                self.selection_to_bounding_rect(selection, line_height, widget_viewport)
+            {
                 // Rectangle is in logical view space, scale to physical pixels
                 let x = rect.x.0 * scale;
                 let y = rect.y.0 * scale;
@@ -298,13 +299,41 @@ impl Initializable for SelectionPlugin {
             pipeline_layout,
             44, // stride: position (8) + color (4) + selection_data (32)
             &[
-                VertexAttributeDescriptor { offset: 0, location: 0, format: VertexFormat::Float32x2 }, // position
-                VertexAttributeDescriptor { offset: 8, location: 1, format: VertexFormat::Uint32 },     // color
-                VertexAttributeDescriptor { offset: 12, location: 2, format: VertexFormat::Float32x2 }, // start_pos
-                VertexAttributeDescriptor { offset: 20, location: 3, format: VertexFormat::Float32x2 }, // end_pos
-                VertexAttributeDescriptor { offset: 28, location: 4, format: VertexFormat::Float32 },   // line_height
-                VertexAttributeDescriptor { offset: 32, location: 5, format: VertexFormat::Float32 },   // margin_left
-                VertexAttributeDescriptor { offset: 36, location: 6, format: VertexFormat::Float32 },   // margin_right
+                VertexAttributeDescriptor {
+                    offset: 0,
+                    location: 0,
+                    format: VertexFormat::Float32x2,
+                }, // position
+                VertexAttributeDescriptor {
+                    offset: 8,
+                    location: 1,
+                    format: VertexFormat::Uint32,
+                }, // color
+                VertexAttributeDescriptor {
+                    offset: 12,
+                    location: 2,
+                    format: VertexFormat::Float32x2,
+                }, // start_pos
+                VertexAttributeDescriptor {
+                    offset: 20,
+                    location: 3,
+                    format: VertexFormat::Float32x2,
+                }, // end_pos
+                VertexAttributeDescriptor {
+                    offset: 28,
+                    location: 4,
+                    format: VertexFormat::Float32,
+                }, // line_height
+                VertexAttributeDescriptor {
+                    offset: 32,
+                    location: 5,
+                    format: VertexFormat::Float32,
+                }, // margin_left
+                VertexAttributeDescriptor {
+                    offset: 36,
+                    location: 6,
+                    format: VertexFormat::Float32,
+                }, // margin_right
             ],
         ));
 
@@ -456,12 +485,6 @@ impl Paintable for SelectionPlugin {
 
 impl Configurable for SelectionPlugin {
     fn config_updated(&mut self, config_data: &str) -> Result<(), PluginError> {
-        // Parse the full plugin.toml structure
-        #[derive(Deserialize)]
-        struct PluginToml {
-            config: PluginConfig,
-        }
-
         #[derive(Default, Deserialize)]
         struct PluginConfig {
             #[serde(default = "default_color")]

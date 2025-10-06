@@ -996,11 +996,6 @@ impl Paintable for DiagnosticsPlugin {
 
 impl Configurable for DiagnosticsPlugin {
     fn config_updated(&mut self, config_data: &str) -> Result<(), PluginError> {
-        #[derive(Deserialize)]
-        struct PluginToml {
-            config: PluginConfig,
-        }
-
         #[derive(Default, Deserialize)]
         struct PluginConfig {
             #[serde(default = "default_popup_bg")]

@@ -448,12 +448,6 @@ impl Paintable for CursorPlugin {
 
 impl Configurable for CursorPlugin {
     fn config_updated(&mut self, config_data: &str) -> Result<(), PluginError> {
-        // Parse the full plugin.toml structure
-        #[derive(Deserialize)]
-        struct PluginToml {
-            config: PluginConfig,
-        }
-
         #[derive(Default, Deserialize)]
         struct PluginConfig {
             #[serde(default = "default_blink_enabled")]
