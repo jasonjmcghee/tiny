@@ -40,6 +40,9 @@ pub struct Tree {
     pub version: u64,
     /// Cached flattened text representation for performance
     cached_flattened_text: Option<Arc<String>>,
+    /// Cached line boundaries: Vec[line_num] = byte_offset
+    /// Built lazily on first access using SIMD-accelerated search
+    cached_line_boundaries: Option<Arc<Vec<usize>>>,
 }
 
 /// Tree node - either leaf with spans or internal with children
@@ -505,6 +508,7 @@ impl Tree {
             },
             version: 0,
             cached_flattened_text: Some(Arc::new(String::new())), // Empty tree = empty string
+            cached_line_boundaries: Some(Arc::new(vec![0])), // Empty tree = one line at byte 0
         }
     }
 
@@ -525,6 +529,10 @@ impl Tree {
         let mut all_leaves = Vec::with_capacity(estimated_leaves);
         let mut current_leaf_spans = Vec::<Span>::with_capacity(MAX_SPANS);
 
+        // Build line boundaries in the same pass (no extra iteration!)
+        let mut boundaries = Vec::with_capacity(256);
+        boundaries.push(0); // Line 0 starts at byte 0
+
         let mut pos = 0;
 
         while pos < bytes.len() {
@@ -544,6 +552,12 @@ impl Tree {
             }
 
             let chunk = &bytes[pos..e];
+
+            // Find newlines in this chunk and add to boundaries
+            for newline_pos in memchr::memchr_iter(b'\n', chunk) {
+                boundaries.push(pos + newline_pos + 1);
+            }
+
             let lines = bytecount_count(chunk, b'\n') as u32;
             let chunk_arc: Arc<[u8]> = Arc::from(chunk);
             let metadata = TextMetadata::compute(&chunk_arc).map(Box::new);
@@ -570,12 +584,16 @@ impl Tree {
         // Cache the text as Arc to avoid copies
         let cached_text = Arc::new(text.to_string());
 
+        // Cache line boundaries (built in single pass during chunking)
+        let cached_boundaries = Arc::new(boundaries);
+
         // If only one leaf, use it as root
         if all_leaves.len() == 1 {
             return Self {
                 root: all_leaves.into_iter().next().unwrap(),
                 version: 0,
                 cached_flattened_text: Some(cached_text),
+                cached_line_boundaries: Some(cached_boundaries),
             };
         }
 
@@ -605,6 +623,7 @@ impl Tree {
             root: nodes.into_iter().next().unwrap(),
             version: 0,
             cached_flattened_text: Some(cached_text),
+            cached_line_boundaries: Some(cached_boundaries),
         }
     }
 
@@ -624,6 +643,7 @@ impl Tree {
             root: new_root,
             version: self.version + 1,
             cached_flattened_text: None, // Cache invalidated by edits
+            cached_line_boundaries: None, // Cache invalidated by edits
         }
     }
 
@@ -932,6 +952,13 @@ impl Tree {
     }
 
     pub fn line_to_byte(&self, line: u32) -> Option<usize> {
+        // Fast path: use cached line boundaries (O(1) array lookup)
+        if let Some(ref boundaries) = self.cached_line_boundaries {
+            return boundaries.get(line as usize).copied();
+        }
+
+        // Fallback path: use cursor (after edits invalidate cache)
+        // Don't rebuild cache here - let it be rebuilt lazily on next from_str or explicit call
         let mut cursor = self.cursor();
         cursor.seek_line(line)
     }
@@ -955,6 +982,12 @@ impl Tree {
     }
 
     pub fn get_text_slice(&self, range: Range<usize>) -> String {
+        // Fast path: use cached flattened text (O(1) slice)
+        if let Some(ref cached) = self.cached_flattened_text {
+            return cached.get(range).map(|s| s.to_string()).unwrap_or_default();
+        }
+
+        // Slow path: use cursor only when cache is invalidated
         let mut cursor = self.cursor();
         cursor.seek_byte(range.start);
         cursor.read_text(range.len())

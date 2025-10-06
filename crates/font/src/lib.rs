@@ -22,8 +22,8 @@ pub use emoji::{
 pub use rasterize::{FontMetrics, RasterResult, Rasterizer};
 pub use shaping::{RunFontType, ShapedGlyph, Shaper, ShapingOptions, ShapingResult, TextRun};
 
-use ahash::{HashMap, HashSet};
-use parking_lot::{Mutex, RwLock};
+use ahash::HashMap;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use swash::FontRef;
 use tiny_sdk::services::{

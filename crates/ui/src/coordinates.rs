@@ -625,51 +625,30 @@ impl Viewport {
 
     /// Get document bounds with caching
     pub fn get_document_bounds(&mut self, tree: &DocTree) -> (f32, f32) {
-        // First, find the line with the most characters (just counting)
-        let mut longest_line_chars = 0;
-        let mut longest_line_text = "".to_string();
-        let mut _longest_line_num = 0;
-
-        for line_num in 0..tree.line_count() {
-            if let Some(line_start) = tree.line_to_byte(line_num) {
-                let line_end = tree.line_to_byte(line_num + 1).unwrap_or(tree.byte_count());
-                let line_text_trimmed = tree.get_text_slice(line_start..line_end);
-                let line_length = line_text_trimmed.chars().count();
-
-                if line_length > longest_line_chars {
-                    longest_line_chars = line_length;
-                    longest_line_text = line_text_trimmed;
-                    _longest_line_num = line_num;
-                }
-            }
-        }
-
-        // Check if we can use cached bounds
+        // Check cache first - if version hasn't changed, use cached bounds
         if let Some(bounds) = self.cached_doc_bounds {
-            if self.cached_bounds_version == tree.version
-                && self.cached_longest_line_chars == longest_line_chars
-            {
+            if self.cached_bounds_version == tree.version {
                 return bounds;
             }
         }
 
-        // Need to recalculate - the longest line changed or tree version changed
-        let total_lines = tree.line_count() as f32;
-        let doc_height = (total_lines + 5.0) * self.metrics.line_height;
+        // Find longest line by scanning all lines
+        // Note: Tree::line_to_byte() now uses SIMD-cached boundaries, so this is fast
+        let mut longest_line_chars = 0;
 
-        // Now measure ONLY the longest line
-        let max_line_width = if let Some(font_system) = &self.font_system {
-            // Measure the actual longest line
-            let layout = font_system.layout_text_scaled(
-                &longest_line_text,
-                self.metrics.font_size,
-                self.scale_factor,
-            );
-            layout.width / self.scale_factor
-        } else {
-            // Fallback to estimation
-            longest_line_chars as f32 * self.metrics.space_width
-        };
+        for line_num in 0..tree.line_count() {
+            let line_text = tree.line_text(line_num);
+            let char_count = line_text.chars().count();
+            if char_count > longest_line_chars {
+                longest_line_chars = char_count;
+            }
+        }
+
+        let total_lines = tree.line_count();
+        let doc_height = (total_lines as f32 + 5.0) * self.metrics.line_height;
+
+        // Estimate line width without measuring (measuring is expensive)
+        let max_line_width = longest_line_chars as f32 * self.metrics.space_width;
 
         // Add 5 characters worth of padding
         let padding = 5.0 * self.metrics.space_width;

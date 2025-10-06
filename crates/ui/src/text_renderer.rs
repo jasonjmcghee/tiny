@@ -5,6 +5,7 @@
 //! Palette: token → color mapping (instant theme switching)
 
 use ahash::HashMap;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::ops::Range;
 use tiny_core::{tree, DocTree as Tree};
 use tiny_sdk::{LayoutPos, PhysicalPos};
@@ -574,13 +575,13 @@ impl TextRenderer {
         if self.line_cache.is_empty() {
             self.visible_lines = 0..0;
         } else if start_line.is_none() && end_line.is_none() {
-            // No lines found in visible range - fallback to showing all
-            self.visible_lines = 0..self.line_cache.len() as u32;
+            // No lines found in visible range - show nothing
+            self.visible_lines = 0..0;
         } else {
             self.visible_lines = start_line.unwrap_or(0)..end_line.unwrap_or(0);
         }
 
-        // Find visible characters
+        // Find visible characters (includes all chars from visible lines)
         self.visible_chars.clear();
         for line_idx in self.visible_lines.clone() {
             if let Some(line) = self.line_cache.get(line_idx as usize) {

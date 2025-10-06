@@ -30,7 +30,7 @@ use wgpu::{
 // Constants
 const ATLAS_SIZE: f32 = 2048.0;
 const RECT_BUFFER_SIZE: u64 = 65536; // 64KB
-const GLYPH_BUFFER_SIZE: u64 = 4 * 1024 * 1024; // 4MB
+const GLYPH_BUFFER_SIZE: u64 = 4 * 1024 * 1024; // 4MB - enough for ~28K glyphs with proper culling
 
 /// Vertex data for rectangles (unit quad)
 #[repr(C)]
@@ -1472,6 +1472,11 @@ impl GpuRenderer {
             return;
         }
 
+        // Generate vertices
+        let vertices = instances_to_vertices(instances);
+        let data = bytemuck::cast_slice(&vertices);
+        let data_size = data.len() as u64;
+
         // Create buffer on demand if it doesn't exist
         let buffer = self.buffers.create_or_get(
             config.buffer_name,
@@ -1479,39 +1484,84 @@ impl GpuRenderer {
             BufferUsages::VERTEX | BufferUsages::COPY_DST,
         );
 
-        // Generate and write vertices (no caching - GPU driver handles this)
-        let vertices = instances_to_vertices(instances);
-        self.queue
-            .write_buffer(buffer, 0, bytemuck::cast_slice(&vertices));
+        // Check if data fits in buffer
+        if data_size > buffer.size() {
+            // Data exceeds buffer - batch into multiple draw calls
+            eprintln!(
+                "Warning: Glyph data ({:.2}MB) exceeds buffer size ({:.2}MB), batching draws. Consider horizontal culling for long lines.",
+                data_size as f64 / (1024.0 * 1024.0),
+                buffer.size() as f64 / (1024.0 * 1024.0)
+            );
 
-        // Set scissor if provided
-        if let Some((x, y, w, h)) = config.scissor {
-            render_pass.set_scissor_rect(x, y, w, h);
-        }
+            let batch_size = buffer.size() as usize;
+            let vertex_size = std::mem::size_of::<GlyphVertex>();
+            let vertices_per_batch = batch_size / vertex_size;
 
-        // Choose pipeline and bind groups
-        let has_themed = self.themed_glyph_pipeline.is_some()
-            && self.theme_bind_group.is_some()
-            && self.uniforms.bind_group("themed_uniform").is_some();
+            for chunk in vertices.chunks(vertices_per_batch) {
+                self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(chunk));
 
-        if config.use_themed && has_themed {
-            let themed_uniform_bg = self.uniforms.bind_group("themed_uniform").unwrap();
-            render_pass.set_pipeline(self.themed_glyph_pipeline.as_ref().unwrap());
-            render_pass.set_bind_group(0, themed_uniform_bg, &[]);
-            render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
-            render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
+                // Set scissor for this batch
+                if let Some((x, y, w, h)) = config.scissor {
+                    render_pass.set_scissor_rect(x, y, w, h);
+                }
+
+                // Choose pipeline and bind groups
+                let has_themed = self.themed_glyph_pipeline.is_some()
+                    && self.theme_bind_group.is_some()
+                    && self.uniforms.bind_group("themed_uniform").is_some();
+
+                if config.use_themed && has_themed {
+                    let themed_uniform_bg = self.uniforms.bind_group("themed_uniform").unwrap();
+                    render_pass.set_pipeline(self.themed_glyph_pipeline.as_ref().unwrap());
+                    render_pass.set_bind_group(0, themed_uniform_bg, &[]);
+                    render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+                    render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
+                } else {
+                    let rect_uniform_bg = self
+                        .uniforms
+                        .bind_group("rect_uniform")
+                        .expect("rect_uniform not found");
+                    render_pass.set_pipeline(&self.glyph_pipeline);
+                    render_pass.set_bind_group(0, rect_uniform_bg, &[]);
+                    render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+                }
+
+                render_pass.set_vertex_buffer(0, buffer.slice(..));
+                render_pass.draw(0..chunk.len() as u32, 0..1);
+            }
         } else {
-            let rect_uniform_bg = self
-                .uniforms
-                .bind_group("rect_uniform")
-                .expect("rect_uniform not found");
-            render_pass.set_pipeline(&self.glyph_pipeline);
-            render_pass.set_bind_group(0, rect_uniform_bg, &[]);
-            render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
-        }
+            // Normal path - data fits in buffer
+            self.queue.write_buffer(buffer, 0, data);
 
-        render_pass.set_vertex_buffer(0, buffer.slice(..));
-        render_pass.draw(0..vertices.len() as u32, 0..1);
+            // Set scissor if provided
+            if let Some((x, y, w, h)) = config.scissor {
+                render_pass.set_scissor_rect(x, y, w, h);
+            }
+
+            // Choose pipeline and bind groups
+            let has_themed = self.themed_glyph_pipeline.is_some()
+                && self.theme_bind_group.is_some()
+                && self.uniforms.bind_group("themed_uniform").is_some();
+
+            if config.use_themed && has_themed {
+                let themed_uniform_bg = self.uniforms.bind_group("themed_uniform").unwrap();
+                render_pass.set_pipeline(self.themed_glyph_pipeline.as_ref().unwrap());
+                render_pass.set_bind_group(0, themed_uniform_bg, &[]);
+                render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+                render_pass.set_bind_group(2, self.theme_bind_group.as_ref().unwrap(), &[]);
+            } else {
+                let rect_uniform_bg = self
+                    .uniforms
+                    .bind_group("rect_uniform")
+                    .expect("rect_uniform not found");
+                render_pass.set_pipeline(&self.glyph_pipeline);
+                render_pass.set_bind_group(0, rect_uniform_bg, &[]);
+                render_pass.set_bind_group(1, &self.glyph_bind_group, &[]);
+            }
+
+            render_pass.set_vertex_buffer(0, buffer.slice(..));
+            render_pass.draw(0..vertices.len() as u32, 0..1);
+        }
     }
 
     /// Draw batched glyphs with per-batch scissor rects

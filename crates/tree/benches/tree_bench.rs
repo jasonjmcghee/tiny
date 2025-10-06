@@ -105,14 +105,34 @@ fn bench_navigation(c: &mut Criterion) {
             });
         });
 
-        // Line to byte conversion (goto line)
-        group.bench_with_input(BenchmarkId::new("line_to_byte", size), size, |b, _| {
+        // Line to byte conversion - CACHED (realistic usage)
+        group.bench_with_input(BenchmarkId::new("line_to_byte_cached", size), size, |b, _| {
             let line_count = tree.line_count();
             let lines: Vec<u32> = (0..100).map(|i| (line_count * i) / 100).collect();
 
             b.iter(|| {
                 for &line in &lines {
                     std::hint::black_box(tree.line_to_byte(line));
+                }
+            });
+        });
+
+        // Line to byte conversion - UNCACHED (algorithm performance)
+        group.bench_with_input(BenchmarkId::new("line_to_byte_uncached", size), size, |b, _| {
+            let line_count = tree.line_count();
+            let lines: Vec<u32> = (0..100).map(|i| (line_count * i) / 100).collect();
+
+            b.iter(|| {
+                // Create new tree without cache each iteration
+                let uncached_tree = tiny_tree::Tree {
+                    root: tree.root.clone(),
+                    version: tree.version,
+                    cached_flattened_text: tree.cached_flattened_text.clone(),
+                    cached_line_boundaries: None, // Force cursor fallback
+                };
+
+                for &line in &lines {
+                    std::hint::black_box(uncached_tree.line_to_byte(line));
                 }
             });
         });
@@ -722,8 +742,15 @@ fn bench_utf16_point_conversions(c: &mut Criterion) {
         let positions: Vec<(u32, u32)> = (0..100)
             .map(|i| {
                 let line = (tree.line_count() * i) / 100;
-                let line_len = tree.line_text_trimmed(line).len() as u32;
-                let col = if line_len > 0 { line_len / 2 } else { 0 };
+                let line_text = tree.line_text_trimmed(line);
+                let char_count = line_text.chars().count();
+                let mid_char = if char_count > 0 { char_count / 2 } else { 0 };
+                // Calculate byte offset at character boundary
+                let col = line_text
+                    .chars()
+                    .take(mid_char)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>() as u32;
                 (line, col)
             })
             .collect();
