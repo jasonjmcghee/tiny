@@ -453,7 +453,14 @@ impl Viewport {
         let doc_x = pos.x.0.max(0.0);
         let doc_y = pos.y.0.max(0.0);
 
-        let line = (doc_y / self.metrics.line_height) as u32;
+        // Clamp line to valid document bounds
+        let unclamped_line = (doc_y / self.metrics.line_height) as u32;
+        let total_lines = tree.line_count();
+        let line = if total_lines > 0 {
+            unclamped_line.min(total_lines - 1)
+        } else {
+            0
+        };
 
         let column = if let Some(font_system) = &self.font_system {
             // Get the line text and use font system's accurate hit testing
@@ -465,18 +472,32 @@ impl Viewport {
                 let line_text_trimmed = line_text.trim_end_matches('\n').trim_end_matches('\r');
 
                 // Use shaped version for proper ligature/cluster handling
-                font_system.hit_test_line_shaped(
+                let col = font_system.hit_test_line_shaped(
                     line_text_trimmed,
                     self.metrics.font_size,
                     self.scale_factor,
                     doc_x,
-                )
+                );
+
+                // Clamp column to line length
+                let line_char_count = line_text_trimmed.chars().count() as u32;
+                col.min(line_char_count)
             } else {
                 0
             }
         } else {
             // Fallback to space-width estimation
-            (doc_x / self.metrics.space_width) as u32
+            let col = (doc_x / self.metrics.space_width) as u32;
+            // Clamp to line length
+            if let Some(line_start) = tree.line_to_byte(line) {
+                let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
+                let line_text = tree.get_text_slice(line_start..line_end);
+                let line_text_trimmed = line_text.trim_end_matches('\n').trim_end_matches('\r');
+                let line_char_count = line_text_trimmed.chars().count() as u32;
+                col.min(line_char_count)
+            } else {
+                0
+            }
         };
 
         DocPos {

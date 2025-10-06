@@ -508,11 +508,16 @@ impl InputHandler {
             y: tiny_sdk::LogicalPixels(y as f32),
         };
 
-        // Store drag anchor in document coordinates
-        self.drag_anchor = Some(viewport.layout_to_doc(tiny_sdk::LayoutPos {
-            x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
-            y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
-        }));
+        // Store drag anchor in document coordinates (properly clamped to document bounds)
+        let tree = doc.read();
+        self.drag_anchor = Some(viewport.layout_to_doc_with_tree(
+            tiny_sdk::LayoutPos {
+                x: tiny_sdk::LogicalPixels(x as f32 + viewport.scroll.x.0),
+                y: tiny_sdk::LogicalPixels(y as f32 + viewport.scroll.y.0),
+            },
+            &tree,
+        ));
+        drop(tree);
 
         // Handle the click
         self.on_mouse_click(doc, viewport, pos, MouseButton::Left, alt_held, shift_held);
