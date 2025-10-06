@@ -224,6 +224,24 @@ impl Renderer {
         }
     }
 
+    pub fn set_line_height(&mut self, line_height: f32) {
+        self.viewport.metrics.line_height = line_height;
+        self.layout_dirty = true;
+        self.glyphs_dirty = true;
+        self.line_numbers_dirty = true;
+        self.ui_dirty = true;
+
+        // Notify plugins about the viewport change
+        let mut state = self.plugin_state.lock().unwrap();
+        state.viewport_info = PluginState::from_viewport(&self.viewport);
+
+        if let Some(ref loader_arc) = self.plugin_loader {
+            if let Ok(mut loader) = loader_arc.lock() {
+                state.sync_all(&mut loader);
+            }
+        }
+    }
+
     pub fn set_gpu_renderer(&mut self, gpu_renderer: &GpuRenderer) {
         if self.gpu_renderer.is_none() {
             self.gpu_renderer = Some(gpu_renderer as *const _);
@@ -1289,7 +1307,8 @@ impl Renderer {
                     relative_pos: g.relative_pos,
                     shader_id: 0,
                     format: 0,
-                    _padding: [0; 2],
+                    atlas_index: g.atlas_index,
+                    _padding: 0,
                 }
             })
             .collect();

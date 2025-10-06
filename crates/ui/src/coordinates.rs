@@ -235,6 +235,11 @@ impl Viewport {
         self.metrics = TextMetrics::new(font_size);
     }
 
+    /// Update metrics from a source of truth (single-direction data flow)
+    pub fn update_metrics(&mut self, metrics: &TextMetrics) {
+        self.metrics = metrics.clone();
+    }
+
     /// Create a child viewport with custom bounds (for widgets/overlays)
     /// Inherits metrics from parent, but has independent bounds + scroll
     pub fn child(&self, bounds: LayoutRect) -> Self {
@@ -456,7 +461,8 @@ impl Viewport {
                 let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
                 let line_text = tree.get_text_slice(line_start..line_end);
 
-                font_system.hit_test_line(
+                // Use shaped version for proper ligature/cluster handling
+                font_system.hit_test_line_shaped(
                     &line_text,
                     self.metrics.font_size,
                     self.scale_factor,

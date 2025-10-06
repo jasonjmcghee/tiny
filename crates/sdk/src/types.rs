@@ -323,8 +323,10 @@ pub struct GlyphInstance {
     pub token_id: u8,
     /// Format flags for visual effects (0x01 = half-opacity, 0x02 = underline, 0x04 = highlight)
     pub format: u8,
+    /// Atlas index: 0 = monochrome (R8), 1 = color (RGBA8)
+    pub atlas_index: u8,
     /// Padding for alignment
-    pub _padding: [u8; 2],
+    pub _padding: u8,
 }
 
 // === Rect ===

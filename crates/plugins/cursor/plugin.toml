@@ -29,7 +29,7 @@ color = 0xE1E1E1FF  # White cursor by default
 height_scale = 1.0  # Multiplier for line height
 
 # Position adjustment
-x_offset = -2.0  # Pixels to shift left for better alignment (compensates for font bearing)
+x_offset = 0.0  # Pixels to shift left for better alignment (compensates for font bearing)
 
 [exports]
 # Entry point function name in the compiled library

@@ -284,11 +284,14 @@ impl PluginLoader {
 
             // Apply config from the loaded plugin
             if let Some(configurable) = instance.as_configurable() {
-                // Serialize toml::Value back to string
-                let config_str = toml::to_string(&loaded.config.config)
-                    .unwrap_or_else(|_| String::new());
+                // Wrap config in [config] section before serializing
+                let mut config_toml = toml::value::Table::new();
+                config_toml.insert("config".to_string(), loaded.config.config.clone());
+                let config_str = toml::to_string(&config_toml)
+                    .expect("Failed to serialize plugin config to TOML");
                 if !config_str.is_empty() {
-                    let _ = configurable.config_updated(&config_str);
+                    configurable.config_updated(&config_str)
+                        .map_err(|e| PluginError::Other(format!("Failed to apply plugin config: {}", e).into()))?;
                 }
             }
 

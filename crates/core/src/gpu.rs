@@ -70,6 +70,7 @@ pub struct GlyphVertex {
     pub token_id: u32,
     pub relative_pos: f32,
     pub format: u32,
+    pub atlas_index: u32,
 }
 
 /// Uniform data for shaders
@@ -126,8 +127,10 @@ pub struct GpuRenderer {
     pub current_time: f32,
     pub current_theme_mode: u32,
 
-    // Glyph atlas texture
+    // Glyph atlas texture (monochrome R8)
     glyph_texture: Texture,
+    // Color glyph atlas texture (RGBA8 for emojis)
+    color_glyph_texture: Texture,
     glyph_bind_group: BindGroup,
 
     // Store registered IDs for plugin context
@@ -199,6 +202,7 @@ fn create_glyph_vertices(
     token_id: u32,
     relative_pos: f32,
     format: u32,
+    atlas_index: u32,
 ) -> [GlyphVertex; 6] {
     let [u0, v0, u1, v1] = tex_coords;
     quad_vertices(x, y, w, h, |[px, py], is_right| {
@@ -210,6 +214,7 @@ fn create_glyph_vertices(
             token_id,
             relative_pos,
             format,
+            atlas_index,
         }
     })
 }
@@ -230,6 +235,7 @@ fn instances_to_vertices(instances: &[GlyphInstance]) -> Vec<GlyphVertex> {
                 glyph.token_id as u32,
                 glyph.relative_pos,
                 glyph.format as u32,
+                glyph.atlas_index as u32,
             )
         })
         .collect()
@@ -243,13 +249,14 @@ fn vertex_attr(offset: u64, location: u32, format: VertexFormat) -> VertexAttrib
     }
 }
 
-fn glyph_vertex_attributes() -> [VertexAttribute; 5] {
+fn glyph_vertex_attributes() -> [VertexAttribute; 6] {
     [
-        vertex_attr(0, 0, VertexFormat::Float32x2),
-        vertex_attr(8, 1, VertexFormat::Float32x2),
-        vertex_attr(16, 2, VertexFormat::Uint32),
-        vertex_attr(20, 3, VertexFormat::Float32),
-        vertex_attr(24, 4, VertexFormat::Uint32),
+        vertex_attr(0, 0, VertexFormat::Float32x2),   // position
+        vertex_attr(8, 1, VertexFormat::Float32x2),   // tex_coord
+        vertex_attr(16, 2, VertexFormat::Uint32),     // token_id
+        vertex_attr(20, 3, VertexFormat::Float32),    // relative_pos
+        vertex_attr(24, 4, VertexFormat::Uint32),     // format
+        vertex_attr(28, 5, VertexFormat::Uint32),     // atlas_index
     ]
 }
 
@@ -662,6 +669,28 @@ impl GpuRenderer {
         );
     }
 
+    pub fn upload_color_font_atlas(&self, atlas_data: &[u8], width: u32, height: u32) {
+        self.queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &self.color_glyph_texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            atlas_data,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4), // For RGBA8 format, 4 bytes per pixel
+                rows_per_image: Some(height),
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Helper to create and upload theme texture
     fn create_theme_texture(
         &self,
@@ -989,8 +1018,9 @@ impl GpuRenderer {
         );
         let glyph_shader = create_shader("Glyph Shader", include_str!("shaders/glyph.wgsl"));
 
+        // Monochrome glyph atlas (R8)
         let glyph_texture = device.create_texture(&TextureDescriptor {
-            label: Some("Glyph Atlas"),
+            label: Some("Glyph Atlas (Monochrome)"),
             size: Extent3d {
                 width: 2048,
                 height: 2048,
@@ -1004,7 +1034,25 @@ impl GpuRenderer {
             view_formats: &[],
         });
 
+        // Color glyph atlas (RGBA8 for emojis)
+        let color_glyph_texture = device.create_texture(&TextureDescriptor {
+            label: Some("Glyph Atlas (Color)"),
+            size: Extent3d {
+                width: 2048,
+                height: 2048,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
         let glyph_texture_view = glyph_texture.create_view(&TextureViewDescriptor::default());
+        let color_glyph_texture_view =
+            color_glyph_texture.create_view(&TextureViewDescriptor::default());
         let glyph_sampler = device.create_sampler(&SamplerDescriptor {
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
@@ -1030,14 +1078,51 @@ impl GpuRenderer {
 
         let rect_uniform_bind_group_layout = uniforms.layout("rect_uniform").unwrap().clone();
 
-        let glyph_bind_group_layout = create_texture_bind_group_layout(
-            &device,
-            "Glyph Bind Group Layout",
-            TextureViewDimension::D2,
-        );
+        // Create bind group layout for dual atlases
+        let glyph_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Glyph Bind Group Layout (Dual Atlas)"),
+            entries: &[
+                // Binding 0: Monochrome texture
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 1: Monochrome sampler
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Binding 2: Color texture
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 3: Color sampler
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let glyph_bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Glyph Bind Group"),
+            label: Some("Glyph Bind Group (Dual Atlas)"),
             layout: &glyph_bind_group_layout,
             entries: &[
                 BindGroupEntry {
@@ -1047,6 +1132,14 @@ impl GpuRenderer {
                 BindGroupEntry {
                     binding: 1,
                     resource: BindingResource::Sampler(&glyph_sampler),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(&color_glyph_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Sampler(&glyph_sampler), // Reuse same sampler
                 },
             ],
         });
@@ -1166,6 +1259,7 @@ impl GpuRenderer {
             current_time: 0.0,
             current_theme_mode: 0,
             glyph_texture,
+            color_glyph_texture,
             glyph_bind_group,
             rect_pipeline_id,
             uniform_bind_group_id,

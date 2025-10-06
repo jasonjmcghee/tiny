@@ -68,7 +68,7 @@ impl LanguageSpec {
             ParserSetup::Native(lang) => lang.clone(),
             ParserSetup::Wasm { .. } => {
                 // For WASM, we need to load it - use the global loader
-                let mut parser = self.setup_parser().expect("Failed to setup parser");
+                let parser = self.setup_parser().expect("Failed to setup parser");
                 parser.language().expect("Parser has no language set").clone()
             }
         }
@@ -326,9 +326,6 @@ pub struct SyntaxHighlighter {
     highlights_query: &'static str,
     /// Syntax highlighting mode (for debugging/validation)
     mode: Arc<ArcSwap<SyntaxMode>>,
-    /// Optional inline/secondary language (None for single-grammar languages)
-    inline_language: Option<Language>,
-    inline_highlights_query: Option<&'static str>,
 }
 
 /// Text edit information for tree-sitter incremental parsing
@@ -514,16 +511,8 @@ impl SyntaxHighlighter {
                 if let Some(ref ts_tree) = tree {
                     // Compile queries on first use (lazy initialization)
                     if query.is_none() {
-                        println!(
-                            "SYNTAX [{}]: Compiling tree-sitter query on background thread...",
-                            language_name
-                        );
                         match Query::new(&language_clone, highlights_query_clone) {
                             Ok(compiled_query) => {
-                                println!(
-                                    "SYNTAX [{}]: Query compilation successful",
-                                    language_name
-                                );
                                 query = Some(compiled_query);
                             }
                             Err(e) => {
@@ -543,10 +532,6 @@ impl SyntaxHighlighter {
                         {
                             match Query::new(inline_lang, inline_query_str) {
                                 Ok(compiled_query) => {
-                                    println!(
-                                        "SYNTAX [{}]: Inline query compilation successful",
-                                        language_name
-                                    );
                                     inline_query = Some(compiled_query);
                                 }
                                 Err(e) => {
@@ -564,10 +549,6 @@ impl SyntaxHighlighter {
                         if let Some(inj_query_str) = injections_query_str {
                             match Query::new(&language_clone, inj_query_str) {
                                 Ok(compiled_query) => {
-                                    println!(
-                                        "SYNTAX [{}]: Injections query compilation successful",
-                                        language_name
-                                    );
                                     injections_query = Some(compiled_query);
                                 }
                                 Err(e) => {
@@ -637,17 +618,10 @@ impl SyntaxHighlighter {
                         final_request.text.as_bytes(),
                     );
 
-                    let mut capture_count = 0;
-                    let mut capture_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
                     while let Some(match_) = matches.next() {
                         for capture in match_.captures {
                             let capture_name = &capture_names[capture.index as usize];
                             let node_type = capture.node.kind();
-                            capture_count += 1;
-
-                            // Track which captures we're seeing
-                            *capture_type_counts.entry(capture_name.to_string()).or_insert(0) += 1;
 
                             // Check for markdown-specific styling
                             let token_type = if language_name == "markdown" {
@@ -740,31 +714,15 @@ impl SyntaxHighlighter {
                                     effect: EffectType::Token(Self::token_type_to_id(token)),
                                     priority: priority::SYNTAX,
                                 });
-                            } else if capture_count <= 10 {
-                                println!("  -> No token type mapping for '{}'", capture_name);
                             }
                         }
                     }
 
                     // Print top 10 most common captures
-                    if !capture_type_counts.is_empty() {
-                        let mut sorted: Vec<_> = capture_type_counts.iter().collect();
-                        sorted.sort_by(|a, b| b.1.cmp(a.1));
-                        println!("SYNTAX [{}]: Top captures:", language_name);
-                        for (name, count) in sorted.iter().take(10) {
-                            println!("  {} x {}", count, name);
-                        }
-                    }
-
-                    println!("SYNTAX [{}]: Block effects before injections: {}", language_name, effects.len());
-
                     // Process language injections (e.g., code blocks in markdown)
-                    println!("SYNTAX [{}]: Found {} language injections", language_name, injections.len());
                     for (lang, range) in injections {
-                        println!("  -> Injecting '{}' at range {}..{}", lang, range.start, range.end);
                         if let Some(mut injection_parser) = Self::create_injection_parser(&lang) {
                             let code_text = &final_request.text[range.clone()];
-                            println!("     Code text length: {} bytes", code_text.len());
                             if let Some(injection_tree) = injection_parser.0.parse(code_text, None) {
                                 let mut injection_cursor = QueryCursor::new();
                                 let mut injection_matches = injection_cursor.matches(
@@ -773,7 +731,6 @@ impl SyntaxHighlighter {
                                     code_text.as_bytes(),
                                 );
 
-                                let mut injection_effect_count = 0;
                                 while let Some(match_) = injection_matches.next() {
                                     for capture in match_.captures {
                                         let capture_name = &injection_parser.1.capture_names()[capture.index as usize];
@@ -785,28 +742,16 @@ impl SyntaxHighlighter {
                                                 effect: EffectType::Token(Self::token_type_to_id(token)),
                                                 priority: priority::SYNTAX + 1, // Higher priority than base markdown
                                             });
-                                            injection_effect_count += 1;
                                         }
                                     }
                                 }
-                                println!("     Generated {} effects for '{}' injection", injection_effect_count, lang);
-                            } else {
-                                println!("     Failed to parse '{}' code", lang);
                             }
-                        } else {
-                            println!("     No parser available for language '{}'", lang);
                         }
                     }
 
                     // For dual-grammar languages, also extract inline syntax highlighting
-                    println!("SYNTAX [{}]: md_tree={}, inline_query={}", language_name, md_tree.is_some(), inline_query.is_some());
-                    if let Some(ref md_t) = &md_tree {
-                        println!("SYNTAX [{}]: Markdown has {} inline trees", language_name, md_t.inline_trees().len());
-                    }
                     if let (Some(ref md_t), Some(ref inline_q)) = (&md_tree, &inline_query) {
                         let inline_capture_names = inline_q.capture_names();
-                        let mut inline_capture_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                        let mut inline_effect_count = 0;
 
                         for inline_tree in md_t.inline_trees() {
                             let mut inline_cursor = QueryCursor::new();
@@ -820,7 +765,6 @@ impl SyntaxHighlighter {
                                 for capture in match_.captures {
                                     let capture_name = &inline_capture_names[capture.index as usize];
                                     let node_type = capture.node.kind();
-                                    *inline_capture_counts.entry(capture_name.to_string()).or_insert(0) += 1;
 
                                     // Special handling for inline markdown elements
                                     let (token_type, effect_priority) = match *capture_name {
@@ -847,30 +791,15 @@ impl SyntaxHighlighter {
                                             effect: EffectType::Token(Self::token_type_to_id(token)),
                                             priority: effect_priority,
                                         });
-                                        inline_effect_count += 1;
                                     }
                                 }
-                            }
-                        }
-
-                        println!("SYNTAX [{}]: Inline effects: {}", language_name, inline_effect_count);
-                        if !inline_capture_counts.is_empty() {
-                            let mut sorted: Vec<_> = inline_capture_counts.iter().collect();
-                            sorted.sort_by(|a, b| b.1.cmp(a.1));
-                            println!("SYNTAX [{}]: Top inline captures:", language_name);
-                            for (name, count) in sorted.iter().take(10) {
-                                println!("  {} x {}", count, name);
                             }
                         }
                     }
 
                     // Sort by range and remove overlaps for clean rendering
-                    let effects_before = effects.len();
-                    println!("SYNTAX [{}]: Total effects before cleanup: {}", language_name, effects_before);
                     effects.sort_by_key(|e| (e.range.start, e.range.end));
                     let cleaned = Self::remove_overlaps(effects);
-
-                    println!("SYNTAX [{}]: Generated {} total effects (after cleanup, removed {})", language_name, cleaned.len(), effects_before - cleaned.len());
 
                     // Atomic swap - readers never block! Old highlighting stays until this completes
                     highlights_clone.store(Arc::new(cleaned));
@@ -899,8 +828,6 @@ impl SyntaxHighlighter {
             language: config.language,
             highlights_query: config.highlights_query,
             mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)), // Default to incremental
-            inline_language: config.inline_language,
-            inline_highlights_query: config.inline_highlights_query,
         })
     }
 
@@ -964,8 +891,6 @@ impl SyntaxHighlighter {
             language: tree_sitter_rust::LANGUAGE.into(), // Dummy language, never used
             highlights_query: "",
             mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)),
-            inline_language: None,
-            inline_highlights_query: None,
         }
     }
 

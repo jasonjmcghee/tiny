@@ -19,6 +19,7 @@ pub struct UnifiedGlyph {
     pub char_byte_offset: usize,   // Byte position in document
     pub token_id: u16,             // Style token ID
     pub relative_pos: f32,         // Position within token (0.0-1.0)
+    pub atlas_index: u8,           // 0 = monochrome (R8), 1 = color (RGBA8)
 }
 
 // Legacy type alias for compatibility during migration
@@ -63,6 +64,8 @@ pub struct TextRenderer {
     pub line_cache: Vec<LineInfo>,
     /// Document version for cache invalidation
     pub layout_version: u64,
+    /// Cluster map for ligature-aware cursor positioning
+    pub cluster_maps: Vec<tiny_font::ClusterMap>,
 
     // === SYNTAX STATE ===
     /// Syntax state
@@ -87,6 +90,7 @@ impl TextRenderer {
             layout_cache: Vec::new(),
             line_cache: Vec::new(),
             layout_version: u64::MAX, // Force initial update
+            cluster_maps: Vec::new(),
             syntax_state: SyntaxState {
                 stable_tokens: Vec::new(),
                 dirty_range: None,
@@ -148,6 +152,7 @@ impl TextRenderer {
 
         self.layout_cache.clear();
         self.line_cache.clear();
+        self.cluster_maps.clear();
 
         // Get text from tree (tree handles caching internally)
         let text = tree.flatten_to_string();
@@ -162,18 +167,24 @@ impl TextRenderer {
         let x_offset = 0.0;
         let mut y_pos = 0.0;
 
-        let text_len = text.len();
-
         for (line_idx, line_text) in lines.iter().enumerate() {
             let line_start_char = char_index;
             let line_start_byte = byte_offset;
 
-            // Layout this line
-            let layout = font_system.layout_text_scaled(
+            // Layout this line with shaping (supports ligatures, proper kerning)
+            let tiny_font::ShapedTextLayout {
+                glyphs: layout_glyphs,
+                cluster_map,
+                ..
+            } = font_system.layout_text_shaped_with_tabs(
                 line_text,
                 viewport.metrics.font_size,
                 viewport.scale_factor,
+                None, // Use default shaping options
             );
+
+            // Store the cluster map for this line
+            self.cluster_maps.push(cluster_map);
 
             // Build a mapping from source text chars to their byte positions
             // This handles tabs which expand to multiple glyphs but occupy 1 byte
@@ -188,7 +199,7 @@ impl TextRenderer {
             let mut source_char_idx = 0;
 
             // Add glyphs to cache
-            for (glyph_idx, glyph) in layout.glyphs.iter().enumerate() {
+            for (glyph_idx, glyph) in layout_glyphs.iter().enumerate() {
                 let layout_pos = LayoutPos::new(
                     x_offset + glyph.pos.x.0 / viewport.scale_factor,
                     y_pos + glyph.pos.y.0 / viewport.scale_factor,
@@ -213,11 +224,12 @@ impl TextRenderer {
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
                     layout_pos,
-                    physical_pos: glyph.pos,
+                    physical_pos: glyph.pos.clone(),
                     tex_coords: glyph.tex_coords,
                     char_byte_offset,
                     token_id,
                     relative_pos,
+                    atlas_index: glyph.atlas_index,
                 });
 
                 char_index += 1;
@@ -230,8 +242,7 @@ impl TextRenderer {
                     // If source is tab but glyph is space, we're in an expansion
                     if source_char == '\t' && glyph.char == ' ' {
                         // Check if we're at the last space of the tab expansion (tab width = 4)
-                        let next_glyph_is_not_space = layout
-                            .glyphs
+                        let next_glyph_is_not_space = layout_glyphs
                             .get(glyph_idx + 1)
                             .map(|g| g.char != ' ')
                             .unwrap_or(true);
@@ -271,6 +282,7 @@ impl TextRenderer {
                     char_byte_offset: byte_offset,
                     token_id,
                     relative_pos,
+                    atlas_index: 0, // Invisible glyph, no atlas needed
                 });
                 byte_offset += 1;
                 char_index += 1;
@@ -288,6 +300,7 @@ impl TextRenderer {
                     char_byte_offset: byte_offset,
                     token_id,
                     relative_pos,
+                    atlas_index: 0, // Invisible glyph, no atlas needed
                 });
                 byte_offset += 1;
                 char_index += 1;
@@ -551,6 +564,51 @@ impl TextRenderer {
             .iter()
             .filter_map(|&idx| self.layout_cache.get(idx).cloned())
             .collect()
+    }
+
+    // === Cluster-Aware Cursor Positioning ===
+
+    /// Get the cluster map for a specific line
+    pub fn get_cluster_map(&self, line: u32) -> Option<&tiny_font::ClusterMap> {
+        self.cluster_maps.get(line as usize)
+    }
+
+    /// Check if a byte position within a line is at a cluster boundary (valid cursor position)
+    /// This is essential for ligatures - cursor can only be placed at cluster boundaries
+    pub fn is_valid_cursor_position(&self, line: u32, byte_offset_in_line: usize) -> bool {
+        if let Some(cluster_map) = self.get_cluster_map(line) {
+            cluster_map.is_cluster_boundary(byte_offset_in_line)
+        } else {
+            true // If no cluster map, all positions are valid (fallback)
+        }
+    }
+
+    /// Snap a byte position to the nearest valid cluster boundary
+    /// Returns the adjusted byte offset within the line
+    pub fn snap_to_cluster_boundary(&self, line: u32, byte_offset_in_line: usize) -> usize {
+        if let Some(cluster_map) = self.get_cluster_map(line) {
+            cluster_map.snap_to_cluster_boundary(byte_offset_in_line)
+        } else {
+            byte_offset_in_line // No cluster map, return as-is
+        }
+    }
+
+    /// Check if a cluster at a given byte position is a ligature
+    pub fn is_ligature_at(&self, line: u32, byte_offset_in_line: usize) -> bool {
+        if let Some(cluster_map) = self.get_cluster_map(line) {
+            // Find which cluster this byte is in
+            for cluster_idx in 0..cluster_map.cluster_count() {
+                if cluster_map.is_ligature(cluster_idx) {
+                    // Check if this byte is in this ligature cluster
+                    if let Some((start, end)) = cluster_map.glyph_to_byte_range(cluster_idx) {
+                        if byte_offset_in_line >= start && byte_offset_in_line < end {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Upload style buffer to GPU

@@ -349,7 +349,8 @@ impl TextView {
                 shader_id: 0,
                 token_id: glyph.token_id as u8,
                 format: 0,
-                _padding: [0, 0],
+                atlas_index: glyph.atlas_index,
+                _padding: 0,
             });
         }
 

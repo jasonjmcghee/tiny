@@ -24,6 +24,8 @@ pub struct EditorConfig {
     pub window_height: f32,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    #[serde(default = "default_line_height")]
+    pub line_height: f32,
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_title_bar_height")]
@@ -79,6 +81,7 @@ impl Default for EditorConfig {
             window_width: default_window_width(),
             window_height: default_window_height(),
             font_size: default_font_size(),
+            line_height: default_line_height(),
             theme: default_theme(),
             title_bar_height: default_title_bar_height(),
             scroll_lock_enabled: default_scroll_lock_enabled(),
@@ -140,6 +143,9 @@ fn default_window_height() -> f32 {
 }
 fn default_font_size() -> f32 {
     14.0
+}
+fn default_line_height() -> f32 {
+    1.4 // Multiplier: line height = font_size * 1.4
 }
 fn default_theme() -> String {
     "dark".to_string()

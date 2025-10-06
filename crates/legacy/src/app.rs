@@ -4,6 +4,7 @@
 
 use crate::{
     accelerator::{Modifiers, MouseButton, Trigger, WheelDirection},
+    coordinates::TextMetrics,
     input::{EventBus, InputAction},
     lsp_manager::LspManager,
     render::Renderer,
@@ -124,7 +125,9 @@ pub struct TinyApp {
     // Settings
     window_title: String,
     window_size: (f32, f32),
-    font_size: f32,
+
+    // Single source of truth for text metrics
+    text_metrics: TextMetrics,
 
     // Title bar settings
     title_bar_height: f32, // Logical pixels
@@ -471,6 +474,9 @@ impl TinyApp {
         let event_bus = EventBus::new();
         let shortcuts = ShortcutRegistry::new();
 
+        // Default text metrics: 14pt font with 1.4x line height
+        let text_metrics = TextMetrics::new(14.0);
+
         Self {
             window: None,
             gpu_renderer: None,
@@ -484,7 +490,7 @@ impl TinyApp {
             orchestrator: PluginOrchestrator::new(),
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
-            font_size: 14.0,
+            text_metrics,
             title_bar_height: 28.0,    // Logical pixels
             scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
@@ -503,7 +509,12 @@ impl TinyApp {
     pub fn with_config(mut self, config: &crate::config::AppConfig) -> Self {
         self.window_title = config.editor.window_title.clone();
         self.window_size = (config.editor.window_width, config.editor.window_height);
-        self.font_size = config.editor.font_size;
+
+        // Create text metrics from config
+        let mut text_metrics = TextMetrics::new(config.editor.font_size);
+        text_metrics.line_height = config.editor.font_size * config.editor.line_height;
+        self.text_metrics = text_metrics;
+
         self.title_bar_height = config.editor.title_bar_height;
         self.scroll_lock_enabled = config.editor.scroll_lock_enabled;
         self.continuous_rendering = config.editor.continuous_rendering;
@@ -521,7 +532,7 @@ impl TinyApp {
     }
 
     pub fn with_font_size(mut self, size: f32) -> Self {
-        self.font_size = size;
+        self.text_metrics = TextMetrics::new(size);
         self
     }
 
@@ -539,32 +550,41 @@ impl TinyApp {
     /// Adjust font size (for Cmd+=/Cmd+-)
     fn adjust_font_size(&mut self, increase: bool) {
         let delta = if increase { 1.0 } else { -1.0 };
-        self.font_size = (self.font_size + delta).clamp(6.0, 72.0); // Clamp between reasonable limits
+        let new_font_size = (self.text_metrics.font_size + delta).clamp(6.0, 72.0);
 
-        println!("Font size changed to: {:.1}pt", self.font_size);
+        println!("Font size changed to: {:.1}pt", new_font_size);
 
-        // Update CPU renderer with new font size
+        // Update source of truth (render_frame will propagate to all viewports)
+        let mut new_metrics = TextMetrics::new(new_font_size);
+        new_metrics.line_height = new_font_size * 1.4; // Keep multiplier
+        self.text_metrics = new_metrics;
+
+        // Update CPU renderer (needed for text rendering)
         if let Some(cpu_renderer) = &mut self.cpu_renderer {
-            cpu_renderer.set_font_size(self.font_size);
-
-            // Re-set font system to recalculate line height
+            cpu_renderer.set_font_size(new_font_size);
             if let Some(font_system) = &self.font_system {
                 cpu_renderer.set_font_system(font_system.clone());
             }
+            cpu_renderer.set_line_height(new_font_size * 1.4);
         }
 
-        // Update font system with new size and clear cache
+        // Update font system rasterization (needed for GPU atlas)
         if let Some(font_system) = &self.font_system {
             if let Some(window) = &self.window {
                 let scale_factor = window.scale_factor() as f32;
-                // This will clear the cache and prerasterize at the new size
-                font_system.prerasterize_ascii(self.font_size * scale_factor);
+                font_system.prerasterize_ascii(new_font_size * scale_factor);
 
-                // Re-upload the font atlas to GPU
+                // Re-upload font atlases to GPU
                 if let Some(gpu_renderer) = &self.gpu_renderer {
                     let atlas_data = font_system.atlas_data();
                     let (atlas_width, atlas_height) = font_system.atlas_size();
                     gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+
+                    if font_system.is_color_dirty() {
+                        let color_atlas_data = font_system.color_atlas_data();
+                        gpu_renderer.upload_color_font_atlas(&color_atlas_data, atlas_width, atlas_height);
+                        font_system.clear_color_dirty();
+                    }
                 }
             }
         }
@@ -1104,9 +1124,14 @@ impl TinyApp {
             tab.plugin.editor.view.viewport.bounds = cpu_renderer.editor_bounds;
             tab.plugin.editor.view.viewport.scroll = tab.scroll_position;
             tab.plugin.editor.view.viewport.scale_factor = cpu_renderer.viewport.scale_factor;
-            // CRITICAL: Set font_system for accurate text measurement (prevents drift)
+
+            // Propagate metrics from source of truth (single-direction data flow)
+            tab.plugin.editor.view.viewport.update_metrics(&self.text_metrics);
+
+            // Update space_width from font system for accurate measurement
             if let Some(ref font_system) = self.font_system {
-                tab.plugin.editor.view.viewport.set_font_system(font_system.clone());
+                tab.plugin.editor.view.viewport.metrics.space_width =
+                    font_system.char_width_coef() * self.text_metrics.font_size;
             }
 
             // Sync cursor/selection state to main editor's plugins
@@ -1117,7 +1142,21 @@ impl TinyApp {
 
             // Set tab bar, file picker, and grep plugins (global UI)
             cpu_renderer.set_tab_bar_plugin(&mut self.editor.tab_bar);
+
+            // Propagate metrics to file picker input
+            self.editor.file_picker.input_mut().view.viewport.update_metrics(&self.text_metrics);
+            if let Some(ref font_system) = self.font_system {
+                self.editor.file_picker.input_mut().view.viewport.metrics.space_width =
+                    font_system.char_width_coef() * self.text_metrics.font_size;
+            }
             cpu_renderer.set_file_picker_plugin(&mut self.editor.file_picker);
+
+            // Propagate metrics to grep input
+            self.editor.grep.input_mut().view.viewport.update_metrics(&self.text_metrics);
+            if let Some(ref font_system) = self.font_system {
+                self.editor.grep.input_mut().view.viewport.metrics.space_width =
+                    font_system.char_width_coef() * self.text_metrics.font_size;
+            }
             cpu_renderer.set_grep_plugin(&mut self.editor.grep);
 
             // Mark renderer UI dirty if UI changed
@@ -1165,7 +1204,7 @@ impl TinyApp {
             }
         }
 
-        // Upload font atlas only if dirty (atlas changed)
+        // Upload font atlases only if dirty (atlas changed)
         if let Some(font_system) = &self.font_system {
             if font_system.is_dirty() {
                 let atlas_data = font_system.atlas_data();
@@ -1174,6 +1213,16 @@ impl TinyApp {
                     gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
                 }
                 font_system.clear_dirty();
+            }
+
+            // Upload color atlas if dirty
+            if font_system.is_color_dirty() {
+                let color_atlas_data = font_system.color_atlas_data();
+                let (atlas_width, atlas_height) = font_system.atlas_size();
+                if let Some(gpu_renderer) = &mut self.gpu_renderer {
+                    gpu_renderer.upload_color_font_atlas(&color_atlas_data, atlas_width, atlas_height);
+                }
+                font_system.clear_color_dirty();
             }
         }
 
@@ -1349,17 +1398,19 @@ impl ApplicationHandler for TinyApp {
             let scale_factor = window.scale_factor() as f32;
             println!(
                 "  Font size: {:.1}pt (scale={:.1}x)",
-                self.font_size, scale_factor
+                self.text_metrics.font_size, scale_factor
             );
 
             // Prerasterize ASCII characters at physical size for crisp rendering
-            font_system.prerasterize_ascii(self.font_size * scale_factor);
+            font_system.prerasterize_ascii(self.text_metrics.font_size * scale_factor);
 
             // Setup CPU renderer
             let mut cpu_renderer =
                 Renderer::new(self.window_size, scale_factor, self.title_bar_height);
-            cpu_renderer.set_font_size(self.font_size);
+            cpu_renderer.set_font_size(self.text_metrics.font_size);
             cpu_renderer.set_font_system(font_system.clone());
+            // Set line height after font_system (to override auto-calculated height)
+            cpu_renderer.set_line_height(self.text_metrics.line_height);
 
             // Clone window for background threads before storing
             let window_for_events = window.clone();

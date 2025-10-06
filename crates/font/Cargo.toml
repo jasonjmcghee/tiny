@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 tiny-sdk = { path = "../sdk" }
-fontdue = "0.9"
 parking_lot = "0.12"
 ahash = "0.8"
+swash = "0.1"
+zeno = "0.2"
+unicode-bidi = "0.3"

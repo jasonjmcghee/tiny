@@ -8,6 +8,7 @@ window_width = 1200.0
 window_height = 1024.0
 # Font size
 font_size = 13.0
+line_height = 1.4
 # Theme: "dark" or "light"
 theme = "dark"
 # Title bar height (logical pixels, for macOS transparent titlebar)

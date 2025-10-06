@@ -14,6 +14,7 @@ struct VertexOutput {
     @location(2) token_id: f32,
     @location(3) relative_pos: f32,
     @location(4) format: u32,
+    @location(5) atlas_index: u32,
 }
 
 @group(0) @binding(0)
@@ -24,6 +25,12 @@ var glyph_texture: texture_2d<f32>;
 
 @group(1) @binding(1)
 var glyph_sampler: sampler;
+
+@group(1) @binding(2)
+var color_glyph_texture: texture_2d<f32>;
+
+@group(1) @binding(3)
+var color_glyph_sampler: sampler;
 
 @group(2) @binding(0)
 var theme_texture: texture_2d<f32>;
@@ -47,6 +54,7 @@ fn vs_main(
     @location(2) token_id: u32,
     @location(3) relative_pos: f32,
     @location(4) format: u32,
+    @location(5) atlas_index: u32,
 ) -> VertexOutput {
     // Convert position from pixel coordinates to normalized device coordinates
     let ndc_x = (position.x / uniforms.viewport_size.x) * 2.0 - 1.0;
@@ -58,6 +66,7 @@ fn vs_main(
     out.token_id = f32(token_id);
     out.relative_pos = relative_pos;
     out.format = format;
+    out.atlas_index = atlas_index;
 
     return out;
 }
@@ -183,8 +192,27 @@ fn theme_interpolation_effect(token_id: f32, relative_pos: f32, time: f32) -> ve
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Sample the glyph texture
-    let glyph_alpha = textureSample(glyph_texture, glyph_sampler, in.tex_coords).r;
+    // Sample from correct atlas based on atlas_index
+    var glyph_alpha: f32;
+    var glyph_color: vec3<f32>;
+    var is_color_glyph: bool = false;
+
+    if in.atlas_index == 1u {
+        // Color atlas (RGBA8) - for emojis
+        let sampled = textureSample(color_glyph_texture, color_glyph_sampler, in.tex_coords);
+        glyph_color = sampled.rgb;
+        glyph_alpha = sampled.a;
+        is_color_glyph = true;
+    } else {
+        // Monochrome atlas (R8) - for regular text
+        glyph_alpha = textureSample(glyph_texture, glyph_sampler, in.tex_coords).r;
+        glyph_color = vec3<f32>(1.0, 1.0, 1.0); // Will be replaced by theme color
+    }
+
+    // For color glyphs (emojis), skip theme effects and use direct color
+    if is_color_glyph {
+        return vec4<f32>(glyph_color, glyph_alpha);
+    }
 
     // Choose theme effect based on uniform
     var final_color: vec3<f32>;

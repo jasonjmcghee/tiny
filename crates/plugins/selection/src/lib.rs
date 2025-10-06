@@ -15,7 +15,7 @@ use tiny_sdk::{
 };
 
 /// Single selection with start and end positions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Selection {
     /// Start position in view coordinates (inclusive)
     pub start: ViewPos,
@@ -115,7 +115,11 @@ impl SelectionPlugin {
     }
 
     /// Generate a single bounding rectangle for the entire selection
-    fn selection_to_bounding_rect(&self, selection: &Selection) -> Option<LayoutRect> {
+    fn selection_to_bounding_rect(
+        &self,
+        selection: &Selection,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+    ) -> Option<LayoutRect> {
         // Skip if it's just a cursor (no selection)
         let epsilon = 0.1;
         if (selection.start.x.0 - selection.end.x.0).abs() < epsilon
@@ -140,11 +144,11 @@ impl SelectionPlugin {
                 self.viewport.line_height,
             ))
         } else {
-            // Multi-line selection: always use full width from margin to margin
+            // Multi-line selection: use full width of the editor widget
             // The shader will handle per-line clipping based on selection data
-            let left = self.viewport.margin.x.0;
-            let right = self.viewport.logical_size.width.0 - self.viewport.margin.x.0;
-            let width = right - left;
+            let widget_vp = widget_viewport.expect("Selection plugin requires widget_viewport");
+            let left = widget_vp.bounds.x.0;
+            let width = widget_vp.bounds.width.0;
             let height = (end_y + self.viewport.line_height) - start_y;
 
             Some(LayoutRect::new(left, start_y, width, height))
@@ -152,14 +156,19 @@ impl SelectionPlugin {
     }
 
     /// Create vertex data for given selections
-    fn create_vertices_for_selections(&self, viewport: &tiny_sdk::ViewportInfo, selections: &[Selection]) -> Vec<SelectionVertex> {
+    fn create_vertices_for_selections(
+        &self,
+        viewport: &tiny_sdk::ViewportInfo,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+        selections: &[Selection],
+    ) -> Vec<SelectionVertex> {
         let mut vertices = Vec::new();
         // Use viewport's scale factor, not our stored one (which might be wrong)
         let scale = viewport.scale_factor;
         let color = self.config.style.color;
 
         for selection in selections {
-            if let Some(rect) = self.selection_to_bounding_rect(selection) {
+            if let Some(rect) = self.selection_to_bounding_rect(selection, widget_viewport) {
                 // Rectangle is in logical view space, scale to physical pixels
                 let x = rect.x.0 * scale;
                 let y = rect.y.0 * scale;
@@ -173,10 +182,12 @@ impl SelectionPlugin {
                 let end_x = selection.end.x.0 * scale;
                 let end_y = selection.end.y.0 * scale;
                 let line_height = self.viewport.line_height * scale;
-                // Margins are also in view coordinates now
-                let margin_left = self.viewport.margin.x.0 * scale;
-                let margin_right =
-                    (self.viewport.logical_size.width.0 - self.viewport.margin.x.0) * scale;
+
+                // Margins in screen coordinates (matching transformed selections)
+                // widget_viewport is required for correct coordinate system
+                let widget_vp = widget_viewport.expect("Selection plugin requires widget_viewport");
+                let margin_left = widget_vp.bounds.x.0 * scale;
+                let margin_right = (widget_vp.bounds.x.0 + widget_vp.bounds.width.0) * scale;
 
                 let selection_data = SelectionData {
                     start_pos: [start_x, start_y],
@@ -406,7 +417,11 @@ impl Paintable for SelectionPlugin {
 
         // Write vertices only if state changed - simplified to one line!
         if let Some(ref vertex_buffer) = self.vertex_buffer {
-            let vertices = self.create_vertices_for_selections(&ctx.viewport, &transformed_selections);
+            let vertices = self.create_vertices_for_selections(
+                &ctx.viewport,
+                ctx.widget_viewport.as_ref(),
+                &transformed_selections,
+            );
             if vertices.is_empty() {
                 return;
             }
