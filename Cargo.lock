@@ -3102,6 +3102,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "simdutf8",
  "tiny-core",
  "tiny-font",
  "tiny-sdk",
@@ -3132,6 +3133,8 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "bytemuck",
+ "serde",
+ "toml",
  "wgpu",
 ]
 
@@ -3184,6 +3187,7 @@ dependencies = [
  "arboard",
  "arc-swap",
  "bytemuck",
+ "crossbeam-channel",
  "lazy_static",
  "lsp-types",
  "parking_lot",

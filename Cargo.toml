@@ -25,6 +25,8 @@ wgpu = { version = "26.0.1", features = ["metal"] }
 bytemuck = { version = "1", features = ["derive"] }
 ahash = { version = "0.8.12", features = ["serde"] }
 winit = "0.30"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 # lto = true
