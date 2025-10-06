@@ -9,10 +9,12 @@ use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::{
-    ffi::{BindGroupId, BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId, VertexAttributeDescriptor, VertexFormat},
-    CachedBuffer, Capability, Configurable, Initializable, LayoutPos, Library,
-    PaintContext, Paintable, Plugin, PluginError, SetupContext, Updatable,
-    UpdateContext, ViewportInfo,
+    ffi::{
+        BindGroupId, BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId,
+        VertexAttributeDescriptor, VertexFormat,
+    },
+    CachedBuffer, Capability, Configurable, Initializable, LayoutPos, Library, PaintContext,
+    Paintable, Plugin, PluginError, SetupContext, Updatable, UpdateContext, ViewportInfo,
 };
 
 /// API exposed by cursor plugin
@@ -61,7 +63,7 @@ impl Default for CursorConfig {
             blink_rate: 1.0,
             solid_duration_ms: 500,
             style: CursorStyle {
-                color: 0xE1E1E1,
+                color: 0xE1E1E1FF,
                 width: 2.0,
                 height_scale: 1.0,
                 x_offset: 0.0,
@@ -259,7 +261,10 @@ impl Initializable for CursorPlugin {
 
         // Create uniform buffer and bind group
         let uniform_size = std::mem::size_of::<CursorUniforms>() as u64;
-        let uniform_buffer = BufferId::create(uniform_size, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let uniform_buffer = BufferId::create(
+            uniform_size,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
         let uniform_layout = BindGroupLayoutId::create_uniform();
         let uniform_bind_group = BindGroupId::create_with_buffer(uniform_layout, uniform_buffer);
         self.uniform_buffer = Some(uniform_buffer);
@@ -419,7 +424,9 @@ impl Paintable for CursorPlugin {
 
         // Draw with our custom pipeline and bind group
         if let Some(ref vertex_buffer) = self.vertex_buffer {
-            if let (Some(uniform_bind_group), Some(pipeline_id)) = (self.uniform_bind_group, self.custom_pipeline_id) {
+            if let (Some(uniform_bind_group), Some(pipeline_id)) =
+                (self.uniform_bind_group, self.custom_pipeline_id)
+            {
                 if let Some(ref gpu_ctx) = ctx.gpu_context {
                     // Use our custom pipeline
                     gpu_ctx.set_pipeline(render_pass, pipeline_id);
@@ -478,7 +485,7 @@ impl Configurable for CursorPlugin {
             2.0
         }
         fn default_color() -> u32 {
-            0xE1E1E1
+            0xE1E1E1FF // RGBA format (shader expects alpha in low byte)
         }
         fn default_height_scale() -> f32 {
             1.0

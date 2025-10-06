@@ -6,11 +6,8 @@ use crate::tab_manager::TabManager;
 use tiny_core::tree::{Point, Rect};
 use tiny_font::SharedFontSystem;
 use tiny_sdk::types::{LayoutRect, RectInstance};
-use tiny_sdk::{
-    Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
-    SetupContext,
-};
-use tiny_ui::text_view::{SizeConstraint, TextView};
+use tiny_sdk::LayoutPos;
+use tiny_ui::text_view::TextView;
 
 /// Default tab bar height in logical pixels (will be calculated dynamically)
 pub const TAB_BAR_HEIGHT: f32 = 30.0;

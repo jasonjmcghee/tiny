@@ -12,7 +12,7 @@ update = true
 # This plugin renders visual content
 paint = true
 
-[dependencies]
+# [dependencies]
 # No dependencies on other plugins for now
 
 [config]

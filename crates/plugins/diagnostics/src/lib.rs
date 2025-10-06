@@ -949,7 +949,7 @@ impl Paintable for DiagnosticsPlugin {
             }
 
             // Render popup using TextView and rounded rect
-            if let Some(popup_view) = self.popup_view.read().unwrap().as_ref() {
+            if let Some(popup_view) = self.popup_view.write().unwrap().as_mut() {
                 // Draw rounded rect frame using the core rounded rect renderer
                 if let Some(frame) = self.get_popup_frame() {
                     unsafe {

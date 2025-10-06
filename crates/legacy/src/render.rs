@@ -1,8 +1,7 @@
 //! Renderer manages widget rendering and viewport transformations
 
 use crate::{
-    coordinates::Viewport,
-    input, syntax,
+    coordinates::Viewport, syntax,
     text_effects::{self, TextStyleProvider},
     text_renderer::{self, TextRenderer},
 };
@@ -1121,86 +1120,6 @@ impl Renderer {
 
             // Paint the view's plugins
             editable_view.paint_plugins(&ctx, pass);
-        }
-    }
-
-    fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
-        // Paint non-cursor/selection plugins only (diagnostics, etc)
-        // Cursor/selection are now owned by EditableTextView instances
-        if let Some(ref loader_arc) = self.plugin_loader {
-            if let Ok(loader) = loader_arc.lock() {
-                let z_filter = if background {
-                    |z: i32| z < 0
-                } else {
-                    |z: i32| z >= 0
-                };
-
-                if let Some(gpu) = self.gpu_renderer {
-                    let gpu_renderer = unsafe { &*gpu };
-
-                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
-                        scroll: self.viewport.scroll,
-                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 2,
-                    };
-
-                    let mut ctx = PaintContext::new(
-                        self.viewport.to_viewport_info(),
-                        gpu_renderer.device_arc(),
-                        gpu_renderer.queue_arc(),
-                        gpu as *mut _,
-                        &self.service_registry,
-                    )
-                    .with_widget_viewport(editor_viewport);
-                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
-                    for key in loader.list_plugins() {
-                        // Skip cursor and selection - they're owned by EditableTextView instances
-                        if key == "cursor" || key == "selection" {
-                            continue;
-                        }
-
-                        if let Some(plugin) = loader.get_plugin(&key) {
-                            if let Some(paintable) = plugin.instance.as_paintable() {
-                                let z_idx = paintable.z_index();
-                                if z_filter(z_idx) {
-                                    paintable.paint(&ctx, pass);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !background {
-            if let Some(diagnostics_ptr) = self.diagnostics_plugin {
-                let diagnostics = unsafe { &*diagnostics_ptr };
-
-                if let Some(gpu) = self.gpu_renderer {
-                    let gpu_renderer = unsafe { &*gpu };
-
-                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
-                        scroll: self.viewport.scroll,
-                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 3,
-                    };
-
-                    let mut ctx = PaintContext::new(
-                        self.viewport.to_viewport_info(),
-                        gpu_renderer.device_arc(),
-                        gpu_renderer.queue_arc(),
-                        gpu as *mut _,
-                        &self.service_registry,
-                    )
-                    .with_widget_viewport(editor_viewport);
-                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
-                    diagnostics.paint(&ctx, pass);
-                }
-            }
         }
     }
 

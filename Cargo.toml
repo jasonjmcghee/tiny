@@ -34,3 +34,8 @@ debug = true
 
 [profile.dev]
 opt-level = 1  # Faster compilation, still decent perf
+
+[patch.crates-io]
+# Patch tree-sitter-md to use tree-sitter 0.25
+tree-sitter-md = { path = ".cargo-patches/tree-sitter-md" }
+

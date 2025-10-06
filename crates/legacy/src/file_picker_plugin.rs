@@ -2,11 +2,10 @@
 
 use crate::{overlay_picker::OverlayPicker, scroll::Scrollable, Widget};
 use crate::coordinates::Viewport;
+use crate::input::{Event, EventSubscriber, PropagationControl};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tiny_core::tree::{Point, Rect};
-use tiny_font::SharedFontSystem;
-use tiny_sdk::{Capability, Initializable, PaintContext, Paintable, Plugin, PluginError, SetupContext};
+use tiny_sdk::Plugin;
 
 /// File picker plugin for finding and opening files
 pub struct FilePickerPlugin {
@@ -58,7 +57,7 @@ impl FilePickerPlugin {
             results.into_iter().map(|(p, _)| p).collect()
         };
 
-        let mut picker = OverlayPicker::new(format_fn, search_fn);
+        let picker = OverlayPicker::new(format_fn, search_fn);
 
         // Spawn background thread to scan directory
         let cached_items = picker.cached_items.clone();
@@ -103,41 +102,51 @@ impl FilePickerPlugin {
     pub fn set_query(&mut self, query: String) {
         self.picker.trigger_filter(query);
     }
+}
 
-    /// Handle generic navigation events
-    /// Returns Some(action) if the event should trigger a specific action
-    pub fn handle_event(&mut self, event_name: &str) -> Option<FilePickerAction> {
+impl EventSubscriber for FilePickerPlugin {
+    fn handle_event(&mut self, event: &Event, event_bus: &mut crate::input::EventBus) -> PropagationControl {
         if !self.visible {
-            return None; // Not visible, don't handle anything
+            return PropagationControl::Continue; // Not active, pass through
         }
 
-        match event_name {
+        use serde_json::json;
+
+        // Handle events: execute logic AND stop propagation
+        match event.name.as_str() {
             "navigate.up" => {
                 self.move_up();
-                Some(FilePickerAction::Continue)
+                event_bus.emit("ui.redraw", json!({}), 20, "file_picker");
+                PropagationControl::Stop
             }
             "navigate.down" => {
                 self.move_down();
-                Some(FilePickerAction::Continue)
+                event_bus.emit("ui.redraw", json!({}), 20, "file_picker");
+                PropagationControl::Stop
             }
-            "action.cancel" => Some(FilePickerAction::Close),
+            "action.cancel" => {
+                self.hide();
+                event_bus.emit("overlay.closed", json!({"source": "file_picker"}), 10, "file_picker");
+                PropagationControl::Stop
+            }
             "action.submit" => {
-                if let Some(path) = self.selected_file() {
-                    Some(FilePickerAction::Select(path.to_path_buf()))
-                } else {
-                    Some(FilePickerAction::Continue)
+                if let Some(path) = self.selected_file().map(|p| p.to_path_buf()) {
+                    self.hide();
+                    event_bus.emit("file.open", json!({"path": path}), 10, "file_picker");
                 }
+                PropagationControl::Stop
             }
-            _ => None, // Don't care about this event
+            _ => PropagationControl::Continue,
         }
     }
-}
 
-/// Action to take after file picker handles an event
-pub enum FilePickerAction {
-    Continue,
-    Close,
-    Select(PathBuf),
+    fn priority(&self) -> i32 {
+        100 // High priority (overlays filter before main editor)
+    }
+
+    fn is_active(&self) -> bool {
+        self.visible
+    }
 }
 
 tiny_sdk::plugin! {

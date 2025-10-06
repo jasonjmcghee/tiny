@@ -275,14 +275,14 @@ impl EditableTextView {
     }
 
     /// Transform screen position to local (document-relative) position
-    /// screen → local: subtract bounds offset, add scroll
+    /// screen → local: subtract bounds, subtract padding, add scroll → layout space
     fn screen_to_local(&self, screen_pos: Point) -> Point {
         Point {
             x: tiny_sdk::LogicalPixels(
-                screen_pos.x.0 - self.view.viewport.bounds.x.0 + self.view.viewport.scroll.x.0,
+                screen_pos.x.0 - self.view.viewport.bounds.x.0 - self.view.padding_x + self.view.viewport.scroll.x.0,
             ),
             y: tiny_sdk::LogicalPixels(
-                screen_pos.y.0 - self.view.viewport.bounds.y.0 + self.view.viewport.scroll.y.0,
+                screen_pos.y.0 - self.view.viewport.bounds.y.0 - self.view.padding_y + self.view.viewport.scroll.y.0,
             ),
         }
     }
@@ -305,16 +305,12 @@ impl EditableTextView {
     pub fn cursor_screen_pos(&self) -> Option<Point> {
         let cursor_doc = self.input.primary_cursor_doc_pos(&self.view.doc);
 
-        // Transform: doc → canonical layout → local → screen (with padding)
-        let canonical_pos = self.view.viewport.doc_to_layout(cursor_doc);
-        let local_x = canonical_pos.x.0 - self.view.viewport.scroll.x.0;
-        let local_y = canonical_pos.y.0 - self.view.viewport.scroll.y.0;
-        let screen_x = self.view.viewport.bounds.x.0 + self.view.padding_x + local_x;
-        let screen_y = self.view.viewport.bounds.y.0 + self.view.padding_y + local_y;
+        // Use Viewport's one-step transform (includes padding)
+        let screen_pos = self.view.viewport.doc_to_screen(cursor_doc, self.view.padding_x, self.view.padding_y);
 
         Some(Point {
-            x: tiny_sdk::LogicalPixels(screen_x),
-            y: tiny_sdk::LogicalPixels(screen_y),
+            x: screen_pos.x,
+            y: screen_pos.y,
         })
     }
 
@@ -401,20 +397,11 @@ impl EditableTextView {
                     // Get layout position (0,0 relative to content)
                     let layout_pos = self.view.viewport.doc_to_layout_with_text(sel.cursor, &line_text);
 
-                    // Convert to view coordinates (apply scroll only, padding is in bounds offset)
-                    let view_x = layout_pos.x.0 - self.view.viewport.scroll.x.0;
-                    let view_y = layout_pos.y.0 - self.view.viewport.scroll.y.0;
-
-                    // Debug: Print cursor position data
-                    if self.id == 0 { // Main editor (first created)
-                        eprintln!("CURSOR: doc=({}, {}), layout=({:.1}, {:.1}), scroll=({:.1}, {:.1}), padding=({:.1}, {:.1}), view=({:.1}, {:.1}), bounds=({:.1}, {:.1})",
-                            sel.cursor.line, sel.cursor.column,
-                            layout_pos.x.0, layout_pos.y.0,
-                            self.view.viewport.scroll.x.0, self.view.viewport.scroll.y.0,
-                            self.view.padding_x, self.view.padding_y,
-                            view_x, view_y,
-                            self.view.viewport.bounds.x.0, self.view.viewport.bounds.y.0);
-                    }
+                    // Convert to view coordinates (subtract scroll, add padding to match text rendering)
+                    // Text is rendered at: bounds.origin + padding + view_pos (see TextView::collect_glyphs)
+                    // So plugins should receive: padding + view_pos
+                    let view_x = layout_pos.x.0 - self.view.viewport.scroll.x.0 + self.view.padding_x;
+                    let view_y = layout_pos.y.0 - self.view.viewport.scroll.y.0 + self.view.padding_y;
 
                     // Send as LayoutPos type (confusing naming, but it's view coords)
                     let view_pos = tiny_sdk::LayoutPos::new(view_x, view_y);
@@ -426,17 +413,25 @@ impl EditableTextView {
         // Update selection plugin with VIEW coordinates (including padding)
         if let Some(ref mut plugin) = self.selection_plugin {
             if let Some(library) = plugin.as_library_mut() {
-                // Get selections in view coordinates (scroll already applied by get_selection_data)
+                // Get selections in view coordinates (scroll applied, need to add padding)
                 let (_, selections) = self.input.get_selection_data(&self.view.doc, &self.view.viewport);
 
-                // Encode selections for plugin
-                // Note: Padding is already in viewport.bounds offset, don't add again
+                // Encode selections for plugin, adding padding to match text rendering
                 let mut args = Vec::new();
                 let len = selections.len() as u32;
                 args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&len));
                 for (start, end) in selections {
-                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&start));
-                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&end));
+                    // Add padding to match text rendering (see TextView::collect_glyphs)
+                    let start_with_padding = tiny_sdk::ViewPos {
+                        x: tiny_sdk::LogicalPixels(start.x.0 + self.view.padding_x),
+                        y: tiny_sdk::LogicalPixels(start.y.0 + self.view.padding_y),
+                    };
+                    let end_with_padding = tiny_sdk::ViewPos {
+                        x: tiny_sdk::LogicalPixels(end.x.0 + self.view.padding_x),
+                        y: tiny_sdk::LogicalPixels(end.y.0 + self.view.padding_y),
+                    };
+                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&start_with_padding));
+                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&end_with_padding));
                 }
                 let _ = library.call("set_selections", &args);
             }
@@ -633,10 +628,11 @@ impl EditableTextView {
             if !sel.is_cursor() {
                 let sel_rects = sel.to_rectangles(&self.view.doc, &self.view.viewport);
                 for rect in sel_rects {
-                    // Transform to screen coordinates (logical) with padding
-                    let screen_x = self.view.viewport.bounds.x.0 + self.view.padding_x + rect.x.0
+                    // Transform to screen coordinates (logical)
+                    // Note: padding is already in viewport.bounds (set by renderer)
+                    let screen_x = self.view.viewport.bounds.x.0 + rect.x.0
                         - self.view.viewport.scroll.x.0;
-                    let screen_y = self.view.viewport.bounds.y.0 + self.view.padding_y + rect.y.0
+                    let screen_y = self.view.viewport.bounds.y.0 + rect.y.0
                         - self.view.viewport.scroll.y.0;
 
                     // Convert to physical pixels

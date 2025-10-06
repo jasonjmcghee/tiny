@@ -155,8 +155,31 @@ pub struct Event {
     pub source: String,
 }
 
+/// Controls event propagation through the subscription chain
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PropagationControl {
+    /// Continue delivering to next subscriber
+    Continue,
+    /// Stop propagation (event handled)
+    Stop,
+}
+
+/// Trait for components that subscribe to events
+/// Components self-filter based on visibility/focus instead of explicit routing
+pub trait EventSubscriber {
+    /// Handle an event, can emit follow-up events, return whether to stop propagation
+    fn handle_event(&mut self, event: &Event, event_bus: &mut EventBus) -> PropagationControl;
+
+    /// Subscription priority (higher = earlier delivery)
+    /// Overlays typically have priority 100+, main editor priority 0
+    fn priority(&self) -> i32;
+
+    /// Whether this subscriber is currently active (visible + focused)
+    fn is_active(&self) -> bool;
+}
+
 /// Simple event bus for queuing and prioritizing events
-/// Components handle events by checking names in dispatch loop
+/// Components subscribe and handle events based on priority
 pub struct EventBus {
     pub queued: Vec<Event>,
     /// Callback to wake up the main thread when events are emitted (e.g., request redraw)
@@ -213,6 +236,30 @@ impl EventBus {
     /// Check if there are pending events
     pub fn has_events(&self) -> bool {
         !self.queued.is_empty()
+    }
+}
+
+/// Dispatch an event to subscribers in priority order
+/// Stops delivery when a subscriber returns PropagationControl::Stop
+/// Only delivers to active subscribers
+/// Subscribers can emit follow-up events via event_bus
+pub fn dispatch_event(event: &Event, subscribers: &mut [&mut dyn EventSubscriber], event_bus: &mut EventBus) {
+    // Sort by priority (higher priority = earlier delivery)
+    let mut indexed: Vec<(usize, i32)> = subscribers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.priority()))
+        .collect();
+    indexed.sort_by(|a, b| b.1.cmp(&a.1)); // Descending order
+
+    // Deliver to subscribers in priority order
+    for (index, _) in indexed {
+        let subscriber = &mut subscribers[index];
+        if subscriber.is_active() {
+            if subscriber.handle_event(event, event_bus) == PropagationControl::Stop {
+                break;
+            }
+        }
     }
 }
 

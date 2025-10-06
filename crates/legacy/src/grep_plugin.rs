@@ -2,11 +2,11 @@
 
 use crate::{overlay_picker::OverlayPicker, scroll::Scrollable, Widget};
 use crate::coordinates::Viewport;
+use crate::input::{Event, EventSubscriber, PropagationControl};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tiny_core::tree::{Point, Rect};
-use tiny_font::SharedFontSystem;
-use tiny_sdk::{Capability, Initializable, PaintContext, Paintable, Plugin, PluginError, SetupContext};
+use tiny_sdk::Plugin;
 
 /// A single grep result
 #[derive(Clone, Debug)]
@@ -23,6 +23,9 @@ pub struct GrepPlugin {
     working_dir: PathBuf,
     searching: bool,
     pub visible: bool,
+    // Channel for receiving search results from background thread (Mutex for Sync)
+    result_rx: Arc<Mutex<std::sync::mpsc::Receiver<Vec<GrepResult>>>>,
+    result_tx: std::sync::mpsc::Sender<Vec<GrepResult>>,
 }
 
 impl GrepPlugin {
@@ -48,11 +51,16 @@ impl GrepPlugin {
         // Search function (empty - results come from background thread)
         let search_fn = |_query: &str, items: &[GrepResult]| items.to_vec();
 
+        // Create channel for background thread communication
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
         Self {
             picker: OverlayPicker::new(format_fn, search_fn),
             working_dir,
             searching: false,
             visible: false,
+            result_rx: Arc::new(Mutex::new(result_rx)),
+            result_tx,
         }
     }
 
@@ -61,14 +69,16 @@ impl GrepPlugin {
         self.searching = !search_term.is_empty();
 
         if !search_term.is_empty() {
-            let cached = self.picker.cached_items.clone();
+            let tx = self.result_tx.clone();
             let wd = self.working_dir.clone();
             let q = search_term.clone();
-            std::thread::spawn(move || *cached.write() = Self::search_codebase(&wd, &q));
+            std::thread::spawn(move || {
+                let results = Self::search_codebase(&wd, &q);
+                let _ = tx.send(results);
+            });
         }
 
-        let results = self.picker.cached_items.read().clone();
-        self.picker.show_with_title(results, "Search in Files");
+        self.picker.show_with_title(Vec::new(), "Search in Files");
         if !search_term.is_empty() {
             self.picker.dropdown.input.set_text(&search_term);
         }
@@ -83,18 +93,24 @@ impl GrepPlugin {
     fn trigger_search(&mut self, query: String) {
         if query.is_empty() {
             self.searching = false;
-            *self.picker.cached_items.write() = Vec::new();
             self.picker.dropdown.set_items(Vec::new());
             return;
         }
 
-        self.searching = true;
-        let cached = self.picker.cached_items.clone();
-        let wd = self.working_dir.clone();
-        std::thread::spawn(move || *cached.write() = Self::search_codebase(&wd, &query));
+        // Don't spawn new search if one is already running (prevents thread spam on fast typing)
+        if self.searching {
+            return;
+        }
 
-        let results = self.picker.cached_items.read().clone();
-        self.picker.dropdown.set_items(results);
+        self.searching = true;
+        let tx = self.result_tx.clone();
+        let wd = self.working_dir.clone();
+        std::thread::spawn(move || {
+            let results = Self::search_codebase(&wd, &query);
+            let _ = tx.send(results); // Non-blocking send
+        });
+
+        // Results will be polled and displayed when ready
     }
 
     /// Search codebase using ripgrep via ignore crate
@@ -155,10 +171,12 @@ impl GrepPlugin {
 
     pub fn poll_results(&mut self) {
         if self.searching {
-            let results = self.picker.cached_items.read().clone();
-            if !results.is_empty() {
-                self.picker.dropdown.set_items(results);
-                self.searching = false;
+            // Non-blocking receive from background thread
+            if let Ok(rx) = self.result_rx.lock() {
+                if let Ok(results) = rx.try_recv() {
+                    self.picker.dropdown.set_items(results);
+                    self.searching = false;
+                }
             }
         }
     }
@@ -172,41 +190,65 @@ impl GrepPlugin {
     pub fn set_query(&mut self, query: String) {
         self.trigger_search(query);
     }
+}
 
-    /// Handle generic navigation events
-    /// Returns Some(action) if the event should trigger a specific action
-    pub fn handle_event(&mut self, event_name: &str) -> Option<GrepAction> {
+impl EventSubscriber for GrepPlugin {
+    fn handle_event(&mut self, event: &Event, event_bus: &mut crate::input::EventBus) -> PropagationControl {
         if !self.visible {
-            return None; // Not visible, don't handle anything
+            return PropagationControl::Continue; // Not active, pass through
         }
 
-        match event_name {
+        use serde_json::json;
+
+        // Handle events: execute logic AND stop propagation
+        match event.name.as_str() {
             "navigate.up" => {
                 self.move_up();
-                Some(GrepAction::Continue)
+                event_bus.emit("ui.redraw", json!({}), 20, "grep");
+                PropagationControl::Stop
             }
             "navigate.down" => {
                 self.move_down();
-                Some(GrepAction::Continue)
+                event_bus.emit("ui.redraw", json!({}), 20, "grep");
+                PropagationControl::Stop
             }
-            "action.cancel" => Some(GrepAction::Close),
+            "action.cancel" => {
+                self.hide();
+                event_bus.emit("overlay.closed", json!({"source": "grep"}), 10, "grep");
+                PropagationControl::Stop
+            }
             "action.submit" => {
-                if let Some(result) = self.selected_result() {
-                    Some(GrepAction::Select(result.clone()))
-                } else {
-                    Some(GrepAction::Continue)
+                if let Some(result) = self.selected_result().cloned() {
+                    self.hide();
+                    event_bus.emit("file.goto", json!({
+                        "file": result.file_path,
+                        "line": result.line_number.saturating_sub(1),
+                        "column": result.column
+                    }), 10, "grep");
                 }
+                PropagationControl::Stop
             }
-            _ => None, // Don't care about this event
+            _ => PropagationControl::Continue,
         }
+    }
+
+    fn priority(&self) -> i32 {
+        100 // High priority (overlays filter events before main editor)
+    }
+
+    fn is_active(&self) -> bool {
+        self.visible
     }
 }
 
-/// Action to take after grep handles an event
-pub enum GrepAction {
-    Continue,
-    Close,
-    Select(GrepResult),
+impl tiny_sdk::Updatable for GrepPlugin {
+    fn update(&mut self, _dt: f32, _ctx: &mut tiny_sdk::UpdateContext) -> Result<(), tiny_sdk::PluginError> {
+        // Poll background search results
+        if self.searching {
+            self.poll_results();
+        }
+        Ok(())
+    }
 }
 
 tiny_sdk::plugin! {
@@ -214,8 +256,8 @@ tiny_sdk::plugin! {
         name: "grep",
         version: "1.0.0",
         z_index: 1000,
-        traits: [Init, Paint],
-        defaults: [Init, Paint],
+        traits: [Init, Update, Paint],
+        defaults: [Init, Paint],  // Update has custom impl above
     }
 }
 

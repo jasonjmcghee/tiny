@@ -38,16 +38,22 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
         }
     }
 
-    /// Set the available items
+    /// Set the available items (non-blocking)
     pub fn set_items(&mut self, items: Vec<T>) {
-        *self.cached_items.write() = items;
+        // Use try_write to avoid blocking main thread if background thread is writing
+        if let Some(mut cached) = self.cached_items.try_write() {
+            *cached = items;
+        }
     }
 
     /// Show with title
     pub fn show_with_title(&mut self, items: Vec<T>, title: &str) {
         self.visible = true;
         self.filtering = false;
-        *self.cached_items.write() = items.clone();
+        // Use try_write to avoid blocking main thread
+        if let Some(mut cached) = self.cached_items.try_write() {
+            *cached = items.clone();
+        }
         self.dropdown.show_with_title(items, title);
     }
 
@@ -100,9 +106,11 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
     }
 
     /// Collect glyphs for rendering
+    /// TextViews now cache glyphs internally - this is cheap to call every frame
     pub fn collect_glyphs(&mut self, font_system: &Arc<SharedFontSystem>) -> Vec<(Vec<tiny_sdk::GlyphInstance>, (u32, u32, u32, u32))> {
         if !self.visible { return Vec::new(); }
 
+        // Update layout (cheap - TextView caches and returns early if unchanged)
         self.dropdown.title_view.update_layout(font_system);
         self.dropdown.input.view.update_layout(font_system);
         self.dropdown.results.update_layout(font_system);

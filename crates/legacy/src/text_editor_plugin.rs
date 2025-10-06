@@ -5,7 +5,7 @@
 use crate::{
     coordinates::Viewport,
     editable_text_view::{EditMode, EditableTextView},
-    input::{InputAction, InputHandler, Selection},
+    input::{Event, EventSubscriber, InputAction, PropagationControl, Selection},
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
 };
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_core::tree::{Doc, Point};
 use tiny_sdk::{
-    Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
+    Initializable, LayoutPos, Plugin, PluginError,
     SetupContext, Updatable, UpdateContext,
 };
 use tiny_ui::{TextView, TextViewCapabilities};
@@ -194,6 +194,22 @@ impl TextEditorPlugin {
 }
 
 // === Plugin Trait Implementations ===
+
+impl EventSubscriber for TextEditorPlugin {
+    fn handle_event(&mut self, event: &Event, _event_bus: &mut crate::input::EventBus) -> PropagationControl {
+        // Main editor doesn't claim navigation events (overlays handle those)
+        // editor.* events are handled by app.rs's explicit editor event handling
+        PropagationControl::Continue
+    }
+
+    fn priority(&self) -> i32 {
+        0 // Low priority (overlays handle events first)
+    }
+
+    fn is_active(&self) -> bool {
+        true // Main editor is always active (unless overlay is focused)
+    }
+}
 
 tiny_sdk::plugin! {
     TextEditorPlugin {

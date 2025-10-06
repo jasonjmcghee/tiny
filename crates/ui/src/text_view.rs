@@ -15,6 +15,7 @@ use crate::{
     syntax::SyntaxHighlighter,
     text_renderer::TextRenderer,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tiny_core::tree::{Doc, Point, Rect};
 use tiny_font::SharedFontSystem;
@@ -81,6 +82,11 @@ pub struct TextView {
     /// Vertical padding (logical pixels) - insets text from top/bottom edges
     pub padding_y: f32,
 
+    /// Cached glyphs
+    cached_glyphs: Vec<GlyphInstance>,
+    /// Last doc version when glyphs were generated (atomic for lock-free check)
+    cached_glyph_version: AtomicU64,
+
     /// Width sizing constraint
     pub width_constraint: SizeConstraint,
 
@@ -114,6 +120,8 @@ impl TextView {
             syntax_highlighter: None,
             padding_x: 0.0,
             padding_y: 0.0,
+            cached_glyphs: Vec::new(),
+            cached_glyph_version: AtomicU64::new(0),
             width_constraint: SizeConstraint::FillContainer,
             height_constraint: SizeConstraint::FillContainer,
             text_align: TextAlign::Left,
@@ -258,9 +266,18 @@ impl TextView {
     /// 5. Convert to physical pixels
     ///
     /// NOTE: Caller MUST set GPU scissor rect to viewport.bounds to prevent overflow
-    pub fn collect_glyphs(&self, font_system: &SharedFontSystem) -> Vec<GlyphInstance> {
+    ///
+    /// Caching: Returns cached glyphs if doc version unchanged
+    pub fn collect_glyphs(&mut self, _font_system: &SharedFontSystem) -> Vec<GlyphInstance> {
         if !self.visible {
             return Vec::new();
+        }
+
+        // Check cache - only regenerate if text changed (lock-free atomic check)
+        let current_version = self.doc.version();
+        let cached_version = self.cached_glyph_version.load(Ordering::Relaxed);
+        if current_version == cached_version && !self.cached_glyphs.is_empty() {
+            return self.cached_glyphs.clone();
         }
 
         let visible_glyphs = self.renderer.get_visible_glyphs_with_style();
@@ -335,6 +352,10 @@ impl TextView {
                 _padding: [0, 0],
             });
         }
+
+        // Update cache
+        self.cached_glyphs = instances.clone();
+        self.cached_glyph_version.store(current_version, Ordering::Relaxed);
 
         instances
     }

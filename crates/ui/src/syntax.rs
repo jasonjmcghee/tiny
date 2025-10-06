@@ -4,7 +4,6 @@
 
 use crate::text_effects::{priority, EffectType, TextEffect, TextStyleProvider};
 use arc_swap::ArcSwap;
-use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -13,66 +12,162 @@ use tree_sitter::{
     WasmStore,
 };
 
-// Generic WASM language loader with lazy initialization
-// Uses parking_lot::RwLock for better read concurrency when many files open at once
-struct WasmLanguageLoader {
-    store: Mutex<Option<Box<WasmStore>>>,
-    languages: RwLock<ahash::HashMap<&'static str, Language>>,
+/// How to set up a parser for a language
+#[derive(Clone)]
+enum ParserSetup {
+    /// Native language (tree-sitter compiled in)
+    Native(Language),
+    /// WASM language (loaded at runtime)
+    Wasm {
+        name: &'static str,
+        wasm_bytes: &'static [u8],
+    },
 }
 
-impl WasmLanguageLoader {
-    fn new() -> Self {
-        Self {
-            store: Mutex::new(None),
-            languages: RwLock::new(ahash::HashMap::default()),
+/// Complete language specification
+#[derive(Clone)]
+struct LanguageSpec {
+    name: &'static str,
+    extensions: &'static [&'static str],
+    parser_setup: ParserSetup,
+    highlights_query: &'static str,
+    /// Optional injections query (for detecting embedded languages)
+    injections_query: Option<&'static str>,
+    /// Optional inline/secondary grammar (for markdown, etc.)
+    inline_spec: Option<Box<LanguageSpec>>,
+}
+
+impl LanguageSpec {
+    /// Set up a parser for this language
+    fn setup_parser(&self) -> Result<Parser, tree_sitter::LanguageError> {
+        let mut parser = Parser::new();
+
+        match &self.parser_setup {
+            ParserSetup::Native(language) => {
+                parser.set_language(language)?;
+            }
+            ParserSetup::Wasm { name, wasm_bytes } => {
+                let engine = Box::leak(Box::new(tree_sitter::wasmtime::Engine::default()));
+                let mut store = WasmStore::new(engine).expect("Failed to create WasmStore");
+                let language = store
+                    .load_language(name, wasm_bytes)
+                    .expect("Failed to load WASM language");
+                parser
+                    .set_wasm_store(store)
+                    .expect("Failed to set WasmStore");
+                parser.set_language(&language)?;
+            }
         }
+
+        Ok(parser)
     }
 
-    fn load(&self, name: &'static str, wasm_bytes: &[u8]) -> Language {
-        // Fast path: check cache with read lock (allows concurrent reads)
-        {
-            let langs = self.languages.read();
-            if let Some(lang) = langs.get(name) {
-                return lang.clone();
+    /// Get the Language for queries
+    fn language(&self) -> Language {
+        match &self.parser_setup {
+            ParserSetup::Native(lang) => lang.clone(),
+            ParserSetup::Wasm { .. } => {
+                // For WASM, we need to load it - use the global loader
+                let mut parser = self.setup_parser().expect("Failed to setup parser");
+                parser.language().expect("Parser has no language set").clone()
             }
         }
+    }
+}
 
-        // Slow path: need to load the language
-        // Take write lock to prevent duplicate loading
-        let mut langs = self.languages.write();
+/// Central registry of all supported languages
+struct LanguageRegistry {
+    languages: Vec<LanguageSpec>,
+}
 
-        // Double-check pattern: another thread might have loaded it
-        if let Some(lang) = langs.get(name) {
-            return lang.clone();
-        }
+impl LanguageRegistry {
+    fn new() -> Self {
+        let mut registry = Self {
+            languages: Vec::new(),
+        };
 
-        // Initialize store if needed (only during first language load)
-        let mut store_guard = self.store.lock();
-        if store_guard.is_none() {
-            let engine = tree_sitter::wasmtime::Engine::default();
-            let store = Box::new(WasmStore::new(&engine).expect("Failed to create WasmStore"));
-            let store_ptr: &'static mut WasmStore = Box::leak(store);
-            unsafe {
-                *store_guard = Some(Box::from_raw(store_ptr));
-            }
-        }
+        // Register all supported languages
+        registry.register_rust();
+        registry.register_toml();
+        registry.register_wgsl();
+        registry.register_markdown();
 
-        // Load the language
-        let store = store_guard.as_mut().unwrap();
-        let language = store
-            .load_language(name, wasm_bytes)
-            .expect(&format!("Failed to load {} language", name));
+        registry
+    }
 
-        // Cache it (we already have write lock)
-        langs.insert(name, language.clone());
-        drop(store_guard); // Release store lock early
+    fn register_rust(&mut self) {
+        self.languages.push(LanguageSpec {
+            name: "rust",
+            extensions: &["rs"],
+            parser_setup: ParserSetup::Native(tree_sitter_rust::LANGUAGE.into()),
+            highlights_query: tree_sitter_rust::HIGHLIGHTS_QUERY,
+            injections_query: None,
+            inline_spec: None,
+        });
+    }
 
-        language
+    fn register_toml(&mut self) {
+        self.languages.push(LanguageSpec {
+            name: "toml",
+            extensions: &["toml"],
+            parser_setup: ParserSetup::Wasm {
+                name: "toml",
+                wasm_bytes: include_bytes!("../assets/grammars/toml/tree-sitter-toml.wasm"),
+            },
+            highlights_query: include_str!("../assets/grammars/toml/highlights.scm"),
+            injections_query: None,
+            inline_spec: None,
+        });
+    }
+
+    fn register_wgsl(&mut self) {
+        self.languages.push(LanguageSpec {
+            name: "wgsl",
+            extensions: &["wgsl"],
+            parser_setup: ParserSetup::Wasm {
+                name: "wgsl",
+                wasm_bytes: include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm"),
+            },
+            highlights_query: include_str!("../assets/grammars/wgsl/highlights.scm"),
+            injections_query: None,
+            inline_spec: None,
+        });
+    }
+
+    fn register_markdown(&mut self) {
+        // Markdown inline grammar
+        let inline_spec = LanguageSpec {
+            name: "markdown_inline",
+            extensions: &[],
+            parser_setup: ParserSetup::Native(tree_sitter_md::INLINE_LANGUAGE.into()),
+            highlights_query: tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            injections_query: Some(tree_sitter_md::INJECTION_QUERY_INLINE),
+            inline_spec: None,
+        };
+
+        self.languages.push(LanguageSpec {
+            name: "markdown",
+            extensions: &["md"],
+            parser_setup: ParserSetup::Native(tree_sitter_md::LANGUAGE.into()),
+            highlights_query: tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+            injections_query: Some(tree_sitter_md::INJECTION_QUERY_BLOCK),
+            inline_spec: Some(Box::new(inline_spec)),
+        });
+    }
+
+    fn by_name(&self, name: &str) -> Option<&LanguageSpec> {
+        self.languages.iter().find(|spec| spec.name == name)
+    }
+
+    fn by_extension(&self, ext: &str) -> Option<&LanguageSpec> {
+        self.languages
+            .iter()
+            .find(|spec| spec.extensions.contains(&ext))
     }
 }
 
 lazy_static::lazy_static! {
-    static ref WASM_LOADER: WasmLanguageLoader = WasmLanguageLoader::new();
+    static ref LANGUAGE_REGISTRY: LanguageRegistry = LanguageRegistry::new();
 }
 
 /// Language configuration for syntax highlighting
@@ -80,55 +175,47 @@ pub struct LanguageConfig {
     pub language: Language,
     pub highlights_query: &'static str,
     pub name: &'static str,
+    /// Optional inline/secondary grammar (e.g., for markdown inline content)
+    pub inline_language: Option<Language>,
+    pub inline_highlights_query: Option<&'static str>,
 }
 
-/// Supported languages
+/// Supported languages - now just a thin wrapper around the registry
 pub struct Languages;
 
 impl Languages {
-    /// Rust language configuration (native)
+    fn spec_to_config(spec: &LanguageSpec) -> LanguageConfig {
+        let inline_language = spec.inline_spec.as_ref().map(|s| s.language());
+        let inline_highlights_query = spec.inline_spec.as_ref().map(|s| s.highlights_query);
+
+        LanguageConfig {
+            language: spec.language(),
+            highlights_query: spec.highlights_query,
+            name: spec.name,
+            inline_language,
+            inline_highlights_query,
+        }
+    }
+
+    /// Rust language configuration
     pub fn rust() -> LanguageConfig {
-        LanguageConfig {
-            language: tree_sitter_rust::LANGUAGE.into(),
-            highlights_query: tree_sitter_rust::HIGHLIGHTS_QUERY,
-            name: "rust",
-        }
+        Self::spec_to_config(LANGUAGE_REGISTRY.by_name("rust").unwrap())
     }
 
-    /// WGSL language configuration (WASM)
+    /// Markdown language configuration
+    pub fn markdown() -> LanguageConfig {
+        Self::spec_to_config(LANGUAGE_REGISTRY.by_name("markdown").unwrap())
+    }
+
+    /// WGSL language configuration
     pub fn wgsl() -> LanguageConfig {
-        const WASM: &[u8] = include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
-        const HIGHLIGHTS: &str = include_str!("../assets/grammars/wgsl/highlights.scm");
-
-        LanguageConfig {
-            language: WASM_LOADER.load("wgsl", WASM),
-            highlights_query: HIGHLIGHTS,
-            name: "wgsl",
-        }
+        Self::spec_to_config(LANGUAGE_REGISTRY.by_name("wgsl").unwrap())
     }
 
-    /// TOML language configuration (WASM)
+    /// TOML language configuration
     pub fn toml() -> LanguageConfig {
-        const WASM: &[u8] = include_bytes!("../assets/grammars/toml/tree-sitter-toml.wasm");
-        const HIGHLIGHTS: &str = include_str!("../assets/grammars/toml/highlights.scm");
-
-        LanguageConfig {
-            language: WASM_LOADER.load("toml", WASM),
-            highlights_query: HIGHLIGHTS,
-            name: "toml",
-        }
+        Self::spec_to_config(LANGUAGE_REGISTRY.by_name("toml").unwrap())
     }
-
-    // Adding new WASM languages is now trivial:
-    // pub fn javascript() -> LanguageConfig {
-    //     const WASM: &[u8] = include_bytes!("../assets/grammars/js/tree-sitter-javascript.wasm");
-    //     const HIGHLIGHTS: &str = include_str!("../assets/grammars/js/highlights.scm");
-    //     LanguageConfig {
-    //         language: WASM_LOADER.load("javascript", WASM),
-    //         highlights_query: HIGHLIGHTS,
-    //         name: "javascript",
-    //     }
-    // }
 }
 
 /// Syntax highlighting mode for debugging and validation
@@ -239,6 +326,9 @@ pub struct SyntaxHighlighter {
     highlights_query: &'static str,
     /// Syntax highlighting mode (for debugging/validation)
     mode: Arc<ArcSwap<SyntaxMode>>,
+    /// Optional inline/secondary language (None for single-grammar languages)
+    inline_language: Option<Language>,
+    inline_highlights_query: Option<&'static str>,
 }
 
 /// Text edit information for tree-sitter incremental parsing
@@ -315,47 +405,20 @@ impl SyntaxHighlighter {
 
     /// Create highlighter for any language with background parsing
     pub fn new(config: LanguageConfig) -> Result<Self, tree_sitter::LanguageError> {
-        // Create the parser with proper setup here, then move to thread
-        let mut parser = Parser::new();
+        let has_inline = config.inline_language.is_some();
 
-        // For WASM languages, we need special handling
-        if config.name == "wgsl" {
-            // Create engine and store here
-            let engine = Box::leak(Box::new(tree_sitter::wasmtime::Engine::default()));
-            let mut store = WasmStore::new(engine).expect("Failed to create WasmStore");
+        // Get the language spec from registry for parser setup
+        let spec = LANGUAGE_REGISTRY
+            .by_name(config.name)
+            .expect("Language not found in registry");
 
-            // Load the language into the store
-            const WGSL_WASM: &[u8] =
-                include_bytes!("../assets/grammars/wgsl/tree-sitter-wgsl.wasm");
-            let language = store
-                .load_language("wgsl", WGSL_WASM)
-                .expect("Failed to load WGSL language");
-
-            // Set up the parser
-            parser
-                .set_wasm_store(store)
-                .expect("Failed to set WasmStore");
-            parser.set_language(&language)?;
-        } else if config.name == "toml" {
-            // Create engine and store here
-            let engine = Box::leak(Box::new(tree_sitter::wasmtime::Engine::default()));
-            let mut store = WasmStore::new(engine).expect("Failed to create WasmStore");
-
-            // Load the language into the store
-            const TOML_WASM: &[u8] =
-                include_bytes!("../assets/grammars/toml/tree-sitter-toml.wasm");
-            let language = store
-                .load_language("toml", TOML_WASM)
-                .expect("Failed to load TOML language");
-
-            // Set up the parser
-            parser
-                .set_wasm_store(store)
-                .expect("Failed to set WasmStore");
-            parser.set_language(&language)?;
+        // Set up the parser using the spec
+        // (Skip for dual-grammar languages - they use special parsers in the background thread)
+        let mut parser = if !has_inline {
+            spec.setup_parser()?
         } else {
-            parser.set_language(&config.language)?;
-        }
+            Parser::new() // Placeholder for dual-grammar
+        };
 
         // Don't create query here - defer to background thread
         let language_clone = config.language.clone();
@@ -373,6 +436,12 @@ impl SyntaxHighlighter {
         let (tx, rx) = mpsc::channel::<ParseRequest>();
 
         let language_name = config.name;
+        let has_inline_clone = has_inline;
+        let inline_language_clone = config.inline_language.clone();
+        let inline_highlights_query_clone = config.inline_highlights_query;
+
+        // Get injections query from spec if available
+        let injections_query_str = spec.injections_query;
 
         // Background parsing thread with debouncing - move parser into it
         thread::spawn(move || {
@@ -382,6 +451,15 @@ impl SyntaxHighlighter {
             let mut is_first_parse = true;
             // Lazy query compilation on first use
             let mut query: Option<Query> = None;
+            let mut inline_query: Option<Query> = None;
+            let mut injections_query: Option<Query> = None;
+
+            // For dual-grammar languages (e.g., markdown), create specialized parser
+            let mut md_parser = if language_name == "markdown" && has_inline_clone {
+                Some(tree_sitter_md::MarkdownParser::default())
+            } else {
+                None
+            };
 
             while let Ok(request) = rx.recv() {
                 // Shorter debounce for initial parse, longer for subsequent
@@ -418,11 +496,23 @@ impl SyntaxHighlighter {
                     }
                 }
 
-                // Parse with tree-sitter (incremental if we have existing tree, fresh if reset)
-                tree = parser.parse(&final_request.text, tree.as_ref());
+                // Parse with tree-sitter (regular or markdown)
+                let md_tree;
+                if let Some(ref mut md_p) = md_parser {
+                    // Markdown: use MarkdownParser (returns MarkdownTree with block + inline trees)
+                    md_tree = md_p.parse(final_request.text.as_bytes(), None);
+                    // Extract the block tree for caching
+                    if let Some(ref md_t) = md_tree {
+                        tree = Some(md_t.block_tree().clone());
+                    }
+                } else {
+                    // Regular language: use standard Parser
+                    tree = parser.parse(&final_request.text, tree.as_ref());
+                    md_tree = None;
+                }
 
                 if let Some(ref ts_tree) = tree {
-                    // Compile query on first use (lazy initialization)
+                    // Compile queries on first use (lazy initialization)
                     if query.is_none() {
                         println!(
                             "SYNTAX [{}]: Compiling tree-sitter query on background thread...",
@@ -446,24 +536,205 @@ impl SyntaxHighlighter {
                         }
                     }
 
+                    // For dual-grammar languages, also compile inline query
+                    if has_inline_clone && inline_query.is_none() {
+                        if let (Some(ref inline_lang), Some(inline_query_str)) =
+                            (&inline_language_clone, inline_highlights_query_clone)
+                        {
+                            match Query::new(inline_lang, inline_query_str) {
+                                Ok(compiled_query) => {
+                                    println!(
+                                        "SYNTAX [{}]: Inline query compilation successful",
+                                        language_name
+                                    );
+                                    inline_query = Some(compiled_query);
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "SYNTAX [{}]: Failed to compile inline query: {:?}",
+                                        language_name, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Compile injections query if available
+                    if injections_query.is_none() {
+                        if let Some(inj_query_str) = injections_query_str {
+                            match Query::new(&language_clone, inj_query_str) {
+                                Ok(compiled_query) => {
+                                    println!(
+                                        "SYNTAX [{}]: Injections query compilation successful",
+                                        language_name
+                                    );
+                                    injections_query = Some(compiled_query);
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "SYNTAX [{}]: Failed to compile injections query: {:?}",
+                                        language_name, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     let query_ref = query.as_ref().unwrap();
                     let mut effects = Vec::new();
-                    let capture_names = query_ref.capture_names();
 
+                    // Track language injections (for markdown code blocks, etc.)
+                    let mut injections: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+
+                    // First, detect language injections using the injections query (if available)
+                    if let Some(ref inj_query) = injections_query {
+                        let mut inj_cursor = QueryCursor::new();
+                        let inj_capture_names = inj_query.capture_names();
+                        let mut inj_matches = inj_cursor.matches(
+                            inj_query,
+                            ts_tree.root_node(),
+                            final_request.text.as_bytes(),
+                        );
+
+                        while let Some(match_) = inj_matches.next() {
+                            let mut injection_lang: Option<String> = None;
+                            let mut injection_range: Option<std::ops::Range<usize>> = None;
+
+                            for capture in match_.captures {
+                                let capture_name = inj_capture_names[capture.index as usize];
+
+                                if capture_name == "injection.language" {
+                                    // Extract the language name from the node text
+                                    let lang_bytes = &final_request.text.as_bytes()
+                                        [capture.node.start_byte()..capture.node.end_byte()];
+                                    if let Ok(lang_str) = std::str::from_utf8(lang_bytes) {
+                                        injection_lang = Some(lang_str.to_string());
+
+                                        // Also highlight the language tag itself
+                                        effects.push(TextEffect {
+                                            range: capture.node.start_byte()..capture.node.end_byte(),
+                                            effect: EffectType::Token(Self::token_type_to_id(TokenType::Type)),
+                                            priority: priority::SYNTAX + 1,
+                                        });
+                                    }
+                                } else if capture_name == "injection.content" {
+                                    injection_range = Some(capture.node.start_byte()..capture.node.end_byte());
+                                }
+                            }
+
+                            // If we found both language and content, record the injection
+                            if let (Some(lang), Some(range)) = (injection_lang, injection_range) {
+                                injections.push((lang, range));
+                            }
+                        }
+                    }
+
+                    // Now extract block-level syntax highlighting
+                    let capture_names = query_ref.capture_names();
                     let mut matches = cursor.matches(
                         query_ref,
                         ts_tree.root_node(),
                         final_request.text.as_bytes(),
                     );
 
-                    // Extract syntax highlighting from tree-sitter results
                     let mut capture_count = 0;
+                    let mut capture_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
                     while let Some(match_) = matches.next() {
                         for capture in match_.captures {
                             let capture_name = &capture_names[capture.index as usize];
+                            let node_type = capture.node.kind();
                             capture_count += 1;
 
-                            if let Some(token) = Self::capture_name_to_token_type(capture_name) {
+                            // Track which captures we're seeing
+                            *capture_type_counts.entry(capture_name.to_string()).or_insert(0) += 1;
+
+                            // Check for markdown-specific styling
+                            let token_type = if language_name == "markdown" {
+                                match *capture_name {
+                                    "punctuation.special" => {
+                                        // Differentiate markers by type
+                                        match node_type {
+                                            "atx_h1_marker" | "setext_h1_underline" => Some(TokenType::Keyword),
+                                            "atx_h2_marker" | "setext_h2_underline" => Some(TokenType::Type),
+                                            "atx_h3_marker" => Some(TokenType::Function),
+                                            "atx_h4_marker" => Some(TokenType::Constant),
+                                            "atx_h5_marker" => Some(TokenType::Namespace),
+                                            "atx_h6_marker" => Some(TokenType::Property),
+                                            "list_marker_plus" | "list_marker_minus" | "list_marker_star" => Some(TokenType::Operator),
+                                            "list_marker_dot" | "list_marker_parenthesis" => Some(TokenType::EnumMember),
+                                            "thematic_break" => Some(TokenType::Delimiter),
+                                            "block_quote_marker" => Some(TokenType::CommentDoc),
+                                            _ => Some(TokenType::Punctuation),
+                                        }
+                                    }
+                                    "punctuation.delimiter" => {
+                                        // Code block delimiters (```) and language tags
+                                        match node_type {
+                                            "fenced_code_block_delimiter" => Some(TokenType::Operator), // ```
+                                            _ => Some(TokenType::Punctuation),
+                                        }
+                                    }
+                                    "text.literal" => {
+                                        // Don't highlight the code block content itself - let injections handle it
+                                        match node_type {
+                                            "fenced_code_block" | "code_fence_content" => None,
+                                            _ => Some(TokenType::String),
+                                        }
+                                    }
+                                    "text.title" => {
+                                        // Differentiate heading text by finding the marker sibling
+                                        if let Some(parent) = capture.node.parent() {
+                                            if parent.kind() == "atx_heading" {
+                                                // Find the marker sibling (first child of parent)
+                                                let mut cursor = parent.walk();
+                                                if cursor.goto_first_child() {
+                                                    let marker_kind = cursor.node().kind();
+                                                    match marker_kind {
+                                                        "atx_h1_marker" => Some(TokenType::Keyword),
+                                                        "atx_h2_marker" => Some(TokenType::Type),
+                                                        "atx_h3_marker" => Some(TokenType::Function),
+                                                        "atx_h4_marker" => Some(TokenType::Constant),
+                                                        "atx_h5_marker" => Some(TokenType::Namespace),
+                                                        "atx_h6_marker" => Some(TokenType::Property),
+                                                        _ => Some(TokenType::Keyword),
+                                                    }
+                                                } else {
+                                                    Some(TokenType::Keyword)
+                                                }
+                                            } else if parent.kind() == "setext_heading" {
+                                                // setext headings are h1 or h2, check the underline
+                                                let mut cursor = parent.walk();
+                                                cursor.goto_first_child();
+                                                let mut result = Some(TokenType::Keyword);
+                                                while cursor.goto_next_sibling() {
+                                                    match cursor.node().kind() {
+                                                        "setext_h1_underline" => {
+                                                            result = Some(TokenType::Keyword);
+                                                            break;
+                                                        }
+                                                        "setext_h2_underline" => {
+                                                            result = Some(TokenType::Type);
+                                                            break;
+                                                        }
+                                                        _ => continue,
+                                                    }
+                                                }
+                                                result
+                                            } else {
+                                                Some(TokenType::Keyword)
+                                            }
+                                        } else {
+                                            Some(TokenType::Keyword)
+                                        }
+                                    }
+                                    _ => Self::capture_name_to_token_type(capture_name),
+                                }
+                            } else {
+                                Self::capture_name_to_token_type(capture_name)
+                            };
+
+                            if let Some(token) = token_type {
                                 effects.push(TextEffect {
                                     range: capture.node.start_byte()..capture.node.end_byte(),
                                     effect: EffectType::Token(Self::token_type_to_id(token)),
@@ -475,9 +746,131 @@ impl SyntaxHighlighter {
                         }
                     }
 
+                    // Print top 10 most common captures
+                    if !capture_type_counts.is_empty() {
+                        let mut sorted: Vec<_> = capture_type_counts.iter().collect();
+                        sorted.sort_by(|a, b| b.1.cmp(a.1));
+                        println!("SYNTAX [{}]: Top captures:", language_name);
+                        for (name, count) in sorted.iter().take(10) {
+                            println!("  {} x {}", count, name);
+                        }
+                    }
+
+                    println!("SYNTAX [{}]: Block effects before injections: {}", language_name, effects.len());
+
+                    // Process language injections (e.g., code blocks in markdown)
+                    println!("SYNTAX [{}]: Found {} language injections", language_name, injections.len());
+                    for (lang, range) in injections {
+                        println!("  -> Injecting '{}' at range {}..{}", lang, range.start, range.end);
+                        if let Some(mut injection_parser) = Self::create_injection_parser(&lang) {
+                            let code_text = &final_request.text[range.clone()];
+                            println!("     Code text length: {} bytes", code_text.len());
+                            if let Some(injection_tree) = injection_parser.0.parse(code_text, None) {
+                                let mut injection_cursor = QueryCursor::new();
+                                let mut injection_matches = injection_cursor.matches(
+                                    &injection_parser.1,
+                                    injection_tree.root_node(),
+                                    code_text.as_bytes(),
+                                );
+
+                                let mut injection_effect_count = 0;
+                                while let Some(match_) = injection_matches.next() {
+                                    for capture in match_.captures {
+                                        let capture_name = &injection_parser.1.capture_names()[capture.index as usize];
+                                        if let Some(token) = Self::capture_name_to_token_type(capture_name) {
+                                            // Adjust byte offsets to be relative to the full document
+                                            effects.push(TextEffect {
+                                                range: (range.start + capture.node.start_byte())
+                                                    ..(range.start + capture.node.end_byte()),
+                                                effect: EffectType::Token(Self::token_type_to_id(token)),
+                                                priority: priority::SYNTAX + 1, // Higher priority than base markdown
+                                            });
+                                            injection_effect_count += 1;
+                                        }
+                                    }
+                                }
+                                println!("     Generated {} effects for '{}' injection", injection_effect_count, lang);
+                            } else {
+                                println!("     Failed to parse '{}' code", lang);
+                            }
+                        } else {
+                            println!("     No parser available for language '{}'", lang);
+                        }
+                    }
+
+                    // For dual-grammar languages, also extract inline syntax highlighting
+                    println!("SYNTAX [{}]: md_tree={}, inline_query={}", language_name, md_tree.is_some(), inline_query.is_some());
+                    if let Some(ref md_t) = &md_tree {
+                        println!("SYNTAX [{}]: Markdown has {} inline trees", language_name, md_t.inline_trees().len());
+                    }
+                    if let (Some(ref md_t), Some(ref inline_q)) = (&md_tree, &inline_query) {
+                        let inline_capture_names = inline_q.capture_names();
+                        let mut inline_capture_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                        let mut inline_effect_count = 0;
+
+                        for inline_tree in md_t.inline_trees() {
+                            let mut inline_cursor = QueryCursor::new();
+                            let mut inline_matches = inline_cursor.matches(
+                                inline_q,
+                                inline_tree.root_node(),
+                                final_request.text.as_bytes(),
+                            );
+
+                            while let Some(match_) = inline_matches.next() {
+                                for capture in match_.captures {
+                                    let capture_name = &inline_capture_names[capture.index as usize];
+                                    let node_type = capture.node.kind();
+                                    *inline_capture_counts.entry(capture_name.to_string()).or_insert(0) += 1;
+
+                                    // Special handling for inline markdown elements
+                                    let (token_type, effect_priority) = match *capture_name {
+                                        "punctuation.delimiter" => {
+                                            let token = match node_type {
+                                                "emphasis_delimiter" => Some(TokenType::Operator),       // * or _ for italic
+                                                "code_span_delimiter" => Some(TokenType::String),        // `
+                                                _ => Some(TokenType::Punctuation),
+                                            };
+                                            (token, priority::SYNTAX + 1) // Higher priority - overrides content
+                                        }
+                                        "text.literal" => (Some(TokenType::String), priority::SYNTAX),           // `code spans`
+                                        "text.emphasis" => (Some(TokenType::Variable), priority::SYNTAX),        // *italic text*
+                                        "text.strong" => (Some(TokenType::Method), priority::SYNTAX),            // **bold text**
+                                        "text.uri" => (Some(TokenType::Constant), priority::SYNTAX),             // URLs
+                                        "text.reference" => (Some(TokenType::Attribute), priority::SYNTAX),      // [link text]
+                                        "string.escape" => (Some(TokenType::StringEscape), priority::SYNTAX + 1), // Escape sequences
+                                        _ => (Self::capture_name_to_token_type(capture_name), priority::SYNTAX),
+                                    };
+
+                                    if let Some(token) = token_type {
+                                        effects.push(TextEffect {
+                                            range: capture.node.start_byte()..capture.node.end_byte(),
+                                            effect: EffectType::Token(Self::token_type_to_id(token)),
+                                            priority: effect_priority,
+                                        });
+                                        inline_effect_count += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        println!("SYNTAX [{}]: Inline effects: {}", language_name, inline_effect_count);
+                        if !inline_capture_counts.is_empty() {
+                            let mut sorted: Vec<_> = inline_capture_counts.iter().collect();
+                            sorted.sort_by(|a, b| b.1.cmp(a.1));
+                            println!("SYNTAX [{}]: Top inline captures:", language_name);
+                            for (name, count) in sorted.iter().take(10) {
+                                println!("  {} x {}", count, name);
+                            }
+                        }
+                    }
+
                     // Sort by range and remove overlaps for clean rendering
+                    let effects_before = effects.len();
+                    println!("SYNTAX [{}]: Total effects before cleanup: {}", language_name, effects_before);
                     effects.sort_by_key(|e| (e.range.start, e.range.end));
                     let cleaned = Self::remove_overlaps(effects);
+
+                    println!("SYNTAX [{}]: Generated {} total effects (after cleanup, removed {})", language_name, cleaned.len(), effects_before - cleaned.len());
 
                     // Atomic swap - readers never block! Old highlighting stays until this completes
                     highlights_clone.store(Arc::new(cleaned));
@@ -506,12 +899,19 @@ impl SyntaxHighlighter {
             language: config.language,
             highlights_query: config.highlights_query,
             mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)), // Default to incremental
+            inline_language: config.inline_language,
+            inline_highlights_query: config.inline_highlights_query,
         })
     }
 
     /// Create highlighter for Rust (convenience method)
     pub fn new_rust() -> Self {
         Self::new(Languages::rust()).expect("Failed to create Rust highlighter")
+    }
+
+    /// Create highlighter for Markdown (convenience method)
+    pub fn new_markdown() -> Self {
+        Self::new(Languages::markdown()).expect("Failed to create Markdown highlighter")
     }
 
     /// Create highlighter for WGSL (convenience method)
@@ -524,14 +924,11 @@ impl SyntaxHighlighter {
         Self::new(Languages::toml()).expect("Failed to create TOML highlighter")
     }
 
-    /// Create highlighter based on file extension
+    /// Create highlighter based on file extension (uses registry)
     pub fn from_file_extension(extension: &str) -> Option<Self> {
-        match extension.to_lowercase().as_str() {
-            "rs" => Some(Self::new_rust()),
-            "wgsl" => Some(Self::new_wgsl()),
-            "toml" => Some(Self::new_toml()),
-            _ => None,
-        }
+        let spec = LANGUAGE_REGISTRY.by_extension(&extension.to_lowercase())?;
+        let config = Languages::spec_to_config(spec);
+        Self::new(config).ok()
     }
 
     /// Get the language name for a file extension without creating a highlighter
@@ -541,17 +938,42 @@ impl SyntaxHighlighter {
             .and_then(|ext| ext.to_str())
             .unwrap_or("");
 
-        match extension.to_lowercase().as_str() {
-            "rs" => "rust",
-            "wgsl" => "wgsl",
-            "toml" => "toml",
-            _ => "none", // Default to no highlighting
+        LANGUAGE_REGISTRY
+            .by_extension(&extension.to_lowercase())
+            .map(|spec| spec.name)
+            .unwrap_or("none")
+    }
+
+    /// Create a null highlighter that returns no effects (for unsupported file types)
+    pub fn new_null() -> Self {
+        // Create a dummy highlighter that never highlights anything
+        let highlights = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let cached_tree = Arc::new(ArcSwap::from_pointee(None));
+        let cached_text = Arc::new(ArcSwap::from_pointee(None));
+        let cached_version = Arc::new(AtomicU64::new(0));
+
+        let (tx, _rx) = mpsc::channel::<ParseRequest>();
+
+        Self {
+            highlights,
+            tx,
+            name: "none",
+            cached_tree,
+            cached_text,
+            cached_version,
+            language: tree_sitter_rust::LANGUAGE.into(), // Dummy language, never used
+            highlights_query: "",
+            mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)),
+            inline_language: None,
+            inline_highlights_query: None,
         }
     }
 
-    /// Create highlighter based on file path
+    /// Create highlighter based on file path (always returns Some, uses null for unsupported)
     pub fn from_file_path(path_raw: &str) -> Option<Self> {
         let path = std::path::Path::new(path_raw);
+
+        // Special cases (e.g., Cargo.lock is TOML)
         if let Some(file_name) = path.file_name() {
             if file_name == "Cargo.lock" {
                 return Some(Self::new_toml());
@@ -561,6 +983,7 @@ impl SyntaxHighlighter {
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(Self::from_file_extension)
+            .or_else(|| Some(Self::new_null())) // Always return something, use null for unsupported
     }
 
     /// Map tree-sitter capture names to token types
@@ -573,6 +996,20 @@ impl SyntaxHighlighter {
             "derive" => return Some(TokenType::Derive),
             "escape" => return Some(TokenType::StringEscape),
             "constant.builtin" => return Some(TokenType::Number),
+
+            // Markdown-specific captures
+            "text.title" | "text.title.1" | "text.title.2" | "text.title.3" |
+            "text.title.4" | "text.title.5" | "text.title.6" => return Some(TokenType::Keyword),
+            "text.literal" | "text.literal.block" => return Some(TokenType::String),
+            "text.uri" => return Some(TokenType::Constant),
+            "text.reference" => return Some(TokenType::Attribute),
+            "text.emphasis" => return Some(TokenType::Variable),
+            "text.strong" => return Some(TokenType::Method),
+            "text.strike" => return Some(TokenType::Comment),
+            "punctuation.list_marker" | "punctuation.special" => return Some(TokenType::Punctuation),
+            "none" => return None, // Explicitly ignored captures
+            "injection.content" => return None, // Handled separately
+
             _ => {}
         }
 
@@ -598,6 +1035,9 @@ impl SyntaxHighlighter {
         } else if name.starts_with("punctuation") {
             Some(TokenType::Punctuation)
         } else if name.starts_with("variable") {
+            Some(TokenType::Variable)
+        } else if name.starts_with("text") {
+            // Generic text captures (markdown, etc.) - default to normal text (Variable)
             Some(TokenType::Variable)
         } else if name.starts_with("attribute")
             || name == "decorator"
@@ -830,23 +1270,45 @@ impl SyntaxHighlighter {
         Self::coalesce_effects(cleaned)
     }
 
-    /// Remove overlapping effects (keeps the more specific one)
-    pub fn remove_overlaps(effects: Vec<TextEffect>) -> Vec<TextEffect> {
+    /// Create a parser for language injection (e.g., rust code blocks in markdown)
+    /// Returns (Parser, Query) if the language is supported
+    /// This now automatically works for ANY language in the registry!
+    fn create_injection_parser(lang: &str) -> Option<(Parser, Query)> {
+        // Look up language in registry - automatically supports all registered languages
+        let spec = LANGUAGE_REGISTRY.by_name(lang)?;
+
+        // Set up parser using the spec
+        let parser = spec.setup_parser().ok()?;
+
+        // Create query
+        let language = spec.language();
+        let query = Query::new(&language, spec.highlights_query).ok()?;
+
+        Some((parser, query))
+    }
+
+    /// Remove overlapping effects (only removes exact duplicates, keeps different priorities)
+    pub fn remove_overlaps(mut effects: Vec<TextEffect>) -> Vec<TextEffect> {
         if effects.is_empty() {
             return effects;
         }
 
+        // Sort by range start, then by priority (descending)
+        effects.sort_by_key(|e| (e.range.start, e.range.end, std::cmp::Reverse(e.priority)));
+
         let mut result = Vec::with_capacity(effects.len());
-        let mut last_end = 0;
 
         for effect in effects {
-            // Skip effects that overlap with previous
-            if effect.range.start < last_end {
-                continue;
-            }
+            // Only skip if we have the EXACT same range and priority (duplicate)
+            let is_duplicate = result.iter().any(|existing: &TextEffect| {
+                existing.range == effect.range &&
+                existing.priority == effect.priority &&
+                existing.effect == effect.effect
+            });
 
-            last_end = effect.range.end;
-            result.push(effect);
+            if !is_duplicate {
+                result.push(effect);
+            }
         }
 
         result

@@ -4,7 +4,7 @@
 
 use crate::{
     accelerator::{Modifiers, MouseButton, Trigger, WheelDirection},
-    input::{self, EventBus, InputAction},
+    input::{EventBus, InputAction},
     lsp_manager::LspManager,
     render::Renderer,
     scroll::{ScrollFocusManager, Scrollable, WidgetId},
@@ -649,26 +649,6 @@ impl TinyApp {
         self.request_redraw();
     }
 
-    /// Helper for overlay hide
-    fn hide_overlay(&mut self, hide: impl FnOnce(&mut EditorLogic)) {
-        hide(&mut self.editor);
-        self.editor.ui_changed = true;
-        self.shortcuts.set_context(ShortcutContext::Editor);
-        self.scroll_focus.clear_focus();
-        // Restore focus to main editor
-        if let Some(tab) = self.editor.tab_manager.active_tab() {
-            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-        }
-        self.request_redraw();
-    }
-
-    /// Helper for simple overlay actions (move up/down, backspace)
-    fn overlay_action(&mut self, action: impl FnOnce(&mut EditorLogic)) {
-        action(&mut self.editor);
-        self.editor.ui_changed = true;
-        self.request_redraw();
-    }
-
     /// Helper for navigation with optional redraw
     fn navigate(&mut self, nav: impl FnOnce(&mut EditorLogic) -> bool) {
         if nav(&mut self.editor) {
@@ -677,66 +657,19 @@ impl TinyApp {
         }
     }
 
-    /// Broadcast event to all components (they decide if they care)
-    fn broadcast_to_components(&mut self, event: &crate::input::Event) {
-        // File picker
-        if let Some(action) = self.editor.file_picker.handle_event(&event.name) {
-            use crate::file_picker_plugin::FilePickerAction;
-            match action {
-                FilePickerAction::Continue => {
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
-                FilePickerAction::Close => {
-                    self.hide_overlay(|e| e.file_picker.hide());
-                }
-                FilePickerAction::Select(path) => {
-                    self.editor.file_picker.hide();
-                    self.shortcuts.set_context(ShortcutContext::Editor);
-                    self.scroll_focus.clear_focus();
-                    self.editor.record_navigation();
-                    if self.editor.tab_manager.open_file(path).is_ok() {
-                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                        }
-                        self.editor.ui_changed = true;
-                        self.request_redraw();
-                    }
-                }
-            }
-            return; // File picker handled it
-        }
+    /// Dispatch event through subscription system
+    /// Components handle events and emit follow-up events as needed
+    fn dispatch_to_components(&mut self, event: &crate::input::Event) {
+        use crate::input::{dispatch_event, EventSubscriber};
 
-        // Grep
-        if let Some(action) = self.editor.grep.handle_event(&event.name) {
-            use crate::grep_plugin::GrepAction;
-            match action {
-                GrepAction::Continue => {
-                    self.editor.ui_changed = true;
-                    self.request_redraw();
-                }
-                GrepAction::Close => {
-                    self.hide_overlay(|e| e.grep.hide());
-                }
-                GrepAction::Select(result) => {
-                    let (file, line, col) = (result.file_path, result.line_number.saturating_sub(1), result.column);
-                    self.editor.grep.hide();
-                    self.shortcuts.set_context(ShortcutContext::Editor);
-                    self.scroll_focus.clear_focus();
-                    if self.editor.jump_to_location(file, line, col, true) {
-                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                        }
-                        self.cursor_needs_scroll = true;
-                    }
-                    self.request_redraw();
-                }
-            }
-            return; // Grep handled it
-        }
-
-        // Future components would be added here
-        // Main editor doesn't care about navigate.* or action.* events
+        // Dispatch through priority-ordered subscribers
+        // Components emit follow-up events (file.open, grep.navigate, etc.)
+        let mut subscribers: Vec<&mut dyn EventSubscriber> = vec![
+            &mut self.editor.grep,           // Priority 100
+            &mut self.editor.file_picker,    // Priority 100
+            // Main editor (priority 0) doesn't claim navigate/action events
+        ];
+        dispatch_event(event, &mut subscribers, &mut self.event_bus);
     }
 
     /// Get the focused EditableTextView for event routing
@@ -767,7 +700,7 @@ impl TinyApp {
 
     fn process_event_queue(&mut self) {
         for event in self.event_bus.drain_sorted() {
-            use ShortcutContext::{Editor, FilePicker, Grep};
+            use ShortcutContext::{FilePicker, Grep};
             use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
 
             match event.name.as_str() {
@@ -894,6 +827,55 @@ impl TinyApp {
                     self.show_overlay(|e| e.grep.show(String::new()), Grep, GrepWidget, grep_input_id);
                 }
 
+                // Component-emitted events
+                "ui.redraw" => {
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                "file.open" => {
+                    if let Some(path_val) = event.data.get("path") {
+                        if let Some(path_str) = path_val.as_str() {
+                            let path = std::path::PathBuf::from(path_str);
+                            self.shortcuts.set_context(ShortcutContext::Editor);
+                            self.scroll_focus.clear_focus();
+                            self.editor.record_navigation();
+                            if self.editor.tab_manager.open_file(path).is_ok() {
+                                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                                }
+                                self.editor.ui_changed = true;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                }
+                "file.goto" => {
+                    // Generic goto location (from grep, LSP, etc.)
+                    if let (Some(file), Some(line), Some(col)) = (
+                        event.data.get("file"),
+                        event.data.get("line").and_then(|v| v.as_u64()),
+                        event.data.get("column").and_then(|v| v.as_u64())
+                    ) {
+                        if let Some(path_str) = file.as_str() {
+                            let path = std::path::PathBuf::from(path_str);
+                            self.shortcuts.set_context(ShortcutContext::Editor);
+                            self.scroll_focus.clear_focus();
+                            if self.editor.jump_to_location(path, line as usize, col as usize, true) {
+                                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                                }
+                                self.cursor_needs_scroll = true;
+                            }
+                            self.request_redraw();
+                        }
+                    }
+                }
+                "overlay.closed" => {
+                    self.shortcuts.set_context(ShortcutContext::Editor);
+                    self.scroll_focus.clear_focus();
+                    self.request_redraw();
+                }
+
                 // Editor events - delegate to focused EditableTextView's InputHandler
                 "editor.code_action" => self.editor.handle_code_action_request(),
                 name if name.starts_with("editor.") => {
@@ -931,11 +913,29 @@ impl TinyApp {
                             self.update_window_title();
                             self.cursor_needs_scroll = true;
                         }
-                        InputAction::Undo | InputAction::Redo | InputAction::Redraw => {
-                            // For overlay inputs, undo/redo should work on their own buffers
+                        InputAction::Undo => {
+                            // Actually perform undo on the focused view's buffer
+                            let (input_handler, doc, _) = self.get_focused_view_mut();
+                            input_handler.undo(doc);
                             self.request_redraw();
                             self.update_window_title();
-                            // Only scroll cursor for main editor
+                            if !self.editor.file_picker.visible && !self.editor.grep.visible {
+                                self.cursor_needs_scroll = true;
+                            }
+                        }
+                        InputAction::Redo => {
+                            // Actually perform redo on the focused view's buffer
+                            let (input_handler, doc, _) = self.get_focused_view_mut();
+                            input_handler.redo(doc);
+                            self.request_redraw();
+                            self.update_window_title();
+                            if !self.editor.file_picker.visible && !self.editor.grep.visible {
+                                self.cursor_needs_scroll = true;
+                            }
+                        }
+                        InputAction::Redraw => {
+                            self.request_redraw();
+                            self.update_window_title();
                             if !self.editor.file_picker.visible && !self.editor.grep.visible {
                                 self.cursor_needs_scroll = true;
                             }
@@ -954,8 +954,8 @@ impl TinyApp {
                 }
 
                 _ => {
-                    // Broadcast all other events to components (they decide if they care)
-                    self.broadcast_to_components(&event);
+                    // Dispatch to components through subscription system
+                    self.dispatch_to_components(&event);
                 }
             }
         }

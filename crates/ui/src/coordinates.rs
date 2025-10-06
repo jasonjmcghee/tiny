@@ -367,6 +367,51 @@ impl Viewport {
         self.view_to_physical(self.layout_to_view(pos))
     }
 
+    // === Complete Transformations (Doc → Screen, Screen → Doc) ===
+    // These are the ONLY methods you should use for positioning text/cursor/selection
+    // They encapsulate ALL coordinate transforms in one step
+
+    /// Complete transform: Document → Screen coordinates
+    /// Includes: doc → layout → view (scroll) → screen (bounds + padding)
+    /// This is the SINGLE source of truth for positioning
+    pub fn doc_to_screen(&self, pos: DocPos, padding_x: f32, padding_y: f32) -> LayoutPos {
+        let layout = self.doc_to_layout(pos);
+        let view_x = layout.x.0 - self.scroll.x.0;
+        let view_y = layout.y.0 - self.scroll.y.0;
+        let screen_x = self.bounds.x.0 + padding_x + view_x;
+        let screen_y = self.bounds.y.0 + padding_y + view_y;
+        LayoutPos::new(screen_x, screen_y)
+    }
+
+    /// Complete transform with accurate text measurement
+    pub fn doc_to_screen_with_text(&self, pos: DocPos, line_text: &str, padding_x: f32, padding_y: f32) -> LayoutPos {
+        let layout = self.doc_to_layout_with_text(pos, line_text);
+        let view_x = layout.x.0 - self.scroll.x.0;
+        let view_y = layout.y.0 - self.scroll.y.0;
+        let screen_x = self.bounds.x.0 + padding_x + view_x;
+        let screen_y = self.bounds.y.0 + padding_y + view_y;
+        LayoutPos::new(screen_x, screen_y)
+    }
+
+    /// Complete reverse transform: Screen → Document coordinates
+    pub fn screen_to_doc(&self, screen_pos: LayoutPos, padding_x: f32, padding_y: f32) -> DocPos {
+        // Reverse: screen → view → layout → doc
+        let view_x = screen_pos.x.0 - self.bounds.x.0 - padding_x;
+        let view_y = screen_pos.y.0 - self.bounds.y.0 - padding_y;
+        let layout_x = view_x + self.scroll.x.0;
+        let layout_y = view_y + self.scroll.y.0;
+        self.layout_to_doc(LayoutPos::new(layout_x, layout_y))
+    }
+
+    /// Complete reverse transform with tree for accurate positioning
+    pub fn screen_to_doc_with_tree(&self, screen_pos: LayoutPos, tree: &DocTree, padding_x: f32, padding_y: f32) -> DocPos {
+        let view_x = screen_pos.x.0 - self.bounds.x.0 - padding_x;
+        let view_y = screen_pos.y.0 - self.bounds.y.0 - padding_y;
+        let layout_x = view_x + self.scroll.x.0;
+        let layout_y = view_y + self.scroll.y.0;
+        self.layout_to_doc_with_tree(LayoutPos::new(layout_x, layout_y), tree)
+    }
+
     // === Reverse Transformations (Physical → View → Layout → Doc) ===
 
     /// Physical position to view position
