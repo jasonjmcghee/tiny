@@ -1,7 +1,7 @@
 //! Text shaping with swash - proper OpenType support for ligatures, kerning, complex scripts
 
 use swash::shape::ShapeContext;
-use swash::text::{Script, Language};
+use swash::text::{Language, Script};
 use swash::FontRef;
 
 /// Shaping options for text layout
@@ -19,6 +19,10 @@ pub struct ShapingOptions {
     pub language: Option<Language>,
     /// Font size in pixels
     pub font_size: f32,
+    /// Use italic variant
+    pub italic: bool,
+    /// Variable font weight (100-900, where 400=normal, 700=bold)
+    pub weight: f32,
 }
 
 impl Default for ShapingOptions {
@@ -27,9 +31,11 @@ impl Default for ShapingOptions {
             enable_ligatures: true, // Default to ligatures ON
             enable_kerning: true,   // Always enable kerning
             enable_contextual_alternates: true,
-            script: None,           // Auto-detect
-            language: None,         // Auto-detect
+            script: None,   // Auto-detect
+            language: None, // Auto-detect
             font_size: 16.0,
+            italic: false, // Default to regular (non-italic)
+            weight: 400.0, // Default to normal weight
         }
     }
 }
@@ -78,6 +84,17 @@ pub struct ShapingResult {
     pub advance: f32,
 }
 
+/// Font type for a text run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFontType {
+    /// Regular text font (main font - regular or italic)
+    Main,
+    /// Nerd font symbols
+    Nerd,
+    /// Emoji font
+    Emoji,
+}
+
 /// A text run with a specific font
 #[derive(Debug, Clone)]
 pub struct TextRun {
@@ -85,8 +102,8 @@ pub struct TextRun {
     pub byte_range: std::ops::Range<usize>,
     /// Text content for this run
     pub text: String,
-    /// Whether this run should use emoji font
-    pub use_emoji_font: bool,
+    /// Which font type to use for this run (determined by charmap checking)
+    pub font_type: RunFontType,
 }
 
 /// Text shaper wrapping swash
@@ -103,50 +120,6 @@ impl Shaper {
         }
     }
 
-    /// Segment text into runs based on font requirements (emoji vs non-emoji)
-    pub fn segment_text(text: &str) -> Vec<TextRun> {
-        use crate::emoji::is_emoji;
-
-        let mut runs = Vec::new();
-        let mut current_run_start = 0;
-        let mut current_run_bytes = 0;
-        let mut current_run_text = String::new();
-        let mut current_is_emoji = false;
-
-        for (byte_offset, ch) in text.char_indices() {
-            let is_emoji_char = is_emoji(ch);
-
-            // Start a new run if font type changes
-            if byte_offset > 0 && is_emoji_char != current_is_emoji {
-                // Finish current run
-                runs.push(TextRun {
-                    byte_range: current_run_start..current_run_start + current_run_bytes,
-                    text: std::mem::take(&mut current_run_text),
-                    use_emoji_font: current_is_emoji,
-                });
-
-                // Start new run
-                current_run_start = byte_offset;
-                current_run_bytes = 0;
-                current_is_emoji = is_emoji_char;
-            }
-
-            current_run_text.push(ch);
-            current_run_bytes += ch.len_utf8();
-        }
-
-        // Don't forget the last run
-        if !current_run_text.is_empty() {
-            runs.push(TextRun {
-                byte_range: current_run_start..current_run_start + current_run_bytes,
-                text: current_run_text,
-                use_emoji_font: current_is_emoji,
-            });
-        }
-
-        runs
-    }
-
     /// Shape a text string with the given font and options
     pub fn shape(
         &mut self,
@@ -159,6 +132,12 @@ impl Shaper {
 
         // Set font size
         builder = builder.size(options.font_size);
+
+        // Set weight variation if font supports it
+        // Standard OpenType 'wght' axis uses tag [119, 103, 104, 116] (b"wght")
+        // Clamp weight to valid range (100-900)
+        let weight = options.weight.clamp(100.0, 900.0);
+        builder = builder.variations(&[([119, 103, 104, 116], weight)]);
 
         // Configure OpenType features
         // Note: swash enables common features by default (liga, kern, calt)
@@ -203,7 +182,6 @@ impl Shaper {
             advance: total_advance,
         }
     }
-
 }
 
 impl Default for Shaper {

@@ -9,8 +9,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize GPU FFI for plugins
     gpu_ffi_host::init_ffi();
 
-    // Load configuration
-    let config = AppConfig::load()?;
+    // Load configuration (use defaults if parse fails)
+    let config = AppConfig::load().unwrap_or_else(|e| {
+        eprintln!("❌ Failed to parse init.toml: {}", e);
+        eprintln!("   Using default configuration");
+        AppConfig::default()
+    });
 
     let args: Vec<String> = env::args().collect();
 

@@ -83,7 +83,11 @@ impl TextEditorPlugin {
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, std::io::Error> {
-        let content = std::fs::read_to_string(&path)?;
+        let bytes = std::fs::read(&path)?;
+        let content = match simdutf8::basic::from_utf8(&bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        };
         let doc = Doc::from_str(&content);
         let mut editor = Self::new(doc);
         editor.file_path = Some(path.clone());

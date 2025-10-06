@@ -114,6 +114,24 @@ impl EventSubscriber for FilePickerPlugin {
 
         // Handle events: execute logic AND stop propagation
         match event.name.as_str() {
+            // Handle text editing events internally
+            event_name if event_name.starts_with("editor.") => {
+                let input = self.input_mut();
+                let text_before = input.view.text();
+
+                // Let InputHandler handle the event
+                let _action = input.input.handle_event(event, &input.view.doc, &input.view.viewport);
+
+                // Check if text changed, trigger filtering if so
+                let text_after = input.view.text();
+                if text_before != text_after {
+                    let query = text_after.to_string();
+                    self.picker.trigger_filter(query);
+                    event_bus.emit("ui.redraw", json!({}), 20, "file_picker");
+                }
+
+                PropagationControl::Stop
+            }
             "navigate.up" => {
                 self.move_up();
                 event_bus.emit("ui.redraw", json!({}), 20, "file_picker");
@@ -135,6 +153,54 @@ impl EventSubscriber for FilePickerPlugin {
                     event_bus.emit("file.open", json!({"path": path}), 10, "file_picker");
                 }
                 PropagationControl::Stop
+            }
+            "app.mouse.scroll" => {
+                // Handle mouse wheel scrolling
+                let delta_y = event.data
+                    .get("delta_y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+
+                self.picker.dropdown.handle_scroll(delta_y);
+                event_bus.emit("ui.redraw", json!({}), 20, "file_picker");
+                PropagationControl::Stop
+            }
+            "app.mouse.move" => {
+                let start = std::time::Instant::now();
+                // Handle mouse hover to highlight items
+                let x = event.data
+                    .get("x")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let y = event.data
+                    .get("y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let t1 = start.elapsed().as_micros();
+
+                // Check if mouse is over picker bounds
+                let bounds = self.picker.get_bounds();
+                let is_over_picker = x >= bounds.x.0
+                    && x < bounds.x.0 + bounds.width.0
+                    && y >= bounds.y.0
+                    && y < bounds.y.0 + bounds.height.0;
+                let t2 = start.elapsed().as_micros();
+
+                if is_over_picker {
+                    let changed = self.picker.handle_hover(x, y);
+                    let t3 = start.elapsed().as_micros();
+                    if changed {
+                        event_bus.emit("ui.redraw", json!({}), 20, "file_picker");
+                    }
+                    let total = start.elapsed().as_micros();
+                    if total > 500 {
+                        eprintln!("Hover slow: parse={}µs, bounds={}µs, hover={}µs, emit={}µs, total={}µs",
+                            t1, t2-t1, t3-t2, total-t3, total);
+                    }
+                    PropagationControl::Stop
+                } else {
+                    PropagationControl::Continue
+                }
             }
             _ => PropagationControl::Continue,
         }

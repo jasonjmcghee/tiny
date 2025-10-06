@@ -221,8 +221,6 @@ mod tests {
             y_offset: 0.0,
             x_advance: 10.0,
             y_advance: 0.0,
-            color_layers: None,
-            is_color_emoji: false,
         }
     }
 

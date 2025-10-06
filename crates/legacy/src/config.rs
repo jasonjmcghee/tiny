@@ -34,6 +34,10 @@ pub struct EditorConfig {
     pub scroll_lock_enabled: bool,
     #[serde(default)]
     pub continuous_rendering: bool,
+    #[serde(default = "default_font_weight")]
+    pub font_weight: f32,
+    #[serde(default)]
+    pub font_italic: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,6 +90,8 @@ impl Default for EditorConfig {
             title_bar_height: default_title_bar_height(),
             scroll_lock_enabled: default_scroll_lock_enabled(),
             continuous_rendering: false,
+            font_weight: default_font_weight(),
+            font_italic: false,
         }
     }
 }
@@ -156,6 +162,9 @@ fn default_title_bar_height() -> f32 {
 fn default_scroll_lock_enabled() -> bool {
     true
 }
+fn default_font_weight() -> f32 {
+    400.0 // Normal weight
+}
 fn default_plugin_dir() -> String {
     "target/plugins/release".to_string()
 }
@@ -168,11 +177,52 @@ impl AppConfig {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
 
-            // Parse the base config first
-            let mut config: AppConfig = toml::from_str(&content)?;
+            // Parse as raw TOML value first
+            let toml_value: toml::Value = match toml::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("❌ TOML syntax error in init.toml: {}", e);
+                    eprintln!("   The file has invalid TOML syntax (missing quotes, brackets, etc.)");
+                    eprintln!("   Using default configuration");
+                    return Ok(AppConfig::default());
+                }
+            };
 
-            // Parse the TOML value to extract plugin sections
-            let toml_value: toml::Value = toml::from_str(&content)?;
+            // Extract sections with individual error handling
+            let mut config = AppConfig::default();
+
+            // Try to parse editor section field-by-field for maximum resilience
+            if let Some(editor_table) = toml_value.get("editor").and_then(|v| v.as_table()) {
+                tiny_sdk::parse_fields!(config.editor, editor_table, {
+                    window_title: default_window_title(),
+                    window_width: default_window_width(),
+                    window_height: default_window_height(),
+                    font_size: default_font_size(),
+                    line_height: default_line_height(),
+                    theme: default_theme(),
+                    title_bar_height: default_title_bar_height(),
+                    scroll_lock_enabled: default_scroll_lock_enabled(),
+                    continuous_rendering: false,
+                    font_weight: default_font_weight(),
+                    font_italic: false,
+                });
+            }
+
+            // Try to parse plugins section field-by-field
+            if let Some(plugins_table) = toml_value.get("plugins").and_then(|v| v.as_table()) {
+                tiny_sdk::parse_fields!(config.plugins, plugins_table, {
+                    plugin_dir: default_plugin_dir(),
+                    enabled: Vec::new(),
+                });
+            }
+
+            // Try to parse development section field-by-field
+            if let Some(dev_table) = toml_value.get("development").and_then(|v| v.as_table()) {
+                tiny_sdk::parse_fields!(config.development, dev_table, {
+                    debug: false,
+                    show_fps: false,
+                });
+            }
 
             // Extract individual plugin configs from [plugins.{name}] sections
             if let Some(plugins_table) = toml_value.get("plugins").and_then(|v| v.as_table()) {

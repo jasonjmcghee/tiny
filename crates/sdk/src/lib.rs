@@ -38,6 +38,7 @@ pub mod gpu_helpers;
 pub mod plugin_macros;
 pub mod services;
 mod traits;
+pub mod toml_utils;
 pub mod types;
 
 // Re-export GPU helpers for convenience

@@ -118,6 +118,7 @@ impl SelectionPlugin {
     fn selection_to_bounding_rect(
         &self,
         selection: &Selection,
+        line_height: f32,
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
     ) -> Option<LayoutRect> {
         // Skip if it's just a cursor (no selection)
@@ -141,7 +142,7 @@ impl SelectionPlugin {
                 start_x,
                 start_y,
                 end_x - start_x,
-                self.viewport.line_height,
+                line_height,
             ))
         } else {
             // Multi-line selection: use full width of the editor widget
@@ -149,7 +150,7 @@ impl SelectionPlugin {
             let widget_vp = widget_viewport.expect("Selection plugin requires widget_viewport");
             let left = widget_vp.bounds.x.0;
             let width = widget_vp.bounds.width.0;
-            let height = (end_y + self.viewport.line_height) - start_y;
+            let height = (end_y + line_height) - start_y;
 
             Some(LayoutRect::new(left, start_y, width, height))
         }
@@ -163,12 +164,13 @@ impl SelectionPlugin {
         selections: &[Selection],
     ) -> Vec<SelectionVertex> {
         let mut vertices = Vec::new();
-        // Use viewport's scale factor, not our stored one (which might be wrong)
+        // Use viewport's scale factor and line_height, not our stored ones (which might be wrong)
         let scale = viewport.scale_factor;
+        let line_height = viewport.line_height;
         let color = self.config.style.color;
 
         for selection in selections {
-            if let Some(rect) = self.selection_to_bounding_rect(selection, widget_viewport) {
+            if let Some(rect) = self.selection_to_bounding_rect(selection, line_height, widget_viewport) {
                 // Rectangle is in logical view space, scale to physical pixels
                 let x = rect.x.0 * scale;
                 let y = rect.y.0 * scale;
@@ -181,7 +183,7 @@ impl SelectionPlugin {
                 let start_y = selection.start.y.0 * scale;
                 let end_x = selection.end.x.0 * scale;
                 let end_y = selection.end.y.0 * scale;
-                let line_height = self.viewport.line_height * scale;
+                let line_height_scaled = line_height * scale;
 
                 // Margins in screen coordinates (matching transformed selections)
                 // widget_viewport is required for correct coordinate system
@@ -192,7 +194,7 @@ impl SelectionPlugin {
                 let selection_data = SelectionData {
                     start_pos: [start_x, start_y],
                     end_pos: [end_x, end_y],
-                    line_height,
+                    line_height: line_height_scaled,
                     margin_left,
                     margin_right,
                     _padding: 0.0,
@@ -460,7 +462,7 @@ impl Configurable for SelectionPlugin {
             config: PluginConfig,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Default, Deserialize)]
         struct PluginConfig {
             #[serde(default = "default_color")]
             color: u32,
@@ -470,25 +472,33 @@ impl Configurable for SelectionPlugin {
             0x4080FF40 // Semi-transparent blue
         }
 
-        match toml::from_str::<PluginToml>(config_data) {
-            Ok(plugin_toml) => {
-                // Update our config from the parsed values
-                self.config.style.color = plugin_toml.config.color;
-
-                eprintln!(
-                    "Selection plugin config updated: color={:#010x}",
-                    self.config.style.color
-                );
-
-                Ok(())
-            }
+        // Parse TOML value first (handles syntax errors gracefully)
+        let toml_value: toml::Value = match toml::from_str(config_data) {
+            Ok(v) => v,
             Err(e) => {
-                eprintln!("Failed to parse selection config: {}", e);
-                Err(PluginError::Other(
-                    format!("Config parse error: {}", e).into(),
-                ))
+                eprintln!("❌ TOML syntax error in selection plugin.toml: {}", e);
+                eprintln!("   Keeping previous configuration");
+                return Ok(()); // Don't fail, just keep current config
             }
+        };
+
+        // Extract [config] section and parse fields individually
+        if let Some(config_table) = toml_value.get("config").and_then(|v| v.as_table()) {
+            let mut temp_config = PluginConfig::default();
+            tiny_sdk::parse_fields!(temp_config, config_table, {
+                color: default_color(),
+            });
+
+            // Apply parsed values
+            self.config.style.color = temp_config.color;
+
+            eprintln!(
+                "Selection plugin config updated: color={:#010x}",
+                self.config.style.color
+            );
         }
+
+        Ok(())
     }
 
     fn get_config(&self) -> Option<String> {

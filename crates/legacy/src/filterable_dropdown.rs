@@ -8,7 +8,6 @@
 
 use crate::coordinates::Viewport;
 use crate::editable_text_view::EditableTextView;
-use crate::input_types::{Key, Modifiers, NamedKey};
 use crate::text_view::TextView;
 use tiny_core::tree::Rect;
 use tiny_sdk::{types::RoundedRectInstance, LogicalPixels};
@@ -86,12 +85,17 @@ impl<T: Clone> FilterableDropdown<T> {
     /// Show dropdown with title
     pub fn show_with_title(&mut self, items: Vec<T>, title: &str) {
         self.visible = true;
+        let has_items = !items.is_empty();
         self.items = items;
         self.selected_index = 0;
+        self.highlighted_line = if has_items { Some(0) } else { None };
         self.title_view.set_text(title);
         self.input.clear();
         self.input.set_focused(true); // Focus input for typing
         self.update_results_display();
+
+        // Reset scroll to top when showing
+        self.results.viewport.scroll.y.0 = 0.0;
     }
 
     /// Hide dropdown
@@ -116,22 +120,24 @@ impl<T: Clone> FilterableDropdown<T> {
     }
 
     /// Update results display based on current items
+    /// Note: Call update_layout_if_needed() after this if you need accurate bounds for scrolling
     fn update_results_display(&mut self) {
         if self.items.is_empty() {
             self.results.set_text("No results");
             self.highlighted_line = None;
         } else {
+            const MAX_DISPLAY_CHARS: usize = 250;
+            // Format items without selection indicators - selection is visual only
+            // Truncate to max 250 chars to avoid expensive shaping
             let text = self
                 .items
                 .iter()
-                .enumerate()
-                .map(|(idx, item)| {
+                .map(|item| {
                     let formatted = (self.format_fn)(item);
-                    // Add selection indicator
-                    if idx == self.selected_index {
-                        format!("→ {}", formatted)
+                    if formatted.len() > MAX_DISPLAY_CHARS {
+                        format!("{}...", &formatted[..MAX_DISPLAY_CHARS])
                     } else {
-                        format!("  {}", formatted)
+                        formatted
                     }
                 })
                 .collect::<Vec<_>>()
@@ -143,67 +149,9 @@ impl<T: Clone> FilterableDropdown<T> {
         }
     }
 
-    /// Handle keyboard input with dual-focus logic
-    pub fn handle_key(
-        &mut self,
-        key: &Key,
-        modifiers: &Modifiers,
-        viewport: &Viewport,
-    ) -> DropdownAction<T> {
-        match key {
-            // Escape → cancel
-            Key::Named(NamedKey::Escape) => DropdownAction::Cancelled,
-
-            // Enter → select current item
-            Key::Named(NamedKey::Enter) => {
-                if !self.items.is_empty() && self.selected_index < self.items.len() {
-                    DropdownAction::Selected(self.items[self.selected_index].clone())
-                } else {
-                    DropdownAction::Continue
-                }
-            }
-
-            // Arrow Up/Down → navigate results
-            Key::Named(NamedKey::ArrowUp) => {
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                    self.update_results_display();
-                    self.scroll_to_selected(viewport);
-                }
-                DropdownAction::Continue
-            }
-
-            Key::Named(NamedKey::ArrowDown) => {
-                if self.selected_index < self.items.len().saturating_sub(1) {
-                    self.selected_index += 1;
-                    self.update_results_display();
-                    self.scroll_to_selected(viewport);
-                }
-                DropdownAction::Continue
-            }
-
-            // Backspace → update filter
-            Key::Named(NamedKey::Backspace) => {
-                self.input.handle_backspace();
-                DropdownAction::FilterChanged(self.filter_text())
-            }
-
-            // Delete → update filter
-            Key::Named(NamedKey::Delete) => {
-                self.input.handle_delete();
-                DropdownAction::FilterChanged(self.filter_text())
-            }
-
-            // Character input → update filter
-            Key::Character(ch) => {
-                for c in ch.chars() {
-                    self.input.handle_char(c);
-                }
-                DropdownAction::FilterChanged(self.filter_text())
-            }
-
-            _ => DropdownAction::Continue,
-        }
+    /// Ensure layout is updated (needed before scrolling calculations work correctly)
+    fn update_layout_if_needed(&mut self, font_system: &tiny_font::SharedFontSystem) {
+        self.results.update_layout(font_system);
     }
 
     /// Calculate bounds for dropdown (centered, adaptive height)
@@ -292,6 +240,8 @@ impl<T: Clone> FilterableDropdown<T> {
 
         // Update results viewport bounds, scale, logical_size, and metrics (below input)
         let results_bounds_width = width - PADDING * 2.0 - BORDER_WIDTH * 2.0;
+        let results_padding_x = 4.0; // Small horizontal padding for results text
+        let results_padding_y = 2.0; // Small vertical padding for results text
 
         self.results.viewport.bounds = tiny_sdk::types::LayoutRect::new(
             x + PADDING + BORDER_WIDTH,
@@ -304,6 +254,11 @@ impl<T: Clone> FilterableDropdown<T> {
             tiny_sdk::LogicalSize::new(results_bounds_width, results_height);
         self.results.viewport.scale_factor = viewport.scale_factor;
         self.results.viewport.metrics = viewport.metrics.clone();
+
+        // Set padding on results view
+        self.results.padding_x = results_padding_x;
+        self.results.padding_y = results_padding_y;
+
         // Results can scroll, so don't reset scroll here
     }
 
@@ -322,15 +277,34 @@ impl<T: Clone> FilterableDropdown<T> {
         &self.items
     }
 
+    /// Move selection up
+    pub fn move_selection_up(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+            self.highlighted_line = Some(self.selected_index);
+            self.scroll_to_selected();
+        }
+    }
+
+    /// Move selection down
+    pub fn move_selection_down(&mut self) {
+        if self.selected_index < self.items.len().saturating_sub(1) {
+            self.selected_index += 1;
+            self.highlighted_line = Some(self.selected_index);
+            self.scroll_to_selected();
+        }
+    }
+
     /// Scroll results to keep selected item visible
-    fn scroll_to_selected(&mut self, viewport: &Viewport) {
+    fn scroll_to_selected(&mut self) {
         if self.items.is_empty() {
             return;
         }
 
-        let line_height = viewport.metrics.line_height;
+        let line_height = self.results.viewport.metrics.line_height;
         let selected_y = self.selected_index as f32 * line_height;
         let visible_height = self.results.viewport.bounds.height.0;
+        let content_height = self.items.len() as f32 * line_height;
 
         // If selected item is below visible area, scroll down
         if selected_y + line_height > self.results.viewport.scroll.y.0 + visible_height {
@@ -340,6 +314,14 @@ impl<T: Clone> FilterableDropdown<T> {
         else if selected_y < self.results.viewport.scroll.y.0 {
             self.results.viewport.scroll.y.0 = selected_y;
         }
+
+        // Clamp scroll to valid range based on total content height
+        let max_scroll = (content_height - visible_height).max(0.0);
+        self.results.viewport.scroll.y.0 = self.results.viewport.scroll.y.0.clamp(0.0, max_scroll);
+
+        // Update TextView's visible range after scrolling
+        let tree = self.results.doc.read();
+        self.results.renderer.update_visible_range(&self.results.viewport, &tree);
     }
 
     /// Get border and background rects for rendering
@@ -420,7 +402,93 @@ impl<T: Clone> FilterableDropdown<T> {
         };
 
         // Use TextView's Scrollable implementation for proper scroll clamping
-        self.results.handle_scroll(delta, &self.results.viewport.clone(), self.results.viewport.bounds);
+        let handled = self.results.handle_scroll(delta, &self.results.viewport.clone(), self.results.viewport.bounds);
+
+        // Update TextView's visible range after scrolling
+        if handled {
+            let tree = self.results.doc.read();
+            self.results.renderer.update_visible_range(&self.results.viewport, &tree);
+        }
+    }
+
+    /// Get selection highlight rect (if an item is selected)
+    pub fn get_selection_highlight_rect(&self) -> Option<tiny_sdk::types::RectInstance> {
+        if !self.visible || self.items.is_empty() {
+            return None;
+        }
+
+        let selected_idx = self.highlighted_line?;
+        if selected_idx >= self.items.len() {
+            return None;
+        }
+
+        let line_height = self.results.viewport.metrics.line_height;
+        let results_bounds = &self.results.viewport.bounds;
+        let scroll_y = self.results.viewport.scroll.y.0;
+
+        // Calculate visual position of selected line
+        let line_y = selected_idx as f32 * line_height - scroll_y;
+
+        // Only render if line is visible in results area
+        if line_y + line_height < 0.0 || line_y > results_bounds.height.0 {
+            return None;
+        }
+
+        const SELECTION_COLOR: u32 = 0x2D3136FF; // Subtle highlight color (RGBA)
+
+        Some(tiny_sdk::types::RectInstance {
+            rect: tiny_core::tree::Rect {
+                x: tiny_sdk::LogicalPixels(results_bounds.x.0),
+                y: tiny_sdk::LogicalPixels(results_bounds.y.0 + line_y),
+                width: tiny_sdk::LogicalPixels(results_bounds.width.0),
+                height: tiny_sdk::LogicalPixels(line_height),
+            },
+            color: SELECTION_COLOR,
+        })
+    }
+
+    /// Convert screen coordinates to item index (accounting for scroll and padding)
+    fn screen_to_item_index(&self, x: f32, y: f32) -> Option<usize> {
+        let results_bounds = &self.results.viewport.bounds;
+
+        // Check if coordinates are in results area
+        if x < results_bounds.x.0
+            || x >= results_bounds.x.0 + results_bounds.width.0
+            || y < results_bounds.y.0
+            || y >= results_bounds.y.0 + results_bounds.height.0
+        {
+            return None;
+        }
+
+        // Convert to local coordinates (relative to results area, accounting for scroll)
+        let relative_y = y - results_bounds.y.0 + self.results.viewport.scroll.y.0;
+
+        // Account for padding
+        let content_y = relative_y - self.results.padding_y;
+        if content_y < 0.0 {
+            return None;
+        }
+
+        let line_height = self.results.viewport.metrics.line_height;
+        let line_idx = (content_y / line_height) as usize;
+
+        if line_idx < self.items.len() {
+            Some(line_idx)
+        } else {
+            None
+        }
+    }
+
+    /// Handle mouse hover - updates selection highlight
+    pub fn handle_hover(&mut self, x: f32, y: f32) -> bool {
+        if let Some(idx) = self.screen_to_item_index(x, y) {
+            if self.selected_index != idx {
+                self.selected_index = idx;
+                self.highlighted_line = Some(idx);
+                return true; // Selection changed
+            }
+        }
+        false
     }
 
     /// Handle mouse click - returns Selected if item clicked, or updates selection
@@ -442,20 +510,8 @@ impl<T: Clone> FilterableDropdown<T> {
         }
 
         // Check if click is in results area
-        let results_bounds = &self.results.viewport.bounds;
-        if x >= results_bounds.x.0
-            && x < results_bounds.x.0 + results_bounds.width.0
-            && y >= results_bounds.y.0
-            && y < results_bounds.y.0 + results_bounds.height.0
-        {
-            // Convert y to line index
-            let relative_y = y - results_bounds.y.0 + self.results.viewport.scroll.y.0;
-            let line_height = self.results.viewport.metrics.line_height;
-            let line_idx = (relative_y / line_height) as usize;
-
-            if line_idx < self.items.len() {
-                return DropdownAction::Selected(self.items[line_idx].clone());
-            }
+        if let Some(idx) = self.screen_to_item_index(x, y) {
+            return DropdownAction::Selected(self.items[idx].clone());
         }
 
         DropdownAction::Continue

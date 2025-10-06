@@ -9,3 +9,5 @@ authors.workspace = true
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 ahash = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

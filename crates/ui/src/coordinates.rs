@@ -461,9 +461,12 @@ impl Viewport {
                 let line_end = tree.line_to_byte(line + 1).unwrap_or(tree.byte_count());
                 let line_text = tree.get_text_slice(line_start..line_end);
 
+                // Strip trailing newline to avoid cursor positioning after it
+                let line_text_trimmed = line_text.trim_end_matches('\n').trim_end_matches('\r');
+
                 // Use shaped version for proper ligature/cluster handling
                 font_system.hit_test_line_shaped(
-                    &line_text,
+                    line_text_trimmed,
                     self.metrics.font_size,
                     self.scale_factor,
                     doc_x,

@@ -55,6 +55,13 @@ pub struct SyntaxState {
     pub edit_deltas: Vec<(usize, isize)>,
 }
 
+/// Cached shaping result for a single line
+#[derive(Clone)]
+struct ShapedLineCache {
+    glyphs: Vec<tiny_font::PositionedGlyph>,
+    cluster_map: tiny_font::ClusterMap,
+}
+
 /// Decoupled text renderer
 pub struct TextRenderer {
     // === LAYOUT WITH INTEGRATED STYLE ===
@@ -82,6 +89,11 @@ pub struct TextRenderer {
     pub gpu_style_buffer: Option<wgpu::Buffer>,
     /// Palette texture (256 colors, RGBA8)
     pub palette_texture: Option<wgpu::Texture>,
+
+    // === SHAPING CACHE ===
+    /// Per-line shaping cache: (line_text_hash, font_size_bits, scale_factor_bits) -> shaped result
+    /// Avoids expensive OpenType shaping for unchanged lines
+    shaping_cache: HashMap<(u64, u32, u32), ShapedLineCache>,
 }
 
 impl TextRenderer {
@@ -101,6 +113,7 @@ impl TextRenderer {
             visible_chars: Vec::new(),
             gpu_style_buffer: None,
             palette_texture: None,
+            shaping_cache: HashMap::default(),
         }
     }
 
@@ -171,17 +184,48 @@ impl TextRenderer {
             let line_start_char = char_index;
             let line_start_byte = byte_offset;
 
-            // Layout this line with shaping (supports ligatures, proper kerning)
-            let tiny_font::ShapedTextLayout {
-                glyphs: layout_glyphs,
-                cluster_map,
-                ..
-            } = font_system.layout_text_shaped_with_tabs(
-                line_text,
-                viewport.metrics.font_size,
-                viewport.scale_factor,
-                None, // Use default shaping options
-            );
+            // Compute cache key for this line
+            let line_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = ahash::AHasher::default();
+                line_text.hash(&mut hasher);
+                hasher.finish()
+            };
+            let font_size_bits = viewport.metrics.font_size.to_bits();
+            let scale_factor_bits = viewport.scale_factor.to_bits();
+            let cache_key = (line_hash, font_size_bits, scale_factor_bits);
+
+            // Check cache first
+            let (layout_glyphs, cluster_map) = if let Some(cached) = self.shaping_cache.get(&cache_key) {
+                // Cache hit - use cached shaped glyphs
+                (cached.glyphs.clone(), cached.cluster_map.clone())
+            } else {
+                // Cache miss - shape the line and store result
+                let tiny_font::ShapedTextLayout {
+                    glyphs: shaped_glyphs,
+                    cluster_map: shaped_cluster_map,
+                    ..
+                } = font_system.layout_text_shaped_with_tabs(
+                    line_text,
+                    viewport.metrics.font_size,
+                    viewport.scale_factor,
+                    None, // Use default shaping options
+                );
+
+                // Store in cache (limit cache size to prevent unbounded growth)
+                const MAX_CACHE_SIZE: usize = 10000;
+                if self.shaping_cache.len() < MAX_CACHE_SIZE {
+                    self.shaping_cache.insert(
+                        cache_key,
+                        ShapedLineCache {
+                            glyphs: shaped_glyphs.clone(),
+                            cluster_map: shaped_cluster_map.clone(),
+                        },
+                    );
+                }
+
+                (shaped_glyphs, shaped_cluster_map)
+            };
 
             // Store the cluster map for this line
             self.cluster_maps.push(cluster_map);

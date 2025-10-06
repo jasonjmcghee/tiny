@@ -1001,7 +1001,7 @@ impl Configurable for DiagnosticsPlugin {
             config: PluginConfig,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Default, Deserialize)]
         struct PluginConfig {
             #[serde(default = "default_popup_bg")]
             popup_background_color: u32,
@@ -1026,22 +1026,34 @@ impl Configurable for DiagnosticsPlugin {
             8.0
         }
 
-        match toml::from_str::<PluginToml>(config_data) {
-            Ok(plugin_toml) => {
-                self.config.popup_background_color = plugin_toml.config.popup_background_color;
-                self.config.popup_text_color = plugin_toml.config.popup_text_color;
-                self.config.popup_border_color = plugin_toml.config.popup_border_color;
-                self.config.popup_padding = plugin_toml.config.popup_padding;
-
-                Ok(())
-            }
+        // Parse TOML value first (handles syntax errors gracefully)
+        let toml_value: toml::Value = match toml::from_str(config_data) {
+            Ok(v) => v,
             Err(e) => {
-                eprintln!("Failed to parse diagnostics config: {}", e);
-                Err(PluginError::Other(
-                    format!("Config parse error: {}", e).into(),
-                ))
+                eprintln!("❌ TOML syntax error in diagnostics plugin.toml: {}", e);
+                eprintln!("   Keeping previous configuration");
+                return Ok(()); // Don't fail, just keep current config
             }
+        };
+
+        // Extract [config] section and parse fields individually
+        if let Some(config_table) = toml_value.get("config").and_then(|v| v.as_table()) {
+            let mut temp_config = PluginConfig::default();
+            tiny_sdk::parse_fields!(temp_config, config_table, {
+                popup_background_color: default_popup_bg(),
+                popup_text_color: default_popup_text(),
+                popup_border_color: default_popup_border(),
+                popup_padding: default_popup_padding(),
+            });
+
+            // Apply parsed values
+            self.config.popup_background_color = temp_config.popup_background_color;
+            self.config.popup_text_color = temp_config.popup_text_color;
+            self.config.popup_border_color = temp_config.popup_border_color;
+            self.config.popup_padding = temp_config.popup_padding;
         }
+
+        Ok(())
     }
 }
 

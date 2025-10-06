@@ -8,8 +8,14 @@ use std::path::Path;
 use tiny_core::tree::Doc;
 
 /// Load document from file
+/// Handles both text and binary files by replacing invalid UTF-8 with �
+/// Uses simdutf8 for fast validation
 pub fn load(path: &Path) -> io::Result<Doc> {
-    let content = fs::read_to_string(path)?;
+    let bytes = fs::read(path)?;
+    let content = match simdutf8::basic::from_utf8(&bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+    };
     Ok(Doc::from_str(&content))
 }
 

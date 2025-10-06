@@ -61,29 +61,60 @@ impl Rasterizer {
         }
     }
 
-    /// Rasterize a glyph by ID
+    /// Rasterize a glyph by ID with optional weight variation
     pub fn rasterize(
         &mut self,
         font_ref: &FontRef,
         glyph_id: u16,
         font_size: f32,
     ) -> Option<RasterResult> {
+        self.rasterize_with_weight(font_ref, glyph_id, font_size, 400.0)
+    }
+
+    /// Rasterize a glyph by ID with weight variation
+    pub fn rasterize_with_weight(
+        &mut self,
+        font_ref: &FontRef,
+        glyph_id: u16,
+        font_size: f32,
+        weight: f32,
+    ) -> Option<RasterResult> {
         // Create a scaler for this font and size
-        let mut scaler = self
+        let mut builder = self
             .context
             .builder(*font_ref)
             .size(font_size)
-            .hint(true)
-            .build();
+            .hint(true);
 
-        // Try to render the glyph - color sources first, then outline
-        let image = Render::new(&[
-            Source::ColorBitmap(StrikeWith::BestFit),
-            Source::ColorOutline(0),
-            Source::Outline,
-        ])
-        .format(Format::Alpha)
-        .render(&mut scaler, glyph_id)?;
+        // Apply weight variation if not default
+        // Standard OpenType 'wght' axis uses tag [119, 103, 104, 116] (b"wght")
+        if weight != 400.0 {
+            builder = builder.variations(&[([119, 103, 104, 116], weight)]);
+        }
+
+        let mut scaler = builder.build();
+
+        // Use catch_unwind to handle panics in swash when parsing malformed font data
+        // Some fonts have corrupted sbix tables that cause overflow panics
+        // SAFETY: We wrap the render call to catch panics from corrupted font data
+        let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Render::new(&[
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::ColorOutline(0),
+                Source::Outline,
+            ])
+            .format(Format::Alpha)
+            .render(&mut scaler, glyph_id)
+        }));
+
+        let image = match render_result {
+            Ok(Some(img)) => img,
+            Ok(None) => return None,
+            Err(_) => {
+                eprintln!("Warning: Swash panicked while rendering glyph_id={} (corrupted font data)", glyph_id);
+                return None;
+            }
+        };
 
         // Check if we got color data (CustomSubpixel would give RGBA, but Format::Alpha gives grayscale)
         // For now, treat all emoji font glyphs as potentially color
@@ -110,23 +141,23 @@ impl Rasterizer {
             .size(16.0) // Size doesn't matter for detection
             .build();
 
-        // Try to get color bitmap first
-        if Render::new(&[Source::ColorBitmap(StrikeWith::BestFit)])
-            .render(&mut scaler, glyph_id)
-            .is_some()
-        {
+        // Try to get color bitmap first - wrap in catch_unwind for corrupted fonts
+        let bitmap_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Render::new(&[Source::ColorBitmap(StrikeWith::BestFit)])
+                .render(&mut scaler, glyph_id)
+        }));
+
+        if matches!(bitmap_result, Ok(Some(_))) {
             return true;
         }
 
-        // Try color outline (COLR/CPAL)
-        if Render::new(&[Source::ColorOutline(0)])
-            .render(&mut scaler, glyph_id)
-            .is_some()
-        {
-            return true;
-        }
+        // Try color outline (COLR/CPAL) - wrap in catch_unwind for corrupted fonts
+        let outline_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Render::new(&[Source::ColorOutline(0)])
+                .render(&mut scaler, glyph_id)
+        }));
 
-        false
+        matches!(outline_result, Ok(Some(_)))
     }
 }
 

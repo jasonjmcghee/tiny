@@ -1,8 +1,7 @@
 //! Generic overlay picker - unified implementation for file picker, grep, command palette, etc.
 
 use crate::coordinates::Viewport;
-use crate::filterable_dropdown::{DropdownAction, FilterableDropdown};
-use crate::input_types::{Key, Modifiers};
+use crate::filterable_dropdown::FilterableDropdown;
 use crate::{scroll::Scrollable, Widget};
 use std::sync::Arc;
 use tiny_core::tree::{Point, Rect};
@@ -86,15 +85,6 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
         self.filtering = false;
     }
 
-    /// Handle keyboard input
-    pub fn handle_key(&mut self, key: &Key, modifiers: &Modifiers, viewport: &Viewport) -> DropdownAction<T> {
-        let action = self.dropdown.handle_key(key, modifiers, viewport);
-        if let DropdownAction::FilterChanged(ref query) = action {
-            self.trigger_filter(query.clone());
-        }
-        action
-    }
-
     /// Calculate bounds based on viewport
     pub fn calculate_bounds(&mut self, viewport: &Viewport) {
         self.dropdown.calculate_bounds(viewport);
@@ -140,6 +130,12 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
     pub fn collect_background_rects(&self) -> Vec<tiny_sdk::types::RectInstance> {
         if !self.visible { return Vec::new(); }
         let mut rects = self.dropdown.get_chrome_rects();
+
+        // Add selection highlight rect (must be before input rects to render behind text)
+        if let Some(highlight_rect) = self.dropdown.get_selection_highlight_rect() {
+            rects.push(highlight_rect);
+        }
+
         rects.extend(self.dropdown.input.collect_background_rects());
         rects
     }
@@ -149,19 +145,14 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
         self.dropdown.get_frame_rounded_rect()
     }
 
-    /// Legacy API compatibility - list navigation
+    /// Move selection up
     pub fn move_up(&mut self) {
-        if self.dropdown.selected_index() > 0 {
-            let viewport = Viewport::new(1920.0, 1080.0, 1.0);
-            let modifiers = Modifiers::new();
-            self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowUp), &modifiers, &viewport);
-        }
+        self.dropdown.move_selection_up();
     }
 
+    /// Move selection down
     pub fn move_down(&mut self) {
-        let viewport = Viewport::new(1920.0, 1080.0, 1.0);
-        let modifiers = Modifiers::new();
-        self.dropdown.handle_key(&Key::Named(crate::input_types::NamedKey::ArrowDown), &modifiers, &viewport);
+        self.dropdown.move_selection_down();
     }
 
     pub fn selected_item(&self) -> Option<&T> {
@@ -170,6 +161,16 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
 
     pub fn items(&self) -> &[T] {
         self.dropdown.items()
+    }
+
+    /// Handle mouse hover - updates selection
+    pub fn handle_hover(&mut self, x: f32, y: f32) -> bool {
+        self.dropdown.handle_hover(x, y)
+    }
+
+    /// Handle mouse click
+    pub fn handle_click(&mut self, x: f32, y: f32, shift: bool) -> crate::filterable_dropdown::DropdownAction<T> {
+        self.dropdown.handle_click(x, y, shift)
     }
 }
 
@@ -231,6 +232,12 @@ impl<T: Clone + Send + Sync + 'static> Widget for OverlayPicker<T> {
     fn collect_background_rects(&self) -> Vec<tiny_sdk::types::RectInstance> {
         if !self.visible { return Vec::new(); }
         let mut rects = self.dropdown.get_chrome_rects();
+
+        // Add selection highlight rect (must be before input rects to render behind text)
+        if let Some(highlight_rect) = self.dropdown.get_selection_highlight_rect() {
+            rects.push(highlight_rect);
+        }
+
         rects.extend(self.dropdown.input.collect_background_rects());
         rects
     }

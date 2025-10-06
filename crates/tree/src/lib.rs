@@ -1651,12 +1651,28 @@ impl<'a> TreeCursor<'a> {
             if let Some((span, _)) = self.current_spans.get(idx) {
                 if let Span::Text { bytes, .. } = span {
                     let available = bytes.len() - pos_in_span;
-                    let to_read = remaining.min(available);
-                    let slice = &bytes[pos_in_span..pos_in_span + to_read];
-                    // SAFETY: We maintain UTF-8 invariant
-                    let text = unsafe { from_utf8(slice).unwrap_unchecked() };
-                    result.push_str(text);
-                    remaining -= to_read;
+                    let mut to_read = remaining.min(available);
+
+                    // Ensure we don't slice in the middle of a UTF-8 character
+                    // If the slice isn't valid UTF-8, backtrack to the nearest character boundary
+                    let mut found_valid = false;
+                    while to_read > 0 {
+                        let slice = &bytes[pos_in_span..pos_in_span + to_read];
+                        if let Ok(text) = from_utf8(slice) {
+                            result.push_str(text);
+                            remaining -= to_read;
+                            found_valid = true;
+                            break;
+                        }
+                        // Not valid UTF-8, try one byte less
+                        to_read -= 1;
+                    }
+
+                    // If we couldn't find any valid UTF-8, stop trying to read more
+                    if !found_valid {
+                        break;
+                    }
+
                     pos_in_span = 0;
                 }
             }

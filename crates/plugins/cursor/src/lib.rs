@@ -454,7 +454,7 @@ impl Configurable for CursorPlugin {
             config: PluginConfig,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Default, Deserialize)]
         struct PluginConfig {
             #[serde(default = "default_blink_enabled")]
             blink_enabled: bool,
@@ -494,35 +494,51 @@ impl Configurable for CursorPlugin {
             0.0
         }
 
-        match toml::from_str::<PluginToml>(config_data) {
-            Ok(plugin_toml) => {
-                // Update our config from the parsed values
-                self.config.blink_enabled = plugin_toml.config.blink_enabled;
-                self.config.blink_rate = plugin_toml.config.blink_rate;
-                self.config.solid_duration_ms = plugin_toml.config.solid_duration_ms;
-                self.config.style.width = plugin_toml.config.width;
-                self.config.style.color = plugin_toml.config.color;
-                self.config.style.height_scale = plugin_toml.config.height_scale;
-                self.config.style.x_offset = plugin_toml.config.x_offset;
-
-                eprintln!(
-                    "Cursor: plugin config updated: width={}, color={:#010x}, blink_rate={}",
-                    self.config.style.width, self.config.style.color, self.config.blink_rate
-                );
-
-                // Reset blink phase when config changes
-                self.blink_phase = 0.0;
-                self.last_active_ms.store(0, Ordering::Relaxed);
-
-                Ok(())
-            }
+        // Parse TOML value first (handles syntax errors gracefully)
+        let toml_value: toml::Value = match toml::from_str(config_data) {
+            Ok(v) => v,
             Err(e) => {
-                eprintln!("Failed to parse cursor config: {}", e);
-                Err(PluginError::Other(
-                    format!("Config parse error: {}", e).into(),
-                ))
+                eprintln!("❌ TOML syntax error in cursor plugin.toml: {}", e);
+                eprintln!("   Keeping previous configuration");
+                return Ok(()); // Don't fail, just keep current config
             }
+        };
+
+        // Extract [config] section and parse fields individually
+        if let Some(config_table) = toml_value.get("config").and_then(|v| v.as_table()) {
+            // Parse each field with tiny_sdk::parse_fields! macro
+            // Bad fields use defaults, good fields work
+            let mut temp_config = PluginConfig::default();
+            tiny_sdk::parse_fields!(temp_config, config_table, {
+                blink_enabled: default_blink_enabled(),
+                blink_rate: default_blink_rate(),
+                solid_duration_ms: default_solid_duration_ms(),
+                width: default_width(),
+                color: default_color(),
+                height_scale: default_height_scale(),
+                x_offset: default_x_offset(),
+            });
+
+            // Apply parsed values
+            self.config.blink_enabled = temp_config.blink_enabled;
+            self.config.blink_rate = temp_config.blink_rate;
+            self.config.solid_duration_ms = temp_config.solid_duration_ms;
+            self.config.style.width = temp_config.width;
+            self.config.style.color = temp_config.color;
+            self.config.style.height_scale = temp_config.height_scale;
+            self.config.style.x_offset = temp_config.x_offset;
+
+            eprintln!(
+                "Cursor: plugin config updated: width={}, color={:#010x}, blink_rate={}",
+                self.config.style.width, self.config.style.color, self.config.blink_rate
+            );
+
+            // Reset blink phase when config changes
+            self.blink_phase = 0.0;
+            self.last_active_ms.store(0, Ordering::Relaxed);
         }
+
+        Ok(())
     }
 
     fn get_config(&self) -> Option<String> {

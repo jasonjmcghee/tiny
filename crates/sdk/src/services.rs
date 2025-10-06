@@ -44,15 +44,6 @@ pub trait FontService: Send + Sync {
 
     /// Pre-rasterize ASCII characters for performance
     fn prerasterize_ascii(&self, font_size_px: f32);
-
-    /// Hit test: find character position at x coordinate
-    fn hit_test_line(
-        &self,
-        line_text: &str,
-        font_size: f32,
-        scale_factor: f32,
-        target_x: f32,
-    ) -> u32;
 }
 
 /// Type of text effect

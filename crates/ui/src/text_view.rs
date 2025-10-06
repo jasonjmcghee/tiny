@@ -82,10 +82,21 @@ pub struct TextView {
     /// Vertical padding (logical pixels) - insets text from top/bottom edges
     pub padding_y: f32,
 
-    /// Cached glyphs
+    /// Cached glyphs (at canonical positions before scroll/viewport offset)
     cached_glyphs: Vec<GlyphInstance>,
     /// Last doc version when glyphs were generated (atomic for lock-free check)
     cached_glyph_version: AtomicU64,
+    /// Last scroll position when glyphs were generated
+    cached_scroll_y: f32,
+    /// Last scroll position when glyphs were generated
+    cached_scroll_x: f32,
+    /// Last bounds when glyphs were generated
+    cached_bounds: Rect,
+    /// Last padding when glyphs were generated
+    cached_padding_x: f32,
+    cached_padding_y: f32,
+    /// Last visible range when glyphs were generated
+    cached_visible_lines: std::ops::Range<u32>,
 
     /// Width sizing constraint
     pub width_constraint: SizeConstraint,
@@ -122,6 +133,12 @@ impl TextView {
             padding_y: 0.0,
             cached_glyphs: Vec::new(),
             cached_glyph_version: AtomicU64::new(0),
+            cached_scroll_y: 0.0,
+            cached_scroll_x: 0.0,
+            cached_bounds: Rect { x: LogicalPixels(0.0), y: LogicalPixels(0.0), width: LogicalPixels(0.0), height: LogicalPixels(0.0) },
+            cached_padding_x: 0.0,
+            cached_padding_y: 0.0,
+            cached_visible_lines: 0..0,
             width_constraint: SizeConstraint::FillContainer,
             height_constraint: SizeConstraint::FillContainer,
             text_align: TextAlign::Left,
@@ -273,11 +290,54 @@ impl TextView {
             return Vec::new();
         }
 
-        // Check cache - only regenerate if text changed (lock-free atomic check)
+        // Check cache - if doc unchanged, we can reuse cached glyphs with position adjustment
         let current_version = self.doc.version();
         let cached_version = self.cached_glyph_version.load(Ordering::Relaxed);
-        if current_version == cached_version && !self.cached_glyphs.is_empty() {
-            return self.cached_glyphs.clone();
+        let current_scroll_y = self.viewport.scroll.y.0;
+        let current_scroll_x = self.viewport.scroll.x.0;
+        let current_visible_lines = &self.renderer.visible_lines;
+
+        // Fast path: if only position changed (not text or visible range), just offset cached glyphs
+        // IMPORTANT: Only use fast path if visible range is unchanged (same lines visible)
+        if current_version == cached_version
+            && !self.cached_glyphs.is_empty()
+            && *current_visible_lines == self.cached_visible_lines {
+
+            let scroll_delta_x = current_scroll_x - self.cached_scroll_x;
+            let scroll_delta_y = current_scroll_y - self.cached_scroll_y;
+            let bounds_delta_x = self.viewport.bounds.x.0 - self.cached_bounds.x.0;
+            let bounds_delta_y = self.viewport.bounds.y.0 - self.cached_bounds.y.0;
+            let padding_delta_x = self.padding_x - self.cached_padding_x;
+            let padding_delta_y = self.padding_y - self.cached_padding_y;
+
+            // Total position delta in logical pixels
+            let delta_x = bounds_delta_x + padding_delta_x - scroll_delta_x;
+            let delta_y = bounds_delta_y + padding_delta_y - scroll_delta_y;
+
+            // If position changed, adjust cached glyphs (much cheaper than full rebuild)
+            if delta_x.abs() > 0.01 || delta_y.abs() > 0.01 {
+                let physical_delta_x = delta_x * self.viewport.scale_factor;
+                let physical_delta_y = delta_y * self.viewport.scale_factor;
+
+                let mut adjusted = self.cached_glyphs.clone();
+                for glyph in &mut adjusted {
+                    glyph.pos.x.0 += physical_delta_x;
+                    glyph.pos.y.0 += physical_delta_y;
+                }
+
+                // Update cache state
+                self.cached_glyphs = adjusted.clone();
+                self.cached_scroll_x = current_scroll_x;
+                self.cached_scroll_y = current_scroll_y;
+                self.cached_bounds = self.viewport.bounds;
+                self.cached_padding_x = self.padding_x;
+                self.cached_padding_y = self.padding_y;
+
+                return adjusted;
+            } else {
+                // No change at all - return cached as-is
+                return self.cached_glyphs.clone();
+            }
         }
 
         let visible_glyphs = self.renderer.get_visible_glyphs_with_style();
@@ -357,6 +417,12 @@ impl TextView {
         // Update cache
         self.cached_glyphs = instances.clone();
         self.cached_glyph_version.store(current_version, Ordering::Relaxed);
+        self.cached_scroll_y = current_scroll_y;
+        self.cached_scroll_x = current_scroll_x;
+        self.cached_bounds = self.viewport.bounds;
+        self.cached_padding_x = self.padding_x;
+        self.cached_padding_y = self.padding_y;
+        self.cached_visible_lines = self.renderer.visible_lines.clone();
 
         instances
     }

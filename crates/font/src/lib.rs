@@ -16,12 +16,14 @@ mod rasterize;
 mod shaping;
 
 pub use cluster_map::ClusterMap;
-pub use emoji::{contains_emoji, is_emoji};
+pub use emoji::{
+    contains_emoji, contains_nerd_symbols, contains_special_chars, is_emoji, is_nerd_font_symbol,
+};
 pub use rasterize::{FontMetrics, RasterResult, Rasterizer};
-pub use shaping::{ShapedGlyph, Shaper, ShapingOptions, ShapingResult, TextRun};
+pub use shaping::{RunFontType, ShapedGlyph, Shaper, ShapingOptions, ShapingResult, TextRun};
 
-use ahash::HashMap;
-use parking_lot::Mutex;
+use ahash::{HashMap, HashSet};
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use swash::FontRef;
 use tiny_sdk::services::{
@@ -87,11 +89,21 @@ pub struct ShapedTextLayout {
 
 /// Consolidated font system - handles everything font-related
 pub struct FontSystem {
-    /// Font data for swash (kept alive for FontRef)
+    /// Regular variable font data (kept alive for FontRef)
     #[allow(dead_code)]
-    font_data: Arc<Vec<u8>>,
-    /// Swash font reference (offset 0 = main font)
-    font_ref: FontRef<'static>,
+    regular_font_data: Arc<Vec<u8>>,
+    /// Regular variable font reference
+    regular_font_ref: FontRef<'static>,
+    /// Italic variable font data (kept alive for FontRef)
+    #[allow(dead_code)]
+    italic_font_data: Arc<Vec<u8>>,
+    /// Italic variable font reference
+    italic_font_ref: FontRef<'static>,
+    /// Nerd font data for glyphs (kept alive)
+    #[allow(dead_code)]
+    nerd_font_data: Arc<Vec<u8>>,
+    /// Nerd font reference for glyph fallback
+    nerd_font_ref: FontRef<'static>,
     /// Emoji fallback font data (kept alive)
     #[allow(dead_code)]
     emoji_font_data: Option<Arc<Vec<u8>>>,
@@ -107,10 +119,13 @@ pub struct FontSystem {
     color_atlas_data: Vec<u8>,
     /// Atlas dimensions (same for both atlases)
     atlas_size: (u32, u32),
-    /// Cache of rasterized glyphs: (glyph_id, size_in_pixels, is_emoji) -> (tex_coords, metrics)
-    /// Changed from char to glyph_id to support shaped glyphs
-    /// Added is_emoji flag to distinguish between main and emoji font glyphs
-    glyph_cache: HashMap<(u16, u32, bool), GlyphEntry>,
+    /// Cache of rasterized glyphs: (glyph_id, size_px, italic, weight_quantized, font_source) -> GlyphEntry
+    /// - glyph_id: Font-specific glyph identifier
+    /// - size_px: Pixel size (already includes scale factor)
+    /// - italic: Whether italic variant is used
+    /// - weight_quantized: Font weight quantized to nearest 100 (e.g., 400, 700)
+    /// - font_source: Which font the glyph came from (Main/Nerd/Emoji)
+    glyph_cache: HashMap<(u16, u32, bool, u16, FontSource), GlyphEntry>,
     /// Current atlas cursor (monochrome)
     next_x: u32,
     next_y: u32,
@@ -131,6 +146,48 @@ pub struct FontSystem {
     current_frame: u64,
 }
 
+impl FontSystem {
+    /// Set default font weight (100-900)
+    pub fn set_default_weight(&mut self, weight: f32) {
+        let clamped = weight.clamp(100.0, 900.0);
+        eprintln!("🔧 FontSystem: Setting default weight to {}", clamped);
+        self.shaping_options.weight = clamped;
+        // DON'T clear cache - let it naturally pick up new glyphs
+        // Clearing causes a flash as the entire atlas is wiped
+        // Old glyphs will be replaced as text is re-laid out with new weight
+    }
+
+    /// Set default italic setting
+    pub fn set_default_italic(&mut self, italic: bool) {
+        eprintln!("🔧 FontSystem: Setting default italic to {}", italic);
+        self.shaping_options.italic = italic;
+        // DON'T clear cache - let it naturally pick up new glyphs
+        // Clearing causes a flash as the entire atlas is wiped
+        // Old glyphs will be replaced as text is re-laid out with new italic
+    }
+
+    /// Get current default weight
+    pub fn default_weight(&self) -> f32 {
+        self.shaping_options.weight
+    }
+
+    /// Get current default italic
+    pub fn default_italic(&self) -> bool {
+        self.shaping_options.italic
+    }
+}
+
+/// Font source for glyph rendering
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FontSource {
+    /// Regular or italic main font
+    Main,
+    /// Nerd font for special glyphs
+    Nerd,
+    /// Emoji font for emoji
+    Emoji,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 struct GlyphEntry {
@@ -149,11 +206,103 @@ struct GlyphEntry {
 }
 
 impl FontSystem {
+    /// Select the main font (regular or italic) based on shaping options
+    fn select_main_font(&self, italic: bool) -> &FontRef<'static> {
+        if italic {
+            &self.italic_font_ref
+        } else {
+            &self.regular_font_ref
+        }
+    }
+
+    /// Find which font actually has a glyph for this character
+    /// Returns (font_ref, font_source) for the first font that has the glyph
+    /// Fallback chain: main (variable weight!) -> nerd (for missing symbols) -> emoji
+    ///
+    /// IMPORTANT: Try main font FIRST so we use the variable weight fonts!
+    /// Nerd font is only for symbols that main font doesn't have.
+    fn select_font_for_char(&self, ch: char, italic: bool) -> (&FontRef<'static>, FontSource) {
+        let main_font = self.select_main_font(italic);
+
+        // Try main font FIRST - this is the variable weight font!
+        if main_font.charmap().map(ch) != 0 {
+            return (main_font, FontSource::Main);
+        }
+
+        // Main font doesn't have it - try nerd font (for symbols like ✓ ✗  etc.)
+        let nerd_glyph_id = self.nerd_font_ref.charmap().map(ch);
+        if nerd_glyph_id != 0 {
+            return (&self.nerd_font_ref, FontSource::Nerd);
+        }
+
+        // Try emoji font
+        if let Some(emoji_font) = self.emoji_font_ref.as_ref() {
+            let emoji_glyph_id = emoji_font.charmap().map(ch);
+            if emoji_glyph_id != 0 {
+                return (emoji_font, FontSource::Emoji);
+            }
+        }
+
+        // Nothing has it - use main font anyway (will render as .notdef tofu)
+        (main_font, FontSource::Main)
+    }
+
+    /// Segment text into runs by checking which font actually has each character
+    /// No guessing - we check the charmap for each font to find which one has the glyph
+    fn segment_text_by_font(&self, text: &str, italic: bool) -> Vec<TextRun> {
+        let mut runs = Vec::new();
+        let mut current_run_start = 0;
+        let mut current_run_bytes = 0;
+        let mut current_run_text = String::new();
+        let mut current_font_type = RunFontType::Main;
+
+        for (byte_offset, ch) in text.char_indices() {
+            // Check which font actually has this character
+            let (_font_ref, font_source) = self.select_font_for_char(ch, italic);
+            let char_font_type = match font_source {
+                FontSource::Main => RunFontType::Main,
+                FontSource::Nerd => RunFontType::Nerd,
+                FontSource::Emoji => RunFontType::Emoji,
+            };
+
+            // Start a new run if font type changes
+            if byte_offset > 0 && char_font_type != current_font_type {
+                // Finish current run
+                runs.push(TextRun {
+                    byte_range: current_run_start..current_run_start + current_run_bytes,
+                    text: std::mem::take(&mut current_run_text),
+                    font_type: current_font_type,
+                });
+
+                // Start new run
+                current_run_start = byte_offset;
+                current_run_bytes = 0;
+                current_font_type = char_font_type;
+            }
+
+            current_run_text.push(ch);
+            current_run_bytes += ch.len_utf8();
+        }
+
+        // Don't forget the last run
+        if !current_run_text.is_empty() {
+            runs.push(TextRun {
+                byte_range: current_run_start..current_run_start + current_run_bytes,
+                text: current_run_text,
+                font_type: current_font_type,
+            });
+        }
+
+        runs
+    }
+
     /// Evict least recently used glyphs and rebuild atlas
     /// Called when atlas overflows
     fn evict_lru_glyphs(&mut self) {
         // Sort cache entries by access order and collect keys to evict
-        let mut entries: Vec<_> = self.glyph_cache.iter()
+        let mut entries: Vec<_> = self
+            .glyph_cache
+            .iter()
             .map(|(k, v)| (*k, v.access_order))
             .collect();
         entries.sort_by_key(|(_, access_order)| *access_order);
@@ -162,14 +311,14 @@ impl FontSystem {
         let evict_count = entries.len() / 4;
         let evict_count = evict_count.max(1); // Always evict at least one
 
-        eprintln!("⚠️  Font atlas overflow! Evicting {} oldest glyphs ({}% of cache)",
-                  evict_count, (evict_count * 100) / entries.len().max(1));
+        eprintln!(
+            "⚠️  Font atlas overflow! Evicting {} oldest glyphs ({}% of cache)",
+            evict_count,
+            (evict_count * 100) / entries.len().max(1)
+        );
 
         // Collect keys to evict
-        let keys_to_evict: Vec<_> = entries.iter()
-            .take(evict_count)
-            .map(|(k, _)| *k)
-            .collect();
+        let keys_to_evict: Vec<_> = entries.iter().take(evict_count).map(|(k, _)| *k).collect();
 
         // Now evict them
         for key in &keys_to_evict {
@@ -194,16 +343,30 @@ impl FontSystem {
         self.glyph_cache.clear();
 
         // Copy font refs before the loop to avoid borrow checker issues
-        let main_font_ref = self.font_ref;
+        let regular_font_ref = self.regular_font_ref;
+        let italic_font_ref = self.italic_font_ref;
+        let nerd_font_ref = self.nerd_font_ref;
         let emoji_font_ref = self.emoji_font_ref;
 
         // Re-rasterize each remaining glyph
         // This is inefficient but keeps the logic simple
-        for (glyph_id, size_px, is_from_emoji_font) in remaining_keys {
-            let font_ref = if is_from_emoji_font && emoji_font_ref.is_some() {
-                emoji_font_ref.as_ref().unwrap()
-            } else {
-                &main_font_ref
+        for (glyph_id, size_px, italic, weight, font_source) in remaining_keys {
+            let font_ref = match font_source {
+                FontSource::Main => {
+                    if italic {
+                        &italic_font_ref
+                    } else {
+                        &regular_font_ref
+                    }
+                }
+                FontSource::Nerd => &nerd_font_ref,
+                FontSource::Emoji => {
+                    if let Some(ref emoji_ref) = emoji_font_ref {
+                        emoji_ref
+                    } else {
+                        continue; // Skip if emoji font not available
+                    }
+                }
             };
 
             // Re-rasterize this glyph (will be added back to cache)
@@ -211,7 +374,9 @@ impl FontSystem {
                 glyph_id,
                 size_px,
                 font_ref,
-                is_from_emoji_font,
+                italic,
+                weight as f32, // Convert from quantized u16 back to f32
+                font_source,
             );
         }
 
@@ -229,9 +394,8 @@ impl FontSystem {
                 let emoji_data = Arc::new(emoji_data_vec);
 
                 // SAFETY: Leak the Arc to get a 'static reference
-                let emoji_data_ref: &'static [u8] = unsafe {
-                    std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len())
-                };
+                let emoji_data_ref: &'static [u8] =
+                    unsafe { std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len()) };
 
                 // Apple Color Emoji is a TrueType Collection (.ttc), try index 0
                 if let Some(emoji_font_ref) = FontRef::from_index(emoji_data_ref, 0) {
@@ -250,9 +414,8 @@ impl FontSystem {
             let emoji_path = "C:\\Windows\\Fonts\\seguiemj.ttf";
             if let Ok(emoji_data_vec) = std::fs::read(emoji_path) {
                 let emoji_data = Arc::new(emoji_data_vec);
-                let emoji_data_ref: &'static [u8] = unsafe {
-                    std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len())
-                };
+                let emoji_data_ref: &'static [u8] =
+                    unsafe { std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len()) };
 
                 if let Some(emoji_font_ref) = FontRef::from_index(emoji_data_ref, 0) {
                     eprintln!("✅ Loaded Segoe UI Emoji font");
@@ -266,9 +429,8 @@ impl FontSystem {
             let emoji_path = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
             if let Ok(emoji_data_vec) = std::fs::read(emoji_path) {
                 let emoji_data = Arc::new(emoji_data_vec);
-                let emoji_data_ref: &'static [u8] = unsafe {
-                    std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len())
-                };
+                let emoji_data_ref: &'static [u8] =
+                    unsafe { std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len()) };
 
                 if let Some(emoji_font_ref) = FontRef::from_index(emoji_data_ref, 0) {
                     eprintln!("✅ Loaded Noto Color Emoji font");
@@ -283,23 +445,34 @@ impl FontSystem {
 
     /// Create new font system
     pub fn new() -> Self {
-        let font_data_static = include_bytes!("../assets/JetBrainsMonoNerdFont-Regular.ttf");
-
-        // Create Arc for swash (needs owned data)
-        let font_data = Arc::new(font_data_static.to_vec());
-
-        // SAFETY: We leak the Arc to get a 'static reference
-        // This is safe because the font data never changes and lives for the program lifetime
-        let font_data_ref: &'static [u8] = unsafe {
-            std::slice::from_raw_parts(
-                font_data.as_ptr(),
-                font_data.len(),
-            )
+        // Load regular variable font
+        let regular_font_static = include_bytes!("../assets/JetBrainsMono-VariableFont_wght.ttf");
+        let regular_font_data = Arc::new(regular_font_static.to_vec());
+        let regular_font_data_ref: &'static [u8] = unsafe {
+            std::slice::from_raw_parts(regular_font_data.as_ptr(), regular_font_data.len())
         };
+        let regular_font_ref = FontRef::from_index(regular_font_data_ref, 0)
+            .expect("Failed to load regular variable font");
 
-        // Create swash FontRef
-        let font_ref = FontRef::from_index(font_data_ref, 0)
-            .expect("Failed to load font for swash");
+        // Load italic variable font
+        let italic_font_static =
+            include_bytes!("../assets/JetBrainsMono-Italic-VariableFont_wght.ttf");
+        let italic_font_data = Arc::new(italic_font_static.to_vec());
+        let italic_font_data_ref: &'static [u8] = unsafe {
+            std::slice::from_raw_parts(italic_font_data.as_ptr(), italic_font_data.len())
+        };
+        let italic_font_ref = FontRef::from_index(italic_font_data_ref, 0)
+            .expect("Failed to load italic variable font");
+
+        // Load nerd font for glyphs and Unicode symbols
+        // Using full JetBrainsMonoNerdFont instead of Symbols-only because we need
+        // standard Unicode symbols (✓ ✗ arrows etc) in addition to PUA nerd icons
+        let nerd_font_static = include_bytes!("../assets/JetBrainsMonoNerdFont-Regular.ttf");
+        let nerd_font_data = Arc::new(nerd_font_static.to_vec());
+        let nerd_font_data_ref: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(nerd_font_data.as_ptr(), nerd_font_data.len()) };
+        let nerd_font_ref =
+            FontRef::from_index(nerd_font_data_ref, 0).expect("Failed to load nerd font");
 
         // Load emoji font for fallback
         let (emoji_font_data, emoji_font_ref) = Self::load_emoji_font();
@@ -315,16 +488,24 @@ impl FontSystem {
         // In a monospace font, all characters should have the same advance
         let test_size = 16.0;
         let test_opts = ShapingOptions::with_size(test_size);
-        let shaped = shaper.shape(&font_ref, "M", &test_opts);
+        let shaped = shaper.shape(&regular_font_ref, "M", &test_opts);
         let char_width_coef = if let Some(glyph) = shaped.glyphs.first() {
             glyph.x_advance / test_size
         } else {
             0.6 // Fallback coefficient
         };
 
+        eprintln!(
+            "✅ Loaded JetBrains Mono variable fonts (regular + italic) with nerd font fallback"
+        );
+
         Self {
-            font_data,
-            font_ref,
+            regular_font_data,
+            regular_font_ref,
+            italic_font_data,
+            italic_font_ref,
+            nerd_font_data,
+            nerd_font_ref,
             emoji_font_data,
             emoji_font_ref,
             shaper,
@@ -365,7 +546,9 @@ impl FontSystem {
         let line_height = if let Some(lh) = physical_line_height {
             lh
         } else {
-            let font_metrics = self.rasterizer.get_font_metrics(&self.font_ref, font_size_px);
+            let font_metrics = self
+                .rasterizer
+                .get_font_metrics(&self.regular_font_ref, font_size_px);
             // Swash returns descent as absolute value (positive), so we ADD it
             font_metrics.ascent + font_metrics.descent + font_metrics.leading
         };
@@ -415,20 +598,29 @@ impl FontSystem {
         // Expand tabs manually
         let expanded = expand_tabs(text);
 
-        // If we have emoji font, segment text into runs
-        if self.emoji_font_ref.is_some() && contains_emoji(&expanded) {
-            // Segment into emoji and non-emoji runs
-            let runs = Shaper::segment_text(&expanded);
+        // Segment text by checking which font has each character
+        let runs = self.segment_text_by_font(&expanded, opts.italic);
+
+        if runs.len() > 1
+            || runs
+                .first()
+                .map_or(false, |r| r.font_type != RunFontType::Main)
+        {
+            // We have multiple font runs - shape each separately
 
             let mut all_glyphs = Vec::new();
             let mut total_advance = 0.0;
 
+            // Copy main font ref to avoid borrow issues
+            let main_font = *self.select_main_font(opts.italic);
+
             // Shape each run with appropriate font
+            // Font type already determined by charmap checking in segment_text_by_font
             for run in &runs {
-                let font_for_run = if run.use_emoji_font {
-                    self.emoji_font_ref.as_ref().unwrap()
-                } else {
-                    &self.font_ref
+                let font_for_run = match run.font_type {
+                    RunFontType::Main => &main_font,
+                    RunFontType::Nerd => &self.nerd_font_ref,
+                    RunFontType::Emoji => self.emoji_font_ref.as_ref().unwrap_or(&main_font),
                 };
 
                 let mut run_result = self.shaper.shape(font_for_run, &run.text, &opts_with_size);
@@ -451,8 +643,9 @@ impl FontSystem {
             return (result, cluster_map, expanded);
         }
 
-        // No emoji font or no emojis - use main font only
-        let result = self.shaper.shape(&self.font_ref, &expanded, &opts_with_size);
+        // No special characters (nerd symbols or emoji) - use main font only
+        let main_font = *self.select_main_font(opts.italic);
+        let result = self.shaper.shape(&main_font, &expanded, &opts_with_size);
         let cluster_map = ClusterMap::from_glyphs(&result.glyphs, expanded.len());
 
         (result, cluster_map, expanded)
@@ -460,15 +653,21 @@ impl FontSystem {
 
     /// Get or rasterize a glyph by glyph ID at physical pixel size
     /// font_ref: which font to use for rasterization
-    /// is_from_emoji_font: whether this glyph came from emoji font shaping
+    /// italic: whether italic variant is being used
+    /// weight: font weight (quantized to nearest 100 for caching)
+    /// font_source: which font family the glyph came from (Main/Nerd/Emoji)
     fn get_or_rasterize_glyph_with_font(
         &mut self,
         glyph_id: u16,
         size_px: u32,
         font_ref: &FontRef<'static>,
-        is_from_emoji_font: bool,
+        italic: bool,
+        weight: f32,
+        font_source: FontSource,
     ) -> GlyphEntry {
-        let key = (glyph_id, size_px, is_from_emoji_font);
+        // Quantize weight to nearest 100 for cache efficiency
+        let weight_quantized = ((weight / 100.0).round() * 100.0) as u16;
+        let key = (glyph_id, size_px, italic, weight_quantized, font_source);
 
         // Check cache first
         if let Some(entry) = self.glyph_cache.get_mut(&key) {
@@ -483,16 +682,38 @@ impl FontSystem {
         // Check if this is a color glyph
         let is_color = self.rasterizer.is_color_glyph(font_ref, glyph_id);
 
-        // Rasterize using swash with appropriate font
-        let raster_result = self
-            .rasterizer
-            .rasterize(font_ref, glyph_id, size_px as f32)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Failed to rasterize glyph_id={} at size={}px with font (is_emoji={})",
-                    glyph_id, size_px, is_from_emoji_font
+        // Rasterize using swash with appropriate font and weight variation
+        let raster_result = match self.rasterizer.rasterize_with_weight(
+            font_ref,
+            glyph_id,
+            size_px as f32,
+            weight,
+        ) {
+            Some(result) => result,
+            None => {
+                // Failed to rasterize (likely corrupted font data) - return empty/missing glyph
+                eprintln!(
+                    "Warning: Failed to rasterize glyph_id={} at size={}px (italic={}, weight={}, source={:?})",
+                    glyph_id, size_px, italic, weight, font_source
                 );
-            });
+
+                // Return a missing glyph entry (empty space with minimal advance)
+                let entry = GlyphEntry {
+                    tex_coords: [0.0, 0.0, 0.0, 0.0],
+                    width: 0.0,
+                    height: 0.0,
+                    advance: size_px as f32 * 0.5, // Half the font size as advance
+                    bearing_x: 0.0,
+                    bearing_y: 0.0,
+                    is_color: false,
+                    atlas_index: 0,
+                    access_order: self.current_frame,
+                };
+
+                self.glyph_cache.insert(key, entry);
+                return entry;
+            }
+        };
 
         let bitmap = &raster_result.bitmap;
         let width = raster_result.width;
@@ -500,9 +721,19 @@ impl FontSystem {
 
         // Choose atlas based on whether this is a color glyph
         let (next_x, next_y, row_height, atlas_index) = if is_color {
-            (&mut self.color_next_x, &mut self.color_next_y, &mut self.color_row_height, 1u8)
+            (
+                &mut self.color_next_x,
+                &mut self.color_next_y,
+                &mut self.color_row_height,
+                1u8,
+            )
         } else {
-            (&mut self.next_x, &mut self.next_y, &mut self.row_height, 0u8)
+            (
+                &mut self.next_x,
+                &mut self.next_y,
+                &mut self.row_height,
+                0u8,
+            )
         };
 
         // Check if glyph fits in current row
@@ -520,7 +751,9 @@ impl FontSystem {
                 glyph_id,
                 size_px,
                 font_ref,
-                is_from_emoji_font,
+                italic,
+                weight,
+                font_source,
             );
         }
 
@@ -550,7 +783,7 @@ impl FontSystem {
                             let bitmap_idx = (y * width + x) as usize;
                             if bitmap_idx < bitmap.len() {
                                 let alpha = bitmap[bitmap_idx];
-                                self.color_atlas_data[atlas_idx] = 255;     // R
+                                self.color_atlas_data[atlas_idx] = 255; // R
                                 self.color_atlas_data[atlas_idx + 1] = 255; // G
                                 self.color_atlas_data[atlas_idx + 2] = 255; // B
                                 self.color_atlas_data[atlas_idx + 3] = alpha; // A
@@ -564,8 +797,7 @@ impl FontSystem {
             // Monochrome atlas is R8
             for y in 0..height {
                 for x in 0..width {
-                    let atlas_idx =
-                        ((*next_y + y) * self.atlas_size.0 + (*next_x + x)) as usize;
+                    let atlas_idx = ((*next_y + y) * self.atlas_size.0 + (*next_x + x)) as usize;
                     let bitmap_idx = (y * width + x) as usize;
                     if atlas_idx < self.atlas_data.len() && bitmap_idx < bitmap.len() {
                         self.atlas_data[atlas_idx] = bitmap[bitmap_idx];
@@ -602,12 +834,18 @@ impl FontSystem {
         entry
     }
 
-    /// Get or rasterize a glyph by glyph ID at physical pixel size (main font)
+    /// Get or rasterize a glyph by glyph ID at physical pixel size (main font, regular weight, no italic)
     fn get_or_rasterize_glyph(&mut self, glyph_id: u16, size_px: u32) -> GlyphEntry {
-        let font_ref = self.font_ref; // Copy FontRef to avoid borrow issues
-        self.get_or_rasterize_glyph_with_font(glyph_id, size_px, &font_ref, false)
+        let font_ref = self.regular_font_ref; // Copy FontRef to avoid borrow issues
+        self.get_or_rasterize_glyph_with_font(
+            glyph_id,
+            size_px,
+            &font_ref,
+            false,
+            400.0,
+            FontSource::Main,
+        )
     }
-
 
     /// Layout text using swash shaping with tab expansion
     pub fn layout_text_shaped_with_tabs(
@@ -617,21 +855,28 @@ impl FontSystem {
         options: Option<&ShapingOptions>,
     ) -> ShapedTextLayout {
         // Get font metrics from main font for baseline
-        let main_font_metrics = self.rasterizer.get_font_metrics(&self.font_ref, font_size_px);
+        let opts = options.unwrap_or(&self.shaping_options);
+
+        let opts_clone = opts.clone(); // Clone to avoid borrow conflicts
+        let main_font_ref = *self.select_main_font(opts_clone.italic); // Copy FontRef
+        let main_font_metrics = self
+            .rasterizer
+            .get_font_metrics(&main_font_ref, font_size_px);
         let baseline_y = main_font_metrics.ascent;
 
         // Expand tabs
         let expanded = expand_tabs(text);
 
-        // Segment into runs if we have emoji font and text contains emojis
-        let has_emoji_font = self.emoji_font_ref.is_some();
-        let has_emojis = contains_emoji(&expanded);
+        // Segment text by checking which font has each character
+        let runs = self.segment_text_by_font(&expanded, opts_clone.italic);
 
-        if has_emoji_font && has_emojis {
-            // Segment text into emoji and non-emoji runs
-            let runs = Shaper::segment_text(&expanded);
+        if runs.len() > 1
+            || runs
+                .first()
+                .map_or(false, |r| r.font_type != RunFontType::Main)
+        {
+            // We have multiple font runs - shape each separately
 
-            let opts = options.unwrap_or(&self.shaping_options);
             let mut opts_with_size = opts.clone();
             opts_with_size.font_size = font_size_px;
 
@@ -641,26 +886,18 @@ impl FontSystem {
             let mut max_y = 0.0f32;
 
             // Shape and position each run
+            // Font type already determined by charmap checking in segment_text_by_font
             for run in &runs {
-                // For emoji runs, check if the emoji font actually has the glyphs
-                // If not, fall back to main font
-                let (font_ref, is_emoji_run) = if run.use_emoji_font {
-                    let emoji_font = self.emoji_font_ref.as_ref().unwrap();
-                    // Check if emoji font has all the glyphs in this run
-                    let emoji_has_glyphs = run.text.chars().all(|ch| {
-                        emoji_font.charmap().map(ch) != 0
-                    });
-
-                    if emoji_has_glyphs {
-                        // Use emoji font
-                        (*emoji_font, true)
-                    } else {
-                        // Emoji font doesn't have these glyphs, use main font
-                        (self.font_ref, false)
+                let (font_ref, font_source) = match run.font_type {
+                    RunFontType::Main => (main_font_ref, FontSource::Main),
+                    RunFontType::Nerd => (self.nerd_font_ref, FontSource::Nerd),
+                    RunFontType::Emoji => {
+                        if let Some(emoji_font) = self.emoji_font_ref.as_ref() {
+                            (*emoji_font, FontSource::Emoji)
+                        } else {
+                            (main_font_ref, FontSource::Main)
+                        }
                     }
-                } else {
-                    // Not an emoji run, use main font
-                    (self.font_ref, false)
                 };
 
                 let mut run_result = self.shaper.shape(&font_ref, &run.text, &opts_with_size);
@@ -672,11 +909,20 @@ impl FontSystem {
 
                 // Position glyphs in this run
                 for shaped_glyph in &run_result.glyphs {
+                    // Use appropriate italic/weight for main font, defaults for others
+                    let (use_italic, use_weight) = if font_source == FontSource::Main {
+                        (opts_clone.italic, opts_clone.weight)
+                    } else {
+                        (false, 400.0) // Emoji and nerd fonts don't have italic/weight
+                    };
+
                     let entry = self.get_or_rasterize_glyph_with_font(
                         shaped_glyph.glyph_id,
                         font_size_px as u32,
                         &font_ref,
-                        is_emoji_run,
+                        use_italic,
+                        use_weight,
+                        font_source,
                     );
 
                     // Get character from expanded text (cluster is byte offset in expanded)
@@ -718,15 +964,16 @@ impl FontSystem {
             };
         }
 
-        // No emoji font or no emojis - use main font only (fast path)
-        let shaped_font_ref = self.font_ref;
+        // No special characters (nerd symbols or emoji) - use main font only (fast path)
+        let shaped_font_ref = main_font_ref;
 
         // Shape directly with main font
-        let opts = options.unwrap_or(&self.shaping_options);
-        let mut opts_with_size = opts.clone();
+        let mut opts_with_size = opts_clone.clone();
         opts_with_size.font_size = font_size_px;
 
-        let shaping_result = self.shaper.shape(&self.font_ref, &expanded, &opts_with_size);
+        let shaping_result = self
+            .shaper
+            .shape(&main_font_ref, &expanded, &opts_with_size);
         let cluster_map = ClusterMap::from_glyphs(&shaping_result.glyphs, expanded.len());
 
         let mut positioned_glyphs = Vec::new();
@@ -739,7 +986,9 @@ impl FontSystem {
                 shaped_glyph.glyph_id,
                 font_size_px as u32,
                 &shaped_font_ref,
-                false, // Main font
+                opts_clone.italic,
+                opts_clone.weight,
+                FontSource::Main,
             );
 
             // Calculate position
@@ -792,7 +1041,7 @@ impl FontSystem {
     /// Pre-rasterize common ASCII characters
     /// font_size_px should already include scale (e.g., 14.0 * 2.0 for retina)
     pub fn prerasterize_ascii(&mut self, font_size_px: f32) {
-        let charmap = self.font_ref.charmap();
+        let charmap = self.regular_font_ref.charmap();
         for ch in ' '..='~' {
             let glyph_id = charmap.map(ch);
             if glyph_id != 0 {
@@ -923,9 +1172,11 @@ impl SharedFontSystem {
     ) -> TextLayout {
         let physical_size = logical_font_size * scale_factor;
         let physical_line_height = logical_line_height * scale_factor;
-        self.inner
-            .lock()
-            .layout_text_with_line_height(text, physical_size, Some(physical_line_height))
+        self.inner.lock().layout_text_with_line_height(
+            text,
+            physical_size,
+            Some(physical_line_height),
+        )
     }
 
     /// Pre-rasterize ASCII - font_size_px should include scale factor
@@ -1031,85 +1282,6 @@ impl SharedFontSystem {
         // Convert byte position to character position
         line_text[..snapped_byte].chars().count() as u32
     }
-
-    /// Hit test: find character position at x coordinate using binary search
-    /// Uses the FULL line layout to get accurate positioning with kerning/ligatures
-    /// Legacy version - prefer hit_test_line_shaped for ligature support
-    pub fn hit_test_line(
-        &self,
-        line_text: &str,
-        logical_font_size: f32,
-        scale_factor: f32,
-        target_x: f32,
-    ) -> u32 {
-        if line_text.is_empty() {
-            return 0;
-        }
-
-        // Layout the full line to get accurate glyph positions
-        let full_layout = self.layout_text_scaled(line_text, logical_font_size, scale_factor);
-
-        // Handle case where layout produces no glyphs (whitespace-only lines)
-        if full_layout.glyphs.is_empty() {
-            if full_layout.width > 0.0 {
-                // Use the font system's actual measurement of the line width
-                let line_width_logical = full_layout.width / scale_factor;
-                let progress = (target_x / line_width_logical).clamp(0.0, 1.0);
-                return (progress * line_text.chars().count() as f32) as u32;
-            } else {
-                // Truly empty line
-                return 0;
-            }
-        }
-
-        let target_x_physical = target_x * scale_factor; // Convert to physical pixels
-
-        // Map glyph positions back to original character positions
-        // We need this because tabs are expanded to spaces in layout
-        let mut char_map = Vec::new(); // Maps expanded position -> original position
-        let mut orig_pos = 0;
-        let mut exp_pos = 0;
-
-        for orig_ch in line_text.chars() {
-            if orig_ch == '\t' {
-                let spaces_needed = 4 - (exp_pos % 4);
-                for _ in 0..spaces_needed {
-                    char_map.push(orig_pos);
-                    exp_pos += 1;
-                }
-            } else {
-                char_map.push(orig_pos);
-                exp_pos += 1;
-            }
-            orig_pos += 1;
-        }
-
-        // Binary search through glyph positions
-        let mut left = 0;
-        let mut right = full_layout.glyphs.len();
-
-        while left < right {
-            let mid = (left + right) / 2;
-            let glyph = &full_layout.glyphs[mid];
-            let glyph_center = glyph.pos.x.0 + glyph.size.width.0 / 2.0;
-
-            if glyph_center <= target_x_physical {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-
-        // Map back to original character position
-        if left < char_map.len() {
-            char_map[left] as u32
-        } else if !char_map.is_empty() {
-            *char_map.last().unwrap() as u32 + 1
-        } else {
-            left as u32
-        }
-    }
-
     /// Find which column corresponds to a pixel position
     pub fn pixel_to_column(&self, x_logical: f32, text: &str, font_size: f32, scale: f32) -> usize {
         self.inner
@@ -1129,6 +1301,26 @@ impl SharedFontSystem {
         self.inner
             .lock()
             .layout_text_shaped_with_tabs(text, physical_size, options)
+    }
+
+    /// Set default font weight for all text (100-900, where 400=normal, 700=bold)
+    pub fn set_default_weight(&self, weight: f32) {
+        self.inner.lock().set_default_weight(weight);
+    }
+
+    /// Set default italic setting for all text
+    pub fn set_default_italic(&self, italic: bool) {
+        self.inner.lock().set_default_italic(italic);
+    }
+
+    /// Get current default weight
+    pub fn default_weight(&self) -> f32 {
+        self.inner.lock().default_weight()
+    }
+
+    /// Get current default italic
+    pub fn default_italic(&self) -> bool {
+        self.inner.lock().default_italic()
     }
 }
 
@@ -1245,14 +1437,62 @@ impl FontService for SharedFontSystem {
     fn prerasterize_ascii(&self, font_size_px: f32) {
         self.inner.lock().prerasterize_ascii(font_size_px);
     }
+}
 
-    fn hit_test_line(
-        &self,
-        line_text: &str,
-        font_size: f32,
-        scale_factor: f32,
-        target_x: f32,
-    ) -> u32 {
-        self.hit_test_line(line_text, font_size, scale_factor, target_x)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nerd_font_has_symbols() {
+        // Load the full nerd font (not just Symbols)
+        let nerd_font_data = include_bytes!("../assets/JetBrainsMonoNerdFont-Regular.ttf");
+        let nerd_font_ref =
+            FontRef::from_index(nerd_font_data, 0).expect("Failed to load nerd font");
+
+        let checkmark = '✓'; // U+2713
+        let ballot_x = '✗'; // U+2717
+        let powerline = '\u{E0A0}'; // U+E0A0 - Powerline triangle
+
+        let checkmark_glyph = nerd_font_ref.charmap().map(checkmark);
+        let ballot_x_glyph = nerd_font_ref.charmap().map(ballot_x);
+        let powerline_glyph = nerd_font_ref.charmap().map(powerline);
+
+        println!("\nNerd font (full JetBrainsMonoNerdFont-Regular) test results:");
+        println!(
+            "  ✓ (U+2713) has glyph_id: {} ({})",
+            checkmark_glyph,
+            if checkmark_glyph != 0 {
+                "✓ FOUND"
+            } else {
+                "✗ NOT FOUND"
+            }
+        );
+        println!(
+            "  ✗ (U+2717) has glyph_id: {} ({})",
+            ballot_x_glyph,
+            if ballot_x_glyph != 0 {
+                "✓ FOUND"
+            } else {
+                "✗ NOT FOUND"
+            }
+        );
+        println!(
+            "  U+E0A0 has glyph_id: {} ({})",
+            powerline_glyph,
+            if powerline_glyph != 0 {
+                "✓ FOUND"
+            } else {
+                "✗ NOT FOUND"
+            }
+        );
+
+        // These should all be present in the full nerd font
+        assert_ne!(
+            checkmark_glyph, 0,
+            "Checkmark ✓ should be in full nerd font"
+        );
+        assert_ne!(ballot_x_glyph, 0, "Ballot X ✗ should be in full nerd font");
+        assert_ne!(powerline_glyph, 0, "Powerline  should be in full nerd font");
     }
 }

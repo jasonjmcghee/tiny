@@ -6,6 +6,7 @@ use tiny_sdk::LogicalPixels;
 use tiny_ui::{coordinates::Viewport, text_view::TextView};
 
 /// Wrapper to make Doc pointer Send + Sync
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct DocPtr(*const Doc);
 
 unsafe impl Send for DocPtr {}
@@ -51,9 +52,12 @@ impl LineNumbersPlugin {
 
     /// Set the document reference
     pub fn set_document(&mut self, doc: &Doc) {
-        self.doc = Some(DocPtr(doc as *const _));
-        // Clear cache when document changes
-        self.last_total_lines = None;
+        let new_ptr = DocPtr(doc as *const _);
+        // Only clear cache if document pointer actually changed
+        if self.doc != Some(new_ptr) {
+            self.doc = Some(new_ptr);
+            self.last_total_lines = None;
+        }
     }
 
     /// Enable or disable line numbers
@@ -63,6 +67,7 @@ impl LineNumbersPlugin {
 
     /// Collect glyphs for batched rendering instead of drawing immediately
     pub fn collect_glyphs(&mut self, collector: &mut crate::render::GlyphCollector) {
+        let start = std::time::Instant::now();
         if !self.enabled {
             return;
         }
@@ -78,6 +83,7 @@ impl LineNumbersPlugin {
             Some(fs) => fs,
             None => return,
         };
+        let t1 = start.elapsed().as_micros();
 
         // Use widget viewport if available for proper bounds
         let widget_viewport = collector.widget_viewport.as_ref();
@@ -100,6 +106,7 @@ impl LineNumbersPlugin {
         let font_size_changed = self.last_font_size != Some(font_size);
 
         if content_changed {
+            eprintln!("Line numbers: regenerating {} lines", total_lines);
             // Calculate max line number width for right alignment
             let max_line_num = total_lines;
             let max_width = max_line_num.to_string().len();
@@ -146,7 +153,9 @@ impl LineNumbersPlugin {
         self.text_view.viewport.scroll.y = LogicalPixels(scroll_y);
 
         // Update layout (this calls update_visible_range with correct scroll)
+        let t2_start = std::time::Instant::now();
         self.text_view.update_layout(&font_service);
+        let t2 = t2_start.elapsed().as_micros();
 
         // Recalculate width from actual measured glyphs if content or font size changed
         if content_changed || font_size_changed {
@@ -155,7 +164,9 @@ impl LineNumbersPlugin {
             self.last_font_size = Some(font_size);
         }
 
+        let t3_start = std::time::Instant::now();
         let mut glyphs = self.text_view.collect_glyphs(&font_service);
+        let t3 = t3_start.elapsed().as_micros();
 
         // Set token_id for line numbers and add to collector
         for glyph in &mut glyphs {
@@ -163,6 +174,12 @@ impl LineNumbersPlugin {
         }
 
         collector.add_glyphs(glyphs);
+
+        let total = start.elapsed().as_micros();
+        if total > 1000 {
+            eprintln!("Line numbers timing: setup={}µs, update_layout={}µs, collect_glyphs={}µs, total={}µs",
+                t1, t2, t3, total);
+        }
     }
 }
 

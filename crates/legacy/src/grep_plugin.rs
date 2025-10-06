@@ -160,8 +160,8 @@ impl GrepPlugin {
                 }
             }
 
-            // Limit results to prevent memory issues
-            if results.len() > 10000 {
+            // Limit results to prevent memory issues and blocking
+            if results.len() >= 200 {
                 break;
             }
         }
@@ -202,6 +202,24 @@ impl EventSubscriber for GrepPlugin {
 
         // Handle events: execute logic AND stop propagation
         match event.name.as_str() {
+            // Handle text editing events internally
+            event_name if event_name.starts_with("editor.") => {
+                let input = self.input_mut();
+                let text_before = input.view.text();
+
+                // Let InputHandler handle the event
+                let _action = input.input.handle_event(event, &input.view.doc, &input.view.viewport);
+
+                // Check if text changed, trigger search if so
+                let text_after = input.view.text();
+                if text_before != text_after {
+                    let query = text_after.to_string();
+                    self.set_query(query);
+                    event_bus.emit("ui.redraw", json!({}), 20, "grep");
+                }
+
+                PropagationControl::Stop
+            }
             "navigate.up" => {
                 self.move_up();
                 event_bus.emit("ui.redraw", json!({}), 20, "grep");
@@ -227,6 +245,44 @@ impl EventSubscriber for GrepPlugin {
                     }), 10, "grep");
                 }
                 PropagationControl::Stop
+            }
+            "app.mouse.scroll" => {
+                // Handle mouse wheel scrolling
+                let delta_y = event.data
+                    .get("delta_y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+
+                self.picker.dropdown.handle_scroll(delta_y);
+                event_bus.emit("ui.redraw", json!({}), 20, "grep");
+                PropagationControl::Stop
+            }
+            "app.mouse.move" => {
+                // Handle mouse hover to highlight items
+                let x = event.data
+                    .get("x")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let y = event.data
+                    .get("y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+
+                // Check if mouse is over picker bounds
+                let bounds = self.picker.get_bounds();
+                let is_over_picker = x >= bounds.x.0
+                    && x < bounds.x.0 + bounds.width.0
+                    && y >= bounds.y.0
+                    && y < bounds.y.0 + bounds.height.0;
+
+                if is_over_picker {
+                    if self.picker.handle_hover(x, y) {
+                        event_bus.emit("ui.redraw", json!({}), 20, "grep");
+                    }
+                    PropagationControl::Stop
+                } else {
+                    PropagationControl::Continue
+                }
             }
             _ => PropagationControl::Continue,
         }

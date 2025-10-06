@@ -109,6 +109,8 @@ pub struct TinyApp {
     cpu_renderer: Option<Renderer>,
     _shader_watcher: Option<notify::RecommendedWatcher>,
     shader_reload_pending: Arc<AtomicBool>,
+    _config_watcher: Option<notify::RecommendedWatcher>,
+    config_reload_pending: Arc<AtomicBool>,
 
     // Application-specific logic
     editor: EditorLogic,
@@ -128,6 +130,9 @@ pub struct TinyApp {
 
     // Single source of truth for text metrics
     text_metrics: TextMetrics,
+
+    // Base font size from config (before any manual zoom)
+    base_font_size: f32,
 
     // Title bar settings
     title_bar_height: f32, // Logical pixels
@@ -306,9 +311,26 @@ impl TinyApp {
                     .on_mouse_leave();
             }
 
-            // Mouse move
-            if self.editor.on_mouse_move(point, &viewport) {
-                if let Some(window) = &self.window {
+            // Emit mouse move event for overlays (file picker, grep)
+            self.event_bus.emit(
+                "app.mouse.move",
+                json!({
+                    "x": point.x.0,
+                    "y": point.y.0,
+                }),
+                15,
+                "winit",
+            );
+
+            // Process mouse move events immediately for responsive hover
+            self.process_event_queue();
+
+            // If hover changed anything, render immediately (don't wait for RedrawRequested)
+            if self.editor.ui_changed || self.editor.on_mouse_move(point, &viewport) {
+                if !self.continuous_rendering {
+                    // Render immediately for instant hover feedback
+                    self.render_frame();
+                } else if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
@@ -419,18 +441,12 @@ impl TinyApp {
 
             match self.scroll_focus.focused_widget() {
                 Some(WidgetId::FilePicker) => {
-                    // Route to file picker with its bounds
-                    let picker_bounds = self.editor.file_picker.get_bounds();
-                    self.editor
-                        .file_picker
-                        .handle_scroll(scroll_delta, viewport, picker_bounds);
+                    // File picker handles scroll through event bus (see file_picker_plugin.rs)
+                    // Event already emitted above, nothing more to do here
                 }
                 Some(WidgetId::Grep) => {
-                    // Route to grep with its bounds
-                    let grep_bounds = self.editor.grep.get_bounds();
-                    self.editor
-                        .grep
-                        .handle_scroll(scroll_delta, viewport, grep_bounds);
+                    // Grep handles scroll through event bus (see grep_plugin.rs)
+                    // Event already emitted above, nothing more to do here
                 }
                 Some(WidgetId::Editor) | None => {
                     // Route to active editor tab with editor bounds
@@ -484,6 +500,8 @@ impl TinyApp {
             cpu_renderer: None,
             _shader_watcher: None,
             shader_reload_pending: Arc::new(AtomicBool::new(false)),
+            _config_watcher: None,
+            config_reload_pending: Arc::new(AtomicBool::new(false)),
             editor,
             event_bus,
             shortcuts,
@@ -491,6 +509,7 @@ impl TinyApp {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             text_metrics,
+            base_font_size: 14.0, // Default base size
             title_bar_height: 28.0,    // Logical pixels
             scroll_lock_enabled: true, // Enabled by default
             current_scroll_direction: None,
@@ -515,6 +534,9 @@ impl TinyApp {
         text_metrics.line_height = config.editor.font_size * config.editor.line_height;
         self.text_metrics = text_metrics;
 
+        // Track base font size from config
+        self.base_font_size = config.editor.font_size;
+
         self.title_bar_height = config.editor.title_bar_height;
         self.scroll_lock_enabled = config.editor.scroll_lock_enabled;
         self.continuous_rendering = config.editor.continuous_rendering;
@@ -533,6 +555,7 @@ impl TinyApp {
 
     pub fn with_font_size(mut self, size: f32) -> Self {
         self.text_metrics = TextMetrics::new(size);
+        self.base_font_size = size;
         self
     }
 
@@ -659,6 +682,159 @@ impl TinyApp {
         self._shader_watcher = Some(watcher);
     }
 
+    fn setup_config_watcher(&mut self) {
+        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+
+        let config_path = std::path::PathBuf::from("init.toml");
+
+        if !config_path.exists() {
+            eprintln!("No init.toml found - config hot-reload disabled");
+            return;
+        }
+
+        let (tx, rx) = channel();
+
+        let mut watcher = match RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if event.kind.is_modify() {
+                        let _ = tx.send(());
+                    }
+                }
+            },
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Failed to create config watcher: {}. Config hot-reload disabled.", e);
+                return;
+            }
+        };
+
+        if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+            eprintln!("Failed to watch init.toml: {}. Config hot-reload disabled.", e);
+            return;
+        }
+
+        eprintln!("Config hot-reload enabled! Watching: {:?}", config_path);
+
+        // Debounce thread
+        let reload_flag = self.config_reload_pending.clone();
+        std::thread::spawn(move || {
+            let mut last_reload = Instant::now();
+            for _ in rx {
+                if last_reload.elapsed() > Duration::from_millis(200) {
+                    reload_flag.store(true, Ordering::Relaxed);
+                    last_reload = Instant::now();
+                    eprintln!("Config change detected, triggering reload...");
+                }
+            }
+        });
+
+        self._config_watcher = Some(watcher);
+    }
+
+    fn reload_config(&mut self) {
+        let config = match crate::config::AppConfig::load() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("❌ Failed to parse config: {}", e);
+                eprintln!("   Using previous values (config not applied)");
+                return; // Keep current settings, don't crash
+            }
+        };
+
+        eprintln!("✅ Reloaded config from init.toml");
+
+                // Update window title if changed
+                if self.window_title != config.editor.window_title {
+                    self.window_title = config.editor.window_title.clone();
+                    if let Some(window) = &self.window {
+                        window.set_title(&self.window_title);
+                    }
+                }
+
+                // Update font settings if BASE font size changed in config
+                // Compare with base_font_size, NOT text_metrics.font_size (which may be manually zoomed)
+                let base_font_size_changed = (self.base_font_size - config.editor.font_size).abs() > 0.1;
+
+                if base_font_size_changed {
+                    // Calculate current zoom ratio (how much user has zoomed)
+                    let zoom_ratio = self.text_metrics.font_size / self.base_font_size;
+
+                    // Update base font size
+                    self.base_font_size = config.editor.font_size;
+
+                    // Apply zoom ratio to new base size to preserve manual zoom
+                    let new_font_size = config.editor.font_size * zoom_ratio;
+                    let new_line_height = new_font_size * config.editor.line_height;
+
+                    let mut new_metrics = TextMetrics::new(new_font_size);
+                    new_metrics.line_height = new_line_height;
+                    self.text_metrics = new_metrics;
+
+                    eprintln!("Updated base font size: {:.1} -> {:.1} (current: {:.1}, zoom: {:.2}x)",
+                        self.base_font_size / zoom_ratio, config.editor.font_size,
+                        new_font_size, zoom_ratio);
+
+                    // Mark everything dirty to force re-layout
+                    if let Some(renderer) = &mut self.cpu_renderer {
+                        renderer.mark_ui_dirty();
+                    }
+                } else {
+                    // Base didn't change, but line height multiplier might have
+                    let expected_line_height = self.text_metrics.font_size * config.editor.line_height;
+                    let line_height_changed = (self.text_metrics.line_height - expected_line_height).abs() > 0.1;
+
+                    if line_height_changed {
+                        self.text_metrics.line_height = expected_line_height;
+                        if let Some(renderer) = &mut self.cpu_renderer {
+                            renderer.mark_ui_dirty();
+                        }
+                    }
+                }
+
+                // Update scroll lock setting
+                self.scroll_lock_enabled = config.editor.scroll_lock_enabled;
+
+                // Update title bar height
+                self.title_bar_height = config.editor.title_bar_height;
+
+                // Update font weight and italic settings
+                if let Some(font_system) = &self.font_system {
+                    let current_weight = font_system.default_weight();
+                    let current_italic = font_system.default_italic();
+
+                    let weight_changed = (current_weight - config.editor.font_weight).abs() > 0.1;
+                    let italic_changed = current_italic != config.editor.font_italic;
+
+                    if weight_changed {
+                        font_system.set_default_weight(config.editor.font_weight);
+                        eprintln!("Updated font weight: {} -> {}", current_weight, config.editor.font_weight);
+                    }
+
+                    if italic_changed {
+                        font_system.set_default_italic(config.editor.font_italic);
+                        eprintln!("Updated font italic: {} -> {}", current_italic, config.editor.font_italic);
+                    }
+
+                    // If font appearance changed, force complete re-layout
+                    if weight_changed || italic_changed {
+                        if let Some(renderer) = &mut self.cpu_renderer {
+                            // Clear all layout caches - text will be re-shaped with new weight/italic
+                            renderer.clear_all_caches();
+                            renderer.mark_ui_dirty();
+                        }
+                        // Force editor to re-layout
+                        self.editor.ui_changed = true;
+                    }
+                }
+
+        self.request_redraw();
+    }
+
     /// Helper for simple overlay show (file picker, grep, etc.)
     fn show_overlay(&mut self, show: impl FnOnce(&mut EditorLogic), ctx: ShortcutContext, focus: WidgetId, editable_id: u64) {
         show(&mut self.editor);
@@ -719,7 +895,15 @@ impl TinyApp {
     }
 
     fn process_event_queue(&mut self) {
-        for event in self.event_bus.drain_sorted() {
+        // Process events in a loop to handle events emitted during event processing
+        // This ensures ui.redraw events from hover handlers are processed immediately
+        loop {
+            let events = self.event_bus.drain_sorted();
+            if events.is_empty() {
+                break;
+            }
+
+            for event in events {
             use ShortcutContext::{FilePicker, Grep};
             use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
 
@@ -735,20 +919,22 @@ impl TinyApp {
 
                 // Mouse events
                 "mouse.press" => {
-                    // Extract mouse position from event data
-                    if let (Some(x), Some(y)) = (
-                        event.data.get("x").and_then(|v| v.as_f64()),
-                        event.data.get("y").and_then(|v| v.as_f64()),
-                    ) {
-                        let shift = event.data.get("modifiers")
-                            .and_then(|m| m.get("shift"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                    // Extract screen coordinates for overlays, editor-local for main editor
+                    let screen_x = event.data.get("screen_x").and_then(|v| v.as_f64());
+                    let screen_y = event.data.get("screen_y").and_then(|v| v.as_f64());
+                    let editor_x = event.data.get("x").and_then(|v| v.as_f64());
+                    let editor_y = event.data.get("y").and_then(|v| v.as_f64());
 
-                        // Check if click is in an overlay
-                        if self.editor.file_picker.visible {
+                    let shift = event.data.get("modifiers")
+                        .and_then(|m| m.get("shift"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    // Check if click is in an overlay (use screen coordinates)
+                    if self.editor.file_picker.visible {
+                        if let (Some(x), Some(y)) = (screen_x, screen_y) {
                             use crate::filterable_dropdown::DropdownAction;
-                            let action = self.editor.file_picker.picker.dropdown.handle_click(x as f32, y as f32, shift);
+                            let action = self.editor.file_picker.picker.handle_click(x as f32, y as f32, shift);
                             match action {
                                 DropdownAction::Selected(path) => {
                                     // Open the file
@@ -764,9 +950,11 @@ impl TinyApp {
                                 _ => {}
                             }
                             self.request_redraw();
-                        } else if self.editor.grep.visible {
+                        }
+                    } else if self.editor.grep.visible {
+                        if let (Some(x), Some(y)) = (screen_x, screen_y) {
                             use crate::filterable_dropdown::DropdownAction;
-                            let action = self.editor.grep.picker.dropdown.handle_click(x as f32, y as f32, shift);
+                            let action = self.editor.grep.picker.handle_click(x as f32, y as f32, shift);
                             match action {
                                 DropdownAction::Selected(result) => {
                                     // Jump to the result
@@ -784,8 +972,19 @@ impl TinyApp {
                                 _ => {}
                             }
                             self.request_redraw();
-                        } else if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
-                            // No overlay - route to main editor
+                        }
+                    } else if let (Some(x), Some(y)) = (editor_x, editor_y) {
+                        // No overlay - route to main editor (use editor-local coordinates)
+                        // Set drag state here since we're actually handling the click in the editor
+                        if let (Some(phys_x), Some(phys_y)) = (
+                            event.data.get("physical_x").and_then(|v| v.as_f64()),
+                            event.data.get("physical_y").and_then(|v| v.as_f64()),
+                        ) {
+                            self.mouse_pressed = true;
+                            self.drag_start = Some(winit::dpi::PhysicalPosition::new(phys_x, phys_y));
+                        }
+
+                        if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
                             let plugin = self.editor.active_plugin_mut();
                             if plugin.editor.input.handle_event(&event, &plugin.editor.view.doc, &viewport) == InputAction::Redraw {
                                 self.request_redraw();
@@ -896,76 +1095,60 @@ impl TinyApp {
                     self.request_redraw();
                 }
 
-                // Editor events - delegate to focused EditableTextView's InputHandler
+                // Editor events - delegate to components first, then main editor if not handled
                 "editor.code_action" => self.editor.handle_code_action_request(),
                 name if name.starts_with("editor.") => {
-                    // Route event to focused view (could be main editor, file picker input, or grep input)
-                    let focused_id = self.focused_editable_view_id.unwrap_or(0);
-                    let is_file_picker_focused = self.editor.file_picker.visible
-                        && focused_id == self.editor.file_picker.input().id;
-                    let is_grep_focused = self.editor.grep.visible
-                        && focused_id == self.editor.grep.input().id;
-
-                    let (input_handler, doc, viewport) = self.get_focused_view_mut();
-                    let action = input_handler.handle_event(&event, doc, &viewport);
-
-                    // After text changes in overlays, trigger filtering/search
-                    // NOTE: Text was already edited by InputHandler above, just trigger filter
-                    if matches!(event.name.as_str(), "editor.insert_char" | "editor.delete_backward" | "editor.delete_forward") {
-                        if is_file_picker_focused {
-                            let query = self.editor.file_picker.input().text().to_string();
-                            self.editor.file_picker.picker.trigger_filter(query);
-                            self.editor.ui_changed = true;
-                            self.request_redraw();
-                        } else if is_grep_focused {
-                            let query = self.editor.grep.input().text().to_string();
-                            self.editor.grep.set_query(query);
-                            self.editor.ui_changed = true;
-                            self.request_redraw();
+                    // First, try dispatching to overlay components (file picker, grep)
+                    // They handle their own text editing and return Stop if they consumed the event
+                    let mut handled = false;
+                    if self.editor.file_picker.visible {
+                        use crate::input::EventSubscriber;
+                        if self.editor.file_picker.handle_event(&event, &mut self.event_bus) == crate::input::PropagationControl::Stop {
+                            handled = true;
+                        }
+                    }
+                    if !handled && self.editor.grep.visible {
+                        use crate::input::EventSubscriber;
+                        if self.editor.grep.handle_event(&event, &mut self.event_bus) == crate::input::PropagationControl::Stop {
+                            handled = true;
                         }
                     }
 
-                    match action {
-                        InputAction::Save => {
-                            // Save only makes sense for main editor
-                            let _ = self.editor.save().map_err(|e| eprintln!("Failed to save: {}", e));
-                            self.request_redraw();
-                            self.update_window_title();
-                            self.cursor_needs_scroll = true;
-                        }
-                        InputAction::Undo => {
-                            // Actually perform undo on the focused view's buffer
-                            let (input_handler, doc, _) = self.get_focused_view_mut();
-                            input_handler.undo(doc);
-                            self.request_redraw();
-                            self.update_window_title();
-                            if !self.editor.file_picker.visible && !self.editor.grep.visible {
+                    // If no overlay handled it, route to main editor
+                    if !handled {
+                        let (input_handler, doc, viewport) = self.get_focused_view_mut();
+                        let action = input_handler.handle_event(&event, doc, &viewport);
+
+                        match action {
+                            InputAction::Save => {
+                                // Save only makes sense for main editor
+                                let _ = self.editor.save().map_err(|e| eprintln!("Failed to save: {}", e));
+                                self.request_redraw();
+                                self.update_window_title();
                                 self.cursor_needs_scroll = true;
                             }
-                        }
-                        InputAction::Redo => {
-                            // Actually perform redo on the focused view's buffer
-                            let (input_handler, doc, _) = self.get_focused_view_mut();
-                            input_handler.redo(doc);
-                            self.request_redraw();
-                            self.update_window_title();
-                            if !self.editor.file_picker.visible && !self.editor.grep.visible {
+                            InputAction::Undo => {
+                                // Actually perform undo on the focused view's buffer
+                                let (input_handler, doc, _) = self.get_focused_view_mut();
+                                input_handler.undo(doc);
+                                self.request_redraw();
+                                self.update_window_title();
                                 self.cursor_needs_scroll = true;
                             }
-                        }
-                        InputAction::Redraw => {
-                            self.request_redraw();
-                            self.update_window_title();
-                            if !self.editor.file_picker.visible && !self.editor.grep.visible {
+                            InputAction::Redo => {
+                                // Actually perform redo on the focused view's buffer
+                                let (input_handler, doc, _) = self.get_focused_view_mut();
+                                input_handler.redo(doc);
+                                self.request_redraw();
+                                self.update_window_title();
                                 self.cursor_needs_scroll = true;
                             }
-                        }
-                        InputAction::None => {
-                            // Even if action is None, we may have edited text in an overlay
-                            // (filtering was already triggered above)
-                            if is_file_picker_focused || is_grep_focused {
-                                // Already handled above with request_redraw()
-                            } else {
+                            InputAction::Redraw => {
+                                self.request_redraw();
+                                self.update_window_title();
+                                self.cursor_needs_scroll = true;
+                            }
+                            InputAction::None => {
                                 // Main editor - might still need a redraw for cursor movement etc
                                 self.request_redraw();
                             }
@@ -977,6 +1160,7 @@ impl TinyApp {
                     // Dispatch to components through subscription system
                     self.dispatch_to_components(&event);
                 }
+            }
             }
         }
     }
@@ -1024,6 +1208,12 @@ impl TinyApp {
                 gpu_renderer.reload_shaders();
                 self.shader_reload_pending.store(false, Ordering::Relaxed);
             }
+        }
+
+        // Check for pending config reload
+        if self.config_reload_pending.load(Ordering::Relaxed) {
+            self.reload_config();
+            self.config_reload_pending.store(false, Ordering::Relaxed);
         }
 
         let dt = self.update_frame_timing();
@@ -1394,11 +1584,17 @@ impl ApplicationHandler for TinyApp {
             // Setup font system
             let font_system = Arc::new(SharedFontSystem::new());
 
+            // Apply font config (weight and italic)
+            let config = crate::config::AppConfig::load().unwrap_or_default();
+            font_system.set_default_weight(config.editor.font_weight);
+            font_system.set_default_italic(config.editor.font_italic);
+
             // Get scale factor for high DPI displays
             let scale_factor = window.scale_factor() as f32;
             println!(
-                "  Font size: {:.1}pt (scale={:.1}x)",
-                self.text_metrics.font_size, scale_factor
+                "  Font size: {:.1}pt (scale={:.1}x, weight={}, italic={})",
+                self.text_metrics.font_size, scale_factor,
+                config.editor.font_weight, config.editor.font_italic
             );
 
             // Prerasterize ASCII characters at physical size for crisp rendering
@@ -1424,6 +1620,9 @@ impl ApplicationHandler for TinyApp {
 
             // Setup shader hot-reloading
             self.setup_shader_watcher();
+
+            // Setup config hot-reloading
+            self.setup_config_watcher();
 
             self.editor.on_ready();
 
@@ -1639,10 +1838,8 @@ impl ApplicationHandler for TinyApp {
                                                 }
                                             }
                                         } else {
-                                            // Editor click - set drag state and emit event
-                                            self.mouse_pressed = true;
-                                            self.drag_start = Some(position);
-
+                                            // Mouse click - emit event (drag state set in handler if needed)
+                                            // Calculate both coordinate systems
                                             let editor_local =
                                                 if let Some(cpu_renderer) = &self.cpu_renderer {
                                                     cpu_renderer.screen_to_editor_local(point)
@@ -1657,11 +1854,17 @@ impl ApplicationHandler for TinyApp {
                                                 _ => "Unknown",
                                             };
 
+                                            // Emit both screen and editor-local coordinates
+                                            // Include physical position for drag state management
                                             self.event_bus.emit(
                                                 "mouse.press",
                                                 json!({
                                                     "x": editor_local.x.0,
                                                     "y": editor_local.y.0,
+                                                    "screen_x": point.x.0,
+                                                    "screen_y": point.y.0,
+                                                    "physical_x": position.x,
+                                                    "physical_y": position.y,
                                                     "button": button_name,
                                                     "modifiers": {
                                                         "shift": self.modifiers.shift,

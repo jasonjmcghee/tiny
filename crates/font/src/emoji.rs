@@ -1,11 +1,46 @@
-//! Emoji support and fallback font handling
+//! Emoji and Nerd Font symbol support
 //!
-//! JetBrains Mono doesn't include emoji glyphs, so we need a fallback system
+//! JetBrains Mono doesn't include emoji or nerd font glyphs, so we need fallback fonts
+//!
+//! ## Font Selection Strategy
+//!
+//! We use a **two-phase approach** for robustness:
+//!
+//! 1. **Unicode Range Hints** (this file): Fast heuristic to segment text into likely runs
+//! 2. **Charmap Verification** (in lib.rs): Actually check if the font has the glyph
+//!
+//! This way we get good performance (segment once) with correctness (verify before using).
+//! The unicode ranges are just hints - we ALWAYS verify with charmap before choosing a font.
 
-/// Check if a character is an emoji
+/// Check if a character is a Nerd Font symbol (heuristic only!)
+///
+/// This is a HINT based on unicode ranges. The actual font selection
+/// checks the charmap to verify the font actually has the glyph.
+///
+/// Nerd Fonts primarily use the Private Use Area (PUA) for icons:
+/// - Powerline symbols (E0A0-E0D4)
+/// - Devicons (E700-E7C5)
+/// - Font Awesome (F000-F2E0)
+/// - Material Design Icons (F500-FD46)
+/// - Weather Icons (E300-E3EB)
+/// - Octicons (F400-F4A9)
+/// And many more icon sets
+pub fn is_nerd_font_symbol(ch: char) -> bool {
+    matches!(ch,
+        // Private Use Area (PUA) - covers most nerd font symbols
+        '\u{E000}'..='\u{F8FF}' |
+        // A few common symbols outside PUA
+        '\u{2665}' |  // Heart ♥
+        '\u{26A1}'    // Lightning bolt ⚡
+    )
+}
+
+/// Check if a character is an emoji (heuristic only!)
+///
+/// This is a HINT based on unicode ranges. The actual font selection
+/// checks the charmap to verify the font actually has the glyph.
 pub fn is_emoji(ch: char) -> bool {
-    // Simple emoji detection using Unicode ranges
-    // This covers most common emojis
+    // Unicode ranges for common emojis
     matches!(ch,
         '\u{1F300}'..='\u{1F6FF}' | // Miscellaneous Symbols, Emoticons, Transport
         '\u{1F900}'..='\u{1F9FF}' | // Supplemental Symbols and Pictographs
@@ -25,6 +60,16 @@ pub fn is_emoji(ch: char) -> bool {
 /// Detect if text contains emojis
 pub fn contains_emoji(text: &str) -> bool {
     text.chars().any(is_emoji)
+}
+
+/// Detect if text contains nerd font symbols
+pub fn contains_nerd_symbols(text: &str) -> bool {
+    text.chars().any(is_nerd_font_symbol)
+}
+
+/// Detect if text contains any special characters requiring font fallback (emoji or nerd symbols)
+pub fn contains_special_chars(text: &str) -> bool {
+    text.chars().any(|ch| is_emoji(ch) || is_nerd_font_symbol(ch))
 }
 
 // TODO: Add emoji font loading

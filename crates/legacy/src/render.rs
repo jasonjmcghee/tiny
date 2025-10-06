@@ -536,6 +536,15 @@ impl Renderer {
     }
 
     /// Clear edit deltas (called after undo/redo when tree is replaced)
+    pub fn clear_all_caches(&mut self) {
+        // Force complete re-layout by marking everything dirty
+        self.layout_dirty = true;
+        self.syntax_dirty = true;
+        self.last_rendered_version = 0; // Force re-render
+        self.cached_doc_text = None;
+        self.cached_doc_version = 0;
+    }
+
     pub fn clear_edit_deltas(&mut self) {
         self.text_renderer.syntax_state.edit_deltas.clear();
     }
