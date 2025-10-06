@@ -315,9 +315,7 @@ impl DiagnosticsPlugin {
             None
         } else {
             self.symbols.iter().find(|symbol| {
-                symbol.line == line
-                    && mouse_x >= symbol.start_x
-                    && mouse_x < symbol.end_x
+                symbol.line == line && mouse_x >= symbol.start_x && mouse_x < symbol.end_x
             })
         };
         let over_symbol = hovered_symbol.is_some();
@@ -344,8 +342,10 @@ impl DiagnosticsPlugin {
                 anchor_x: prev_anchor_x,
             } => {
                 let current_anchor_x = hovered_symbol.map(|s| s.start_x);
-                if line != *prev_line || column != *prev_column
-                    || current_anchor_x != Some(*prev_anchor_x) {
+                if line != *prev_line
+                    || column != *prev_column
+                    || current_anchor_x != Some(*prev_anchor_x)
+                {
                     // Position changed, reset
                     if let Some(symbol) = hovered_symbol {
                         self.hover_state = HoverState::WaitingForDelay {
@@ -371,8 +371,11 @@ impl DiagnosticsPlugin {
                 anchor_x: prev_anchor_x,
             } => {
                 let current_anchor_x = hovered_symbol.map(|s| s.start_x);
-                if line != *prev_line || column != *prev_column || !over_symbol
-                    || current_anchor_x != Some(*prev_anchor_x) {
+                if line != *prev_line
+                    || column != *prev_column
+                    || !over_symbol
+                    || current_anchor_x != Some(*prev_anchor_x)
+                {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
@@ -394,8 +397,11 @@ impl DiagnosticsPlugin {
                 ..
             } => {
                 let current_anchor_x = hovered_symbol.map(|s| s.start_x);
-                if line != *prev_line || column != *prev_column || !over_symbol
-                    || current_anchor_x != Some(*prev_anchor_x) {
+                if line != *prev_line
+                    || column != *prev_column
+                    || !over_symbol
+                    || current_anchor_x != Some(*prev_anchor_x)
+                {
                     // Position changed or moved off symbol
                     self.hover_state = HoverState::None;
                     self.current_popup = None;
@@ -422,10 +428,6 @@ impl DiagnosticsPlugin {
         let mut vertices = Vec::new();
         let scale = self.viewport.scale_factor;
 
-        if !self.diagnostics.is_empty() {
-            eprintln!("Creating vertices for {} diagnostics", self.diagnostics.len());
-        }
-
         // Get widget bounds offset and scroll
         let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
         let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
@@ -435,10 +437,6 @@ impl DiagnosticsPlugin {
         let widget_scroll_y = widget_viewport
             .map(|w| w.scroll.y.0)
             .unwrap_or(self.viewport.scroll.y.0);
-
-        eprintln!("Scroll: ({}, {}), Offset: ({}, {}), Scale: {}, Line height: {}",
-                  widget_scroll_x, widget_scroll_y, widget_offset_x, widget_offset_y, scale,
-                  self.viewport.line_height);
 
         for diagnostic in &self.diagnostics {
             // Positions from layout cache are in layout space (0,0 origin)
@@ -460,9 +458,6 @@ impl DiagnosticsPlugin {
             let screen_x = (view_x + widget_offset_x) * scale;
             let screen_y = (view_y + widget_offset_y) * scale;
             let width_scaled = width * scale;
-
-            eprintln!("  Line {}: x={}-{} -> screen ({}, {})",
-                      diagnostic.line, layout_start_x, layout_end_x, screen_x, screen_y);
 
             // Create a quad that covers the area where the squiggly line will be drawn
             let padding = 4.0 * scale; // Extra height for the wave amplitude
@@ -670,8 +665,6 @@ impl Initializable for DiagnosticsPlugin {
         );
         self.custom_pipeline_id = Some(pipeline_id);
 
-        eprintln!("Diagnostics plugin initialized with GPU resources");
-
         Ok(())
     }
 }
@@ -731,7 +724,8 @@ impl Library for DiagnosticsPlugin {
                     return Err(PluginError::Other("Invalid message length".into()));
                 }
 
-                let message = String::from_utf8_lossy(&args[25..25 + message_len as usize]).to_string();
+                let message =
+                    String::from_utf8_lossy(&args[25..25 + message_len as usize]).to_string();
 
                 self.diagnostics.push(Diagnostic {
                     line: line as usize,
@@ -797,8 +791,8 @@ impl Library for DiagnosticsPlugin {
                         return Err(PluginError::Other("Invalid symbol kind length".into()));
                     }
 
-                    let kind =
-                        String::from_utf8_lossy(&args[offset..offset + kind_len as usize]).to_string();
+                    let kind = String::from_utf8_lossy(&args[offset..offset + kind_len as usize])
+                        .to_string();
                     offset += kind_len as usize;
 
                     if args.len() < offset + 4 {
@@ -813,8 +807,8 @@ impl Library for DiagnosticsPlugin {
                         return Err(PluginError::Other("Invalid symbol name length".into()));
                     }
 
-                    let name =
-                        String::from_utf8_lossy(&args[offset..offset + name_len as usize]).to_string();
+                    let name = String::from_utf8_lossy(&args[offset..offset + name_len as usize])
+                        .to_string();
                     offset += name_len as usize;
 
                     self.symbols.push(Symbol {
@@ -908,7 +902,6 @@ impl Paintable for DiagnosticsPlugin {
 
                 if let Some(ref gpu_ctx) = ctx.gpu_context {
                     if let Some(pipeline_id) = self.custom_pipeline_id {
-                        eprintln!("DRAWING {} vertices for diagnostics", vertex_count);
                         gpu_ctx.set_pipeline(render_pass, pipeline_id);
                         gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
                         gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
@@ -1040,7 +1033,6 @@ impl Configurable for DiagnosticsPlugin {
                 self.config.popup_border_color = plugin_toml.config.popup_border_color;
                 self.config.popup_padding = plugin_toml.config.popup_padding;
 
-                eprintln!("Diagnostics plugin config updated");
                 Ok(())
             }
             Err(e) => {
@@ -1102,11 +1094,21 @@ impl DiagnosticsPlugin {
         }
 
         // Check if we need to transition hover state based on timing
-        if let HoverState::WaitingForDelay { line, column, anchor_x, .. } = self.hover_state {
+        if let HoverState::WaitingForDelay {
+            line,
+            column,
+            anchor_x,
+            ..
+        } = self.hover_state
+        {
             if let Some(start_time) = self.hover_start_time {
                 if start_time.elapsed().as_millis() >= 500 {
                     // 500ms elapsed, request hover info
-                    self.hover_state = HoverState::RequestingHover { line, column, anchor_x };
+                    self.hover_state = HoverState::RequestingHover {
+                        line,
+                        column,
+                        anchor_x,
+                    };
                     self.last_hover_request = Some((line, column));
                     return Some((line, column));
                 }
@@ -1141,7 +1143,6 @@ impl DiagnosticsPlugin {
 
     /// Set document symbols from LSP
     pub fn set_symbols(&mut self, symbols: Vec<Symbol>) {
-        eprintln!("Diagnostics: Loaded {} symbols for hover", symbols.len());
         self.symbols = symbols;
     }
 

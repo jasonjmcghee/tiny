@@ -1,10 +1,16 @@
-//! EditableTextView - TextView + Input Handling
+//! EditableTextView - TextView + Editing Capabilities
 //!
-//! Adds interaction to TextView:
-//! - Keyboard input (typing, navigation, clipboard)
-//! - Mouse input (click, drag, selection)
+//! Builds on TextView's interactive capabilities to add:
+//! - Cursor rendering and management
+//! - Text editing (insert, delete, replace)
+//! - Undo/redo history
+//! - Advanced clipboard (cut, paste)
 //! - Edit modes (single-line, multi-line, read-only)
-//! - Cursor and selection management
+//!
+//! TextView already provides:
+//! - Selection, mouse interaction, keyboard navigation
+//! - Copy, select all, focus management
+//! - Scrolling, syntax highlighting
 
 use crate::{
     coordinates::Viewport,
@@ -13,6 +19,7 @@ use crate::{
 };
 use tiny_core::tree::Point;
 use tiny_sdk::LayoutPos;
+use tiny_ui::{ArrowDirection, TextViewCapabilities};
 
 /// Edit mode for text view
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -24,6 +31,9 @@ pub enum EditMode {
     /// Read-only view with optional selection support
     ReadOnly { allow_selection: bool },
 }
+
+/// Unique ID for an editable text view (for focus tracking)
+static NEXT_VIEW_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// TextView with input handling
 pub struct EditableTextView {
@@ -41,39 +51,89 @@ pub struct EditableTextView {
 
     /// Submit callback for single-line mode
     pub on_submit: Option<Box<dyn Fn(String) + Send + Sync>>,
+
+    /// Unique ID for focus tracking
+    pub id: u64,
+
+    /// Cursor rendering plugin (owned by this view)
+    pub cursor_plugin: Option<Box<dyn tiny_sdk::Plugin>>,
+
+    /// Selection rendering plugin (owned by this view)
+    pub selection_plugin: Option<Box<dyn tiny_sdk::Plugin>>,
 }
 
 impl EditableTextView {
     /// Create a new editable text view
     pub fn new(view: TextView, mode: EditMode) -> Self {
+        // Ensure TextView has appropriate capabilities for the mode
+        let mut view = view;
+        match mode {
+            EditMode::SingleLine | EditMode::MultiLine => {
+                // Editable modes need full editing capabilities
+                view.set_capabilities(TextViewCapabilities::editable());
+                view.set_focused(true); // Auto-focus editable views
+            }
+            EditMode::ReadOnly { allow_selection } => {
+                // Read-only mode: selectable or completely read-only
+                let caps = if allow_selection {
+                    TextViewCapabilities::selectable()
+                } else {
+                    TextViewCapabilities::read_only()
+                };
+                view.set_capabilities(caps);
+            }
+        }
+
         Self {
             view,
             input: InputHandler::new(),
             mode,
             show_cursor: true,
             on_submit: None,
+            id: NEXT_VIEW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            cursor_plugin: None,
+            selection_plugin: None,
         }
     }
 
     /// Create a single-line input
     pub fn single_line(viewport: Viewport) -> Self {
-        Self::new(
-            TextView::empty(viewport).with_padding(8.0), // Default padding for input fields
-            EditMode::SingleLine,
+        let view = TextView::with_capabilities(
+            tiny_core::tree::Doc::new(),
+            viewport,
+            TextViewCapabilities::editable(),
         )
+        .with_padding(8.0); // Default padding for input fields
+
+        Self::new(view, EditMode::SingleLine)
     }
 
     /// Create a multi-line editor
     pub fn multi_line(viewport: Viewport) -> Self {
-        Self::new(TextView::empty(viewport), EditMode::MultiLine)
+        let view = TextView::with_capabilities(
+            tiny_core::tree::Doc::new(),
+            viewport,
+            TextViewCapabilities::editable(),
+        );
+
+        Self::new(view, EditMode::MultiLine)
     }
 
     /// Create a read-only view with selection
     pub fn read_only(viewport: Viewport, allow_selection: bool) -> Self {
-        Self::new(
-            TextView::empty(viewport),
-            EditMode::ReadOnly { allow_selection },
-        )
+        let caps = if allow_selection {
+            TextViewCapabilities::selectable()
+        } else {
+            TextViewCapabilities::read_only()
+        };
+
+        let view = TextView::with_capabilities(
+            tiny_core::tree::Doc::new(),
+            viewport,
+            caps,
+        );
+
+        Self::new(view, EditMode::ReadOnly { allow_selection })
     }
 
     /// Set submit callback for single-line mode
@@ -241,36 +301,6 @@ impl EditableTextView {
         minimal
     }
 
-    /// Handle undo
-    pub fn handle_undo(&mut self) -> bool {
-        self.input.undo(&self.view.doc)
-    }
-
-    /// Handle redo
-    pub fn handle_redo(&mut self) -> bool {
-        self.input.redo(&self.view.doc)
-    }
-
-    /// Handle copy
-    pub fn handle_copy(&mut self) {
-        self.input.copy(&self.view.doc);
-    }
-
-    /// Handle cut
-    pub fn handle_cut(&mut self) {
-        self.input.cut(&self.view.doc);
-    }
-
-    /// Handle paste
-    pub fn handle_paste(&mut self) {
-        self.input.paste(&self.view.doc);
-    }
-
-    /// Handle select all
-    pub fn handle_select_all(&mut self) {
-        self.input.select_all(&self.view.doc);
-    }
-
     /// Get cursor position in screen coordinates
     pub fn cursor_screen_pos(&self) -> Option<Point> {
         let cursor_doc = self.input.primary_cursor_doc_pos(&self.view.doc);
@@ -303,6 +333,220 @@ impl EditableTextView {
         self.show_cursor
     }
 
+    // === Plugin Management ===
+
+    /// Check if plugins are initialized
+    pub fn has_plugins(&self) -> bool {
+        self.cursor_plugin.is_some() && self.selection_plugin.is_some()
+    }
+
+    /// Initialize cursor and selection plugins for this view
+    /// Call this once after creating the view, passing the global plugin loader
+    pub fn initialize_plugins(&mut self, plugin_loader: &tiny_core::plugin_loader::PluginLoader) -> Result<(), String> {
+        // Skip if already initialized
+        if self.has_plugins() {
+            return Ok(());
+        }
+        // Create cursor plugin instance
+        match plugin_loader.create_plugin_instance("cursor") {
+            Ok(plugin) => {
+                self.cursor_plugin = Some(plugin);
+            }
+            Err(e) => {
+                eprintln!("Failed to create cursor plugin instance: {:?}", e);
+                return Err(format!("Failed to create cursor plugin: {:?}", e));
+            }
+        }
+
+        // Create selection plugin instance
+        match plugin_loader.create_plugin_instance("selection") {
+            Ok(plugin) => {
+                self.selection_plugin = Some(plugin);
+            }
+            Err(e) => {
+                eprintln!("Failed to create selection plugin instance: {:?}", e);
+                return Err(format!("Failed to create selection plugin: {:?}", e));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Setup plugins with GPU resources (must be called after initialize_plugins)
+    pub fn setup_plugins(&mut self, ctx: &mut tiny_sdk::SetupContext) -> Result<(), tiny_sdk::PluginError> {
+        if let Some(ref mut plugin) = self.cursor_plugin {
+            if let Some(init) = plugin.as_initializable() {
+                init.setup(ctx)?;
+            }
+        }
+        if let Some(ref mut plugin) = self.selection_plugin {
+            if let Some(init) = plugin.as_initializable() {
+                init.setup(ctx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync cursor and selection state to plugins
+    /// Call this whenever cursor/selection changes or viewport updates
+    /// Note: Plugins get ViewportInfo from PaintContext during paint(), we just send positions
+    pub fn sync_plugins(&mut self) {
+        // Update cursor plugin with VIEW coordinates (layout - scroll)
+        if let Some(ref mut plugin) = self.cursor_plugin {
+            if let Some(library) = plugin.as_library_mut() {
+                if let Some(sel) = self.input.selections().first() {
+                    let tree = self.view.doc.read();
+                    let line_text = tree.line_text(sel.cursor.line);
+
+                    // Get layout position (0,0 relative to content)
+                    let layout_pos = self.view.viewport.doc_to_layout_with_text(sel.cursor, &line_text);
+
+                    // Convert to view coordinates (apply scroll only, padding is in bounds offset)
+                    let view_x = layout_pos.x.0 - self.view.viewport.scroll.x.0;
+                    let view_y = layout_pos.y.0 - self.view.viewport.scroll.y.0;
+
+                    // Debug: Print cursor position data
+                    if self.id == 0 { // Main editor (first created)
+                        eprintln!("CURSOR: doc=({}, {}), layout=({:.1}, {:.1}), scroll=({:.1}, {:.1}), padding=({:.1}, {:.1}), view=({:.1}, {:.1}), bounds=({:.1}, {:.1})",
+                            sel.cursor.line, sel.cursor.column,
+                            layout_pos.x.0, layout_pos.y.0,
+                            self.view.viewport.scroll.x.0, self.view.viewport.scroll.y.0,
+                            self.view.padding_x, self.view.padding_y,
+                            view_x, view_y,
+                            self.view.viewport.bounds.x.0, self.view.viewport.bounds.y.0);
+                    }
+
+                    // Send as LayoutPos type (confusing naming, but it's view coords)
+                    let view_pos = tiny_sdk::LayoutPos::new(view_x, view_y);
+                    let _ = library.call("set_position", tiny_sdk::bytemuck::bytes_of(&view_pos));
+                }
+            }
+        }
+
+        // Update selection plugin with VIEW coordinates (including padding)
+        if let Some(ref mut plugin) = self.selection_plugin {
+            if let Some(library) = plugin.as_library_mut() {
+                // Get selections in view coordinates (scroll already applied by get_selection_data)
+                let (_, selections) = self.input.get_selection_data(&self.view.doc, &self.view.viewport);
+
+                // Encode selections for plugin
+                // Note: Padding is already in viewport.bounds offset, don't add again
+                let mut args = Vec::new();
+                let len = selections.len() as u32;
+                args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&len));
+                for (start, end) in selections {
+                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&start));
+                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&end));
+                }
+                let _ = library.call("set_selections", &args);
+            }
+        }
+    }
+
+    /// Paint cursor and selection plugins
+    /// Call this during rendering with the appropriate PaintContext
+    pub fn paint_plugins(&self, ctx: &tiny_sdk::PaintContext, render_pass: &mut wgpu::RenderPass) {
+        // Paint selection first (behind text)
+        if let Some(ref plugin) = self.selection_plugin {
+            if let Some(paintable) = plugin.as_paintable() {
+                paintable.paint(ctx, render_pass);
+            }
+        }
+
+        // Paint cursor second (in front of text)
+        if self.show_cursor {
+            if let Some(ref plugin) = self.cursor_plugin {
+                if let Some(paintable) = plugin.as_paintable() {
+                    paintable.paint(ctx, render_pass);
+                }
+            }
+        }
+    }
+
+    // === Undo/Redo Operations ===
+
+    /// Undo last edit
+    /// Returns true if undo was performed
+    pub fn handle_undo(&mut self) -> bool {
+        if !self.view.capabilities.undo_redo {
+            return false;
+        }
+
+        match self.mode {
+            EditMode::SingleLine | EditMode::MultiLine => self.input.undo(&self.view.doc),
+            EditMode::ReadOnly { .. } => false,
+        }
+    }
+
+    /// Redo last undone edit
+    /// Returns true if redo was performed
+    pub fn handle_redo(&mut self) -> bool {
+        if !self.view.capabilities.undo_redo {
+            return false;
+        }
+
+        match self.mode {
+            EditMode::SingleLine | EditMode::MultiLine => self.input.redo(&self.view.doc),
+            EditMode::ReadOnly { .. } => false,
+        }
+    }
+
+    // === Clipboard Operations ===
+
+    /// Copy selected text to clipboard
+    /// Returns true if text was copied
+    pub fn handle_copy(&mut self) -> bool {
+        if !self.view.capabilities.clipboard {
+            return false;
+        }
+
+        self.input.copy(&self.view.doc);
+        true
+    }
+
+    /// Cut selected text to clipboard (copy + delete)
+    /// Returns true if text was cut
+    pub fn handle_cut(&mut self) -> bool {
+        if !self.view.capabilities.clipboard || !self.view.capabilities.editing {
+            return false;
+        }
+
+        match self.mode {
+            EditMode::SingleLine | EditMode::MultiLine => {
+                self.input.cut(&self.view.doc);
+                true
+            }
+            EditMode::ReadOnly { .. } => false,
+        }
+    }
+
+    /// Paste text from clipboard
+    /// Returns true if text was pasted
+    pub fn handle_paste(&mut self) -> bool {
+        if !self.view.capabilities.clipboard || !self.view.capabilities.editing {
+            return false;
+        }
+
+        match self.mode {
+            EditMode::SingleLine | EditMode::MultiLine => {
+                self.input.paste(&self.view.doc);
+                true
+            }
+            EditMode::ReadOnly { .. } => false,
+        }
+    }
+
+    /// Select all text
+    /// Returns true if selection was performed
+    pub fn handle_select_all(&mut self) -> bool {
+        if !self.view.capabilities.selection {
+            return false;
+        }
+
+        self.input.select_all(&self.view.doc);
+        true
+    }
+
     /// Get current text
     pub fn text(&self) -> std::sync::Arc<String> {
         self.view.text()
@@ -328,6 +572,51 @@ impl EditableTextView {
     /// Flush pending edits to document
     pub fn flush_edits(&mut self) {
         self.input.flush_pending_edits(&self.view.doc);
+    }
+
+    // === Text Editing Operations ===
+
+    /// Insert text at cursor(s)
+    /// Returns true if text was inserted
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        if !self.view.capabilities.editing {
+            return false;
+        }
+
+        match self.mode {
+            EditMode::SingleLine | EditMode::MultiLine => {
+                self.input.insert_text(&self.view.doc, text);
+                true
+            }
+            EditMode::ReadOnly { .. } => false,
+        }
+    }
+
+    /// Delete character at cursor (backspace or delete)
+    /// forward: true for Delete key, false for Backspace
+    /// Returns true if deletion occurred
+    pub fn delete_char(&mut self, forward: bool) -> bool {
+        if !self.view.capabilities.editing {
+            return false;
+        }
+
+        match self.mode {
+            EditMode::SingleLine | EditMode::MultiLine => {
+                self.input.delete_at_cursor(&self.view.doc, forward);
+                true
+            }
+            EditMode::ReadOnly { .. } => false,
+        }
+    }
+
+    /// Move cursor to a specific position
+    pub fn set_cursor(&mut self, pos: tiny_sdk::DocPos) {
+        self.input.set_cursor(pos);
+    }
+
+    /// Get primary cursor position
+    pub fn cursor_pos(&self) -> tiny_sdk::DocPos {
+        self.input.primary_cursor_doc_pos(&self.view.doc)
     }
 
     /// Collect background rects (selections, highlights)
@@ -372,15 +661,6 @@ impl EditableTextView {
 
         rects
     }
-}
-
-/// Arrow direction for keyboard navigation
-#[derive(Debug, Clone, Copy)]
-pub enum ArrowDirection {
-    Up,
-    Down,
-    Left,
-    Right,
 }
 
 impl Default for EditableTextView {

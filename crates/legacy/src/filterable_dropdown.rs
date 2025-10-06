@@ -90,6 +90,7 @@ impl<T: Clone> FilterableDropdown<T> {
         self.selected_index = 0;
         self.title_view.set_text(title);
         self.input.clear();
+        self.input.set_focused(true); // Focus input for typing
         self.update_results_display();
     }
 
@@ -411,7 +412,15 @@ impl<T: Clone> FilterableDropdown<T> {
 
     /// Handle mouse wheel scroll
     pub fn handle_scroll(&mut self, delta_y: f32) {
-        self.results.viewport.scroll.y.0 = (self.results.viewport.scroll.y.0 - delta_y).max(0.0);
+        use crate::scroll::Scrollable;
+
+        let delta = tiny_core::tree::Point {
+            x: tiny_sdk::LogicalPixels(0.0),
+            y: tiny_sdk::LogicalPixels(delta_y),
+        };
+
+        // Use TextView's Scrollable implementation for proper scroll clamping
+        self.results.handle_scroll(delta, &self.results.viewport.clone(), self.results.viewport.bounds);
     }
 
     /// Handle mouse click - returns Selected if item clicked, or updates selection

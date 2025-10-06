@@ -260,6 +260,46 @@ impl PluginLoader {
         Ok(())
     }
 
+    /// Create a new instance of an already-loaded plugin
+    /// This allows multiple instances of the same plugin (e.g., multiple cursors)
+    /// The library must already be loaded for this to work
+    pub fn create_plugin_instance(&self, name: &str) -> Result<Box<dyn Plugin>, PluginError> {
+        let loaded = self.plugins.get(name).ok_or_else(|| {
+            PluginError::Other(
+                format!("Plugin '{}' not loaded. Load it first with load_plugin.", name).into(),
+            )
+        })?;
+
+        // Get the library handle - plugins keep the lib alive
+        if let Some(ref lib) = loaded._lib {
+            // Get entry point function
+            let entry_point = loaded.config.entry_point.as_bytes();
+            let create_fn: libloading::Symbol<fn() -> Box<dyn Plugin>> = unsafe {
+                lib.get(entry_point)
+                    .map_err(|e| PluginError::Other(Box::new(e)))?
+            };
+
+            // Create a NEW instance
+            let mut instance = create_fn();
+
+            // Apply config from the loaded plugin
+            if let Some(configurable) = instance.as_configurable() {
+                // Serialize toml::Value back to string
+                let config_str = toml::to_string(&loaded.config.config)
+                    .unwrap_or_else(|_| String::new());
+                if !config_str.is_empty() {
+                    let _ = configurable.config_updated(&config_str);
+                }
+            }
+
+            Ok(instance)
+        } else {
+            Err(PluginError::Other(
+                format!("Plugin '{}' has no library handle", name).into(),
+            ))
+        }
+    }
+
     /// Load a specific plugin by name using default paths
     /// Note: You must call initialize_plugin separately with GPU resources
     pub fn load_plugin(&mut self, name: &str) -> Result<(), PluginError> {

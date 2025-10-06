@@ -508,6 +508,10 @@ impl Renderer {
         self.gpu_renderer
     }
 
+    pub fn get_plugin_loader(&self) -> Option<&Arc<Mutex<PluginLoader>>> {
+        self.plugin_loader.as_ref()
+    }
+
     pub fn apply_incremental_edit(&mut self, edit: &tree::Edit) {
         self.text_renderer.apply_incremental_edit(edit);
         self.glyphs_dirty = true;
@@ -564,50 +568,6 @@ impl Renderer {
         crate::Point {
             x: tiny_sdk::LogicalPixels(screen_pos.x.0 - self.editor_bounds.x.0),
             y: tiny_sdk::LogicalPixels(screen_pos.y.0 - self.editor_bounds.y.0),
-        }
-    }
-
-    pub fn set_selection_plugin(&mut self, input_handler: &input::InputHandler, doc: &tree::Doc) {
-        let (cursor_pos, selections) = input_handler.get_selection_data(doc, &self.viewport);
-
-        let transformed_cursor_pos = cursor_pos;
-
-        let transformed_selections: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = selections;
-
-        let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
-        let viewport_changed = current_scroll != self.last_viewport_scroll;
-
-        // Update plugin state
-        let mut state = self.plugin_state.lock().unwrap();
-        let mut needs_sync = false;
-
-        if viewport_changed {
-            state.viewport_info = PluginState::from_viewport(&self.viewport);
-            self.last_viewport_scroll = current_scroll;
-            needs_sync = true;
-        }
-
-        if state.selections != transformed_selections {
-            state.selections = transformed_selections.clone();
-            needs_sync = true;
-        }
-
-        if let Some(pos) = transformed_cursor_pos {
-            let view_pos = self.viewport.layout_to_view(pos);
-            let cursor_changed = state.cursor_pos != Some((view_pos.x.0, view_pos.y.0));
-            if cursor_changed {
-                state.cursor_pos = Some((view_pos.x.0, view_pos.y.0));
-                needs_sync = true;
-            }
-        }
-
-        // Sync to plugins if anything changed
-        if needs_sync {
-            if let Some(ref loader_arc) = self.plugin_loader {
-                if let Ok(mut loader) = loader_arc.lock() {
-                    state.sync_all(&mut loader);
-                }
-            }
         }
     }
 
@@ -677,9 +637,10 @@ impl Renderer {
 
         // Only regenerate glyphs if something actually changed
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
-        if self.glyphs_dirty || content_changed {
+        if self.glyphs_dirty || content_changed || scroll_changed {
             self.accumulated_glyphs.clear();
             self.collect_main_text_glyphs(tree, visible_range.clone());
+            // Note: cursor/selection rects will be collected from app.rs when needed
             self.glyphs_dirty = false;
         }
 
@@ -706,6 +667,7 @@ impl Renderer {
                     self.line_numbers_dirty = false;
                 }
             }
+
 
             // Only regenerate UI if dirty
             if self.ui_dirty {
@@ -751,14 +713,83 @@ impl Renderer {
 
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
 
-            // Paint background layers (selection)
-            self.paint_layers(pass, true);
+            // Paint main editor's selection (background)
+            if let Some(tab_mgr) = tab_manager {
+                if let Some(tab) = tab_mgr.active_tab() {
+                    let editor_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: self.editor_bounds,
+                        scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 2,
+                    };
+                    // Only paint selection (z_index < 0)
+                    if let Some(gpu) = self.gpu_renderer {
+                        let gpu_renderer = unsafe { &*gpu };
+                        let mut ctx = PaintContext::new(
+                            self.viewport.to_viewport_info(),
+                            gpu_renderer.device_arc(),
+                            gpu_renderer.queue_arc(),
+                            gpu as *mut _,
+                            &self.service_registry,
+                        )
+                        .with_widget_viewport(editor_viewport);
+                        ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                        // Paint selection only (background)
+                        if let Some(ref plugin) = tab.plugin.editor.selection_plugin {
+                            if let Some(paintable) = plugin.as_paintable() {
+                                if paintable.z_index() < 0 {
+                                    paintable.paint(&ctx, pass);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Draw main text
             self.draw_all_accumulated_glyphs(pass);
 
-            // Paint foreground layers (cursor)
-            self.paint_layers(pass, false);
+            // Paint main editor's cursor (foreground)
+            if let Some(tab_mgr) = tab_manager {
+                if let Some(tab) = tab_mgr.active_tab() {
+                    let editor_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: self.editor_bounds,
+                        scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 2,
+                    };
+
+                    // Debug: Print editor bounds vs TextView bounds
+                    if tab.plugin.editor.id == 0 {
+                        eprintln!("PAINT: editor_bounds=({:.1}, {:.1}), TextView.bounds=({:.1}, {:.1})",
+                            editor_viewport.bounds.x.0, editor_viewport.bounds.y.0,
+                            tab.plugin.editor.view.viewport.bounds.x.0, tab.plugin.editor.view.viewport.bounds.y.0);
+                    }
+
+                    if let Some(gpu) = self.gpu_renderer {
+                        let gpu_renderer = unsafe { &*gpu };
+                        let mut ctx = PaintContext::new(
+                            self.viewport.to_viewport_info(),
+                            gpu_renderer.device_arc(),
+                            gpu_renderer.queue_arc(),
+                            gpu as *mut _,
+                            &self.service_registry,
+                        )
+                        .with_widget_viewport(editor_viewport);
+                        ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                        // Paint cursor only (foreground)
+                        if let Some(ref plugin) = tab.plugin.editor.cursor_plugin {
+                            if let Some(paintable) = plugin.as_paintable() {
+                                if paintable.z_index() >= 0 {
+                                    paintable.paint(&ctx, pass);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // === DRAW TAB BAR BACKGROUNDS ===
             if !self.tab_bar_rects.is_empty() {
@@ -874,6 +905,24 @@ impl Renderer {
                     }
                 }
             }
+            // Paint file picker input's cursor/selection plugins
+            if let Some(plugin_ptr) = self.file_picker_plugin {
+                let plugin = unsafe { &mut *plugin_ptr };
+                if plugin.visible {
+                    // Sync plugin state right before painting
+                    plugin.input_mut().sync_plugins();
+
+                    let input_bounds = plugin.picker.dropdown.input.view.viewport.bounds;
+                    let input_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: input_bounds,
+                        scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 100,
+                    };
+                    pass.set_scissor_rect(0, 0, target_w, target_h);
+                    self.paint_editable_view_plugins(&plugin.picker.dropdown.input, input_viewport, pass);
+                }
+            }
 
             // === DRAW GREP OVERLAY (on top of everything) ===
             // Render rounded frame with border first
@@ -903,6 +952,24 @@ impl Renderer {
                         let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
                         gpu_renderer.draw_glyphs_batched(pass, &self.grep_glyphs, "grep", true);
                     }
+                }
+            }
+            // Paint grep input's cursor/selection plugins
+            if let Some(plugin_ptr) = self.grep_plugin {
+                let plugin = unsafe { &mut *plugin_ptr };
+                if plugin.visible {
+                    // Sync plugin state right before painting
+                    plugin.input_mut().sync_plugins();
+
+                    let input_bounds = plugin.picker.dropdown.input.view.viewport.bounds;
+                    let input_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: input_bounds,
+                        scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 101,
+                    };
+                    pass.set_scissor_rect(0, 0, target_w, target_h);
+                    self.paint_editable_view_plugins(&plugin.picker.dropdown.input, input_viewport, pass);
                 }
             }
         }
@@ -1031,8 +1098,81 @@ impl Renderer {
         }
     }
 
+    /// Paint an EditableTextView's owned plugins (cursor/selection)
+    /// Must be called with appropriate widget_viewport for the view
+    fn paint_editable_view_plugins(
+        &self,
+        editable_view: &crate::editable_text_view::EditableTextView,
+        widget_viewport: tiny_sdk::types::WidgetViewport,
+        pass: &mut wgpu::RenderPass,
+    ) {
+        if let Some(gpu) = self.gpu_renderer {
+            let gpu_renderer = unsafe { &*gpu };
+
+            let mut ctx = PaintContext::new(
+                self.viewport.to_viewport_info(),
+                gpu_renderer.device_arc(),
+                gpu_renderer.queue_arc(),
+                gpu as *mut _,
+                &self.service_registry,
+            )
+            .with_widget_viewport(widget_viewport);
+            ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+            // Paint the view's plugins
+            editable_view.paint_plugins(&ctx, pass);
+        }
+    }
+
     fn paint_layers(&mut self, pass: &mut wgpu::RenderPass, background: bool) {
-        self.paint_plugins(pass, background);
+        // Paint non-cursor/selection plugins only (diagnostics, etc)
+        // Cursor/selection are now owned by EditableTextView instances
+        if let Some(ref loader_arc) = self.plugin_loader {
+            if let Ok(loader) = loader_arc.lock() {
+                let z_filter = if background {
+                    |z: i32| z < 0
+                } else {
+                    |z: i32| z >= 0
+                };
+
+                if let Some(gpu) = self.gpu_renderer {
+                    let gpu_renderer = unsafe { &*gpu };
+
+                    let editor_viewport = tiny_sdk::types::WidgetViewport {
+                        bounds: self.editor_bounds,
+                        scroll: self.viewport.scroll,
+                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                        widget_id: 2,
+                    };
+
+                    let mut ctx = PaintContext::new(
+                        self.viewport.to_viewport_info(),
+                        gpu_renderer.device_arc(),
+                        gpu_renderer.queue_arc(),
+                        gpu as *mut _,
+                        &self.service_registry,
+                    )
+                    .with_widget_viewport(editor_viewport);
+                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                    for key in loader.list_plugins() {
+                        // Skip cursor and selection - they're owned by EditableTextView instances
+                        if key == "cursor" || key == "selection" {
+                            continue;
+                        }
+
+                        if let Some(plugin) = loader.get_plugin(&key) {
+                            if let Some(paintable) = plugin.instance.as_paintable() {
+                                let z_idx = paintable.z_index();
+                                if z_filter(z_idx) {
+                                    paintable.paint(&ctx, pass);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if !background {
             if let Some(diagnostics_ptr) = self.diagnostics_plugin {

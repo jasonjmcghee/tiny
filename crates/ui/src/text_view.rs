@@ -9,7 +9,10 @@
 //! TextView transforms them to screen coordinates in one step.
 
 use crate::{
-    coordinates::Viewport, scroll::Scrollable, syntax::SyntaxHighlighter,
+    capabilities::TextViewCapabilities,
+    coordinates::Viewport,
+    scroll::Scrollable,
+    syntax::SyntaxHighlighter,
     text_renderer::TextRenderer,
 };
 use std::sync::Arc;
@@ -36,15 +39,26 @@ pub enum TextAlign {
     Right,
 }
 
+/// Arrow direction for keyboard navigation (used by EditableTextView)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArrowDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// Universal text display component
 ///
+/// Capabilities control which plugins are active (cursor, selection, etc.)
+/// The actual interaction is handled by InputHandler + plugins.
+///
 /// Used for:
-/// - Main editor
-/// - Search input fields
-/// - Dropdown lists (file picker, grep results)
-/// - Line numbers
-/// - Status bar text
-/// - Pop-up menus
+/// - Main editor (full_editor capabilities)
+/// - Search input fields (editable capabilities)
+/// - Dropdown lists (selectable capabilities)
+/// - Line numbers (read_only capabilities)
+/// - Status bar text (read_only capabilities)
 pub struct TextView {
     /// The document (text storage)
     pub doc: Doc,
@@ -75,11 +89,23 @@ pub struct TextView {
 
     /// Text alignment (horizontal)
     pub text_align: TextAlign,
+
+    /// Feature flags controlling which plugins/features are active
+    pub capabilities: TextViewCapabilities,
 }
 
 impl TextView {
     /// Create a new TextView with document and viewport
     pub fn new(doc: Doc, viewport: Viewport) -> Self {
+        Self::with_capabilities(doc, viewport, TextViewCapabilities::selectable())
+    }
+
+    /// Create a new TextView with specific capabilities
+    pub fn with_capabilities(
+        doc: Doc,
+        viewport: Viewport,
+        capabilities: TextViewCapabilities,
+    ) -> Self {
         Self {
             doc,
             renderer: TextRenderer::new(),
@@ -91,6 +117,7 @@ impl TextView {
             width_constraint: SizeConstraint::FillContainer,
             height_constraint: SizeConstraint::FillContainer,
             text_align: TextAlign::Left,
+            capabilities,
         }
     }
 
@@ -320,8 +347,8 @@ impl TextView {
             return rects;
         }
 
-        // TODO: Add selection rectangles, highlighted line, etc.
-        // This will be handled by EditableTextView for editable content
+        // Selection/cursor rendering is handled by plugins (cursor, selection)
+        // Capabilities control whether those plugins are active
 
         rects
     }
@@ -364,6 +391,16 @@ impl TextView {
     /// Calculate intrinsic height (content height + vertical padding)
     pub fn intrinsic_height(&self) -> f32 {
         self.content_height() + (self.padding_y * 2.0)
+    }
+
+    /// Set capabilities (controls which plugins/features are active)
+    pub fn set_capabilities(&mut self, capabilities: TextViewCapabilities) {
+        self.capabilities = capabilities;
+    }
+
+    /// Set visibility
+    pub fn set_focused(&mut self, _focused: bool) {
+        // Focus is tracked by EditableTextView - this is just for compatibility
     }
 }
 
@@ -424,6 +461,7 @@ impl Default for TextView {
     fn default() -> Self {
         // Create a default viewport (will be overridden by parent)
         let viewport = Viewport::new(800.0, 600.0, 1.0);
-        Self::new(Doc::new(), viewport)
+        // Default to selectable (can select and copy, but not edit)
+        Self::with_capabilities(Doc::new(), viewport, TextViewCapabilities::selectable())
     }
 }

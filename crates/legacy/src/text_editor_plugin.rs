@@ -4,6 +4,7 @@
 
 use crate::{
     coordinates::Viewport,
+    editable_text_view::{EditMode, EditableTextView},
     input::{InputAction, InputHandler, Selection},
     syntax::SyntaxHighlighter,
     text_effects::TextStyleProvider,
@@ -15,12 +16,12 @@ use tiny_sdk::{
     Capability, Initializable, LayoutPos, PaintContext, Paintable, Plugin, PluginError,
     SetupContext, Updatable, UpdateContext,
 };
+use tiny_ui::{TextView, TextViewCapabilities};
 
 /// The main text editor plugin - handles everything
 pub struct TextEditorPlugin {
-    // Core document and editing
-    pub doc: Doc,
-    pub input: InputHandler,
+    // Core editing view with full capabilities
+    pub editor: EditableTextView,
 
     // Rendering state
     pub syntax_highlighter: Option<Box<dyn TextStyleProvider>>,
@@ -34,11 +35,24 @@ pub struct TextEditorPlugin {
     pub cmd_hover_range: Option<(u32, u32, u32)>,
 }
 
+
 impl TextEditorPlugin {
     pub fn new(doc: Doc) -> Self {
-        Self {
+        // Create viewport (will be updated by renderer)
+        let viewport = Viewport::new(800.0, 600.0, 1.0);
+
+        // Create TextView with full editor capabilities
+        let text_view = TextView::with_capabilities(
             doc,
-            input: InputHandler::new(),
+            viewport,
+            TextViewCapabilities::full_editor(),
+        );
+
+        // Wrap in EditableTextView for editing support
+        let editor = EditableTextView::new(text_view, EditMode::MultiLine);
+
+        Self {
+            editor,
             syntax_highlighter: None,
             show_line_numbers: true,
             file_path: None,
@@ -51,11 +65,21 @@ impl TextEditorPlugin {
     pub fn is_modified(&self) -> bool {
         use ahash::AHasher;
         use std::hash::{Hash, Hasher};
-        let current_text = self.doc.read().flatten_to_string();
+        let current_text = self.editor.view.doc.read().flatten_to_string();
         let mut hasher = AHasher::default();
         current_text.hash(&mut hasher);
         let current_hash = hasher.finish();
         current_hash != self.last_saved_content_hash
+    }
+
+    /// Initialize plugins for the editor (must be called after construction)
+    pub fn initialize_plugins(&mut self, plugin_loader: &tiny_core::plugin_loader::PluginLoader) -> Result<(), String> {
+        self.editor.initialize_plugins(plugin_loader)
+    }
+
+    /// Setup plugins with GPU resources
+    pub fn setup_plugins(&mut self, ctx: &mut tiny_sdk::SetupContext) -> Result<(), tiny_sdk::PluginError> {
+        self.editor.setup_plugins(ctx)
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, std::io::Error> {
@@ -81,10 +105,10 @@ impl TextEditorPlugin {
                 .downcast_ref::<crate::syntax::SyntaxHighlighter>()
             {
                 let shared_highlighter = Arc::new(syntax_hl.clone());
-                editor.input.set_syntax_highlighter(shared_highlighter);
+                editor.editor.input.set_syntax_highlighter(shared_highlighter);
 
                 // Request initial syntax highlighting
-                syntax_hl.request_update_with_edit(&content, editor.doc.version(), None);
+                syntax_hl.request_update_with_edit(&content, editor.editor.view.doc.version(), None);
             }
 
             editor.syntax_highlighter = Some(syntax_highlighter);
@@ -100,16 +124,11 @@ impl TextEditorPlugin {
         viewport: &Viewport,
         modifiers: &crate::input_types::Modifiers,
     ) -> bool {
-        use crate::input_types::MouseButton;
-        self.input.on_mouse_click(
-            &self.doc,
-            viewport,
+        self.editor.handle_click(
             pos,
-            MouseButton::Left,
-            modifiers.state().alt_key(),
             modifiers.state().shift_key(),
-        );
-        true
+            modifiers.state().alt_key(),
+        )
     }
 
     /// Handle mouse drag
@@ -120,15 +139,12 @@ impl TextEditorPlugin {
         viewport: &Viewport,
         modifiers: &crate::input_types::Modifiers,
     ) -> bool {
-        let (_redraw, _scroll) =
-            self.input
-                .on_mouse_drag(&self.doc, viewport, from, to, modifiers.state().alt_key());
-        true
+        self.editor.handle_drag(from, to, modifiers.state().alt_key())
     }
 
     pub fn save(&mut self) -> Result<(), std::io::Error> {
         if let Some(ref path) = self.file_path {
-            let content = self.doc.read().flatten_to_string();
+            let content = self.editor.view.doc.read().flatten_to_string();
             std::fs::write(path, content.as_bytes())?;
 
             // Update saved content hash
@@ -149,8 +165,8 @@ impl TextEditorPlugin {
                 }
                 true
             }
-            InputAction::Undo => self.input.undo(&self.doc),
-            InputAction::Redo => self.input.redo(&self.doc),
+            InputAction::Undo => self.editor.handle_undo(),
+            InputAction::Redo => self.editor.handle_redo(),
             InputAction::Redraw => true,
             InputAction::None => false,
         }
@@ -158,8 +174,7 @@ impl TextEditorPlugin {
 
     /// Get cursor position for scrolling
     pub fn get_cursor_doc_pos(&self) -> Option<tiny_sdk::DocPos> {
-        // Get primary cursor position
-        self.input.selections().first().map(|sel| sel.cursor)
+        Some(self.editor.cursor_pos())
     }
 
     /// Get primary cursor layout position for rendering
@@ -168,15 +183,13 @@ impl TextEditorPlugin {
         doc: &Doc,
         viewport: &crate::coordinates::Viewport,
     ) -> Option<LayoutPos> {
-        self.input
-            .selections()
-            .first()
-            .map(|sel| viewport.doc_to_layout(sel.cursor))
+        let cursor = self.editor.cursor_pos();
+        Some(viewport.doc_to_layout(cursor))
     }
 
     /// Get selections for rendering
     pub fn selections(&self) -> &[Selection] {
-        self.input.selections()
+        self.editor.selections()
     }
 }
 
@@ -196,8 +209,8 @@ impl Initializable for TextEditorPlugin {
     fn setup(&mut self, _ctx: &mut SetupContext) -> Result<(), PluginError> {
         if let Some(ref mut highlighter) = self.syntax_highlighter {
             if let Some(syntax_hl) = highlighter.as_any().downcast_ref::<SyntaxHighlighter>() {
-                let text = self.doc.read().flatten_to_string();
-                syntax_hl.request_update_with_edit(&text, self.doc.version(), None);
+                let text = self.editor.view.doc.read().flatten_to_string();
+                syntax_hl.request_update_with_edit(&text, self.editor.view.doc.version(), None);
             }
         }
         Ok(())

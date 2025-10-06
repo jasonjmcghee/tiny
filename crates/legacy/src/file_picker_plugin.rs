@@ -10,12 +10,22 @@ use tiny_sdk::{Capability, Initializable, PaintContext, Paintable, Plugin, Plugi
 
 /// File picker plugin for finding and opening files
 pub struct FilePickerPlugin {
-    picker: OverlayPicker<PathBuf>,
+    pub picker: OverlayPicker<PathBuf>,
     working_dir: PathBuf,
     pub visible: bool,
 }
 
 impl FilePickerPlugin {
+    /// Get the input field for cursor/selection routing
+    pub fn input(&self) -> &crate::editable_text_view::EditableTextView {
+        &self.picker.dropdown.input
+    }
+
+    /// Get mutable input field
+    pub fn input_mut(&mut self) -> &mut crate::editable_text_view::EditableTextView {
+        &mut self.picker.dropdown.input
+    }
+
     pub fn new() -> Self {
         let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let wd_clone = working_dir.clone();
@@ -85,15 +95,49 @@ impl FilePickerPlugin {
         self.picker.hide();
     }
 
-    pub fn add_char(&mut self, ch: char) { self.picker.add_char(ch); }
-    pub fn backspace(&mut self) { self.picker.backspace(); }
     pub fn move_up(&mut self) { self.picker.move_up(); }
     pub fn move_down(&mut self) { self.picker.move_down(); }
     pub fn selected_file(&self) -> Option<&Path> { self.picker.selected_item().map(|p| p.as_path()) }
+    /// Trigger filtering with the given query
+    /// Note: Assumes input text is already set (by InputHandler)
     pub fn set_query(&mut self, query: String) {
-        self.picker.dropdown.input.set_text(&query);
         self.picker.trigger_filter(query);
     }
+
+    /// Handle generic navigation events
+    /// Returns Some(action) if the event should trigger a specific action
+    pub fn handle_event(&mut self, event_name: &str) -> Option<FilePickerAction> {
+        if !self.visible {
+            return None; // Not visible, don't handle anything
+        }
+
+        match event_name {
+            "navigate.up" => {
+                self.move_up();
+                Some(FilePickerAction::Continue)
+            }
+            "navigate.down" => {
+                self.move_down();
+                Some(FilePickerAction::Continue)
+            }
+            "action.cancel" => Some(FilePickerAction::Close),
+            "action.submit" => {
+                if let Some(path) = self.selected_file() {
+                    Some(FilePickerAction::Select(path.to_path_buf()))
+                } else {
+                    Some(FilePickerAction::Continue)
+                }
+            }
+            _ => None, // Don't care about this event
+        }
+    }
+}
+
+/// Action to take after file picker handles an event
+pub enum FilePickerAction {
+    Continue,
+    Close,
+    Select(PathBuf),
 }
 
 tiny_sdk::plugin! {

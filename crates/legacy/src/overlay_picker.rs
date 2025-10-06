@@ -131,10 +131,8 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
     /// Collect background rects
     pub fn collect_background_rects(&self) -> Vec<tiny_sdk::types::RectInstance> {
         if !self.visible { return Vec::new(); }
-
         let mut rects = self.dropdown.get_chrome_rects();
         rects.extend(self.dropdown.input.collect_background_rects());
-        rects.extend(self.dropdown.results.collect_background_rects());
         rects
     }
 
@@ -143,17 +141,7 @@ impl<T: Clone + Send + Sync + 'static> OverlayPicker<T> {
         self.dropdown.get_frame_rounded_rect()
     }
 
-    /// Legacy API compatibility
-    pub fn add_char(&mut self, ch: char) {
-        self.dropdown.input.handle_char(ch);
-        self.trigger_filter(self.dropdown.filter_text());
-    }
-
-    pub fn backspace(&mut self) {
-        self.dropdown.input.handle_backspace();
-        self.trigger_filter(self.dropdown.filter_text());
-    }
-
+    /// Legacy API compatibility - list navigation
     pub fn move_up(&mut self) {
         if self.dropdown.selected_index() > 0 {
             let viewport = Viewport::new(1920.0, 1080.0, 1.0);
@@ -236,7 +224,6 @@ impl<T: Clone + Send + Sync + 'static> Widget for OverlayPicker<T> {
         if !self.visible { return Vec::new(); }
         let mut rects = self.dropdown.get_chrome_rects();
         rects.extend(self.dropdown.input.collect_background_rects());
-        rects.extend(self.dropdown.results.collect_background_rects());
         rects
     }
 

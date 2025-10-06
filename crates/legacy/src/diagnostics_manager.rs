@@ -90,7 +90,10 @@ impl DiagnosticsManager {
         }
 
         // Start LSP service (handles all LSP features)
-        eprintln!("DiagnosticsManager::open_file() starting LSP for {:?}", file_path);
+        eprintln!(
+            "DiagnosticsManager::open_file() starting LSP for {:?}",
+            file_path
+        );
         self.lsp_service.open_file(file_path, content);
 
         // Request document symbols for hover support
@@ -145,8 +148,11 @@ impl DiagnosticsManager {
         for result in self.lsp_service.poll_results() {
             match result {
                 LspResult::Diagnostics(diagnostics) => {
-                    eprintln!("LSP returned {} diagnostics for {:?}",
-                              diagnostics.len(), self.lsp_service.current_file());
+                    eprintln!(
+                        "LSP returned {} diagnostics for {:?}",
+                        diagnostics.len(),
+                        self.lsp_service.current_file()
+                    );
                     self.apply_diagnostics(&diagnostics, text_renderer);
                     let content = doc.read().flatten_to_string();
                     if let Some(file_path) = self.lsp_service.current_file() {
@@ -305,8 +311,11 @@ impl DiagnosticsManager {
             text_renderer.line_cache.len()
         );
 
-        eprintln!("Applying {} diagnostics with layout cache size: {}",
-                  diagnostics.len(), text_renderer.layout_cache.len());
+        eprintln!(
+            "Applying {} diagnostics with layout cache size: {}",
+            diagnostics.len(),
+            text_renderer.layout_cache.len()
+        );
 
         self.plugin.clear_diagnostics();
 
@@ -317,18 +326,19 @@ impl DiagnosticsManager {
                 .expect(&format!(
                     "Failed to get X position for diagnostic at line {}, col {}. \
                      Layout has {} lines in cache.",
-                    diag.line, diag.column_start, text_renderer.line_cache.len()
+                    diag.line,
+                    diag.column_start,
+                    text_renderer.line_cache.len()
                 ));
             let end_x = text_renderer
                 .get_x_at_line_col(diag.line as u32, diag.column_end)
                 .expect(&format!(
                     "Failed to get X position for diagnostic at line {}, col {}. \
                      Layout has {} lines in cache.",
-                    diag.line, diag.column_end, text_renderer.line_cache.len()
+                    diag.line,
+                    diag.column_end,
+                    text_renderer.line_cache.len()
                 ));
-
-            eprintln!("  Diagnostic at line {}, cols {}-{}: x={}-{}",
-                      diag.line, diag.column_start, diag.column_end, start_x, end_x);
 
             self.plugin.add_diagnostic_with_positions(
                 diag.line,

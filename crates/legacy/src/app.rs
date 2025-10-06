@@ -154,6 +154,9 @@ pub struct TinyApp {
 
     // Scroll focus management
     scroll_focus: ScrollFocusManager,
+
+    // EditableTextView focus tracking (for cursor/selection routing)
+    focused_editable_view_id: Option<u64>,
 }
 
 impl TinyApp {
@@ -493,6 +496,7 @@ impl TinyApp {
             continuous_rendering: false,
             last_frame_time: std::time::Instant::now(),
             scroll_focus: ScrollFocusManager::new(),
+            focused_editable_view_id: None, // Will be set when first tab is created
         }
     }
 
@@ -636,11 +640,12 @@ impl TinyApp {
     }
 
     /// Helper for simple overlay show (file picker, grep, etc.)
-    fn show_overlay(&mut self, show: impl FnOnce(&mut EditorLogic), ctx: ShortcutContext, focus: WidgetId) {
+    fn show_overlay(&mut self, show: impl FnOnce(&mut EditorLogic), ctx: ShortcutContext, focus: WidgetId, editable_id: u64) {
         show(&mut self.editor);
         self.editor.ui_changed = true;
         self.shortcuts.set_context(ctx);
         self.scroll_focus.set_focus(focus);
+        self.focused_editable_view_id = Some(editable_id);
         self.request_redraw();
     }
 
@@ -650,6 +655,10 @@ impl TinyApp {
         self.editor.ui_changed = true;
         self.shortcuts.set_context(ShortcutContext::Editor);
         self.scroll_focus.clear_focus();
+        // Restore focus to main editor
+        if let Some(tab) = self.editor.tab_manager.active_tab() {
+            self.focused_editable_view_id = Some(tab.plugin.editor.id);
+        }
         self.request_redraw();
     }
 
@@ -666,6 +675,94 @@ impl TinyApp {
             self.request_redraw();
             self.cursor_needs_scroll = true;
         }
+    }
+
+    /// Broadcast event to all components (they decide if they care)
+    fn broadcast_to_components(&mut self, event: &crate::input::Event) {
+        // File picker
+        if let Some(action) = self.editor.file_picker.handle_event(&event.name) {
+            use crate::file_picker_plugin::FilePickerAction;
+            match action {
+                FilePickerAction::Continue => {
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                FilePickerAction::Close => {
+                    self.hide_overlay(|e| e.file_picker.hide());
+                }
+                FilePickerAction::Select(path) => {
+                    self.editor.file_picker.hide();
+                    self.shortcuts.set_context(ShortcutContext::Editor);
+                    self.scroll_focus.clear_focus();
+                    self.editor.record_navigation();
+                    if self.editor.tab_manager.open_file(path).is_ok() {
+                        if let Some(tab) = self.editor.tab_manager.active_tab() {
+                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                        }
+                        self.editor.ui_changed = true;
+                        self.request_redraw();
+                    }
+                }
+            }
+            return; // File picker handled it
+        }
+
+        // Grep
+        if let Some(action) = self.editor.grep.handle_event(&event.name) {
+            use crate::grep_plugin::GrepAction;
+            match action {
+                GrepAction::Continue => {
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
+                GrepAction::Close => {
+                    self.hide_overlay(|e| e.grep.hide());
+                }
+                GrepAction::Select(result) => {
+                    let (file, line, col) = (result.file_path, result.line_number.saturating_sub(1), result.column);
+                    self.editor.grep.hide();
+                    self.shortcuts.set_context(ShortcutContext::Editor);
+                    self.scroll_focus.clear_focus();
+                    if self.editor.jump_to_location(file, line, col, true) {
+                        if let Some(tab) = self.editor.tab_manager.active_tab() {
+                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                        }
+                        self.cursor_needs_scroll = true;
+                    }
+                    self.request_redraw();
+                }
+            }
+            return; // Grep handled it
+        }
+
+        // Future components would be added here
+        // Main editor doesn't care about navigate.* or action.* events
+    }
+
+    /// Get the focused EditableTextView for event routing
+    /// Returns (input_handler, doc, viewport) tuple
+    fn get_focused_view_mut(&mut self) -> (&mut crate::input::InputHandler, &tiny_core::tree::Doc, crate::coordinates::Viewport) {
+        let focused_id = self.focused_editable_view_id.unwrap_or(0);
+
+        // Try file picker input first
+        if self.editor.file_picker.visible && focused_id == self.editor.file_picker.input().id {
+            let input = self.editor.file_picker.input_mut();
+            let viewport = input.view.viewport.clone();
+            return (&mut input.input, &input.view.doc, viewport);
+        }
+
+        // Try grep input
+        if self.editor.grep.visible && focused_id == self.editor.grep.input().id {
+            let input = self.editor.grep.input_mut();
+            let viewport = input.view.viewport.clone();
+            return (&mut input.input, &input.view.doc, viewport);
+        }
+
+        // Fallback to main editor
+        let tab = self.editor.tab_manager.active_tab_mut();
+        let viewport = self.cpu_renderer.as_ref().map(|r| r.viewport.clone())
+            .unwrap_or_else(|| crate::coordinates::Viewport::new(800.0, 600.0, 1.0));
+        (&mut tab.plugin.editor.input, &tab.plugin.editor.view.doc, viewport)
     }
 
     fn process_event_queue(&mut self) {
@@ -685,11 +782,62 @@ impl TinyApp {
 
                 // Mouse events
                 "mouse.press" => {
-                    if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
-                        let plugin = self.editor.active_plugin_mut();
-                        if plugin.input.handle_event(&event, &plugin.doc, &viewport) == InputAction::Redraw {
+                    // Extract mouse position from event data
+                    if let (Some(x), Some(y)) = (
+                        event.data.get("x").and_then(|v| v.as_f64()),
+                        event.data.get("y").and_then(|v| v.as_f64()),
+                    ) {
+                        let shift = event.data.get("modifiers")
+                            .and_then(|m| m.get("shift"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+
+                        // Check if click is in an overlay
+                        if self.editor.file_picker.visible {
+                            use crate::filterable_dropdown::DropdownAction;
+                            let action = self.editor.file_picker.picker.dropdown.handle_click(x as f32, y as f32, shift);
+                            match action {
+                                DropdownAction::Selected(path) => {
+                                    // Open the file
+                                    self.editor.file_picker.hide();
+                                    self.shortcuts.set_context(ShortcutContext::Editor);
+                                    self.scroll_focus.clear_focus();
+                                    let _ = self.editor.tab_manager.open_file(path);
+                                    if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                        self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                                    }
+                                    self.cursor_needs_scroll = true;
+                                }
+                                _ => {}
+                            }
                             self.request_redraw();
-                            self.cursor_needs_scroll = true;
+                        } else if self.editor.grep.visible {
+                            use crate::filterable_dropdown::DropdownAction;
+                            let action = self.editor.grep.picker.dropdown.handle_click(x as f32, y as f32, shift);
+                            match action {
+                                DropdownAction::Selected(result) => {
+                                    // Jump to the result
+                                    let (file, line, col) = (result.file_path.clone(), result.line_number.saturating_sub(1), result.column);
+                                    self.editor.grep.hide();
+                                    self.shortcuts.set_context(ShortcutContext::Editor);
+                                    self.scroll_focus.clear_focus();
+                                    if self.editor.jump_to_location(file, line, col, true) {
+                                        if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                                        }
+                                        self.cursor_needs_scroll = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            self.request_redraw();
+                        } else if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
+                            // No overlay - route to main editor
+                            let plugin = self.editor.active_plugin_mut();
+                            if plugin.editor.input.handle_event(&event, &plugin.editor.view.doc, &viewport) == InputAction::Redraw {
+                                self.request_redraw();
+                                self.cursor_needs_scroll = true;
+                            }
                         }
                     }
                 }
@@ -697,8 +845,8 @@ impl TinyApp {
                 "mouse.drag" => {
                     if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
                         let plugin = self.editor.active_plugin_mut();
-                        plugin.input.handle_event(&event, &plugin.doc, &viewport);
-                        if let Some((dx, dy)) = plugin.input.pending_scroll_delta.take() {
+                        plugin.editor.input.handle_event(&event, &plugin.editor.view.doc, &viewport);
+                        if let Some((dx, dy)) = plugin.editor.input.pending_scroll_delta.take() {
                             self.event_bus.emit("app.drag.scroll", json!({ "delta_x": dx, "delta_y": dy }), 15, "mouse_drag");
                         }
                         self.request_redraw();
@@ -710,7 +858,7 @@ impl TinyApp {
                         tab.scroll_position.x.0 += dx as f32;
                         tab.scroll_position.y.0 += dy as f32;
                         if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                            let (doc, editor_bounds) = (&tab.plugin.doc, cpu_renderer.editor_bounds);
+                            let (doc, editor_bounds) = (&tab.plugin.editor.view.doc, cpu_renderer.editor_bounds);
                             cpu_renderer.viewport.scroll = tab.scroll_position;
                             cpu_renderer.viewport.clamp_scroll_to_bounds(&doc.read(), editor_bounds);
                             tab.scroll_position = cpu_renderer.viewport.scroll;
@@ -725,72 +873,90 @@ impl TinyApp {
                 "navigation.forward" => self.navigate(|e| e.navigate_forward()),
 
                 // Tabs
-                "tabs.close" => { self.editor.tab_manager.close_active_tab(); self.editor.ui_changed = true; self.request_redraw(); }
+                "tabs.close" => {
+                    self.editor.tab_manager.close_active_tab();
+                    // Restore focus to newly active tab
+                    if let Some(tab) = self.editor.tab_manager.active_tab() {
+                        self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                    }
+                    self.editor.ui_changed = true;
+                    self.request_redraw();
+                }
 
                 // File picker
-                "file_picker.open" => self.show_overlay(|e| e.file_picker.show(), FilePicker, FPWidget),
-                "file_picker.close" => self.hide_overlay(|e| e.file_picker.hide()),
-                "file_picker.move_up" => self.overlay_action(|e| e.file_picker.move_up()),
-                "file_picker.move_down" => self.overlay_action(|e| e.file_picker.move_down()),
-                "file_picker.backspace" => self.overlay_action(|e| e.file_picker.backspace()),
-                "file_picker.select" => {
-                    if let Some(path) = self.editor.file_picker.selected_file().map(|p| p.to_path_buf()) {
-                        self.editor.file_picker.hide();
-                        self.shortcuts.set_context(Editor);
-                        self.scroll_focus.clear_focus();
-                        self.editor.record_navigation();
-                        if self.editor.tab_manager.open_file(path).is_ok() {
+                "file_picker.open" => {
+                    let picker_input_id = self.editor.file_picker.input().id;
+                    self.show_overlay(|e| e.file_picker.show(), FilePicker, FPWidget, picker_input_id);
+                }
+                // Grep
+                "grep.open" => {
+                    let grep_input_id = self.editor.grep.input().id;
+                    self.show_overlay(|e| e.grep.show(String::new()), Grep, GrepWidget, grep_input_id);
+                }
+
+                // Editor events - delegate to focused EditableTextView's InputHandler
+                "editor.code_action" => self.editor.handle_code_action_request(),
+                name if name.starts_with("editor.") => {
+                    // Route event to focused view (could be main editor, file picker input, or grep input)
+                    let focused_id = self.focused_editable_view_id.unwrap_or(0);
+                    let is_file_picker_focused = self.editor.file_picker.visible
+                        && focused_id == self.editor.file_picker.input().id;
+                    let is_grep_focused = self.editor.grep.visible
+                        && focused_id == self.editor.grep.input().id;
+
+                    let (input_handler, doc, viewport) = self.get_focused_view_mut();
+                    let action = input_handler.handle_event(&event, doc, &viewport);
+
+                    // After text changes in overlays, trigger filtering/search
+                    // NOTE: Text was already edited by InputHandler above, just trigger filter
+                    if matches!(event.name.as_str(), "editor.insert_char" | "editor.delete_backward" | "editor.delete_forward") {
+                        if is_file_picker_focused {
+                            let query = self.editor.file_picker.input().text().to_string();
+                            self.editor.file_picker.picker.trigger_filter(query);
+                            self.editor.ui_changed = true;
+                            self.request_redraw();
+                        } else if is_grep_focused {
+                            let query = self.editor.grep.input().text().to_string();
+                            self.editor.grep.set_query(query);
                             self.editor.ui_changed = true;
                             self.request_redraw();
                         }
                     }
-                }
 
-                // Grep
-                "grep.open" => self.show_overlay(|e| e.grep.show(String::new()), Grep, GrepWidget),
-                "grep.close" => self.hide_overlay(|e| e.grep.hide()),
-                "grep.move_up" => self.overlay_action(|e| e.grep.move_up()),
-                "grep.move_down" => self.overlay_action(|e| e.grep.move_down()),
-                "grep.backspace" => self.overlay_action(|e| e.grep.backspace()),
-                "grep.select" => {
-                    if let Some(result) = self.editor.grep.selected_result() {
-                        let (file, line, col) = (result.file_path.clone(), result.line_number.saturating_sub(1), result.column);
-                        self.editor.grep.hide();
-                        self.shortcuts.set_context(Editor);
-                        self.scroll_focus.clear_focus();
-                        if self.editor.jump_to_location(file, line, col, true) {
+                    match action {
+                        InputAction::Save => {
+                            // Save only makes sense for main editor
+                            let _ = self.editor.save().map_err(|e| eprintln!("Failed to save: {}", e));
+                            self.request_redraw();
+                            self.update_window_title();
                             self.cursor_needs_scroll = true;
                         }
-                        self.request_redraw();
-                    }
-                }
-
-                // Editor events - delegate to InputHandler
-                "editor.code_action" => self.editor.handle_code_action_request(),
-                name if name.starts_with("editor.") => {
-                    if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
-                        let plugin = self.editor.active_plugin_mut();
-                        let action = plugin.input.handle_event(&event, &plugin.doc, &viewport);
-                        match action {
-                            InputAction::Save => {
-                                let _ = self.editor.save().map_err(|e| eprintln!("Failed to save: {}", e));
-                                self.request_redraw();
-                                self.update_window_title();
+                        InputAction::Undo | InputAction::Redo | InputAction::Redraw => {
+                            // For overlay inputs, undo/redo should work on their own buffers
+                            self.request_redraw();
+                            self.update_window_title();
+                            // Only scroll cursor for main editor
+                            if !self.editor.file_picker.visible && !self.editor.grep.visible {
                                 self.cursor_needs_scroll = true;
                             }
-                            InputAction::Undo | InputAction::Redo | InputAction::Redraw => {
-                                if input::handle_input_action(action, plugin) {
-                                    self.request_redraw();
-                                    self.update_window_title();
-                                    self.cursor_needs_scroll = true;
-                                }
+                        }
+                        InputAction::None => {
+                            // Even if action is None, we may have edited text in an overlay
+                            // (filtering was already triggered above)
+                            if is_file_picker_focused || is_grep_focused {
+                                // Already handled above with request_redraw()
+                            } else {
+                                // Main editor - might still need a redraw for cursor movement etc
+                                self.request_redraw();
                             }
-                            InputAction::None => {}
                         }
                     }
                 }
 
-                _ => {} // Unknown event
+                _ => {
+                    // Broadcast all other events to components (they decide if they care)
+                    self.broadcast_to_components(&event);
+                }
             }
         }
     }
@@ -813,6 +979,24 @@ impl TinyApp {
         // Process all queued events at the beginning of the frame
         // This ensures events are handled before rendering
         self.process_event_queue();
+
+        // Lazy initialize EditableTextView plugins (for new tabs/views only)
+        if let Some(ref cpu_renderer) = self.cpu_renderer {
+            if let Some(loader_arc) = cpu_renderer.get_plugin_loader() {
+                let loader = loader_arc.lock().unwrap();
+                // Returns list of newly-initialized views that need GPU setup
+                if let Ok(newly_initialized) = self.editor.initialize_all_plugins(&loader) {
+                    if !newly_initialized.is_empty() {
+                        drop(loader); // Release lock
+                        if let Some(gpu_renderer) = &self.gpu_renderer {
+                            let device = gpu_renderer.device_arc();
+                            let queue = gpu_renderer.queue_arc();
+                            let _ = self.editor.setup_plugins_for_views(newly_initialized, device, queue);
+                        }
+                    }
+                }
+            }
+        }
 
         // Check for pending shader reload
         if self.shader_reload_pending.load(Ordering::Relaxed) {
@@ -916,11 +1100,20 @@ impl TinyApp {
             // Use the active tab's scroll position for rendering
             cpu_renderer.viewport.scroll = tab.scroll_position;
 
-            // Always update selection widgets
-            cpu_renderer.set_selection_plugin(&tab.plugin.input, &tab.plugin.doc);
+            // Update main editor's TextView viewport to match actual render state
+            tab.plugin.editor.view.viewport.bounds = cpu_renderer.editor_bounds;
+            tab.plugin.editor.view.viewport.scroll = tab.scroll_position;
+            tab.plugin.editor.view.viewport.scale_factor = cpu_renderer.viewport.scale_factor;
+            // CRITICAL: Set font_system for accurate text measurement (prevents drift)
+            if let Some(ref font_system) = self.font_system {
+                tab.plugin.editor.view.viewport.set_font_system(font_system.clone());
+            }
+
+            // Sync cursor/selection state to main editor's plugins
+            tab.plugin.editor.sync_plugins();
 
             // Set line numbers plugin with fresh document reference
-            cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.doc);
+            cpu_renderer.set_line_numbers_plugin(&mut tab.line_numbers, &tab.plugin.editor.view.doc);
 
             // Set tab bar, file picker, and grep plugins (global UI)
             cpu_renderer.set_tab_bar_plugin(&mut self.editor.tab_bar);
@@ -934,7 +1127,7 @@ impl TinyApp {
             }
 
             // Set diagnostics plugin for rendering (will be updated after layout is computed)
-            cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.doc);
+            cpu_renderer.set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.editor.view.doc);
 
             // Initialize diagnostics plugin with GPU resources if needed
             // Check if THIS specific plugin instance needs initialization
@@ -1015,7 +1208,7 @@ impl TinyApp {
         // Apply pending renderer edits for syntax token adjustment
         // Note: text_renderer has already been swapped in from the active tab
         if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
-            let pending_edits = self.editor.active_plugin_mut().input.take_renderer_edits();
+            let pending_edits = self.editor.active_plugin_mut().editor.input.take_renderer_edits();
 
             // If version changed without edits, it's undo/redo
             // Clear edit_deltas but KEEP stable_tokens - they'll be updated by background parse
@@ -1067,7 +1260,7 @@ impl TinyApp {
 
             // Update diagnostics manager (handles LSP polling, caching, plugin updates)
             // NOTE: cpu_renderer.text_renderer now has populated layout cache from rendering
-            tab.diagnostics.update(&tab.plugin.doc, &cpu_renderer.text_renderer);
+            tab.diagnostics.update(&tab.plugin.editor.view.doc, &cpu_renderer.text_renderer);
 
             // Swap the text_renderer back to the tab and save scroll position
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
@@ -1183,6 +1376,36 @@ impl ApplicationHandler for TinyApp {
 
             self.editor.on_ready();
 
+            // Initialize cursor/selection plugins for all EditableTextViews
+            if let Some(ref cpu_renderer) = self.cpu_renderer {
+                if let Some(loader_arc) = cpu_renderer.get_plugin_loader() {
+                    let loader = loader_arc.lock().unwrap();
+                    match self.editor.initialize_all_plugins(&loader) {
+                        Ok(newly_initialized) => {
+                            // Setup GPU resources for newly initialized views
+                            drop(loader); // Release lock before setup
+                            if !newly_initialized.is_empty() {
+                                if let Some(gpu_renderer) = &self.gpu_renderer {
+                                    let device = gpu_renderer.device_arc();
+                                    let queue = gpu_renderer.queue_arc();
+                                    if let Err(e) = self.editor.setup_plugins_for_views(newly_initialized, device, queue) {
+                                        eprintln!("Failed to setup EditableTextView plugins: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to initialize EditableTextView plugins: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Set initial focus to main editor
+            if let Some(tab) = self.editor.tab_manager.active_tab() {
+                self.focused_editable_view_id = Some(tab.plugin.editor.id);
+            }
+
             // Set initial window title
             self.update_window_title();
 
@@ -1287,32 +1510,13 @@ impl ApplicationHandler for TinyApp {
                                     && !self.modifiers.ctrl
                                     && !self.modifiers.alt
                                 {
-                                    // Check context
-                                    match self.shortcuts.context() {
-                                        ShortcutContext::FilePicker => {
-                                            // Add character to file picker query
-                                            if let Some(c) = ch.chars().next() {
-                                                self.editor.file_picker.add_char(c);
-                                                self.editor.ui_changed = true;
-                                            }
-                                        }
-                                        ShortcutContext::Grep => {
-                                            // Add character to grep filter query
-                                            if let Some(c) = ch.chars().next() {
-                                                self.editor.grep.add_char(c);
-                                                self.editor.ui_changed = true;
-                                            }
-                                        }
-                                        _ => {
-                                            // Insert character in editor (original preserves shift)
-                                            self.event_bus.emit(
-                                                "editor.insert_char",
-                                                json!({ "char": ch }),
-                                                10,
-                                                "keyboard",
-                                            );
-                                        }
-                                    }
+                                    // Emit event for focused view to handle
+                                    self.event_bus.emit(
+                                        "editor.insert_char",
+                                        json!({ "char": ch }),
+                                        10,
+                                        "keyboard",
+                                    );
                                 }
                             }
                         }

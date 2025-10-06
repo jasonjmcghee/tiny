@@ -19,13 +19,23 @@ pub struct GrepResult {
 
 /// Grep plugin for full codebase search
 pub struct GrepPlugin {
-    picker: OverlayPicker<GrepResult>,
+    pub picker: OverlayPicker<GrepResult>,
     working_dir: PathBuf,
     searching: bool,
     pub visible: bool,
 }
 
 impl GrepPlugin {
+    /// Get the input field for cursor/selection routing
+    pub fn input(&self) -> &crate::editable_text_view::EditableTextView {
+        &self.picker.dropdown.input
+    }
+
+    /// Get mutable input field
+    pub fn input_mut(&mut self) -> &mut crate::editable_text_view::EditableTextView {
+        &mut self.picker.dropdown.input
+    }
+
     pub fn new() -> Self {
         let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -153,17 +163,50 @@ impl GrepPlugin {
         }
     }
 
-    pub fn add_char(&mut self, ch: char) {
-        self.picker.dropdown.input.handle_char(ch);
-        self.trigger_search(self.picker.dropdown.filter_text());
-    }
-    pub fn backspace(&mut self) {
-        self.picker.dropdown.input.handle_backspace();
-        self.trigger_search(self.picker.dropdown.filter_text());
-    }
     pub fn move_up(&mut self) { self.picker.move_up(); }
     pub fn move_down(&mut self) { self.picker.move_down(); }
     pub fn selected_result(&self) -> Option<&GrepResult> { self.picker.selected_item() }
+
+    /// Set the query and trigger search
+    /// Note: Assumes input text is already set (by InputHandler)
+    pub fn set_query(&mut self, query: String) {
+        self.trigger_search(query);
+    }
+
+    /// Handle generic navigation events
+    /// Returns Some(action) if the event should trigger a specific action
+    pub fn handle_event(&mut self, event_name: &str) -> Option<GrepAction> {
+        if !self.visible {
+            return None; // Not visible, don't handle anything
+        }
+
+        match event_name {
+            "navigate.up" => {
+                self.move_up();
+                Some(GrepAction::Continue)
+            }
+            "navigate.down" => {
+                self.move_down();
+                Some(GrepAction::Continue)
+            }
+            "action.cancel" => Some(GrepAction::Close),
+            "action.submit" => {
+                if let Some(result) = self.selected_result() {
+                    Some(GrepAction::Select(result.clone()))
+                } else {
+                    Some(GrepAction::Continue)
+                }
+            }
+            _ => None, // Don't care about this event
+        }
+    }
+}
+
+/// Action to take after grep handles an event
+pub enum GrepAction {
+    Continue,
+    Close,
+    Select(GrepResult),
 }
 
 tiny_sdk::plugin! {

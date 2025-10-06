@@ -35,6 +35,56 @@ pub struct EditorLogic {
 }
 
 impl EditorLogic {
+    /// Initialize cursor/selection plugins for all EditableTextViews
+    /// Safe to call multiple times - will skip already-initialized views
+    /// Returns list of newly-initialized views that need GPU setup
+    pub fn initialize_all_plugins(&mut self, plugin_loader: &tiny_core::plugin_loader::PluginLoader) -> Result<Vec<*mut crate::editable_text_view::EditableTextView>, String> {
+        let mut newly_initialized = Vec::new();
+
+        // Initialize plugins for all tabs (including newly opened ones)
+        for tab in self.tab_manager.tabs_mut() {
+            if !tab.plugin.editor.has_plugins() {
+                tab.plugin.initialize_plugins(plugin_loader)?;
+                newly_initialized.push(&mut tab.plugin.editor as *mut _);
+            }
+        }
+
+        // Initialize plugins for file picker input
+        if !self.file_picker.picker.dropdown.input.has_plugins() {
+            self.file_picker.picker.dropdown.input.initialize_plugins(plugin_loader)?;
+            newly_initialized.push(&mut self.file_picker.picker.dropdown.input as *mut _);
+        }
+
+        // Initialize plugins for grep input
+        if !self.grep.picker.dropdown.input.has_plugins() {
+            self.grep.picker.dropdown.input.initialize_plugins(plugin_loader)?;
+            newly_initialized.push(&mut self.grep.picker.dropdown.input as *mut _);
+        }
+
+        Ok(newly_initialized)
+    }
+
+    /// Setup plugins with GPU resources for specific EditableTextViews
+    pub fn setup_plugins_for_views(&mut self, views: Vec<*mut crate::editable_text_view::EditableTextView>, device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Result<(), tiny_sdk::PluginError> {
+        if views.is_empty() {
+            return Ok(());
+        }
+
+        let registry = tiny_sdk::PluginRegistry::empty();
+        let mut ctx = tiny_sdk::SetupContext {
+            device,
+            queue,
+            registry,
+        };
+
+        for view_ptr in views {
+            let view = unsafe { &mut *view_ptr };
+            view.setup_plugins(&mut ctx)?;
+        }
+
+        Ok(())
+    }
+
     /// Get the active tab's plugin
     fn active_editor(&self) -> &TextEditorPlugin {
         &self.tab_manager.active_tab().expect("No active tab").plugin
@@ -48,10 +98,10 @@ impl EditorLogic {
     /// Handle code action request (Alt+Enter)
     pub fn handle_code_action_request(&mut self) {
         let tab = self.tab_manager.active_tab_mut();
-        let cursor_pos = tab.plugin.input.selections()[0].cursor;
+        let cursor_pos = tab.plugin.editor.input.selections()[0].cursor;
 
         // Convert cursor position to UTF-16
-        let tree = tab.plugin.doc.read();
+        let tree = tab.plugin.editor.view.doc.read();
         let byte_offset = tree.doc_pos_to_byte(cursor_pos);
         let cursor_utf16 = tree.offset_to_point_utf16(byte_offset);
 
@@ -111,12 +161,12 @@ impl EditorLogic {
             // Trigger syntax highlighting for newly active tab
             let plugin = &self.tab_manager.active_tab().unwrap().plugin;
             if let Some(ref syntax_highlighter) = plugin.syntax_highlighter {
-                let text = plugin.doc.read().flatten_to_string();
+                let text = plugin.editor.view.doc.read().flatten_to_string();
                 if let Some(syntax_hl) = syntax_highlighter
                     .as_any()
                     .downcast_ref::<syntax::SyntaxHighlighter>()
                 {
-                    syntax_hl.request_update_with_edit(&text, plugin.doc.version(), None);
+                    syntax_hl.request_update_with_edit(&text, plugin.editor.view.doc.version(), None);
                 }
             }
             return true;
@@ -152,8 +202,8 @@ impl EditorLogic {
 
         // Normal click handling
         let plugin = self.active_plugin_mut();
-        plugin.input.on_mouse_click(
-            &plugin.doc,
+        plugin.editor.input.on_mouse_click(
+            &plugin.editor.view.doc,
             viewport,
             pos,
             crate::input_types::MouseButton::Left,
@@ -171,13 +221,13 @@ impl EditorLogic {
 
     /// Handle mouse button release (for cleaning up drag state)
     pub fn on_mouse_release(&mut self) {
-        self.active_plugin_mut().input.clear_drag_anchor();
+        self.active_plugin_mut().editor.input.clear_drag_anchor();
         self.pending_scroll = None;
     }
 
     /// Get document to render
     pub fn doc(&self) -> &Doc {
-        &self.active_editor().doc
+        &self.active_editor().editor.view.doc
     }
 
     /// Get cursor document position for scrolling
@@ -209,9 +259,9 @@ impl EditorLogic {
         let mut cursor_moved = false;
         let plugin = self.active_plugin_mut();
         // Check if we should send pending syntax updates (debounce timer expired)
-        if plugin.input.should_flush() {
+        if plugin.editor.input.should_flush() {
             println!("DEBOUNCE: Sending pending syntax updates after idle timeout");
-            plugin.input.flush_syntax_updates(&plugin.doc);
+            plugin.editor.input.flush_syntax_updates(&plugin.editor.view.doc);
         }
 
         // LSP results are now handled in tab.diagnostics.update() in app.rs
@@ -233,7 +283,7 @@ impl EditorLogic {
 
             // Convert UTF-16 positions to byte offsets and apply edits
             for edit in sorted_edits {
-                let tree = tab.plugin.doc.read();
+                let tree = tab.plugin.editor.view.doc.read();
 
                 let start_utf16 = tiny_tree::PointUtf16::new(
                     edit.range_utf16.0.line as u32,
@@ -261,20 +311,20 @@ impl EditorLogic {
                 // Apply the edit
                 if start_byte == end_byte {
                     // Insert
-                    tab.plugin.doc.edit(tiny_tree::Edit::Insert {
+                    tab.plugin.editor.view.doc.edit(tiny_tree::Edit::Insert {
                         pos: start_byte,
                         content: tiny_tree::Content::Text(edit.new_text),
                     });
                 } else {
                     // Replace
-                    tab.plugin.doc.edit(tiny_tree::Edit::Replace {
+                    tab.plugin.editor.view.doc.edit(tiny_tree::Edit::Replace {
                         range: start_byte..end_byte,
                         content: tiny_tree::Content::Text(edit.new_text),
                     });
                 }
             }
 
-            tab.plugin.doc.flush();
+            tab.plugin.editor.view.doc.flush();
             self.ui_changed = true;
         }
 
@@ -307,7 +357,7 @@ impl EditorLogic {
         let tab = self.tab_manager.active_tab_mut();
         if let Some((line, column)) = tab.diagnostics.cmd_hover_position() {
             // Find word boundaries at hover position
-            let doc = &tab.plugin.doc;
+            let doc = &tab.plugin.editor.view.doc;
             let tree = doc.read();
             let line_text = tree.line_text(line as u32);
             let word_range = find_word_at_position(&line_text, column);
@@ -333,7 +383,7 @@ impl EditorLogic {
         let plugin = self.active_editor();
         let location = history::FileLocation {
             path: plugin.file_path.clone(),
-            position: plugin.input.primary_cursor_doc_pos(&plugin.doc),
+            position: plugin.editor.input.primary_cursor_doc_pos(&plugin.editor.view.doc),
         };
         self.global_nav_history.checkpoint_if_changed(location);
     }
@@ -344,8 +394,9 @@ impl EditorLogic {
             path: self.active_editor().file_path.clone(),
             position: self
                 .active_editor()
+                .editor
                 .input
-                .primary_cursor_doc_pos(&self.active_editor().doc),
+                .primary_cursor_doc_pos(&self.active_editor().editor.view.doc),
         };
 
         if let Some(target) = self.global_nav_history.undo(current_location) {
@@ -361,8 +412,9 @@ impl EditorLogic {
             path: self.active_editor().file_path.clone(),
             position: self
                 .active_editor()
+                .editor
                 .input
-                .primary_cursor_doc_pos(&self.active_editor().doc),
+                .primary_cursor_doc_pos(&self.active_editor().editor.view.doc),
         };
 
         if let Some(target) = self.global_nav_history.redo(current_location) {
@@ -387,7 +439,7 @@ impl EditorLogic {
 
         // Set cursor position in active tab
         let plugin = self.active_plugin_mut();
-        plugin.input.set_cursor(location.position);
+        plugin.editor.input.set_cursor(location.position);
         self.ui_changed = true;
         true
     }
@@ -417,7 +469,7 @@ impl EditorLogic {
 
         // Set cursor to the position (already in UTF-8 doc coords)
         let plugin = self.active_plugin_mut();
-        plugin.input.set_cursor(tiny_sdk::DocPos {
+        plugin.editor.input.set_cursor(tiny_sdk::DocPos {
             line: line as u32,
             column: column as u32,
             byte_offset: 0,
@@ -455,14 +507,14 @@ impl EditorLogic {
         // Convert UTF-16 position to byte-based DocPos
         let (line, byte_column) = {
             let tab = self.tab_manager.active_tab().expect("No active tab");
-            let tree = tab.plugin.doc.read();
+            let tree = tab.plugin.editor.view.doc.read();
             let utf16_point = tiny_tree::PointUtf16::new(line_utf16, column_utf16);
             tree.point_utf16_to_doc_pos(utf16_point)
         };
 
         // Set cursor to the converted position
         let plugin = self.active_plugin_mut();
-        plugin.input.set_cursor(tiny_sdk::DocPos {
+        plugin.editor.input.set_cursor(tiny_sdk::DocPos {
             line: line as u32,
             column: byte_column as u32,
             byte_offset: 0,
@@ -482,10 +534,10 @@ impl EditorLogic {
 
         let tab = self.tab_manager.active_tab_mut();
         let plugin = &tab.plugin;
-        let cursor_pos = plugin.input.primary_cursor_doc_pos(&plugin.doc);
+        let cursor_pos = plugin.editor.input.primary_cursor_doc_pos(&plugin.editor.view.doc);
 
         // Convert cursor position to UTF-16
-        let tree = plugin.doc.read();
+        let tree = plugin.editor.view.doc.read();
         let byte_offset = tree.doc_pos_to_byte(cursor_pos);
         let cursor_utf16 = tree.offset_to_point_utf16(byte_offset);
 
@@ -537,10 +589,10 @@ impl EditorLogic {
         let tab = self.tab_manager.active_tab_mut();
         let plugin = &mut tab.plugin;
         if let Some(ref path) = plugin.file_path {
-            io::autosave(&plugin.doc, path)?;
+            io::autosave(&plugin.editor.view.doc, path)?;
 
             // Update saved content hash
-            let current_text = plugin.doc.read().flatten_to_string();
+            let current_text = plugin.editor.view.doc.read().flatten_to_string();
             let mut hasher = AHasher::default();
             current_text.hash(&mut hasher);
             plugin.last_saved_content_hash = hasher.finish();
@@ -580,7 +632,7 @@ impl EditorLogic {
         let mut plugin = TextEditorPlugin::new(doc);
 
         // Calculate initial content hash
-        let initial_text = plugin.doc.read().flatten_to_string();
+        let initial_text = plugin.editor.view.doc.read().flatten_to_string();
         let mut hasher = AHasher::default();
         initial_text.hash(&mut hasher);
         plugin.last_saved_content_hash = hasher.finish();

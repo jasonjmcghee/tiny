@@ -1539,8 +1539,8 @@ pub fn handle_input_action(action: InputAction, plugin: &mut TextEditorPlugin) -
             eprintln!("Warning: Save action should be handled by caller");
             false
         }
-        InputAction::Undo => plugin.input.undo(&plugin.doc),
-        InputAction::Redo => plugin.input.redo(&plugin.doc),
+        InputAction::Undo => plugin.editor.input.undo(&plugin.editor.view.doc),
+        InputAction::Redo => plugin.editor.input.redo(&plugin.editor.view.doc),
         InputAction::Redraw => true,
         InputAction::None => false,
     }

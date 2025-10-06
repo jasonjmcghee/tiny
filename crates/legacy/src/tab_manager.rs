@@ -36,7 +36,7 @@ impl Tab {
         // Open file in diagnostics manager if we have a path
         let mut diagnostics = DiagnosticsManager::new();
         if let Some(ref path) = plugin.file_path {
-            let content = plugin.doc.read().flatten_to_string();
+            let content = plugin.editor.view.doc.read().flatten_to_string();
             diagnostics.open_file(path.clone(), (*content).clone(), &text_renderer);
         }
 
@@ -102,6 +102,10 @@ impl TabManager {
         &self.tabs
     }
 
+    pub fn tabs_mut(&mut self) -> &mut [Tab] {
+        &mut self.tabs
+    }
+
     /// Get active index
     pub fn active_index(&self) -> usize {
         self.active_index
@@ -127,7 +131,7 @@ impl TabManager {
             // Notify LSP about the file switch
             let tab = &mut self.tabs[index];
             if let Some(ref path) = tab.plugin.file_path {
-                let content = tab.plugin.doc.read().flatten_to_string();
+                let content = tab.plugin.editor.view.doc.read().flatten_to_string();
                 tab.diagnostics
                     .lsp_service_mut()
                     .open_file(path.clone(), (*content).clone());
@@ -218,7 +222,7 @@ impl Scrollable for Tab {
         self.scroll_position.x.0 -= delta.x.0;
 
         // Get document for proper clamping
-        let doc = &self.plugin.doc;
+        let doc = &self.plugin.editor.view.doc;
         let tree = doc.read();
 
         // Use viewport's proper clamp_scroll_to_bounds with actual widget bounds
@@ -233,7 +237,7 @@ impl Scrollable for Tab {
 
     fn get_content_bounds(&self, viewport: &Viewport) -> Rect {
         // Content bounds based on actual document size and viewport metrics
-        let doc = &self.plugin.doc;
+        let doc = &self.plugin.editor.view.doc;
         let tree = doc.read();
         let line_count = tree.line_count();
 

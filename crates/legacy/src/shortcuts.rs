@@ -142,24 +142,27 @@ impl ShortcutRegistry {
 
             // Editor shortcuts
             ("Editor", "cmd+s", "editor.save"),
-            ("Editor", "cmd+z", "editor.undo"),
-            ("Editor", "cmd+shift+z", "editor.redo"),
-            ("Editor", "cmd+c", "editor.copy"),
-            ("Editor", "cmd+x", "editor.cut"),
-            ("Editor", "cmd+v", "editor.paste"),
-            ("Editor", "cmd+a", "editor.select_all"),
+            // Editing commands - Global so they work in all text inputs
+            ("Global", "cmd+z", "editor.undo"),
+            ("Global", "cmd+shift+z", "editor.redo"),
+            ("Global", "cmd+c", "editor.copy"),
+            ("Global", "cmd+x", "editor.cut"),
+            ("Global", "cmd+v", "editor.paste"),
+            ("Global", "cmd+a", "editor.select_all"),
             ("Editor", "cmd+b", "navigation.goto_definition"),
             ("Editor", "cmd+[", "navigation.back"),
             ("Editor", "cmd+]", "navigation.forward"),
             ("Editor", "cmd+w", "tabs.close"),
             ("Editor", "alt+enter", "editor.code_action"),
+            // Text editing - Global so they work in all text inputs
+            ("Global", "space", "editor.insert_space"),
+            ("Global", "backspace", "editor.delete_backward"),
+            ("Global", "delete", "editor.delete_forward"),
+            ("Global", "left", "editor.move_left"),
+            ("Global", "right", "editor.move_right"),
+            // Editor-specific (newlines and tabs don't make sense in single-line inputs)
             ("Editor", "enter", "editor.insert_newline"),
             ("Editor", "tab", "editor.insert_tab"),
-            ("Editor", "space", "editor.insert_space"),
-            ("Editor", "backspace", "editor.delete_backward"),
-            ("Editor", "delete", "editor.delete_forward"),
-            ("Editor", "left", "editor.move_left"),
-            ("Editor", "right", "editor.move_right"),
             ("Editor", "up", "editor.move_up"),
             ("Editor", "down", "editor.move_down"),
             ("Editor", "shift+left", "editor.extend_left"),
@@ -177,19 +180,11 @@ impl ShortcutRegistry {
             ("Editor", "shift shift", "file_picker.open"),
             ("Editor", "cmd+shift+f", "grep.open"),
 
-            // File picker shortcuts
-            ("FilePicker", "escape", "file_picker.close"),
-            ("FilePicker", "enter", "file_picker.select"),
-            ("FilePicker", "up", "file_picker.move_up"),
-            ("FilePicker", "down", "file_picker.move_down"),
-            ("FilePicker", "backspace", "file_picker.backspace"),
-
-            // Grep shortcuts
-            ("Grep", "escape", "grep.close"),
-            ("Grep", "enter", "grep.select"),
-            ("Grep", "up", "grep.move_up"),
-            ("Grep", "down", "grep.move_down"),
-            ("Grep", "backspace", "grep.backspace"),
+            // Navigation keys - generic events, focused component decides behavior
+            ("Global", "up", "navigate.up"),
+            ("Global", "down", "navigate.down"),
+            ("Global", "escape", "action.cancel"),
+            ("Global", "enter", "action.submit"),
         ];
 
         for &(ctx_str, accel, event) in SHORTCUTS {
