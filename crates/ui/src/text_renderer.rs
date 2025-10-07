@@ -26,10 +26,10 @@ pub struct UnifiedGlyph {
     pub relative_pos: f32,         // Position within token (0.0-1.0)
     pub atlas_index: u8,           // 0 = monochrome (R8), 1 = color (RGBA8)
     // Style attributes (populated from theme during syntax highlighting)
-    pub weight: f32,               // Font weight (400 = normal, 700 = bold)
-    pub italic: bool,              // Italic flag
-    pub underline: bool,           // Underline decoration
-    pub strikethrough: bool,       // Strikethrough decoration
+    pub weight: f32,         // Font weight (400 = normal, 700 = bold)
+    pub italic: bool,        // Italic flag
+    pub underline: bool,     // Underline decoration
+    pub strikethrough: bool, // Strikethrough decoration
 }
 
 // Legacy type alias for compatibility during migration
@@ -178,11 +178,8 @@ impl TextRenderer {
         // Check against last_tree_version (what document version we last built from)
         // layout_version is for cache invalidation and can be bumped independently
         if !force && tree.version == self.last_tree_version {
-            eprintln!("🔨 TextRenderer::update_layout SKIPPED (no changes): tree.version={}", tree.version);
             return;
         }
-
-        eprintln!("🔨 TextRenderer::update_layout RUNNING: tree.version={}, will populate layout_cache", tree.version);
 
         // Build map of (line, pos_in_line, char) → (token_id, relative_pos, weight, italic, underline, strikethrough) for preservation
         // This keeps colors stable when layout rebuilds (e.g., after undo)
@@ -211,7 +208,14 @@ impl TextRenderer {
                 let pos_in_line = (glyph_idx - line_info.char_range.start) as u32;
                 Some((
                     (line_info.line_number, pos_in_line, g.char),
-                    (g.token_id, g.relative_pos, g.weight, g.italic, g.underline, g.strikethrough),
+                    (
+                        g.token_id,
+                        g.relative_pos,
+                        g.weight,
+                        g.italic,
+                        g.underline,
+                        g.strikethrough,
+                    ),
                 ))
             })
             .collect();
@@ -249,36 +253,37 @@ impl TextRenderer {
             let cache_key = (line_hash, font_size_bits, scale_factor_bits);
 
             // Check cache first
-            let (layout_glyphs, cluster_map) = if let Some(cached) = self.shaping_cache.get(&cache_key) {
-                // Cache hit - use cached shaped glyphs
-                (cached.glyphs.clone(), cached.cluster_map.clone())
-            } else {
-                // Cache miss - shape the line and store result
-                let tiny_font::ShapedTextLayout {
-                    glyphs: shaped_glyphs,
-                    cluster_map: shaped_cluster_map,
-                    ..
-                } = font_system.layout_text_shaped_with_tabs(
-                    line_text,
-                    viewport.metrics.font_size,
-                    viewport.scale_factor,
-                    None, // Use default shaping options
-                );
-
-                // Store in cache (limit cache size to prevent unbounded growth)
-                const MAX_CACHE_SIZE: usize = 10000;
-                if self.shaping_cache.len() < MAX_CACHE_SIZE {
-                    self.shaping_cache.insert(
-                        cache_key,
-                        ShapedLineCache {
-                            glyphs: shaped_glyphs.clone(),
-                            cluster_map: shaped_cluster_map.clone(),
-                        },
+            let (layout_glyphs, cluster_map) =
+                if let Some(cached) = self.shaping_cache.get(&cache_key) {
+                    // Cache hit - use cached shaped glyphs
+                    (cached.glyphs.clone(), cached.cluster_map.clone())
+                } else {
+                    // Cache miss - shape the line and store result
+                    let tiny_font::ShapedTextLayout {
+                        glyphs: shaped_glyphs,
+                        cluster_map: shaped_cluster_map,
+                        ..
+                    } = font_system.layout_text_shaped_with_tabs(
+                        line_text,
+                        viewport.metrics.font_size,
+                        viewport.scale_factor,
+                        None, // Use default shaping options
                     );
-                }
 
-                (shaped_glyphs, shaped_cluster_map)
-            };
+                    // Store in cache (limit cache size to prevent unbounded growth)
+                    const MAX_CACHE_SIZE: usize = 10000;
+                    if self.shaping_cache.len() < MAX_CACHE_SIZE {
+                        self.shaping_cache.insert(
+                            cache_key,
+                            ShapedLineCache {
+                                glyphs: shaped_glyphs.clone(),
+                                cluster_map: shaped_cluster_map.clone(),
+                            },
+                        );
+                    }
+
+                    (shaped_glyphs, shaped_cluster_map)
+                };
 
             // Store the cluster map for this line
             self.cluster_maps.push(cluster_map);
@@ -316,8 +321,10 @@ impl TextRenderer {
                     (char_index - line_start_char) as u32,
                     glyph.char,
                 );
-                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
-                    old_tokens.get(&key).copied().unwrap_or((0, 0.0, 400.0, false, false, false));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) = old_tokens
+                    .get(&key)
+                    .copied()
+                    .unwrap_or((0, 0.0, 400.0, false, false, false));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
@@ -373,8 +380,10 @@ impl TextRenderer {
             // Add newline as a glyph (invisible but maintains byte position)
             if line_idx < lines.len() - 1 {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
-                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
-                    old_tokens.get(&key).copied().unwrap_or((0, 0.0, 400.0, false, false, false));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) = old_tokens
+                    .get(&key)
+                    .copied()
+                    .unwrap_or((0, 0.0, 400.0, false, false, false));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -382,7 +391,7 @@ impl TextRenderer {
                         x_offset * viewport.scale_factor,
                         y_pos * viewport.scale_factor,
                     ),
-                    physical_width: 0.0, // Newlines have no width
+                    physical_width: 0.0,              // Newlines have no width
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
                     char_byte_offset: byte_offset,
                     token_id,
@@ -397,8 +406,10 @@ impl TextRenderer {
                 char_index += 1;
             } else if text.ends_with('\n') {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
-                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
-                    old_tokens.get(&key).copied().unwrap_or((0, 0.0, 400.0, false, false, false));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) = old_tokens
+                    .get(&key)
+                    .copied()
+                    .unwrap_or((0, 0.0, 400.0, false, false, false));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -406,7 +417,7 @@ impl TextRenderer {
                         x_offset * viewport.scale_factor,
                         y_pos * viewport.scale_factor,
                     ),
-                    physical_width: 0.0, // Newlines have no width
+                    physical_width: 0.0,              // Newlines have no width
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
                     char_byte_offset: byte_offset,
                     token_id,
@@ -484,10 +495,10 @@ impl TextRenderer {
             // Build runs: consecutive glyphs with same (weight, italic)
             #[derive(Debug)]
             struct StyleRun {
-                glyph_start: usize,  // Index in layout_cache
-                glyph_end: usize,    // Exclusive
-                char_start: usize,   // Index in line_text
-                char_end: usize,     // Exclusive
+                glyph_start: usize, // Index in layout_cache
+                glyph_end: usize,   // Exclusive
+                char_start: usize,  // Index in line_text
+                char_end: usize,    // Exclusive
                 weight: f32,
                 italic: bool,
             }
@@ -823,7 +834,9 @@ impl TextRenderer {
 
                 // Apply style attributes from theme if available
                 if let Some(theme) = theme {
-                    if let Some(style) = theme.get_token_style_for_language(token.token_id, language) {
+                    if let Some(style) =
+                        theme.get_token_style_for_language(token.token_id, language)
+                    {
                         // Apply weight override (or keep default 400.0)
                         if let Some(weight) = style.weight {
                             self.layout_cache[glyph_idx].weight = weight;
@@ -940,7 +953,6 @@ impl TextRenderer {
                 }
             }
         }
-
     }
 
     /// Get visible glyphs with their token IDs
@@ -1139,12 +1151,19 @@ impl TextRenderer {
 
     /// Get style attributes from a glyph as a tuple (weight, italic, underline, strikethrough)
     pub fn get_glyph_style(&self, glyph: &UnifiedGlyph) -> (f32, bool, bool, bool) {
-        (glyph.weight, glyph.italic, glyph.underline, glyph.strikethrough)
+        (
+            glyph.weight,
+            glyph.italic,
+            glyph.underline,
+            glyph.strikethrough,
+        )
     }
 
     /// Get style attributes for a specific glyph index
     pub fn get_glyph_style_at(&self, glyph_idx: usize) -> Option<(f32, bool, bool, bool)> {
-        self.layout_cache.get(glyph_idx).map(|g| self.get_glyph_style(g))
+        self.layout_cache
+            .get(glyph_idx)
+            .map(|g| self.get_glyph_style(g))
     }
 
     // === Position Lookup Methods ===
@@ -1153,7 +1172,10 @@ impl TextRenderer {
     /// Returns None if the byte offset is out of bounds
     pub fn get_position_at_byte(&self, byte_offset: usize) -> Option<LayoutPos> {
         // Binary search for the glyph at or before this byte offset
-        match self.layout_cache.binary_search_by_key(&byte_offset, |g| g.char_byte_offset) {
+        match self
+            .layout_cache
+            .binary_search_by_key(&byte_offset, |g| g.char_byte_offset)
+        {
             Ok(idx) => self.layout_cache.get(idx).map(|g| g.layout_pos),
             Err(idx) => {
                 // Not exact match - get the previous glyph if it exists

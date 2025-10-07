@@ -127,11 +127,7 @@ impl EditableTextView {
             TextViewCapabilities::read_only()
         };
 
-        let view = TextView::with_capabilities(
-            tiny_core::tree::Doc::new(),
-            viewport,
-            caps,
-        );
+        let view = TextView::with_capabilities(tiny_core::tree::Doc::new(), viewport, caps);
 
         Self::new(view, EditMode::ReadOnly { allow_selection })
     }
@@ -279,10 +275,12 @@ impl EditableTextView {
     fn screen_to_local(&self, screen_pos: Point) -> Point {
         Point {
             x: tiny_sdk::LogicalPixels(
-                screen_pos.x.0 - self.view.viewport.bounds.x.0 - self.view.padding_x + self.view.viewport.scroll.x.0,
+                screen_pos.x.0 - self.view.viewport.bounds.x.0 - self.view.padding_x
+                    + self.view.viewport.scroll.x.0,
             ),
             y: tiny_sdk::LogicalPixels(
-                screen_pos.y.0 - self.view.viewport.bounds.y.0 - self.view.padding_y + self.view.viewport.scroll.y.0,
+                screen_pos.y.0 - self.view.viewport.bounds.y.0 - self.view.padding_y
+                    + self.view.viewport.scroll.y.0,
             ),
         }
     }
@@ -306,7 +304,10 @@ impl EditableTextView {
         let cursor_doc = self.input.primary_cursor_doc_pos(&self.view.doc);
 
         // Use Viewport's one-step transform (includes padding)
-        let screen_pos = self.view.viewport.doc_to_screen(cursor_doc, self.view.padding_x, self.view.padding_y);
+        let screen_pos =
+            self.view
+                .viewport
+                .doc_to_screen(cursor_doc, self.view.padding_x, self.view.padding_y);
 
         Some(Point {
             x: screen_pos.x,
@@ -338,7 +339,10 @@ impl EditableTextView {
 
     /// Initialize cursor and selection plugins for this view
     /// Call this once after creating the view, passing the global plugin loader
-    pub fn initialize_plugins(&mut self, plugin_loader: &tiny_core::plugin_loader::PluginLoader) -> Result<(), String> {
+    pub fn initialize_plugins(
+        &mut self,
+        plugin_loader: &tiny_core::plugin_loader::PluginLoader,
+    ) -> Result<(), String> {
         // Skip if already initialized
         if self.has_plugins() {
             return Ok(());
@@ -369,7 +373,10 @@ impl EditableTextView {
     }
 
     /// Setup plugins with GPU resources (must be called after initialize_plugins)
-    pub fn setup_plugins(&mut self, ctx: &mut tiny_sdk::SetupContext) -> Result<(), tiny_sdk::PluginError> {
+    pub fn setup_plugins(
+        &mut self,
+        ctx: &mut tiny_sdk::SetupContext,
+    ) -> Result<(), tiny_sdk::PluginError> {
         if let Some(ref mut plugin) = self.cursor_plugin {
             if let Some(init) = plugin.as_initializable() {
                 init.setup(ctx)?;
@@ -394,19 +401,19 @@ impl EditableTextView {
                     let tree = self.view.doc.read();
                     let line_text = tree.line_text(sel.cursor.line);
 
-                    eprintln!("🔧 sync_plugins: cursor at line={}, column={}, line_text={:?}",
-                        sel.cursor.line, sel.cursor.column, line_text);
-
                     // Get layout position (0,0 relative to content)
-                    let layout_pos = self.view.viewport.doc_to_layout_with_text(sel.cursor, &line_text);
-
-                    eprintln!("🔧 sync_plugins: layout_pos=({}, {})", layout_pos.x.0, layout_pos.y.0);
+                    let layout_pos = self
+                        .view
+                        .viewport
+                        .doc_to_layout_with_text(sel.cursor, &line_text);
 
                     // Convert to view coordinates (subtract scroll, add padding to match text rendering)
                     // Text is rendered at: bounds.origin + padding + view_pos (see TextView::collect_glyphs)
                     // So plugins should receive: padding + view_pos
-                    let view_x = layout_pos.x.0 - self.view.viewport.scroll.x.0 + self.view.padding_x;
-                    let view_y = layout_pos.y.0 - self.view.viewport.scroll.y.0 + self.view.padding_y;
+                    let view_x =
+                        layout_pos.x.0 - self.view.viewport.scroll.x.0 + self.view.padding_x;
+                    let view_y =
+                        layout_pos.y.0 - self.view.viewport.scroll.y.0 + self.view.padding_y;
 
                     // Send as LayoutPos type (confusing naming, but it's view coords)
                     let view_pos = tiny_sdk::LayoutPos::new(view_x, view_y);
@@ -419,7 +426,9 @@ impl EditableTextView {
         if let Some(ref mut plugin) = self.selection_plugin {
             if let Some(library) = plugin.as_library_mut() {
                 // Get selections in view coordinates (scroll applied, need to add padding)
-                let (_, selections) = self.input.get_selection_data(&self.view.doc, &self.view.viewport);
+                let (_, selections) = self
+                    .input
+                    .get_selection_data(&self.view.doc, &self.view.viewport);
 
                 // Encode selections for plugin, adding padding to match text rendering
                 let mut args = Vec::new();
@@ -635,10 +644,10 @@ impl EditableTextView {
                 for rect in sel_rects {
                     // Transform to screen coordinates (logical)
                     // Note: padding is already in viewport.bounds (set by renderer)
-                    let screen_x = self.view.viewport.bounds.x.0 + rect.x.0
-                        - self.view.viewport.scroll.x.0;
-                    let screen_y = self.view.viewport.bounds.y.0 + rect.y.0
-                        - self.view.viewport.scroll.y.0;
+                    let screen_x =
+                        self.view.viewport.bounds.x.0 + rect.x.0 - self.view.viewport.scroll.x.0;
+                    let screen_y =
+                        self.view.viewport.bounds.y.0 + rect.y.0 - self.view.viewport.scroll.y.0;
 
                     // Convert to physical pixels
                     let physical_rect = tiny_core::tree::Rect {

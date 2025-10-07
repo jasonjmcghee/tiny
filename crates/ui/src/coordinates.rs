@@ -316,7 +316,6 @@ impl Viewport {
     /// Document position to layout with actual text (more accurate)
     /// Outputs canonical position starting at (0, 0) - no bounds offset
     pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
-        eprintln!("🐛 doc_to_layout_with_text: pos.column={}, line_text={:?}", pos.column, line_text);
         let x = if let Some(font_system) = &self.font_system {
             // Build the text up to the cursor position (pos.column is character index)
             let mut expanded = String::new();
@@ -406,7 +405,13 @@ impl Viewport {
     }
 
     /// Complete transform with accurate text measurement
-    pub fn doc_to_screen_with_text(&self, pos: DocPos, line_text: &str, padding_x: f32, padding_y: f32) -> LayoutPos {
+    pub fn doc_to_screen_with_text(
+        &self,
+        pos: DocPos,
+        line_text: &str,
+        padding_x: f32,
+        padding_y: f32,
+    ) -> LayoutPos {
         let layout = self.doc_to_layout_with_text(pos, line_text);
         let view_x = layout.x.0 - self.scroll.x.0;
         let view_y = layout.y.0 - self.scroll.y.0;
@@ -426,7 +431,13 @@ impl Viewport {
     }
 
     /// Complete reverse transform with tree for accurate positioning
-    pub fn screen_to_doc_with_tree(&self, screen_pos: LayoutPos, tree: &DocTree, padding_x: f32, padding_y: f32) -> DocPos {
+    pub fn screen_to_doc_with_tree(
+        &self,
+        screen_pos: LayoutPos,
+        tree: &DocTree,
+        padding_x: f32,
+        padding_y: f32,
+    ) -> DocPos {
         let view_x = screen_pos.x.0 - self.bounds.x.0 - padding_x;
         let view_y = screen_pos.y.0 - self.bounds.y.0 - padding_y;
         let layout_x = view_x + self.scroll.x.0;
@@ -479,7 +490,12 @@ impl Viewport {
             0
         };
 
-        eprintln!("🐛 layout_to_doc_with_tree: line={}, doc_x={}, has_font_system={}", line, doc_x, self.font_system.is_some());
+        eprintln!(
+            "🐛 layout_to_doc_with_tree: line={}, doc_x={}, has_font_system={}",
+            line,
+            doc_x,
+            self.font_system.is_some()
+        );
         let column = if let Some(font_system) = &self.font_system {
             // Get the line text and use font system's accurate hit testing
             if let Some(line_start) = tree.line_to_byte(line) {
@@ -618,8 +634,7 @@ impl Viewport {
         let first_line = (self.scroll.y / self.metrics.line_height) as u32;
         // Use bounds.height for the viewport height (works for both root and child viewports)
         let viewport_height = self.bounds.height.0;
-        let last_line =
-            ((self.scroll.y + viewport_height) / self.metrics.line_height) as u32 + 1;
+        let last_line = ((self.scroll.y + viewport_height) / self.metrics.line_height) as u32 + 1;
 
         first_line..last_line
     }
