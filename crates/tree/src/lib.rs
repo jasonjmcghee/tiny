@@ -1805,10 +1805,17 @@ fn compute_sums(spans: &[Span]) -> Sums {
                     sums.len_utf16.0 += meta.total_utf16();
                 } else {
                     // Slow path: iterate characters for large spans (>128 bytes)
-                    let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
-                    for c in text.chars() {
-                        sums.chars += 1;
-                        sums.len_utf16.0 += c.len_utf16();
+                    match from_utf8(bytes) {
+                        Ok(text) => {
+                            for c in text.chars() {
+                                sums.chars += 1;
+                                sums.len_utf16.0 += c.len_utf16();
+                            }
+                        }
+                        Err(_) => {
+                            // Skip invalid UTF-8 bytes
+                            sums.chars += bytes.len();
+                        }
                     }
                 }
             }
@@ -1851,8 +1858,9 @@ fn collect_text(node: &Node, out: &mut String) {
         Node::Leaf { spans, .. } => {
             for span in spans {
                 if let Span::Text { bytes, .. } = span {
-                    let text = unsafe { from_utf8(bytes).unwrap_unchecked() };
-                    out.push_str(text);
+                    if let Ok(text) = from_utf8(bytes) {
+                        out.push_str(text);
+                    }
                 }
             }
         }

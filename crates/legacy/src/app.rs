@@ -1344,6 +1344,9 @@ impl TinyApp {
             self.cursor_needs_scroll = true;
         }
 
+        // NOTE: diagnostics.update() is called AFTER rendering (around line 1675)
+        // when layout cache is populated. Don't call it here!
+
         // Update plugins through orchestrator
         if let Err(e) = self.orchestrator.update_all(dt) {
             eprintln!("Plugin update error: {}", e);
@@ -1362,7 +1365,12 @@ impl TinyApp {
                     let tab = self.editor.tab_manager.active_tab_mut();
                     // Set viewport to current tab scroll before scrolling
                     cpu_renderer.viewport.scroll = tab.scroll_position;
-                    let layout_pos = cpu_renderer.viewport.doc_to_layout(cursor_pos);
+
+                    // Get layout position with tab-aware positioning
+                    let layout_pos = {
+                        let tree = tab.plugin.editor.view.doc.read();
+                        cpu_renderer.viewport.doc_to_layout_with_tree(cursor_pos, &tree)
+                    };
 
                     // Center for goto-definition, otherwise just ensure visible
                     if self.editor.cursor_needs_centering {
@@ -1656,6 +1664,8 @@ impl TinyApp {
 
             // Update diagnostics manager (handles LSP polling, caching, plugin updates)
             // NOTE: cpu_renderer.text_renderer now has populated layout cache from rendering
+            eprintln!("🔍 [APP] Calling diagnostics.update() AFTER rendering, layout cache size: {}",
+                cpu_renderer.text_renderer.layout_cache.len());
             tab.diagnostics
                 .update(&tab.plugin.editor.view.doc, &cpu_renderer.text_renderer);
 

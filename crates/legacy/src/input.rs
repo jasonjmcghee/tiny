@@ -86,7 +86,7 @@ impl Selection {
     }
 
     /// Generate rectangles for this selection (1-3 rectangles for multi-line)
-    pub fn to_rectangles(&self, _doc: &Doc, viewport: &Viewport) -> Vec<LayoutRect> {
+    pub fn to_rectangles(&self, doc: &Doc, viewport: &Viewport) -> Vec<LayoutRect> {
         if self.is_cursor() {
             return Vec::new();
         }
@@ -101,9 +101,11 @@ impl Selection {
         // Dummy rectangle for GPU bug workaround
         let mut rects = vec![LayoutRect::new(0.0, 0.0, 0.0, 0.0)];
 
+        let tree = doc.read();
+
         if start.line == end.line {
-            let start_layout = viewport.doc_to_layout(start);
-            let end_layout = viewport.doc_to_layout(end);
+            let start_layout = viewport.doc_to_layout_with_tree(start, &tree);
+            let end_layout = viewport.doc_to_layout_with_tree(end, &tree);
             rects.push(LayoutRect::new(
                 start_layout.x.0 - 2.0,
                 start_layout.y.0,
@@ -111,8 +113,8 @@ impl Selection {
                 line_height,
             ));
         } else {
-            let start_layout = viewport.doc_to_layout(start);
-            let end_layout = viewport.doc_to_layout(end);
+            let start_layout = viewport.doc_to_layout_with_tree(start, &tree);
+            let end_layout = viewport.doc_to_layout_with_tree(end, &tree);
             let viewport_right = viewport.bounds.width.0;
 
             // First line
@@ -634,6 +636,7 @@ impl InputHandler {
 
         // Handle horizontal movement
         if dx != 0 {
+            eprintln!("⬅️➡️ move_cursor: horizontal movement dx={}", dx);
             self.goal_column = None;
 
             // Get current cursor position
@@ -643,6 +646,7 @@ impl InputHandler {
                 .map(|s| s.cursor)
                 .unwrap_or_default();
 
+            eprintln!("⬅️➡️ move_cursor: current pos line={}, column={}", new_pos.line, new_pos.column);
             if dx < 0 {
                 if new_pos.column > 0 {
                     new_pos.column -= 1;
@@ -1004,8 +1008,10 @@ impl InputHandler {
             x: pos.x + viewport.scroll.x,
             y: pos.y + viewport.scroll.y,
         };
+        eprintln!("🖱️  on_mouse_click: pos=({}, {}), layout_pos=({}, {})", pos.x.0, pos.y.0, layout_pos.x.0, layout_pos.y.0);
         let tree = doc.read();
         let doc_pos = viewport.layout_to_doc_with_tree(layout_pos, &tree);
+        eprintln!("🖱️  on_mouse_click: resulted in doc_pos line={}, column={}", doc_pos.line, doc_pos.column);
 
         // Save to nav history if jumping >5 lines
         if current_pos.line.abs_diff(doc_pos.line) > 5 {

@@ -114,8 +114,10 @@ pub struct TextRenderer {
     pub layout_cache: Vec<UnifiedGlyph>,
     /// Line metadata for culling
     pub line_cache: Vec<LineInfo>,
-    /// Document version for cache invalidation
+    /// Cache invalidation version (increments on any layout change)
     pub layout_version: u64,
+    /// Last tree version we built layout from (tracks document content)
+    last_tree_version: u64,
     /// Cluster map for ligature-aware cursor positioning
     pub cluster_maps: Vec<tiny_font::ClusterMap>,
 
@@ -146,7 +148,8 @@ impl TextRenderer {
         Self {
             layout_cache: Vec::new(),
             line_cache: Vec::new(),
-            layout_version: u64::MAX, // Force initial update
+            layout_version: 0,
+            last_tree_version: u64::MAX, // Force initial update (no tree version will match)
             cluster_maps: Vec::new(),
             syntax_state: SyntaxState {
                 stable_tokens: Vec::new(),
@@ -172,9 +175,14 @@ impl TextRenderer {
         force: bool,
     ) {
         // Only rebuild if text actually changed or forced
-        if !force && tree.version == self.layout_version {
+        // Check against last_tree_version (what document version we last built from)
+        // layout_version is for cache invalidation and can be bumped independently
+        if !force && tree.version == self.last_tree_version {
+            eprintln!("🔨 TextRenderer::update_layout SKIPPED (no changes): tree.version={}", tree.version);
             return;
         }
+
+        eprintln!("🔨 TextRenderer::update_layout RUNNING: tree.version={}, will populate layout_cache", tree.version);
 
         // Build map of (line, pos_in_line, char) → (token_id, relative_pos, weight, italic, underline, strikethrough) for preservation
         // This keeps colors stable when layout rebuilds (e.g., after undo)
@@ -416,15 +424,17 @@ impl TextRenderer {
             y_pos += viewport.metrics.line_height;
         }
 
-        self.layout_version = tree.version;
+        // Track which tree version we built layout from
+        self.last_tree_version = tree.version;
+
+        // Always increment layout_version when we rebuild (for cache invalidation)
+        self.layout_version = self.layout_version.wrapping_add(1);
 
         // Apply demo styles if enabled (parse [w700] tags and reshape)
+        // This modifies glyphs in-place but doesn't require another version bump
         if DEMO_STYLES_MODE.load(Ordering::Relaxed) {
             self.apply_demo_styles(tree);
             self.reshape_for_styles(tree, font_system, viewport);
-
-            // Bump version so collect_glyphs cache invalidates
-            self.layout_version = self.layout_version.wrapping_add(1);
         }
     }
 
@@ -621,20 +631,20 @@ impl TextRenderer {
 
                     // Find the line in line_cache
                     if let Some(line_info) = self.line_cache.get(line_idx) {
-                        // Count glyphs BEFORE tag (box drawing chars, etc)
-                        let glyphs_before_tag = line_text[..tag_start].chars().count();
-                        // Count glyphs IN tag (including brackets)
-                        let tag_glyph_count = line_text[tag_start..=tag_end].chars().count();
-                        // Total glyphs to skip (before + tag itself)
-                        let skip_count = glyphs_before_tag + tag_glyph_count;
+                        // Calculate byte offsets for tag boundaries
+                        let line_start_byte = line_info.byte_range.start;
+                        let tag_start_byte = line_start_byte + tag_start;
+                        let tag_end_byte = line_start_byte + tag_end + 1; // +1 to be past the ']'
 
                         // Apply styles to all glyphs on this line AFTER the tag
-                        for (i, glyph_idx) in line_info.char_range.clone().enumerate() {
-                            if i < skip_count {
-                                continue; // Skip glyphs before and including tag
-                            }
-
+                        // Use byte offsets to handle tabs correctly (tabs expand to multiple glyphs)
+                        for glyph_idx in line_info.char_range.clone() {
                             if let Some(glyph) = self.layout_cache.get_mut(glyph_idx) {
+                                // Skip glyphs before and including the tag
+                                if glyph.char_byte_offset < tag_end_byte {
+                                    continue;
+                                }
+
                                 glyph.weight = weight;
                                 glyph.italic = italic;
                                 glyph.underline = underline;

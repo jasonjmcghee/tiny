@@ -269,7 +269,7 @@ impl EditorLogic {
 
         // Apply pending text edits from code actions
         if let Some(edits) = tab.diagnostics.take_text_edits() {
-            eprintln!("DEBUG: Applying {} text edits to document", edits.len());
+            eprintln!("🔍 [LSP-EDIT] Applying {} text edits to document", edits.len());
 
             // Sort edits by position (reverse order to apply from end to start)
             let mut sorted_edits = edits.clone();
@@ -325,6 +325,27 @@ impl EditorLogic {
             }
 
             tab.plugin.editor.view.doc.flush();
+            eprintln!("🔍 [LSP-EDIT] Text edits applied, document flushed");
+
+            // Notify LSP of document changes
+            let updated_text = tab.plugin.editor.view.doc.read().flatten_to_string();
+            eprintln!("🔍 [LSP-EDIT] Notifying diagnostics of document change (length: {})", updated_text.len());
+            tab.diagnostics.document_changed(updated_text.to_string());
+
+            // Trigger syntax highlighting update
+            if let Some(ref syntax_highlighter) = tab.plugin.syntax_highlighter {
+                if let Some(syntax_hl) = syntax_highlighter
+                    .as_any()
+                    .downcast_ref::<syntax::SyntaxHighlighter>()
+                {
+                    syntax_hl.request_update_with_edit(
+                        &updated_text,
+                        tab.plugin.editor.view.doc.version(),
+                        None
+                    );
+                }
+            }
+
             self.ui_changed = true;
         }
 

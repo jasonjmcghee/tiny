@@ -301,9 +301,22 @@ impl Viewport {
         )
     }
 
+    /// Document position to layout with tree access (gets line text automatically)
+    /// Outputs canonical position starting at (0, 0) - no bounds offset
+    pub fn doc_to_layout_with_tree(&self, pos: DocPos, tree: &tiny_core::tree::Tree) -> LayoutPos {
+        let line_text = if let Some(line_start) = tree.line_to_byte(pos.line) {
+            let line_end = tree.line_to_byte(pos.line + 1).unwrap_or(tree.byte_count());
+            tree.get_text_slice(line_start..line_end)
+        } else {
+            String::new()
+        };
+        self.doc_to_layout_with_text(pos, &line_text)
+    }
+
     /// Document position to layout with actual text (more accurate)
     /// Outputs canonical position starting at (0, 0) - no bounds offset
     pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
+        eprintln!("🐛 doc_to_layout_with_text: pos.column={}, line_text={:?}", pos.column, line_text);
         let x = if let Some(font_system) = &self.font_system {
             // Build the text up to the cursor position (pos.column is character index)
             let mut expanded = String::new();
@@ -466,6 +479,7 @@ impl Viewport {
             0
         };
 
+        eprintln!("🐛 layout_to_doc_with_tree: line={}, doc_x={}, has_font_system={}", line, doc_x, self.font_system.is_some());
         let column = if let Some(font_system) = &self.font_system {
             // Get the line text and use font system's accurate hit testing
             if let Some(line_start) = tree.line_to_byte(line) {

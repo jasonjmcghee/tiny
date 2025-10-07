@@ -32,12 +32,16 @@ impl Tab {
 
         // Create text renderer first (needed for precise diagnostic positions)
         let text_renderer = TextRenderer::new();
+        eprintln!("🔍 [TAB] Created new TextRenderer, layout cache size: {}", text_renderer.layout_cache.len());
 
         // Open file in diagnostics manager if we have a path
         let mut diagnostics = DiagnosticsManager::new();
         if let Some(ref path) = plugin.file_path {
             let content = plugin.editor.view.doc.read().flatten_to_string();
+            eprintln!("🔍 [TAB] Opening file in diagnostics manager: {:?}", path);
             diagnostics.open_file(path.clone(), (*content).clone(), &text_renderer);
+        } else {
+            eprintln!("🔍 [TAB] No file path, skipping diagnostics.open_file()");
         }
 
         Self {

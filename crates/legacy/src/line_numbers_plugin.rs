@@ -106,7 +106,6 @@ impl LineNumbersPlugin {
         let font_size_changed = self.last_font_size != Some(font_size);
 
         if content_changed {
-            eprintln!("Line numbers: regenerating {} lines", total_lines);
             // Calculate max line number width for right alignment
             let max_line_num = total_lines;
             let max_width = max_line_num.to_string().len();

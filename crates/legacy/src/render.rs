@@ -811,6 +811,34 @@ impl Renderer {
             // Draw main text
             self.draw_all_accumulated_glyphs(pass);
 
+            // Paint diagnostics plugin (squiggly lines under text, before cursor)
+            if let Some(diagnostics_ptr) = self.diagnostics_plugin {
+                let editor_viewport = tiny_sdk::types::WidgetViewport {
+                    bounds: self.editor_bounds,
+                    scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
+                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                    widget_id: 2,
+                };
+
+                if let Some(gpu) = self.gpu_renderer {
+                    let gpu_renderer = unsafe { &*gpu };
+                    let mut ctx = PaintContext::new(
+                        self.viewport.to_viewport_info(),
+                        gpu_renderer.device_arc(),
+                        gpu_renderer.queue_arc(),
+                        gpu as *mut _,
+                        &self.service_registry,
+                    )
+                    .with_widget_viewport(editor_viewport);
+                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+
+                    let diagnostics = unsafe { &*diagnostics_ptr };
+                    // DiagnosticsPlugin implements Paintable directly
+                    use tiny_sdk::Paintable as _;
+                    diagnostics.paint(&ctx, pass);
+                }
+            }
+
             // Paint main editor's cursor (foreground)
             if let Some(tab_mgr) = tab_manager {
                 if let Some(tab) = tab_mgr.active_tab() {

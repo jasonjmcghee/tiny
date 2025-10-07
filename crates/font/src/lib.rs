@@ -1249,6 +1249,9 @@ impl SharedFontSystem {
             return 0;
         }
 
+        // Expand tabs to match what layout_text_shaped_with_tabs does internally
+        let expanded = expand_tabs(line_text);
+
         // Use shaped layout to get cluster map
         let shaped = self.layout_text_shaped_with_tabs(
             line_text,
@@ -1280,21 +1283,49 @@ impl SharedFontSystem {
         }
 
         // Get byte position from glyph index using cluster map
-        let byte_pos = if left < shaped.glyphs.len() {
+        // Note: byte positions from cluster map are relative to the EXPANDED text
+        let byte_pos_expanded = if left < shaped.glyphs.len() {
             // Get byte position from cluster map
             shaped
                 .cluster_map
                 .glyph_to_byte(left)
-                .unwrap_or(line_text.len())
+                .unwrap_or(expanded.len())
         } else {
-            line_text.len()
+            expanded.len()
         };
 
         // Snap to cluster boundary to ensure cursor is in a valid position
-        let snapped_byte = shaped.cluster_map.snap_to_cluster_boundary(byte_pos);
+        let snapped_byte_expanded = shaped.cluster_map.snap_to_cluster_boundary(byte_pos_expanded);
 
-        // Convert byte position to character position
-        line_text[..snapped_byte].chars().count() as u32
+        // Convert expanded byte position to character position in expanded text
+        // Then map back to original text by counting characters
+        let char_pos_expanded = expanded[..snapped_byte_expanded.min(expanded.len())].chars().count();
+
+        // Map character position in expanded text to character position in original text
+        // by walking through both strings in parallel
+        let mut orig_char_idx = 0;
+        let mut exp_char_idx = 0;
+
+        for ch in line_text.chars() {
+            if exp_char_idx >= char_pos_expanded {
+                break;
+            }
+
+            if ch == '\t' {
+                // Tab expands to multiple spaces
+                const TAB_WIDTH: usize = 4;
+                let spaces_added = TAB_WIDTH - (exp_char_idx % TAB_WIDTH);
+                exp_char_idx += spaces_added;
+            } else {
+                exp_char_idx += 1;
+            }
+            orig_char_idx += 1;
+        }
+
+        eprintln!("🐛 hit_test_line_shaped: char_pos_expanded={}, orig_char_idx={}, line_text={:?}",
+                  char_pos_expanded, orig_char_idx, line_text);
+
+        orig_char_idx as u32
     }
     /// Find which column corresponds to a pixel position
     pub fn pixel_to_column(&self, x_logical: f32, text: &str, font_size: f32, scale: f32) -> usize {

@@ -394,8 +394,13 @@ impl EditableTextView {
                     let tree = self.view.doc.read();
                     let line_text = tree.line_text(sel.cursor.line);
 
+                    eprintln!("🔧 sync_plugins: cursor at line={}, column={}, line_text={:?}",
+                        sel.cursor.line, sel.cursor.column, line_text);
+
                     // Get layout position (0,0 relative to content)
                     let layout_pos = self.view.viewport.doc_to_layout_with_text(sel.cursor, &line_text);
+
+                    eprintln!("🔧 sync_plugins: layout_pos=({}, {})", layout_pos.x.0, layout_pos.y.0);
 
                     // Convert to view coordinates (subtract scroll, add padding to match text rendering)
                     // Text is rendered at: bounds.origin + padding + view_pos (see TextView::collect_glyphs)
