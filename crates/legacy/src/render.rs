@@ -815,7 +815,7 @@ impl Renderer {
             if let Some(diagnostics_ptr) = self.diagnostics_plugin {
                 let editor_viewport = tiny_sdk::types::WidgetViewport {
                     bounds: self.editor_bounds,
-                    scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
+                    scroll: self.viewport.scroll, // Diagnostics need scroll to convert layout → view
                     content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
                     widget_id: 2,
                 };

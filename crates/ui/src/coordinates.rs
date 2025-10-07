@@ -259,16 +259,9 @@ impl Viewport {
     }
 
     /// Set font system for accurate text measurement
+    /// Note: Does NOT modify line_height - that's set via update_metrics() from app config
     pub fn set_font_system(&mut self, font_system: Arc<tiny_font::SharedFontSystem>) {
-        // Cache the actual metrics from the font system once
-        let line_layout =
-            font_system.layout_text_scaled("A\nB", self.metrics.font_size, self.scale_factor);
-        if line_layout.glyphs.len() >= 2 {
-            self.metrics.line_height =
-                (line_layout.glyphs[1].pos.y.0 - line_layout.glyphs[0].pos.y.0) / self.scale_factor;
-        }
-
-        // Approximated
+        // Update space_width for accurate character measurement
         self.metrics.space_width = font_system.char_width_coef() * self.metrics.font_size;
 
         self.font_system = Some(font_system);
