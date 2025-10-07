@@ -181,15 +181,6 @@ impl TextEditorPlugin {
         Some(self.editor.cursor_pos())
     }
 
-    /// Get primary cursor layout position for rendering
-    pub fn get_primary_cursor_layout_pos(
-        &self,
-        doc: &Doc,
-        viewport: &crate::coordinates::Viewport,
-    ) -> Option<LayoutPos> {
-        let cursor = self.editor.cursor_pos();
-        Some(viewport.doc_to_layout(cursor))
-    }
 
     /// Get selections for rendering
     pub fn selections(&self) -> &[Selection] {

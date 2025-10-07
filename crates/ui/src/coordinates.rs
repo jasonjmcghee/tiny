@@ -129,10 +129,6 @@ impl TextMetrics {
         column
     }
 
-    /// Calculate x position for a column
-    pub fn column_to_x(&self, column: u32) -> f32 {
-        column as f32 * self.space_width
-    }
 }
 
 // === THE Viewport - Central transformation hub ===
@@ -290,17 +286,6 @@ impl Viewport {
 
     // === Forward Transformations (Doc → Layout → View → Physical) ===
 
-    /// Document position to layout position (relative to document origin, no bounds offset)
-    /// This outputs canonical positions starting at (0, 0).
-    /// To get screen position, add viewport.bounds offset and subtract viewport.scroll.
-    pub fn doc_to_layout(&self, pos: DocPos) -> LayoutPos {
-        // Just convert doc coords to logical pixels - NO positioning
-        LayoutPos::new(
-            self.metrics.column_to_x(pos.column),
-            pos.line as f32 * self.metrics.line_height,
-        )
-    }
-
     /// Document position to layout with tree access (gets line text automatically)
     /// Outputs canonical position starting at (0, 0) - no bounds offset
     pub fn doc_to_layout_with_tree(&self, pos: DocPos, tree: &tiny_core::tree::Tree) -> LayoutPos {
@@ -315,48 +300,48 @@ impl Viewport {
 
     /// Document position to layout with actual text (more accurate)
     /// Outputs canonical position starting at (0, 0) - no bounds offset
+    ///
+    /// PANICS if font_system is not set - call set_font_system() first!
     pub fn doc_to_layout_with_text(&self, pos: DocPos, line_text: &str) -> LayoutPos {
-        let x = if let Some(font_system) = &self.font_system {
-            // Build the text up to the cursor position (pos.column is character index)
-            let mut expanded = String::new();
-            let mut char_index = 0u32;
-            let mut visual_column = 0u32;
+        let font_system = self.font_system.as_ref()
+            .expect("font_system must be set before calling doc_to_layout_with_text - call set_font_system() first!");
 
-            for ch in line_text.chars() {
-                if char_index >= pos.column {
-                    break;
-                }
+        // Build the text up to the cursor position (pos.column is character index)
+        let mut expanded = String::new();
+        let mut char_index = 0u32;
+        let mut visual_column = 0u32;
 
-                if ch == '\t' {
-                    // Add spaces to reach next tab stop
-                    let next_tab_stop =
-                        ((visual_column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
-                    let spaces_to_add = next_tab_stop - visual_column;
-                    for _ in 0..spaces_to_add {
-                        expanded.push(' ');
-                    }
-                    visual_column = next_tab_stop;
-                } else {
-                    expanded.push(ch);
-                    visual_column += 1;
-                }
-                char_index += 1; // Each character (including tab) increments char position by 1
+        for ch in line_text.chars() {
+            if char_index >= pos.column {
+                break;
             }
 
-            // Now measure the expanded text
-            if !expanded.is_empty() {
-                let layout = font_system.layout_text_scaled(
-                    &expanded,
-                    self.metrics.font_size,
-                    self.scale_factor,
-                );
-                layout.width / self.scale_factor
+            if ch == '\t' {
+                // Add spaces to reach next tab stop
+                let next_tab_stop =
+                    ((visual_column / self.metrics.tab_stops) + 1) * self.metrics.tab_stops;
+                let spaces_to_add = next_tab_stop - visual_column;
+                for _ in 0..spaces_to_add {
+                    expanded.push(' ');
+                }
+                visual_column = next_tab_stop;
             } else {
-                0.0
+                expanded.push(ch);
+                visual_column += 1;
             }
+            char_index += 1; // Each character (including tab) increments char position by 1
+        }
+
+        // Now measure the expanded text
+        let x = if !expanded.is_empty() {
+            let layout = font_system.layout_text_scaled(
+                &expanded,
+                self.metrics.font_size,
+                self.scale_factor,
+            );
+            layout.width / self.scale_factor
         } else {
-            // Fallback to column-based positioning
-            self.metrics.column_to_x(pos.column)
+            0.0
         };
 
         // Just convert to logical pixels - NO positioning
@@ -373,51 +358,9 @@ impl Viewport {
         PhysicalPos::new(pos.x.0 * self.scale_factor, pos.y.0 * self.scale_factor)
     }
 
-    /// Document to view position
-    pub fn doc_to_view(&self, pos: DocPos) -> ViewPos {
-        self.layout_to_view(self.doc_to_layout(pos))
-    }
-
-    /// Document to physical position
-    pub fn doc_to_physical(&self, pos: DocPos) -> PhysicalPos {
-        self.view_to_physical(self.layout_to_view(self.doc_to_layout(pos)))
-    }
-
     /// Layout to physical position
     pub fn layout_to_physical(&self, pos: LayoutPos) -> PhysicalPos {
         self.view_to_physical(self.layout_to_view(pos))
-    }
-
-    // === Complete Transformations (Doc → Screen, Screen → Doc) ===
-    // These are the ONLY methods you should use for positioning text/cursor/selection
-    // They encapsulate ALL coordinate transforms in one step
-
-    /// Complete transform: Document → Screen coordinates
-    /// Includes: doc → layout → view (scroll) → screen (bounds + padding)
-    /// This is the SINGLE source of truth for positioning
-    pub fn doc_to_screen(&self, pos: DocPos, padding_x: f32, padding_y: f32) -> LayoutPos {
-        let layout = self.doc_to_layout(pos);
-        let view_x = layout.x.0 - self.scroll.x.0;
-        let view_y = layout.y.0 - self.scroll.y.0;
-        let screen_x = self.bounds.x.0 + padding_x + view_x;
-        let screen_y = self.bounds.y.0 + padding_y + view_y;
-        LayoutPos::new(screen_x, screen_y)
-    }
-
-    /// Complete transform with accurate text measurement
-    pub fn doc_to_screen_with_text(
-        &self,
-        pos: DocPos,
-        line_text: &str,
-        padding_x: f32,
-        padding_y: f32,
-    ) -> LayoutPos {
-        let layout = self.doc_to_layout_with_text(pos, line_text);
-        let view_x = layout.x.0 - self.scroll.x.0;
-        let view_y = layout.y.0 - self.scroll.y.0;
-        let screen_x = self.bounds.x.0 + padding_x + view_x;
-        let screen_y = self.bounds.y.0 + padding_y + view_y;
-        LayoutPos::new(screen_x, screen_y)
     }
 
     /// Complete reverse transform: Screen → Document coordinates

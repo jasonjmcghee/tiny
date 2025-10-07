@@ -299,21 +299,6 @@ impl EditableTextView {
         minimal
     }
 
-    /// Get cursor position in screen coordinates
-    pub fn cursor_screen_pos(&self) -> Option<Point> {
-        let cursor_doc = self.input.primary_cursor_doc_pos(&self.view.doc);
-
-        // Use Viewport's one-step transform (includes padding)
-        let screen_pos =
-            self.view
-                .viewport
-                .doc_to_screen(cursor_doc, self.view.padding_x, self.view.padding_y);
-
-        Some(Point {
-            x: screen_pos.x,
-            y: screen_pos.y,
-        })
-    }
 
     /// Get selections
     pub fn selections(&self) -> &[Selection] {

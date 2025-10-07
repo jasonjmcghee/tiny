@@ -1452,10 +1452,9 @@ impl TinyApp {
                 .viewport
                 .update_metrics(&self.text_metrics);
 
-            // Update space_width from font system for accurate measurement
+            // Set font system for accurate text measurement (especially tabs!)
             if let Some(ref font_system) = self.font_system {
-                tab.plugin.editor.view.viewport.metrics.space_width =
-                    font_system.char_width_coef() * self.text_metrics.font_size;
+                tab.plugin.editor.view.viewport.set_font_system(font_system.clone());
             }
 
             // Sync cursor/selection state to main editor's plugins
@@ -1468,7 +1467,7 @@ impl TinyApp {
             // Set tab bar, file picker, and grep plugins (global UI)
             cpu_renderer.set_tab_bar_plugin(&mut self.editor.tab_bar);
 
-            // Propagate metrics to file picker input
+            // Propagate metrics and font system to file picker input
             self.editor
                 .file_picker
                 .input_mut()
@@ -1481,12 +1480,11 @@ impl TinyApp {
                     .input_mut()
                     .view
                     .viewport
-                    .metrics
-                    .space_width = font_system.char_width_coef() * self.text_metrics.font_size;
+                    .set_font_system(font_system.clone());
             }
             cpu_renderer.set_file_picker_plugin(&mut self.editor.file_picker);
 
-            // Propagate metrics to grep input
+            // Propagate metrics and font system to grep input
             self.editor
                 .grep
                 .input_mut()
@@ -1499,8 +1497,7 @@ impl TinyApp {
                     .input_mut()
                     .view
                     .viewport
-                    .metrics
-                    .space_width = font_system.char_width_coef() * self.text_metrics.font_size;
+                    .set_font_system(font_system.clone());
             }
             cpu_renderer.set_grep_plugin(&mut self.editor.grep);
 
