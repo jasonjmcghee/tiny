@@ -91,6 +91,8 @@ pub enum RunFontType {
     Main,
     /// Nerd font symbols
     Nerd,
+    /// System fallback font for Unicode symbols
+    SystemFallback,
     /// Emoji font
     Emoji,
 }

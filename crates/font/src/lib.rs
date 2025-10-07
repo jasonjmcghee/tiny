@@ -18,6 +18,7 @@ mod shaping;
 pub use cluster_map::ClusterMap;
 pub use emoji::{
     contains_emoji, contains_nerd_symbols, contains_special_chars, is_emoji, is_nerd_font_symbol,
+    is_variation_selector,
 };
 pub use rasterize::{FontMetrics, RasterResult, Rasterizer};
 pub use shaping::{RunFontType, ShapedGlyph, Shaper, ShapingOptions, ShapingResult, TextRun};
@@ -31,7 +32,7 @@ use tiny_sdk::services::{
 };
 use tiny_sdk::types::{LayoutPos, PhysicalPos, PhysicalSizeF};
 
-/// Helper to expand tabs to spaces
+/// Helper to expand tabs to spaces and filter variation selectors
 fn expand_tabs(text: &str) -> String {
     const TAB_WIDTH: usize = 4;
     const SPACES: &str = "    "; // Pre-allocated 4 spaces
@@ -40,6 +41,11 @@ fn expand_tabs(text: &str) -> String {
     let mut column = 0;
 
     for ch in text.chars() {
+        // Skip variation selectors - they don't render as separate glyphs
+        if is_variation_selector(ch) {
+            continue;
+        }
+
         if ch == '\t' {
             let spaces_needed = TAB_WIDTH - (column % TAB_WIDTH);
             result.push_str(&SPACES[..spaces_needed]);
@@ -104,6 +110,11 @@ pub struct FontSystem {
     nerd_font_data: Arc<Vec<u8>>,
     /// Nerd font reference for glyph fallback
     nerd_font_ref: FontRef<'static>,
+    /// System Unicode fallback font data (kept alive)
+    #[allow(dead_code)]
+    system_fallback_data: Option<Arc<Vec<u8>>>,
+    /// System Unicode fallback font for missing symbols
+    system_fallback_ref: Option<FontRef<'static>>,
     /// Emoji fallback font data (kept alive)
     #[allow(dead_code)]
     emoji_font_data: Option<Arc<Vec<u8>>>,
@@ -184,6 +195,8 @@ enum FontSource {
     Main,
     /// Nerd font for special glyphs
     Nerd,
+    /// System fallback font for Unicode symbols
+    SystemFallback,
     /// Emoji font for emoji
     Emoji,
 }
@@ -215,12 +228,21 @@ impl FontSystem {
         }
     }
 
+    /// Check if a character is in ambiguous symbol ranges that could be either text or emoji
+    /// These ranges contain both text symbols (★ ♠) and true emojis (☀️ ⛄)
+    /// We prefer monochrome text rendering for these
+    fn is_ambiguous_symbol(ch: char) -> bool {
+        matches!(ch,
+            '\u{2600}'..='\u{26FF}' | // Miscellaneous Symbols (contains ♠♣♥♦, ★☆, ☀☁, etc.)
+            '\u{2700}'..='\u{27BF}'   // Dingbats (contains ✂✈, arrows, etc.)
+        )
+    }
+
     /// Find which font actually has a glyph for this character
     /// Returns (font_ref, font_source) for the first font that has the glyph
-    /// Fallback chain: main (variable weight!) -> nerd (for missing symbols) -> emoji
+    /// Fallback chain: main -> nerd -> system fallback (for ambiguous symbols) -> emoji -> system fallback (last resort)
     ///
     /// IMPORTANT: Try main font FIRST so we use the variable weight fonts!
-    /// Nerd font is only for symbols that main font doesn't have.
     fn select_font_for_char(&self, ch: char, italic: bool) -> (&FontRef<'static>, FontSource) {
         let main_font = self.select_main_font(italic);
 
@@ -229,17 +251,36 @@ impl FontSystem {
             return (main_font, FontSource::Main);
         }
 
-        // Main font doesn't have it - try nerd font (for symbols like ✓ ✗  etc.)
+        // Main font doesn't have it - try nerd font (for symbols like ✓ ✗ ♥ ⚠ etc.)
         let nerd_glyph_id = self.nerd_font_ref.charmap().map(ch);
         if nerd_glyph_id != 0 {
             return (&self.nerd_font_ref, FontSource::Nerd);
         }
 
-        // Try emoji font
+        // For ambiguous symbols (U+2600-U+26FF, U+2700-U+27BF), try system fallback
+        // BEFORE emoji font to prefer monochrome rendering (★ ♠ ♣ ♦ etc.)
+        if Self::is_ambiguous_symbol(ch) {
+            if let Some(system_font) = self.system_fallback_ref.as_ref() {
+                let system_glyph_id = system_font.charmap().map(ch);
+                if system_glyph_id != 0 {
+                    return (system_font, FontSource::SystemFallback);
+                }
+            }
+        }
+
+        // Try emoji font for true color emojis (🎯 🚀 etc.)
         if let Some(emoji_font) = self.emoji_font_ref.as_ref() {
             let emoji_glyph_id = emoji_font.charmap().map(ch);
             if emoji_glyph_id != 0 {
                 return (emoji_font, FontSource::Emoji);
+            }
+        }
+
+        // Last resort: Try system fallback font for anything else
+        if let Some(system_font) = self.system_fallback_ref.as_ref() {
+            let system_glyph_id = system_font.charmap().map(ch);
+            if system_glyph_id != 0 {
+                return (system_font, FontSource::SystemFallback);
             }
         }
 
@@ -254,30 +295,41 @@ impl FontSystem {
         let mut current_run_start = 0;
         let mut current_run_bytes = 0;
         let mut current_run_text = String::new();
-        let mut current_font_type = RunFontType::Main;
+        let mut current_font_type: Option<RunFontType> = None;
 
         for (byte_offset, ch) in text.char_indices() {
+            // Skip variation selectors - they modify the previous character but don't render
+            if is_variation_selector(ch) {
+                continue;
+            }
+
             // Check which font actually has this character
             let (_font_ref, font_source) = self.select_font_for_char(ch, italic);
             let char_font_type = match font_source {
                 FontSource::Main => RunFontType::Main,
                 FontSource::Nerd => RunFontType::Nerd,
+                FontSource::SystemFallback => RunFontType::SystemFallback,
                 FontSource::Emoji => RunFontType::Emoji,
             };
 
+            // Initialize font type from first character
+            if current_font_type.is_none() {
+                current_font_type = Some(char_font_type);
+            }
+
             // Start a new run if font type changes
-            if byte_offset > 0 && char_font_type != current_font_type {
+            if byte_offset > 0 && char_font_type != current_font_type.unwrap() {
                 // Finish current run
                 runs.push(TextRun {
                     byte_range: current_run_start..current_run_start + current_run_bytes,
                     text: std::mem::take(&mut current_run_text),
-                    font_type: current_font_type,
+                    font_type: current_font_type.unwrap(),
                 });
 
                 // Start new run
                 current_run_start = byte_offset;
                 current_run_bytes = 0;
-                current_font_type = char_font_type;
+                current_font_type = Some(char_font_type);
             }
 
             current_run_text.push(ch);
@@ -289,7 +341,7 @@ impl FontSystem {
             runs.push(TextRun {
                 byte_range: current_run_start..current_run_start + current_run_bytes,
                 text: current_run_text,
-                font_type: current_font_type,
+                font_type: current_font_type.unwrap(),
             });
         }
 
@@ -346,6 +398,7 @@ impl FontSystem {
         let regular_font_ref = self.regular_font_ref;
         let italic_font_ref = self.italic_font_ref;
         let nerd_font_ref = self.nerd_font_ref;
+        let system_fallback_ref = self.system_fallback_ref;
         let emoji_font_ref = self.emoji_font_ref;
 
         // Re-rasterize each remaining glyph
@@ -360,6 +413,13 @@ impl FontSystem {
                     }
                 }
                 FontSource::Nerd => &nerd_font_ref,
+                FontSource::SystemFallback => {
+                    if let Some(ref system_ref) = system_fallback_ref {
+                        system_ref
+                    } else {
+                        continue; // Skip if system fallback font not available
+                    }
+                }
                 FontSource::Emoji => {
                     if let Some(ref emoji_ref) = emoji_font_ref {
                         emoji_ref
@@ -383,6 +443,80 @@ impl FontSystem {
         // Mark both atlases as dirty
         self.dirty = true;
         self.color_dirty = true;
+    }
+
+    /// Load system Unicode fallback font (platform-specific)
+    /// Tries to find a monospace font with good Unicode symbol coverage
+    fn load_unicode_fallback_font() -> (Option<Arc<Vec<u8>>>, Option<FontRef<'static>>) {
+        #[cfg(target_os = "macos")]
+        {
+            // Try Menlo (macOS monospace with decent Unicode coverage)
+            let paths = [
+                "/System/Library/Fonts/Menlo.ttc",
+                "/System/Library/Fonts/Monaco.dfont",
+                "/System/Library/Fonts/Helvetica.ttc", // Last resort
+            ];
+
+            for path in &paths {
+                if let Ok(font_data_vec) = std::fs::read(path) {
+                    let font_data = Arc::new(font_data_vec);
+                    let font_data_ref: &'static [u8] =
+                        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
+
+                    if let Some(font_ref) = FontRef::from_index(font_data_ref, 0) {
+                        eprintln!("✅ Loaded system fallback font: {}", path);
+                        return (Some(font_data), Some(font_ref));
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Try fonts with good Unicode coverage on Windows
+            let paths = [
+                "C:\\Windows\\Fonts\\consola.ttf", // Consolas
+                "C:\\Windows\\Fonts\\arial.ttf",   // Arial has good coverage
+            ];
+
+            for path in &paths {
+                if let Ok(font_data_vec) = std::fs::read(path) {
+                    let font_data = Arc::new(font_data_vec);
+                    let font_data_ref: &'static [u8] =
+                        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
+
+                    if let Some(font_ref) = FontRef::from_index(font_data_ref, 0) {
+                        eprintln!("✅ Loaded system fallback font: {}", path);
+                        return (Some(font_data), Some(font_ref));
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // Try DejaVu Sans Mono - excellent Unicode coverage
+            let paths = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            ];
+
+            for path in &paths {
+                if let Ok(font_data_vec) = std::fs::read(path) {
+                    let font_data = Arc::new(font_data_vec);
+                    let font_data_ref: &'static [u8] =
+                        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
+
+                    if let Some(font_ref) = FontRef::from_index(font_data_ref, 0) {
+                        eprintln!("✅ Loaded system fallback font: {}", path);
+                        return (Some(font_data), Some(font_ref));
+                    }
+                }
+            }
+        }
+
+        eprintln!("⚠️ No system Unicode fallback font loaded");
+        (None, None)
     }
 
     /// Load system emoji font (platform-specific)
@@ -474,7 +608,10 @@ impl FontSystem {
         let nerd_font_ref =
             FontRef::from_index(nerd_font_data_ref, 0).expect("Failed to load nerd font");
 
-        // Load emoji font for fallback
+        // Load system Unicode fallback font for missing symbols
+        let (system_fallback_data, system_fallback_ref) = Self::load_unicode_fallback_font();
+
+        // Load emoji font for color emoji fallback
         let (emoji_font_data, emoji_font_ref) = Self::load_emoji_font();
 
         let mut shaper = Shaper::new();
@@ -506,6 +643,8 @@ impl FontSystem {
             italic_font_ref,
             nerd_font_data,
             nerd_font_ref,
+            system_fallback_data,
+            system_fallback_ref,
             emoji_font_data,
             emoji_font_ref,
             shaper,
@@ -620,6 +759,9 @@ impl FontSystem {
                 let font_for_run = match run.font_type {
                     RunFontType::Main => &main_font,
                     RunFontType::Nerd => &self.nerd_font_ref,
+                    RunFontType::SystemFallback => {
+                        self.system_fallback_ref.as_ref().unwrap_or(&main_font)
+                    }
                     RunFontType::Emoji => self.emoji_font_ref.as_ref().unwrap_or(&main_font),
                 };
 
@@ -891,6 +1033,13 @@ impl FontSystem {
                 let (font_ref, font_source) = match run.font_type {
                     RunFontType::Main => (main_font_ref, FontSource::Main),
                     RunFontType::Nerd => (self.nerd_font_ref, FontSource::Nerd),
+                    RunFontType::SystemFallback => {
+                        if let Some(system_font) = self.system_fallback_ref.as_ref() {
+                            (*system_font, FontSource::SystemFallback)
+                        } else {
+                            (main_font_ref, FontSource::Main)
+                        }
+                    }
                     RunFontType::Emoji => {
                         if let Some(emoji_font) = self.emoji_font_ref.as_ref() {
                             (*emoji_font, FontSource::Emoji)
@@ -913,7 +1062,7 @@ impl FontSystem {
                     let (use_italic, use_weight) = if font_source == FontSource::Main {
                         (opts_clone.italic, opts_clone.weight)
                     } else {
-                        (false, 400.0) // Emoji and nerd fonts don't have italic/weight
+                        (false, 400.0) // Fallback fonts (nerd/system/emoji) don't have italic/weight
                     };
 
                     let entry = self.get_or_rasterize_glyph_with_font(
@@ -1295,11 +1444,15 @@ impl SharedFontSystem {
         };
 
         // Snap to cluster boundary to ensure cursor is in a valid position
-        let snapped_byte_expanded = shaped.cluster_map.snap_to_cluster_boundary(byte_pos_expanded);
+        let snapped_byte_expanded = shaped
+            .cluster_map
+            .snap_to_cluster_boundary(byte_pos_expanded);
 
         // Convert expanded byte position to character position in expanded text
         // Then map back to original text by counting characters
-        let char_pos_expanded = expanded[..snapped_byte_expanded.min(expanded.len())].chars().count();
+        let char_pos_expanded = expanded[..snapped_byte_expanded.min(expanded.len())]
+            .chars()
+            .count();
 
         // Map character position in expanded text to character position in original text
         // by walking through both strings in parallel
@@ -1321,9 +1474,6 @@ impl SharedFontSystem {
             }
             orig_char_idx += 1;
         }
-
-        eprintln!("🐛 hit_test_line_shaped: char_pos_expanded={}, orig_char_idx={}, line_text={:?}",
-                  char_pos_expanded, orig_char_idx, line_text);
 
         orig_char_idx as u32
     }
@@ -1495,44 +1645,70 @@ mod tests {
         let nerd_font_ref =
             FontRef::from_index(nerd_font_data, 0).expect("Failed to load nerd font");
 
-        let checkmark = '✓'; // U+2713
-        let ballot_x = '✗'; // U+2717
-        let powerline = '\u{E0A0}'; // U+E0A0 - Powerline triangle
+        // Sample of common Nerd Font PUA icons
+        let nerd_icons = vec![
+            // Powerline
+            ('\u{E0A0}', "U+E0A0", "powerline branch"),
+            ('\u{E0A1}', "U+E0A1", "powerline ln"),
+            ('\u{E0A2}', "U+E0A2", "powerline lock"),
+            ('\u{E0B0}', "U+E0B0", "powerline arrow right"),
+            ('\u{E0B1}', "U+E0B1", "powerline arrow right alt"),
+            ('\u{E0B2}', "U+E0B2", "powerline arrow left"),
+            ('\u{E0B3}', "U+E0B3", "powerline arrow left alt"),
+            // Devicons (file types)
+            ('\u{E7C5}', "U+E7C5", "devicon javascript"),
+            ('\u{E718}', "U+E718", "devicon python"),
+            ('\u{E7A8}', "U+E7A8", "devicon rust"),
+            // Font Awesome
+            ('\u{F07C}', "U+F07C", "folder"),
+            ('\u{F15B}', "U+F15B", "file"),
+            ('\u{F1C0}', "U+F1C0", "database"),
+            ('\u{F09B}', "U+F09B", "github"),
+            ('\u{F126}', "U+F126", "code"),
+            ('\u{F0C9}', "U+F0C9", "list"),
+        ];
 
-        let checkmark_glyph = nerd_font_ref.charmap().map(checkmark);
-        let ballot_x_glyph = nerd_font_ref.charmap().map(ballot_x);
-        let powerline_glyph = nerd_font_ref.charmap().map(powerline);
+        let standard_symbols = vec![
+            ('✓', "U+2713", "checkmark"),
+            ('✗', "U+2717", "ballot x"),
+            ('★', "U+2605", "star"),
+            ('♥', "U+2665", "heart"),
+            ('⚠', "U+26A0", "warning sign"),
+        ];
 
-        println!("\nNerd font (full JetBrainsMonoNerdFont-Regular) test results:");
-        println!(
-            "  ✓ (U+2713) has glyph_id: {} ({})",
-            checkmark_glyph,
-            if checkmark_glyph != 0 {
-                "✓ FOUND"
-            } else {
-                "✗ NOT FOUND"
-            }
-        );
-        println!(
-            "  ✗ (U+2717) has glyph_id: {} ({})",
-            ballot_x_glyph,
-            if ballot_x_glyph != 0 {
-                "✓ FOUND"
-            } else {
-                "✗ NOT FOUND"
-            }
-        );
-        println!(
-            "  U+E0A0 has glyph_id: {} ({})",
-            powerline_glyph,
-            if powerline_glyph != 0 {
-                "✓ FOUND"
-            } else {
-                "✗ NOT FOUND"
-            }
-        );
+        println!("\n=== Nerd Font Icon Coverage Test ===");
+        println!("\nNerd Font PUA Icons:");
+        for (ch, unicode, name) in &nerd_icons {
+            let glyph_id = nerd_font_ref.charmap().map(*ch);
+            println!(
+                "  {} {} {:30} glyph_id: {:5} {}",
+                if glyph_id != 0 { '✓' } else { '✗' },
+                unicode,
+                name,
+                glyph_id,
+                if glyph_id != 0 { "" } else { "NOT FOUND" }
+            );
+        }
 
-        // These should all be present in the full nerd font
+        println!("\nStandard Unicode Symbols:");
+        for (ch, unicode, name) in &standard_symbols {
+            let glyph_id = nerd_font_ref.charmap().map(*ch);
+            println!(
+                "  {} {} {} {:30} glyph_id: {:5} {}",
+                ch,
+                if glyph_id != 0 { '✓' } else { '✗' },
+                unicode,
+                name,
+                glyph_id,
+                if glyph_id != 0 { "" } else { "NOT FOUND" }
+            );
+        }
+
+        // Basic symbols should be present
+        let checkmark_glyph = nerd_font_ref.charmap().map('✓');
+        let ballot_x_glyph = nerd_font_ref.charmap().map('✗');
+        let powerline_glyph = nerd_font_ref.charmap().map('\u{E0A0}');
+
         assert_ne!(
             checkmark_glyph, 0,
             "Checkmark ✓ should be in full nerd font"

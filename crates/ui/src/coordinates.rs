@@ -490,12 +490,6 @@ impl Viewport {
             0
         };
 
-        eprintln!(
-            "🐛 layout_to_doc_with_tree: line={}, doc_x={}, has_font_system={}",
-            line,
-            doc_x,
-            self.font_system.is_some()
-        );
         let column = if let Some(font_system) = &self.font_system {
             // Get the line text and use font system's accurate hit testing
             if let Some(line_start) = tree.line_to_byte(line) {

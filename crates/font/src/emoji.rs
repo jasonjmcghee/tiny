@@ -35,6 +35,12 @@ pub fn is_nerd_font_symbol(ch: char) -> bool {
     )
 }
 
+/// Check if a character is a variation selector (emoji/text presentation modifier)
+/// These should not be rendered as separate glyphs
+pub fn is_variation_selector(ch: char) -> bool {
+    matches!(ch, '\u{FE00}'..='\u{FE0F}')
+}
+
 /// Check if a character is an emoji (heuristic only!)
 ///
 /// This is a HINT based on unicode ranges. The actual font selection
@@ -46,7 +52,6 @@ pub fn is_emoji(ch: char) -> bool {
         '\u{1F900}'..='\u{1F9FF}' | // Supplemental Symbols and Pictographs
         '\u{2600}'..='\u{26FF}'   | // Miscellaneous Symbols
         '\u{2700}'..='\u{27BF}'   | // Dingbats
-        '\u{FE00}'..='\u{FE0F}'   | // Variation Selectors
         '\u{1F000}'..='\u{1F02F}' | // Mahjong Tiles
         '\u{1F0A0}'..='\u{1F0FF}' | // Playing Cards
         '\u{1F700}'..='\u{1F77F}' | // Alchemical Symbols
