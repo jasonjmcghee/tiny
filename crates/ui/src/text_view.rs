@@ -84,8 +84,10 @@ pub struct TextView {
 
     /// Cached glyphs (at canonical positions before scroll/viewport offset)
     cached_glyphs: Vec<GlyphInstance>,
-    /// Last doc version when glyphs were generated (atomic for lock-free check)
+    /// Last layout version when glyphs were generated (atomic for lock-free check)
     cached_glyph_version: AtomicU64,
+    /// Last layout version that was rendered (for external change detection)
+    last_rendered_layout_version: AtomicU64,
     /// Last scroll position when glyphs were generated
     cached_scroll_y: f32,
     /// Last scroll position when glyphs were generated
@@ -133,6 +135,7 @@ impl TextView {
             padding_y: 0.0,
             cached_glyphs: Vec::new(),
             cached_glyph_version: AtomicU64::new(0),
+            last_rendered_layout_version: AtomicU64::new(0),
             cached_scroll_y: 0.0,
             cached_scroll_x: 0.0,
             cached_bounds: Rect { x: LogicalPixels(0.0), y: LogicalPixels(0.0), width: LogicalPixels(0.0), height: LogicalPixels(0.0) },
@@ -459,6 +462,19 @@ impl TextView {
     /// Get content height in logical pixels
     pub fn content_height(&self) -> f32 {
         self.renderer.line_cache.len() as f32 * self.viewport.metrics.line_height
+    }
+
+    /// Check if rendering is needed (layout changed since last render)
+    /// Call this once per frame, it will return true only once per layout change
+    pub fn needs_render(&self) -> bool {
+        let current = self.renderer.layout_version;
+        let last = self.last_rendered_layout_version.load(Ordering::Relaxed);
+        if current != last {
+            self.last_rendered_layout_version.store(current, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Get content width in logical pixels (max line width)

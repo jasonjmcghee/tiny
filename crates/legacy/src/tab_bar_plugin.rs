@@ -147,17 +147,14 @@ impl TabBarPlugin {
         collector: &mut crate::render::GlyphCollector,
         tab_manager: &TabManager,
     ) {
-        // Get font service from service registry
         let font_service = match collector.services().get::<SharedFontSystem>() {
             Some(fs) => fs,
             None => return,
         };
 
-        let scale_factor = collector.viewport.scale_factor;
-        let font_size = collector.viewport.font_size;
         let line_height = collector.viewport.line_height;
 
-        // Extract widget bounds before loop to avoid borrow issues
+        // Extract widget bounds before loop
         let bounds_x = collector
             .widget_viewport
             .as_ref()
@@ -188,10 +185,9 @@ impl TabBarPlugin {
                 display_name.push_str(" •");
             }
 
-            // Create viewport for this tab's text
-            let mut tab_viewport = Viewport::new(tab_width - CLOSE_BUTTON_WIDTH, self.height, scale_factor);
-            tab_viewport.metrics.font_size = font_size;
-            tab_viewport.metrics.line_height = line_height;
+            // Create and configure viewport for this tab's text
+            let mut tab_viewport = Viewport::new(tab_width - CLOSE_BUTTON_WIDTH, self.height, collector.viewport.scale_factor);
+            collector.configure_viewport(&mut tab_viewport);
             tab_viewport.bounds = Rect {
                 x: tiny_sdk::LogicalPixels(bounds_x + x_offset),
                 y: tiny_sdk::LogicalPixels(bounds_y),
@@ -218,8 +214,9 @@ impl TabBarPlugin {
             // Close button "x"
             let close_x = x_offset + tab_width - CLOSE_BUTTON_WIDTH;
 
-            let close_viewport = Viewport::new(CLOSE_BUTTON_WIDTH, self.height, scale_factor);
-            let close_bounds = Rect {
+            let mut close_viewport = Viewport::new(CLOSE_BUTTON_WIDTH, self.height, collector.viewport.scale_factor);
+            collector.configure_viewport(&mut close_viewport);
+            close_viewport.bounds = Rect {
                 x: tiny_sdk::LogicalPixels(bounds_x + close_x),
                 y: tiny_sdk::LogicalPixels(bounds_y),
                 width: tiny_sdk::LogicalPixels(CLOSE_BUTTON_WIDTH),
@@ -229,9 +226,6 @@ impl TabBarPlugin {
             let mut close_view = TextView::from_text("×", close_viewport)
                 .with_align(tiny_ui::text_view::TextAlign::Center)
                 .with_padding_y((self.height - line_height) / 2.0);
-            close_view.viewport.bounds = close_bounds;
-            close_view.viewport.metrics.font_size = font_size;
-            close_view.viewport.metrics.line_height = line_height;
             close_view.update_layout(&font_service);
 
             let mut close_glyphs = close_view.collect_glyphs(&font_service);
@@ -247,8 +241,9 @@ impl TabBarPlugin {
         let dropdown_x = viewport_width - 30.0;
         let dropdown_y = (self.height - line_height) / 2.0;
 
-        let dropdown_viewport = Viewport::new(30.0, self.height, scale_factor);
-        let dropdown_bounds = Rect {
+        let mut dropdown_viewport = Viewport::new(30.0, self.height, collector.viewport.scale_factor);
+        collector.configure_viewport(&mut dropdown_viewport);
+        dropdown_viewport.bounds = Rect {
             x: tiny_sdk::LogicalPixels(bounds_x + dropdown_x),
             y: tiny_sdk::LogicalPixels(bounds_y + dropdown_y),
             width: tiny_sdk::LogicalPixels(30.0),
@@ -256,9 +251,6 @@ impl TabBarPlugin {
         };
 
         let mut dropdown_view = TextView::from_text("▼", dropdown_viewport);
-        dropdown_view.viewport.bounds = dropdown_bounds;
-        dropdown_view.viewport.metrics.font_size = font_size;
-        dropdown_view.viewport.metrics.line_height = line_height;
         dropdown_view.update_layout(&font_service);
 
         let mut dropdown_glyphs = dropdown_view.collect_glyphs(&font_service);
@@ -292,8 +284,9 @@ impl TabBarPlugin {
 
                 // Create TextView for dropdown item
                 let dropdown_item_x = dropdown_x - DROPDOWN_WIDTH + 10.0;
-                let dropdown_item_viewport = Viewport::new(DROPDOWN_WIDTH - 30.0, line_height, scale_factor);
-                let dropdown_item_bounds = Rect {
+                let mut dropdown_item_viewport = Viewport::new(DROPDOWN_WIDTH - 30.0, line_height, collector.viewport.scale_factor);
+                collector.configure_viewport(&mut dropdown_item_viewport);
+                dropdown_item_viewport.bounds = Rect {
                     x: tiny_sdk::LogicalPixels(bounds_x + dropdown_item_x),
                     y: tiny_sdk::LogicalPixels(bounds_y + item_y),
                     width: tiny_sdk::LogicalPixels(DROPDOWN_WIDTH - 30.0),
@@ -301,9 +294,6 @@ impl TabBarPlugin {
                 };
 
                 let mut dropdown_item_view = TextView::from_text(&dropdown_text, dropdown_item_viewport);
-                dropdown_item_view.viewport.bounds = dropdown_item_bounds;
-                dropdown_item_view.viewport.metrics.font_size = font_size;
-                dropdown_item_view.viewport.metrics.line_height = line_height;
                 dropdown_item_view.update_layout(&font_service);
 
                 let mut dropdown_item_glyphs = dropdown_item_view.collect_glyphs(&font_service);
@@ -314,8 +304,9 @@ impl TabBarPlugin {
 
                 // Close button for dropdown items
                 let close_dropdown_x = dropdown_x - 20.0;
-                let close_dropdown_viewport = Viewport::new(20.0, line_height, scale_factor);
-                let close_dropdown_bounds = Rect {
+                let mut close_dropdown_viewport = Viewport::new(20.0, line_height, collector.viewport.scale_factor);
+                collector.configure_viewport(&mut close_dropdown_viewport);
+                close_dropdown_viewport.bounds = Rect {
                     x: tiny_sdk::LogicalPixels(bounds_x + close_dropdown_x),
                     y: tiny_sdk::LogicalPixels(bounds_y + item_y),
                     width: tiny_sdk::LogicalPixels(20.0),
@@ -323,9 +314,6 @@ impl TabBarPlugin {
                 };
 
                 let mut close_dropdown_view = TextView::from_text("×", close_dropdown_viewport);
-                close_dropdown_view.viewport.bounds = close_dropdown_bounds;
-                close_dropdown_view.viewport.metrics.font_size = font_size;
-                close_dropdown_view.viewport.metrics.line_height = line_height;
                 close_dropdown_view.update_layout(&font_service);
 
                 let mut close_dropdown_glyphs = close_dropdown_view.collect_glyphs(&font_service);

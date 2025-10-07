@@ -560,11 +560,14 @@ impl Renderer {
         self.line_numbers_dirty = true;
     }
 
-    /// Clear edit deltas (called after undo/redo when tree is replaced)
+    /// Clear all caches (called when font size/metrics change)
     pub fn clear_all_caches(&mut self) {
         // Force complete re-layout by marking everything dirty
         self.layout_dirty = true;
         self.syntax_dirty = true;
+        self.glyphs_dirty = true;
+        self.line_numbers_dirty = true;
+        self.ui_dirty = true; // Tab bar and other UI need regeneration too
         self.last_rendered_version = 0; // Force re-render
         self.cached_doc_text = None;
         self.cached_doc_version = 0;
@@ -622,6 +625,64 @@ impl Renderer {
         }
     }
 
+    /// Collect all glyphs to trigger rasterization (call BEFORE starting render pass)
+    pub fn collect_all_glyphs(&mut self, tree: &Tree, tab_manager: Option<&crate::tab_manager::TabManager>) {
+        let content_changed =
+            tree.version != self.last_rendered_version || self.layout_dirty || self.syntax_dirty;
+
+        let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
+        let scroll_changed = current_scroll != self.last_scroll;
+        if scroll_changed {
+            self.glyphs_dirty = true;
+            self.last_scroll = current_scroll;
+        }
+
+        if content_changed {
+            self.prepare_render(tree);
+        }
+
+        let visible_range = self.viewport.visible_byte_range_with_tree(tree);
+        if self.glyphs_dirty || content_changed || scroll_changed {
+            self.accumulated_glyphs.clear();
+            self.text_decoration_rects.clear();
+            self.collect_main_text_glyphs(tree, visible_range.clone());
+            self.glyphs_dirty = false;
+        }
+
+        if self.line_numbers_dirty || scroll_changed {
+            self.line_number_glyphs.clear();
+            let old_editor_bounds_x = self.editor_bounds.x.0;
+            self.collect_line_number_glyphs();
+            if self.line_numbers_dirty {
+                let (w, h) = (self.viewport.logical_size.width.0, self.viewport.logical_size.height.0);
+                self.update_editor_bounds(w, h);
+                if (old_editor_bounds_x - self.editor_bounds.x.0).abs() > 0.01 {
+                    self.accumulated_glyphs.clear();
+                    self.text_decoration_rects.clear();
+                    self.collect_main_text_glyphs(tree, visible_range.clone());
+                }
+                self.line_numbers_dirty = false;
+            }
+        }
+
+        if self.ui_dirty {
+            self.tab_bar_glyphs.clear();
+            self.tab_bar_rects.clear();
+            if let Some(tab_mgr) = tab_manager {
+                self.collect_tab_bar_glyphs(tab_mgr);
+            }
+            self.file_picker_glyphs.clear();
+            self.collect_file_picker_glyphs();
+            self.grep_glyphs.clear();
+            self.collect_grep_glyphs();
+            self.ui_dirty = false;
+        }
+
+        self.last_rendered_version = tree.version;
+        self.layout_dirty = false;
+        self.syntax_dirty = false;
+    }
+
     pub fn render_with_pass_and_context(
         &mut self,
         tree: &Tree,
@@ -660,84 +721,10 @@ impl Renderer {
             self.last_grep_visible = grep_visible;
         }
 
-        // Check if scroll changed
-        let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
-        let scroll_changed = current_scroll != self.last_scroll;
-        if scroll_changed {
-            self.glyphs_dirty = true;
-            self.last_scroll = current_scroll;
-        }
-
-        let content_changed =
-            tree.version != self.last_rendered_version || self.layout_dirty || self.syntax_dirty;
-
-        // Early exit if nothing changed at all
-        if !content_changed
-            && !scroll_changed
-            && !self.glyphs_dirty
-            && !self.line_numbers_dirty
-            && !self.ui_dirty
-        {
-            return;
-        }
-
-        // Only prepare render if content actually changed
-        if content_changed {
-            self.prepare_render(tree);
-        }
-
-        // Only regenerate glyphs if something actually changed
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
-        if self.glyphs_dirty || content_changed || scroll_changed {
-            self.accumulated_glyphs.clear();
-            self.text_decoration_rects.clear();
-            self.collect_main_text_glyphs(tree, visible_range.clone());
-            // Note: cursor/selection rects will be collected from app.rs when needed
-            self.glyphs_dirty = false;
-        }
 
         if let Some(pass) = render_pass.as_deref_mut() {
             let scale = self.viewport.scale_factor;
-
-            // === COLLECT GLYPHS ===
-            // Only regenerate line numbers if dirty (but scroll will still update every call)
-            if self.line_numbers_dirty || scroll_changed {
-                self.line_number_glyphs.clear();
-                let old_editor_bounds_x = self.editor_bounds.x.0;
-                self.collect_line_number_glyphs();
-
-                // Only update editor bounds if content actually changed (not just scroll)
-                if self.line_numbers_dirty {
-                    // Update editor bounds in case line numbers width changed
-                    let (w, h) = (self.viewport.logical_size.width.0, self.viewport.logical_size.height.0);
-                    self.update_editor_bounds(w, h);
-                    // If editor X position changed (line numbers width changed), regenerate main text
-                    if (old_editor_bounds_x - self.editor_bounds.x.0).abs() > 0.01 {
-                        self.accumulated_glyphs.clear();
-                        self.text_decoration_rects.clear();
-                        self.collect_main_text_glyphs(tree, visible_range.clone());
-                    }
-                    self.line_numbers_dirty = false;
-                }
-            }
-
-
-            // Only regenerate UI if dirty
-            if self.ui_dirty {
-                self.tab_bar_glyphs.clear();
-                self.tab_bar_rects.clear();
-                if let Some(tab_mgr) = tab_manager {
-                    self.collect_tab_bar_glyphs(tab_mgr);
-                }
-
-                self.file_picker_glyphs.clear();
-                self.collect_file_picker_glyphs();
-
-                self.grep_glyphs.clear();
-                self.collect_grep_glyphs();
-
-                self.ui_dirty = false;
-            }
 
             // === DRAW EDITOR CONTENT FIRST ===
             // Set scissor rect - using consistent rounding to avoid off-by-one errors
@@ -1074,11 +1061,8 @@ impl Renderer {
             // Draw any remaining spatial widgets
             self.walk_visible_range_no_glyphs(tree, visible_range, pass);
         }
-
-        self.last_rendered_version = tree.version;
-        self.layout_dirty = false;
-        self.syntax_dirty = false;
     }
+
 
     fn prepare_render(&mut self, tree: &Tree) {
         // TextRenderer now outputs canonical (0,0)-relative glyphs
@@ -1665,5 +1649,16 @@ impl GlyphCollector {
 
     pub fn services(&self) -> &ServiceRegistry {
         unsafe { &*self.services }
+    }
+
+    /// Configure a viewport with current font metrics and font system
+    /// Call this instead of manually setting font_size/line_height/font_system
+    pub fn configure_viewport(&self, viewport: &mut Viewport) {
+        viewport.metrics.font_size = self.viewport.font_size;
+        viewport.metrics.line_height = self.viewport.line_height;
+        viewport.scale_factor = self.viewport.scale_factor;
+        if let Some(font_system) = self.services().get::<tiny_font::SharedFontSystem>() {
+            viewport.set_font_system(font_system.clone());
+        }
     }
 }

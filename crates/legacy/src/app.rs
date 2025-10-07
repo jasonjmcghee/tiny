@@ -577,42 +577,26 @@ impl TinyApp {
 
         println!("Font size changed to: {:.1}pt", new_font_size);
 
+        // Calculate current line height multiplier to preserve it
+        let line_height_multiplier = self.text_metrics.line_height / self.text_metrics.font_size;
+
         // Update source of truth (render_frame will propagate to all viewports)
         let mut new_metrics = TextMetrics::new(new_font_size);
-        new_metrics.line_height = new_font_size * 1.4; // Keep multiplier
+        new_metrics.line_height = new_font_size * line_height_multiplier;
         self.text_metrics = new_metrics;
 
-        // Update CPU renderer (needed for text rendering)
+        // Update CPU renderer and clear font atlas cache
         if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            cpu_renderer.clear_all_caches();
             cpu_renderer.set_font_size(new_font_size);
-            if let Some(font_system) = &self.font_system {
-                cpu_renderer.set_font_system(font_system.clone());
-            }
-            cpu_renderer.set_line_height(new_font_size * 1.4);
+            cpu_renderer.set_line_height(new_font_size * line_height_multiplier);
         }
 
-        // Update font system rasterization (needed for GPU atlas)
+        // Clear and re-rasterize font atlas at new size
         if let Some(font_system) = &self.font_system {
             if let Some(window) = &self.window {
                 let scale_factor = window.scale_factor() as f32;
                 font_system.prerasterize_ascii(new_font_size * scale_factor);
-
-                // Re-upload font atlases to GPU
-                if let Some(gpu_renderer) = &self.gpu_renderer {
-                    let atlas_data = font_system.atlas_data();
-                    let (atlas_width, atlas_height) = font_system.atlas_size();
-                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
-
-                    if font_system.is_color_dirty() {
-                        let color_atlas_data = font_system.color_atlas_data();
-                        gpu_renderer.upload_color_font_atlas(
-                            &color_atlas_data,
-                            atlas_width,
-                            atlas_height,
-                        );
-                        font_system.clear_color_dirty();
-                    }
-                }
             }
         }
 
@@ -793,8 +777,11 @@ impl TinyApp {
                 zoom_ratio
             );
 
-            // Mark everything dirty to force re-layout
+            // Update renderer with new metrics
             if let Some(renderer) = &mut self.cpu_renderer {
+                renderer.clear_all_caches(); // Clear before changing metrics
+                renderer.set_font_size(new_font_size);
+                renderer.set_line_height(new_line_height);
                 renderer.mark_ui_dirty();
             }
         } else {
@@ -806,6 +793,8 @@ impl TinyApp {
             if line_height_changed {
                 self.text_metrics.line_height = expected_line_height;
                 if let Some(renderer) = &mut self.cpu_renderer {
+                    renderer.clear_all_caches(); // Clear before changing line height
+                    renderer.set_line_height(expected_line_height);
                     renderer.mark_ui_dirty();
                 }
             }
@@ -1547,32 +1536,6 @@ impl TinyApp {
             }
         }
 
-        // Upload font atlases only if dirty (atlas changed)
-        if let Some(font_system) = &self.font_system {
-            if font_system.is_dirty() {
-                let atlas_data = font_system.atlas_data();
-                let (atlas_width, atlas_height) = font_system.atlas_size();
-                if let Some(gpu_renderer) = &mut self.gpu_renderer {
-                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
-                }
-                font_system.clear_dirty();
-            }
-
-            // Upload color atlas if dirty
-            if font_system.is_color_dirty() {
-                let color_atlas_data = font_system.color_atlas_data();
-                let (atlas_width, atlas_height) = font_system.atlas_size();
-                if let Some(gpu_renderer) = &mut self.gpu_renderer {
-                    gpu_renderer.upload_color_font_atlas(
-                        &color_atlas_data,
-                        atlas_width,
-                        atlas_height,
-                    );
-                }
-                font_system.clear_color_dirty();
-            }
-        }
-
         let doc = self.editor.doc();
         let doc_read = doc.read();
 
@@ -1636,13 +1599,41 @@ impl TinyApp {
             _padding: [0.0, 0.0, 0.0],
         };
 
-        // Set up CPU renderer state and render
+        // Collect all glyphs BEFORE starting render pass (triggers rasterization)
+        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+            unsafe {
+                let tab_manager_ref = tab_manager.map(|ptr| &*ptr);
+                cpu_renderer.collect_all_glyphs(&doc_read, tab_manager_ref);
+            }
+        }
+
+        // Upload atlases AFTER all rasterization, BEFORE render pass
+        if let Some(font_system) = &self.font_system {
+            if font_system.is_dirty() {
+                let atlas_data = font_system.atlas_data();
+                let (atlas_width, atlas_height) = font_system.atlas_size();
+                if let Some(gpu_renderer) = &mut self.gpu_renderer {
+                    gpu_renderer.upload_font_atlas(&atlas_data, atlas_width, atlas_height);
+                }
+                font_system.clear_dirty();
+            }
+
+            if font_system.is_color_dirty() {
+                let color_atlas_data = font_system.color_atlas_data();
+                let (atlas_width, atlas_height) = font_system.atlas_size();
+                if let Some(gpu_renderer) = &mut self.gpu_renderer {
+                    gpu_renderer.upload_color_font_atlas(&color_atlas_data, atlas_width, atlas_height);
+                }
+                font_system.clear_color_dirty();
+            }
+        }
+
+        // Render
         if let (Some(gpu_renderer), Some(cpu_renderer)) =
             (&mut self.gpu_renderer, &mut self.cpu_renderer)
         {
             cpu_renderer.set_gpu_renderer(gpu_renderer);
 
-            // Just use the existing render pipeline - it was working!
             unsafe {
                 let tab_manager_ref = tab_manager.map(|ptr| &*ptr);
                 gpu_renderer.render_with_callback(uniforms, |render_pass| {

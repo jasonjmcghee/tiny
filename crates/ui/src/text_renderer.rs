@@ -118,6 +118,10 @@ pub struct TextRenderer {
     pub layout_version: u64,
     /// Last tree version we built layout from (tracks document content)
     last_tree_version: u64,
+    /// Last metrics we built layout with (for auto-invalidation on metric changes)
+    last_font_size: f32,
+    last_line_height: f32,
+    last_scale_factor: f32,
     /// Cluster map for ligature-aware cursor positioning
     pub cluster_maps: Vec<tiny_font::ClusterMap>,
 
@@ -150,6 +154,9 @@ impl TextRenderer {
             line_cache: Vec::new(),
             layout_version: 0,
             last_tree_version: u64::MAX, // Force initial update (no tree version will match)
+            last_font_size: 0.0,
+            last_line_height: 0.0,
+            last_scale_factor: 0.0,
             cluster_maps: Vec::new(),
             syntax_state: SyntaxState {
                 stable_tokens: Vec::new(),
@@ -167,6 +174,7 @@ impl TextRenderer {
 
     /// Update layout cache when text changes
     /// Outputs glyphs in canonical (0,0)-relative positions
+    /// Automatically detects changes in font_size, line_height, scale_factor and rebuilds
     pub fn update_layout(
         &mut self,
         tree: &Tree,
@@ -174,10 +182,13 @@ impl TextRenderer {
         viewport: &crate::coordinates::Viewport,
         force: bool,
     ) {
-        // Only rebuild if text actually changed or forced
-        // Check against last_tree_version (what document version we last built from)
-        // layout_version is for cache invalidation and can be bumped independently
-        if !force && tree.version == self.last_tree_version {
+        // Auto-detect metrics changes (font size, line height, scale factor)
+        let metrics_changed = (viewport.metrics.font_size - self.last_font_size).abs() > 0.01
+            || (viewport.metrics.line_height - self.last_line_height).abs() > 0.01
+            || (viewport.scale_factor - self.last_scale_factor).abs() > 0.01;
+
+        // Rebuild if text changed, metrics changed, or forced
+        if !force && tree.version == self.last_tree_version && !metrics_changed {
             return;
         }
 
@@ -435,8 +446,11 @@ impl TextRenderer {
             y_pos += viewport.metrics.line_height;
         }
 
-        // Track which tree version we built layout from
+        // Track which tree version and metrics we built layout from
         self.last_tree_version = tree.version;
+        self.last_font_size = viewport.metrics.font_size;
+        self.last_line_height = viewport.metrics.line_height;
+        self.last_scale_factor = viewport.scale_factor;
 
         // Always increment layout_version when we rebuild (for cache invalidation)
         self.layout_version = self.layout_version.wrapping_add(1);

@@ -1343,9 +1343,9 @@ impl SharedFontSystem {
     }
 
     /// Pre-rasterize ASCII - font_size_px should include scale factor
+    /// Clears cache first since glyph positions are size-dependent
     pub fn prerasterize_ascii(&self, font_size_px: f32) {
         let mut font_system = self.inner.lock();
-        // Clear cache before prerasterizing at new size
         font_system.clear_cache();
         font_system.prerasterize_ascii(font_size_px);
     }
