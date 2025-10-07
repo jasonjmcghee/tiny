@@ -95,6 +95,7 @@ impl PluginState {
 pub struct Renderer {
     pub syntax_highlighter: Option<Arc<syntax::SyntaxHighlighter>>,
     pub font_system: Option<Arc<tiny_font::SharedFontSystem>>,
+    pub theme: Option<Arc<tiny_ui::theme::Theme>>,
     pub viewport: Viewport,
     gpu_renderer: Option<*const GpuRenderer>,
     pub cached_doc_text: Option<Arc<String>>,
@@ -122,6 +123,8 @@ pub struct Renderer {
     pub editor_bounds: tiny_sdk::types::LayoutRect,
     /// Accumulated glyphs for batched rendering
     accumulated_glyphs: Vec<GlyphInstance>,
+    /// Text decoration rectangles (underline, strikethrough)
+    text_decoration_rects: Vec<tiny_sdk::types::RectInstance>,
     /// Line number glyphs (rendered separately)
     line_number_glyphs: Vec<GlyphInstance>,
     /// Tab bar glyphs (rendered separately)
@@ -163,6 +166,7 @@ impl Renderer {
         Self {
             syntax_highlighter: None,
             font_system: None,
+            theme: None,
             viewport,
             gpu_renderer: None,
             cached_doc_text: None,
@@ -187,6 +191,7 @@ impl Renderer {
             // Default editor bounds - updated in update_viewport
             editor_bounds: tiny_sdk::types::LayoutRect::new(0.0, 0.0, 800.0, 600.0),
             accumulated_glyphs: Vec::new(),
+            text_decoration_rects: Vec::new(),
             line_number_glyphs: Vec::new(),
             tab_bar_glyphs: Vec::new(),
             tab_bar_rects: Vec::new(),
@@ -208,6 +213,15 @@ impl Renderer {
 
     pub fn set_font_size(&mut self, font_size: f32) {
         self.viewport.set_font_size(font_size);
+
+        // Update baseline from font metrics when font size changes
+        if let Some(ref font_system) = self.font_system {
+            self.viewport.metrics.baseline = font_system.get_baseline(
+                self.viewport.metrics.font_size,
+                self.viewport.scale_factor
+            );
+        }
+
         self.layout_dirty = true;
         self.glyphs_dirty = true;
         self.line_numbers_dirty = true;
@@ -462,8 +476,19 @@ impl Renderer {
     pub fn set_font_system(&mut self, font_system: Arc<tiny_font::SharedFontSystem>) {
         self.viewport.set_font_system(font_system.clone());
         self.service_registry.register(font_system.clone());
+
+        // Update baseline from font metrics
+        self.viewport.metrics.baseline = font_system.get_baseline(
+            self.viewport.metrics.font_size,
+            self.viewport.scale_factor
+        );
+
         self.font_system = Some(font_system);
         self.layout_dirty = true;
+    }
+
+    pub fn set_theme(&mut self, theme: tiny_ui::theme::Theme) {
+        self.theme = Some(Arc::new(theme));
     }
 
     pub fn set_line_numbers_plugin(
@@ -665,6 +690,7 @@ impl Renderer {
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
         if self.glyphs_dirty || content_changed || scroll_changed {
             self.accumulated_glyphs.clear();
+            self.text_decoration_rects.clear();
             self.collect_main_text_glyphs(tree, visible_range.clone());
             // Note: cursor/selection rects will be collected from app.rs when needed
             self.glyphs_dirty = false;
@@ -688,6 +714,7 @@ impl Renderer {
                     // If editor X position changed (line numbers width changed), regenerate main text
                     if (old_editor_bounds_x - self.editor_bounds.x.0).abs() > 0.01 {
                         self.accumulated_glyphs.clear();
+                        self.text_decoration_rects.clear();
                         self.collect_main_text_glyphs(tree, visible_range.clone());
                     }
                     self.line_numbers_dirty = false;
@@ -770,6 +797,14 @@ impl Renderer {
                             }
                         }
                     }
+                }
+            }
+
+            // Draw text decorations (underline, strikethrough) BEFORE text
+            if !self.text_decoration_rects.is_empty() {
+                if let Some(gpu_ptr) = self.gpu_renderer {
+                    let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
+                    gpu_mut.draw_rects(pass, &self.text_decoration_rects, self.viewport.scale_factor);
                 }
             }
 
@@ -1067,7 +1102,17 @@ impl Renderer {
                         .collect()
                 };
 
-                self.text_renderer.update_syntax(&tokens, fresh_parse);
+                // Apply syntax with theme for style attributes (weight, italic, underline, strikethrough)
+                let language = highlighter.language();
+                self.text_renderer.update_syntax_with_theme(
+                    &tokens,
+                    self.theme.as_ref().map(|t| t.as_ref()),
+                    fresh_parse,
+                    Some(tree),
+                    self.font_system.as_ref().map(|fs| fs.as_ref()),
+                    Some(&self.viewport),
+                    Some(language),
+                );
             }
         }
 
@@ -1295,8 +1340,183 @@ impl Renderer {
         }
     }
 
+    /// Get theme color for a token_id as packed u32 (RGBA8)
+    fn get_token_color(&self, token_id: u8) -> u32 {
+        if let Some(ref theme) = self.theme {
+            if let Some(style) = theme.get_token_style(token_id) {
+                if let Some(color) = style.colors.first() {
+                    // Convert [f32; 4] RGBA to packed u32
+                    let r = (color[0] * 255.0) as u8;
+                    let g = (color[1] * 255.0) as u8;
+                    let b = (color[2] * 255.0) as u8;
+                    let a = (color[3] * 255.0) as u8;
+                    return ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32);
+                }
+            }
+        }
+        0xFFFFFFFF // Default white if no theme
+    }
+
+    fn collect_text_decorations(&mut self, glyphs: &[tiny_ui::text_renderer::UnifiedGlyph]) {
+        use tiny_sdk::types::{RectInstance, LayoutRect};
+
+        // Group glyphs by line and decoration type, then create rect spans
+        // Use line's canonical Y position (not glyph Y, which varies per glyph)
+        let mut current_line_idx: Option<usize> = None;
+        let mut underline_start_x: Option<f32> = None;
+        let mut underline_end_x: Option<f32> = None;
+        let mut underline_token_id: u8 = 0;
+        let mut strike_start_x: Option<f32> = None;
+        let mut strike_end_x: Option<f32> = None;
+        let mut strike_token_id: u8 = 0;
+
+        // Thickness: 10% of font size, minimum 1px (in logical pixels)
+        let thickness_logical = (self.viewport.metrics.font_size * 0.1).max(1.0 / self.viewport.scale_factor);
+        let underline_thickness = thickness_logical;
+        let strike_thickness = thickness_logical;
+
+        for (i, glyph) in glyphs.iter().enumerate() {
+            // Work in logical pixels (LayoutRect expects logical coordinates)
+            let view_x = glyph.layout_pos.x.0 - self.viewport.scroll.x.0;
+            let screen_x = view_x + self.editor_bounds.x.0;
+            let glyph_width_logical = glyph.physical_width / self.viewport.scale_factor;
+
+            // Find which line this glyph belongs to (use canonical Y to find line)
+            let glyph_line_idx = self.text_renderer.line_cache.iter()
+                .position(|line| {
+                    let line_y = line.y_position;
+                    let line_bottom = line_y + line.height;
+                    glyph.layout_pos.y.0 >= line_y && glyph.layout_pos.y.0 < line_bottom
+                });
+
+            // Check if we moved to a new line
+            if current_line_idx != glyph_line_idx {
+                // Flush previous line's decorations using line's canonical Y
+                if let Some(prev_line_idx) = current_line_idx {
+                    if let Some(line_info) = self.text_renderer.line_cache.get(prev_line_idx) {
+                        let line_view_y = line_info.y_position - self.viewport.scroll.y.0;
+                        let line_screen_y = line_view_y + self.editor_bounds.y.0;
+
+                        if let (Some(start), Some(end)) = (underline_start_x, underline_end_x) {
+                            // Underline: baseline + small offset (10% of font size)
+                            let underline_y = line_screen_y + self.viewport.metrics.baseline + self.viewport.metrics.font_size * 0.1;
+
+                            // Get color from theme based on token_id
+                            let color = self.get_token_color(underline_token_id);
+
+                            self.text_decoration_rects.push(RectInstance {
+                                rect: LayoutRect::new(start, underline_y, end - start, underline_thickness),
+                                color,
+                            });
+                        }
+                        if let (Some(start), Some(end)) = (strike_start_x, strike_end_x) {
+                            // Strikethrough: middle of line height
+                            let strike_y = line_screen_y + self.viewport.metrics.line_height * 0.5;
+
+                            // Get color from theme based on token_id
+                            let color = self.get_token_color(strike_token_id);
+
+                            self.text_decoration_rects.push(RectInstance {
+                                rect: LayoutRect::new(start, strike_y, end - start, strike_thickness),
+                                color,
+                            });
+                        }
+                    }
+                }
+
+                // Reset for new line
+                current_line_idx = glyph_line_idx;
+                underline_start_x = None;
+                underline_end_x = None;
+                strike_start_x = None;
+                strike_end_x = None;
+            }
+
+            // Track underline spans
+            if glyph.underline {
+                if underline_start_x.is_none() {
+                    underline_start_x = Some(screen_x);
+                    underline_token_id = glyph.token_id as u8;
+                }
+                // Extend span to include this glyph's full width
+                underline_end_x = Some(screen_x + glyph_width_logical);
+            } else if underline_start_x.is_some() {
+                // End of underline span within same line - flush it
+                if let Some(line_idx) = current_line_idx {
+                    if let Some(line_info) = self.text_renderer.line_cache.get(line_idx) {
+                        let line_view_y = line_info.y_position - self.viewport.scroll.y.0;
+                        let line_screen_y = line_view_y + self.editor_bounds.y.0;
+                        let underline_y = line_screen_y + self.viewport.metrics.baseline + self.viewport.metrics.font_size * 0.1;
+                        let color = self.get_token_color(underline_token_id);
+                        self.text_decoration_rects.push(RectInstance {
+                            rect: LayoutRect::new(underline_start_x.unwrap(), underline_y,
+                                                 underline_end_x.unwrap() - underline_start_x.unwrap(), underline_thickness),
+                            color,
+                        });
+                    }
+                }
+                underline_start_x = None;
+                underline_end_x = None;
+            }
+
+            // Track strikethrough spans
+            if glyph.strikethrough {
+                if strike_start_x.is_none() {
+                    strike_start_x = Some(screen_x);
+                    strike_token_id = glyph.token_id as u8;
+                }
+                strike_end_x = Some(screen_x + glyph_width_logical);
+            } else if strike_start_x.is_some() {
+                // End of strike span within same line - flush it
+                if let Some(line_idx) = current_line_idx {
+                    if let Some(line_info) = self.text_renderer.line_cache.get(line_idx) {
+                        let line_view_y = line_info.y_position - self.viewport.scroll.y.0;
+                        let line_screen_y = line_view_y + self.editor_bounds.y.0;
+                        let strike_y = line_screen_y + self.viewport.metrics.line_height * 0.5;
+                        let color = self.get_token_color(strike_token_id);
+                        self.text_decoration_rects.push(RectInstance {
+                            rect: LayoutRect::new(strike_start_x.unwrap(), strike_y,
+                                                 strike_end_x.unwrap() - strike_start_x.unwrap(), strike_thickness),
+                            color,
+                        });
+                    }
+                }
+                strike_start_x = None;
+                strike_end_x = None;
+            }
+        }
+
+        // Flush any remaining decorations from last line
+        if let Some(line_idx) = current_line_idx {
+            if let Some(line_info) = self.text_renderer.line_cache.get(line_idx) {
+                let line_view_y = line_info.y_position - self.viewport.scroll.y.0;
+                let line_screen_y = line_view_y + self.editor_bounds.y.0;
+
+                if let (Some(start), Some(end)) = (underline_start_x, underline_end_x) {
+                    let underline_y = line_screen_y + self.viewport.metrics.baseline + self.viewport.metrics.font_size * 0.1;
+                    let color = self.get_token_color(underline_token_id);
+                    self.text_decoration_rects.push(RectInstance {
+                        rect: LayoutRect::new(start, underline_y, end - start, underline_thickness),
+                        color,
+                    });
+                }
+                if let (Some(start), Some(end)) = (strike_start_x, strike_end_x) {
+                    let strike_y = line_screen_y + self.viewport.metrics.line_height * 0.5;
+                    let color = self.get_token_color(strike_token_id);
+                    self.text_decoration_rects.push(RectInstance {
+                        rect: LayoutRect::new(start, strike_y, end - start, strike_thickness),
+                        color,
+                    });
+                }
+            }
+        }
+    }
+
     fn collect_main_text_glyphs(&mut self, tree: &Tree, visible_range: std::ops::Range<usize>) {
         let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
+
+        // Collect decoration rectangles (underline, strikethrough)
+        self.collect_text_decorations(&visible_glyphs);
 
         let glyph_instances: Vec<_> = visible_glyphs
             .into_iter()
@@ -1309,13 +1529,14 @@ impl Renderer {
                 let physical_x = (view_x + self.editor_bounds.x.0) * self.viewport.scale_factor;
                 let physical_y = (view_y + self.editor_bounds.y.0) * self.viewport.scale_factor;
 
+                // Don't set format flags - decorations are now drawn as separate rects
                 GlyphInstance {
                     pos: LayoutPos::new(physical_x, physical_y),
                     tex_coords: g.tex_coords,
                     token_id: g.token_id as u8,
                     relative_pos: g.relative_pos,
                     shader_id: 0,
-                    format: 0,
+                    format: 0, // Decorations drawn as separate rects
                     atlas_index: g.atlas_index,
                     _padding: 0,
                 }

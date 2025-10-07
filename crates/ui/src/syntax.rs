@@ -311,7 +311,7 @@ pub struct SyntaxHighlighter {
     highlights: Arc<ArcSwap<Vec<TextEffect>>>,
     /// Send parse requests to background thread
     tx: mpsc::Sender<ParseRequest>,
-    /// Provider name
+    /// Provider name (language name, e.g. "markdown", "rust", "toml")
     name: &'static str,
     /// Cached tree for viewport queries
     cached_tree: Arc<ArcSwap<Option<TSTree>>>,
@@ -1128,6 +1128,11 @@ impl SyntaxHighlighter {
     /// Get the version of the cached syntax data
     pub fn cached_version(&self) -> u64 {
         self.cached_version.load(Ordering::Relaxed)
+    }
+
+    /// Get the language name (e.g. "markdown", "rust", "toml")
+    pub fn language(&self) -> &'static str {
+        self.name
     }
 
     /// Get syntax effects for only the visible byte range - O(visible nodes)

@@ -1125,6 +1125,20 @@ impl SharedFontSystem {
         self.inner.lock().char_width_coef()
     }
 
+    /// Get baseline offset (ascent) for a given font size in logical pixels
+    pub fn get_baseline(&self, logical_font_size: f32, scale_factor: f32) -> f32 {
+        let font_system = self.inner.lock();
+        let physical_size = logical_font_size * scale_factor;
+
+        // Get metrics directly from font (avoid borrow checker issue)
+        let font_ref = &font_system.regular_font_ref;
+        let metrics = font_ref.metrics(&[]);
+        let scale = physical_size / metrics.units_per_em as f32;
+        let ascent_physical = metrics.ascent * scale;
+
+        ascent_physical / scale_factor
+    }
+
     /// Layout text with automatic crisp rasterization based on stored scale factor
     pub fn layout_text(&self, text: &str, logical_font_size: f32) -> TextLayout {
         // Use scale factor of 1.0 for now - widgets should call layout_text_scaled for crisp rendering

@@ -3,22 +3,51 @@
 //! Themes define colors for each token type and can have multiple colors per token
 //! for effects like rainbow variables or animated gradients.
 
-/// A theme defining colors for syntax highlighting
+/// A theme defining colors and styles for syntax highlighting
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub name: String,
-    /// Colors per token type (up to 256 token types)
-    /// Each token can have multiple colors for effects
-    pub token_colors: Vec<TokenColors>,
+    /// Styles per token type (up to 256 token types)
+    /// Each token can have colors and optional style overrides
+    pub token_styles: Vec<TokenStyle>,
     /// Maximum number of colors any token has in this theme
     pub max_colors_per_token: usize,
+    /// Language-specific style overrides (language name → token overrides)
+    pub language_overrides: std::collections::HashMap<String, Vec<(u8, TokenStyle)>>,
 }
 
-/// Colors for a single token type
+/// Style attributes for a single token type
+#[derive(Clone, Debug)]
+pub struct TokenStyle {
+    /// RGBA colors (can be 1 or more for effects)
+    pub colors: Vec<[f32; 4]>,
+    /// Font weight override (None = use default, 100-900 where 400=normal, 700=bold)
+    pub weight: Option<f32>,
+    /// Italic override (None = use default)
+    pub italic: Option<bool>,
+    /// Underline decoration
+    pub underline: bool,
+    /// Strikethrough decoration
+    pub strikethrough: bool,
+}
+
+/// Colors for a single token type (backward compatibility)
 #[derive(Clone, Debug)]
 pub struct TokenColors {
     /// RGBA colors (can be 1 or more for effects)
     pub colors: Vec<[f32; 4]>,
+}
+
+impl From<TokenColors> for TokenStyle {
+    fn from(colors: TokenColors) -> Self {
+        Self {
+            colors: colors.colors,
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        }
+    }
 }
 
 impl Theme {
@@ -26,23 +55,73 @@ impl Theme {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            token_colors: Vec::new(),
+            token_styles: Vec::new(),
             max_colors_per_token: 1,
+            language_overrides: std::collections::HashMap::new(),
         }
     }
 
-    /// Set colors for a token ID
-    pub fn set_token_colors(&mut self, token_id: u8, colors: Vec<[f32; 4]>) {
+    /// Add language-specific style override for a token
+    pub fn add_language_override(&mut self, language: &str, token_id: u8, style: TokenStyle) {
+        self.language_overrides
+            .entry(language.to_string())
+            .or_insert_with(Vec::new)
+            .push((token_id, style));
+    }
+
+    /// Get token style with language-specific overrides applied
+    pub fn get_token_style_for_language(&self, token_id: u8, language: Option<&str>) -> Option<&TokenStyle> {
+        // Check for language-specific override first
+        if let Some(lang) = language {
+            if let Some(overrides) = self.language_overrides.get(lang) {
+                for (override_token_id, override_style) in overrides {
+                    if *override_token_id == token_id {
+                        return Some(override_style);
+                    }
+                }
+            }
+        }
+
+        // Fall back to base theme
+        self.get_token_style(token_id)
+    }
+
+    /// Set full style for a token ID (colors + weight + italic + decorations)
+    pub fn set_token_style(&mut self, token_id: u8, style: TokenStyle) {
         // Ensure we have enough slots
-        while self.token_colors.len() <= token_id as usize {
-            self.token_colors.push(TokenColors {
-                // TODO: why is this happening? (falling back on some tokens)
+        while self.token_styles.len() <= token_id as usize {
+            self.token_styles.push(TokenStyle {
                 colors: vec![[0.882, 0.882, 0.882, 1.0]], // Default white
+                weight: None,
+                italic: None,
+                underline: false,
+                strikethrough: false,
             });
         }
 
-        self.max_colors_per_token = self.max_colors_per_token.max(colors.len());
-        self.token_colors[token_id as usize] = TokenColors { colors };
+        self.max_colors_per_token = self.max_colors_per_token.max(style.colors.len());
+        self.token_styles[token_id as usize] = style;
+    }
+
+    /// Set colors for a token ID (backward compatible - no style overrides)
+    pub fn set_token_colors(&mut self, token_id: u8, colors: Vec<[f32; 4]>) {
+        self.set_token_style(token_id, TokenStyle {
+            colors,
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+    }
+
+    /// Get style for a token ID
+    pub fn get_token_style(&self, token_id: u8) -> Option<&TokenStyle> {
+        self.token_styles.get(token_id as usize)
+    }
+
+    /// Get colors for a token ID (backward compatible accessor)
+    pub fn get_token_colors(&self, token_id: u8) -> Option<&Vec<[f32; 4]>> {
+        self.token_styles.get(token_id as usize).map(|s| &s.colors)
     }
 
     /// Generate texture data for GPU (256 x max_colors_per_token)
@@ -52,8 +131,8 @@ impl Theme {
         let height = self.max_colors_per_token.max(1);
         let mut data = vec![255u8; width * height * 4]; // RGBA8
 
-        for (token_id, token_colors) in self.token_colors.iter().enumerate() {
-            for (color_idx, color) in token_colors.colors.iter().enumerate() {
+        for (token_id, token_style) in self.token_styles.iter().enumerate() {
+            for (color_idx, color) in token_style.colors.iter().enumerate() {
                 if color_idx >= height {
                     break;
                 }
@@ -66,8 +145,8 @@ impl Theme {
             }
 
             // Fill remaining color slots with the last color (for clamping)
-            let last_color = token_colors.colors.last().unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
-            for color_idx in token_colors.colors.len()..height {
+            let last_color = token_style.colors.last().unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+            for color_idx in token_style.colors.len()..height {
                 let pixel_idx = (color_idx * width + token_id) * 4;
                 data[pixel_idx] = (last_color[0] * 255.0) as u8;
                 data[pixel_idx + 1] = (last_color[1] * 255.0) as u8;
@@ -90,8 +169,8 @@ impl Theme {
         let mut data = vec![255u8; width * height * 4];
 
         // First theme in top half
-        for (token_id, token_colors) in theme1.token_colors.iter().enumerate() {
-            for (color_idx, color) in token_colors.colors.iter().enumerate() {
+        for (token_id, token_style) in theme1.token_styles.iter().enumerate() {
+            for (color_idx, color) in token_style.colors.iter().enumerate() {
                 if color_idx >= max_colors {
                     break;
                 }
@@ -105,8 +184,8 @@ impl Theme {
         }
 
         // Second theme in bottom half
-        for (token_id, token_colors) in theme2.token_colors.iter().enumerate() {
-            for (color_idx, color) in token_colors.colors.iter().enumerate() {
+        for (token_id, token_style) in theme2.token_styles.iter().enumerate() {
+            for (color_idx, color) in token_style.colors.iter().enumerate() {
                 if color_idx >= max_colors {
                     break;
                 }
@@ -131,7 +210,7 @@ impl Themes {
     pub fn one_dark() -> Theme {
         let mut theme = Theme::new("One Dark");
 
-        // Basic tokens (1-14) - Original One Dark colors
+        // Basic tokens (1-14) - Original One Dark colors (NO style overrides in base)
         theme.set_token_colors(1, vec![[0.776, 0.471, 0.867, 1.0]]); // Keyword - purple
         theme.set_token_colors(2, vec![[0.380, 0.686, 0.937, 1.0]]); // Function - blue
         theme.set_token_colors(3, vec![[0.898, 0.753, 0.482, 1.0]]); // Type - yellow-orange
@@ -148,7 +227,7 @@ impl Themes {
         theme.set_token_colors(14, vec![[0.671, 0.698, 0.749, 1.0]]); // Parameter - light gray
 
         // Extended tokens (15+) - Rich syntax highlighting
-        theme.set_token_colors(15, vec![[0.380, 0.686, 0.937, 1.0]]); // Method - blue (like function)
+        theme.set_token_colors(15, vec![[0.380, 0.686, 0.937, 1.0]]); // Method - blue
         theme.set_token_colors(16, vec![[0.898, 0.753, 0.482, 1.0]]); // Field - yellow (like property)
         theme.set_token_colors(17, vec![[0.380, 0.686, 0.937, 1.0]]); // Constructor - blue
         theme.set_token_colors(18, vec![[0.898, 0.753, 0.482, 1.0]]); // Enum - yellow
@@ -204,6 +283,36 @@ impl Themes {
 
         // Line numbers - dim gray
         theme.set_token_colors(255, vec![[0.3, 0.32, 0.34, 1.0]]); // Line numbers - 40% gray, 80% opacity
+
+        // === MARKDOWN-SPECIFIC STYLE OVERRIDES ===
+        // These ONLY apply when rendering markdown files, not Rust/TOML/etc.
+
+        // Token 1 (Keyword): Headings with weight 900 (extra bold)
+        theme.add_language_override("markdown", 1, TokenStyle {
+            colors: vec![[0.776, 0.471, 0.867, 1.0]], // Purple (same color)
+            weight: Some(900.0), // Extra bold for headings
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // Token 10 (Variable): Emphasis with italic
+        theme.add_language_override("markdown", 10, TokenStyle {
+            colors: vec![[0.671, 0.698, 0.749, 1.0]], // Light gray (same color)
+            weight: None,
+            italic: Some(true), // Italic for *emphasis*
+            underline: false,
+            strikethrough: false,
+        });
+
+        // Token 15 (Method): Strong with weight 700 (bold)
+        theme.add_language_override("markdown", 15, TokenStyle {
+            colors: vec![[0.380, 0.686, 0.937, 1.0]], // Blue (same color)
+            weight: Some(700.0), // Bold for **strong**
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
 
         theme
     }
@@ -332,4 +441,418 @@ impl Themes {
 
         theme
     }
+
+    /// Demonstrative theme - showcases all font weights, italics, and decorations
+    /// Systematically shows weight progression and style combinations
+    pub fn demonstrative() -> Theme {
+        let mut theme = Theme::new("Demonstrative");
+
+        // Helper: Generate a distinct color for each token based on hue rotation
+        let color_for_token = |token_id: u8| -> [f32; 4] {
+            let hue = (token_id as f32 * 13.7) % 360.0; // Prime number for good distribution
+            let (r, g, b) = hsl_to_rgb(hue, 0.8, 0.6);
+            [r, g, b, 1.0]
+        };
+
+        // Tokens 1-9: Regular weight progression (100-900)
+        for (i, weight) in [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0].iter().enumerate() {
+            let token_id = (i + 1) as u8;
+            theme.set_token_style(token_id, TokenStyle {
+                colors: vec![color_for_token(token_id)],
+                weight: Some(*weight),
+                italic: None,
+                underline: false,
+                strikethrough: false,
+            });
+        }
+
+        // Tokens 10-18: Italic weight progression (100-900)
+        for (i, weight) in [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0].iter().enumerate() {
+            let token_id = (i + 10) as u8;
+            theme.set_token_style(token_id, TokenStyle {
+                colors: vec![color_for_token(token_id)],
+                weight: Some(*weight),
+                italic: Some(true),
+                underline: false,
+                strikethrough: false,
+            });
+        }
+
+        // Token 19: Regular weight 400, underline
+        theme.set_token_style(19, TokenStyle {
+            colors: vec![[0.2, 0.8, 1.0, 1.0]], // Bright cyan
+            weight: Some(400.0),
+            italic: None,
+            underline: true,
+            strikethrough: false,
+        });
+
+        // Token 20: Regular weight 400, strikethrough
+        theme.set_token_style(20, TokenStyle {
+            colors: vec![[1.0, 0.5, 0.2, 1.0]], // Orange
+            weight: Some(400.0),
+            italic: None,
+            underline: false,
+            strikethrough: true,
+        });
+
+        // Token 21: Bold 700, italic, underline
+        theme.set_token_style(21, TokenStyle {
+            colors: vec![[0.9, 0.2, 0.9, 1.0]], // Magenta
+            weight: Some(700.0),
+            italic: Some(true),
+            underline: true,
+            strikethrough: false,
+        });
+
+        // Token 22: Bold 700, italic, strikethrough
+        theme.set_token_style(22, TokenStyle {
+            colors: vec![[0.2, 0.9, 0.3, 1.0]], // Green
+            weight: Some(700.0),
+            italic: Some(true),
+            underline: false,
+            strikethrough: true,
+        });
+
+        // Token 23: Bold 700, italic, underline + strikethrough
+        theme.set_token_style(23, TokenStyle {
+            colors: vec![[0.9, 0.9, 0.2, 1.0]], // Yellow
+            weight: Some(700.0),
+            italic: Some(true),
+            underline: true,
+            strikethrough: true,
+        });
+
+        // Token 24: Thin 100, italic, underline
+        theme.set_token_style(24, TokenStyle {
+            colors: vec![[1.0, 0.4, 0.7, 1.0]], // Pink
+            weight: Some(100.0),
+            italic: Some(true),
+            underline: true,
+            strikethrough: false,
+        });
+
+        // Token 25: Extra-bold 900, underline
+        theme.set_token_style(25, TokenStyle {
+            colors: vec![[0.5, 0.3, 0.9, 1.0]], // Purple
+            weight: Some(900.0),
+            italic: None,
+            underline: true,
+            strikethrough: false,
+        });
+
+        theme
+    }
+
+    /// Showcase theme - demonstrates ALL styling features with actual syntax tokens
+    /// Uses variety of weights, italics, underline, strikethrough, multi-colors, etc.
+    pub fn showcase() -> Theme {
+        let mut theme = Theme::new("Showcase");
+
+        // === KEYWORDS (token 1) ===
+        // Bold 700, purple gradient (2 colors for shine/rainbow effect)
+        theme.set_token_style(1, TokenStyle {
+            colors: vec![
+                [0.776, 0.471, 0.867, 1.0], // Purple
+                [0.867, 0.471, 0.776, 1.0], // Pink-purple
+            ],
+            weight: Some(700.0), // Bold
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === FUNCTION (token 2) ===
+        // Weight 600, italic, blue with cyan gradient (3 colors)
+        theme.set_token_style(2, TokenStyle {
+            colors: vec![
+                [0.380, 0.686, 0.937, 1.0], // Blue
+                [0.337, 0.714, 0.761, 1.0], // Cyan
+                [0.400, 0.851, 0.937, 1.0], // Light blue
+            ],
+            weight: Some(600.0),
+            italic: Some(true), // Italic functions
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === TYPE (token 3) ===
+        // Weight 500, yellow-orange gradient
+        theme.set_token_style(3, TokenStyle {
+            colors: vec![
+                [0.898, 0.753, 0.482, 1.0], // Yellow
+                [0.992, 0.592, 0.122, 1.0], // Orange
+            ],
+            weight: Some(500.0),
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === STRING (token 4) ===
+        // Weight 400, green gradient (4 colors for rainbow effect)
+        theme.set_token_style(4, TokenStyle {
+            colors: vec![
+                [0.596, 0.765, 0.475, 1.0], // Green
+                [0.651, 0.886, 0.180, 1.0], // Bright green
+                [0.400, 0.851, 0.937, 1.0], // Cyan
+                [0.596, 0.765, 0.475, 1.0], // Back to green
+            ],
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === NUMBER (token 5) ===
+        // Weight 800, orange gradient
+        theme.set_token_style(5, TokenStyle {
+            colors: vec![
+                [0.820, 0.604, 0.400, 1.0], // Orange
+                [0.992, 0.592, 0.122, 1.0], // Bright orange
+            ],
+            weight: Some(800.0),
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === COMMENT (token 6) ===
+        // Weight 300, italic, dim gray gradient
+        theme.set_token_style(6, TokenStyle {
+            colors: vec![
+                [0.361, 0.388, 0.439, 1.0], // Gray
+                [0.451, 0.478, 0.529, 1.0], // Lighter gray
+            ],
+            weight: Some(300.0), // Thin
+            italic: Some(true),  // Italic comments
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === CONSTANT (token 7) ===
+        // Weight 900, underlined, bright purple gradient
+        theme.set_token_style(7, TokenStyle {
+            colors: vec![
+                [0.682, 0.506, 0.976, 1.0], // Purple
+                [0.776, 0.471, 0.867, 1.0], // Magenta
+            ],
+            weight: Some(900.0), // Extra bold
+            italic: None,
+            underline: true, // Underlined constants
+            strikethrough: false,
+        });
+
+        // === OPERATOR (token 8) ===
+        // Weight 600, cyan-pink rainbow (5 colors!)
+        theme.set_token_style(8, TokenStyle {
+            colors: vec![
+                [0.337, 0.714, 0.761, 1.0], // Cyan
+                [0.380, 0.686, 0.937, 1.0], // Blue
+                [0.776, 0.471, 0.867, 1.0], // Purple
+                [0.976, 0.149, 0.447, 1.0], // Pink
+                [0.337, 0.714, 0.761, 1.0], // Back to cyan
+            ],
+            weight: Some(600.0),
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === PUNCTUATION (token 9) ===
+        // Weight 400, light gray
+        theme.set_token_style(9, TokenStyle {
+            colors: vec![[0.671, 0.698, 0.749, 1.0]],
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === VARIABLE (token 10) ===
+        // Weight 400, full rainbow spectrum (6 colors)
+        theme.set_token_style(10, TokenStyle {
+            colors: vec![
+                [1.0, 0.3, 0.3, 1.0], // Red
+                [1.0, 0.6, 0.2, 1.0], // Orange
+                [0.9, 0.9, 0.3, 1.0], // Yellow
+                [0.3, 0.9, 0.4, 1.0], // Green
+                [0.3, 0.6, 1.0, 1.0], // Blue
+                [0.7, 0.4, 1.0, 1.0], // Purple
+            ],
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === ATTRIBUTE (token 11) ===
+        // Weight 500, italic, underlined, red-orange gradient
+        theme.set_token_style(11, TokenStyle {
+            colors: vec![
+                [0.878, 0.424, 0.459, 1.0], // Red
+                [0.992, 0.592, 0.122, 1.0], // Orange
+            ],
+            weight: Some(500.0),
+            italic: Some(true),
+            underline: true, // Underlined attributes
+            strikethrough: false,
+        });
+
+        // === NAMESPACE (token 12) ===
+        // Weight 700, blue
+        theme.set_token_style(12, TokenStyle {
+            colors: vec![[0.380, 0.686, 0.937, 1.0]],
+            weight: Some(700.0),
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === PROPERTY (token 13) ===
+        // Weight 400, italic, yellow gradient
+        theme.set_token_style(13, TokenStyle {
+            colors: vec![
+                [0.898, 0.753, 0.482, 1.0], // Yellow
+                [0.902, 0.859, 0.455, 1.0], // Bright yellow
+            ],
+            weight: None,
+            italic: Some(true), // Italic properties
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === PARAMETER (token 14) ===
+        // Weight 400, orange gradient
+        theme.set_token_style(14, TokenStyle {
+            colors: vec![
+                [0.992, 0.592, 0.122, 1.0], // Orange
+                [0.820, 0.604, 0.400, 1.0], // Muted orange
+            ],
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === METHOD (token 15) ===
+        // Weight 600, italic, blue-cyan gradient
+        theme.set_token_style(15, TokenStyle {
+            colors: vec![
+                [0.380, 0.686, 0.937, 1.0], // Blue
+                [0.400, 0.851, 0.937, 1.0], // Cyan
+            ],
+            weight: Some(600.0),
+            italic: Some(true),
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === MACRO (token 24) ===
+        // Weight 900, underlined + strikethrough (!), pink-purple rainbow
+        theme.set_token_style(24, TokenStyle {
+            colors: vec![
+                [0.976, 0.149, 0.447, 1.0], // Pink
+                [0.867, 0.471, 0.776, 1.0], // Magenta
+                [0.776, 0.471, 0.867, 1.0], // Purple
+            ],
+            weight: Some(900.0),
+            italic: Some(true),
+            underline: true,
+            strikethrough: true, // Both decorations!
+        });
+
+        // === COMMENT DOC (token 33) ===
+        // Weight 400, italic, underlined, brighter gray
+        theme.set_token_style(33, TokenStyle {
+            colors: vec![[0.451, 0.478, 0.529, 1.0]],
+            weight: None,
+            italic: Some(true),
+            underline: true, // Underlined doc comments
+            strikethrough: false,
+        });
+
+        // === DEPRECATED (token 46) ===
+        // Weight 400, strikethrough, muted gray
+        theme.set_token_style(46, TokenStyle {
+            colors: vec![[0.584, 0.584, 0.584, 0.7]],
+            weight: None,
+            italic: None,
+            underline: false,
+            strikethrough: true, // Strikethrough for deprecated
+        });
+
+        // === LIFETIME (token 49) ===
+        // Weight 700, italic, cyan-blue gradient
+        theme.set_token_style(49, TokenStyle {
+            colors: vec![
+                [0.337, 0.714, 0.761, 1.0], // Cyan
+                [0.380, 0.686, 0.937, 1.0], // Blue
+            ],
+            weight: Some(700.0),
+            italic: Some(true), // Italic lifetimes
+            underline: false,
+            strikethrough: false,
+        });
+
+        // === TRAIT (token 52) ===
+        // Weight 700, underlined, bright blue gradient
+        theme.set_token_style(52, TokenStyle {
+            colors: vec![
+                [0.380, 0.686, 0.937, 1.0], // Blue
+                [0.400, 0.851, 0.937, 1.0], // Cyan
+            ],
+            weight: Some(700.0),
+            italic: None,
+            underline: true, // Underlined traits
+            strikethrough: false,
+        });
+
+        // === DERIVE (token 53) ===
+        // Weight 800, italic + underlined, purple-pink gradient
+        theme.set_token_style(53, TokenStyle {
+            colors: vec![
+                [0.776, 0.471, 0.867, 1.0], // Purple
+                [0.976, 0.149, 0.447, 1.0], // Pink
+            ],
+            weight: Some(800.0),
+            italic: Some(true),
+            underline: true, // Multiple effects
+            strikethrough: false,
+        });
+
+        // Line numbers - dim gray
+        theme.set_token_style(255, TokenStyle {
+            colors: vec![[0.3, 0.32, 0.34, 1.0]],
+            weight: Some(300.0), // Thin
+            italic: None,
+            underline: false,
+            strikethrough: false,
+        });
+
+        theme
+    }
+}
+
+/// Convert HSL to RGB (helper for demonstrative theme)
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+
+    (r + m, g + m, b + m)
 }

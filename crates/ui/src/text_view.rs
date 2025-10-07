@@ -240,6 +240,7 @@ impl TextView {
         let tree = self.doc.read();
         self.renderer
             .update_layout(&tree, font_system, &self.viewport, false);
+
         self.renderer.update_visible_range(&self.viewport, &tree);
     }
 
@@ -290,8 +291,8 @@ impl TextView {
             return Vec::new();
         }
 
-        // Check cache - if doc unchanged, we can reuse cached glyphs with position adjustment
-        let current_version = self.doc.version();
+        // Check cache - use renderer's layout_version (includes style changes) not doc version
+        let current_version = self.renderer.layout_version;
         let cached_version = self.cached_glyph_version.load(Ordering::Relaxed);
         let current_scroll_y = self.viewport.scroll.y.0;
         let current_scroll_x = self.viewport.scroll.x.0;
@@ -402,13 +403,22 @@ impl TextView {
             let physical_x = screen_x * self.viewport.scale_factor;
             let physical_y = screen_y * self.viewport.scale_factor;
 
+            // Build format flags from glyph attributes
+            let mut format = 0u8;
+            if glyph.underline {
+                format |= 0x02; // Underline bit
+            }
+            if glyph.strikethrough {
+                format |= 0x08; // Strikethrough bit (new)
+            }
+
             instances.push(GlyphInstance {
                 pos: LayoutPos::new(physical_x, physical_y),
                 tex_coords: glyph.tex_coords,
                 relative_pos: glyph.relative_pos,
                 shader_id: 0,
                 token_id: glyph.token_id as u8,
-                format: 0,
+                format,
                 atlas_index: glyph.atlas_index,
                 _padding: 0,
             });

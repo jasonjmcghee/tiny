@@ -264,7 +264,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Bit 0 (0x01): Half opacity (for autocomplete)
     // Bit 1 (0x02): Underline
     // Bit 2 (0x04): Background highlight
-    // Bit 3-7: Reserved for future use
+    // Bit 3 (0x08): Strikethrough
+    // Bit 4-7: Reserved for future use
 
     var final_alpha = glyph_alpha;
 
@@ -273,7 +274,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         final_alpha *= 0.5;
     }
 
-    // TODO: Underline rendering (bit 1)
+    // Note: Underline (bit 1) and strikethrough (bit 3) are now drawn as separate rectangles
+    // This ensures consistent positioning at baseline regardless of glyph height
     // TODO: Background highlight (bit 2)
 
     // Combine glyph shape with chosen color effect and format modifiers

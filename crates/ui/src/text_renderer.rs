@@ -5,10 +5,13 @@
 //! Palette: token → color mapping (instant theme switching)
 
 use ahash::HashMap;
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tiny_core::{tree, DocTree as Tree};
 use tiny_sdk::{LayoutPos, PhysicalPos};
+
+/// Global flag for demo styles mode (for testing only)
+pub static DEMO_STYLES_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Unified glyph with position and style data
 #[derive(Clone, Debug)]
@@ -16,11 +19,17 @@ pub struct UnifiedGlyph {
     pub char: char,
     pub layout_pos: LayoutPos,     // Logical position
     pub physical_pos: PhysicalPos, // Physical pixels
+    pub physical_width: f32,       // Glyph advance width in physical pixels
     pub tex_coords: [f32; 4],      // Atlas coordinates
     pub char_byte_offset: usize,   // Byte position in document
     pub token_id: u16,             // Style token ID
     pub relative_pos: f32,         // Position within token (0.0-1.0)
     pub atlas_index: u8,           // 0 = monochrome (R8), 1 = color (RGBA8)
+    // Style attributes (populated from theme during syntax highlighting)
+    pub weight: f32,               // Font weight (400 = normal, 700 = bold)
+    pub italic: bool,              // Italic flag
+    pub underline: bool,           // Underline decoration
+    pub strikethrough: bool,       // Strikethrough decoration
 }
 
 // Legacy type alias for compatibility during migration
@@ -61,6 +70,41 @@ pub struct SyntaxState {
 struct ShapedLineCache {
     glyphs: Vec<tiny_font::PositionedGlyph>,
     cluster_map: tiny_font::ClusterMap,
+}
+
+/// Parse a demo style tag like "w700", "italic", "w700+italic+underline"
+/// Returns (weight, italic, underline, strikethrough)
+fn parse_demo_tag(tag: &str) -> (f32, bool, bool, bool) {
+    let mut weight = 400.0;
+    let mut italic = false;
+    let mut underline = false;
+    let mut strikethrough = false;
+
+    for part in tag.split('+') {
+        let part = part.trim();
+        if part.starts_with('w') {
+            // Weight like "w700"
+            if let Ok(w) = part[1..].parse::<f32>() {
+                weight = w;
+            }
+        } else if part == "italic" {
+            italic = true;
+        } else if part == "roman" {
+            italic = false;
+        } else if part == "underline" {
+            underline = true;
+        } else if part == "strike" {
+            strikethrough = true;
+        } else if part == "both" {
+            underline = true;
+            strikethrough = true;
+        } else if part == "plain" {
+            underline = false;
+            strikethrough = false;
+        }
+    }
+
+    (weight, italic, underline, strikethrough)
 }
 
 /// Decoupled text renderer
@@ -132,9 +176,9 @@ impl TextRenderer {
             return;
         }
 
-        // Build map of (line, pos_in_line, char) → (token_id, relative_pos) for preservation
+        // Build map of (line, pos_in_line, char) → (token_id, relative_pos, weight, italic, underline, strikethrough) for preservation
         // This keeps colors stable when layout rebuilds (e.g., after undo)
-        let old_tokens: HashMap<(u32, u32, char), (u16, f32)> = self
+        let old_tokens: HashMap<(u32, u32, char), (u16, f32, f32, bool, bool, bool)> = self
             .layout_cache
             .iter()
             .enumerate()
@@ -159,7 +203,7 @@ impl TextRenderer {
                 let pos_in_line = (glyph_idx - line_info.char_range.start) as u32;
                 Some((
                     (line_info.line_number, pos_in_line, g.char),
-                    (g.token_id, g.relative_pos),
+                    (g.token_id, g.relative_pos, g.weight, g.italic, g.underline, g.strikethrough),
                 ))
             })
             .collect();
@@ -264,17 +308,23 @@ impl TextRenderer {
                     (char_index - line_start_char) as u32,
                     glyph.char,
                 );
-                let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
+                    old_tokens.get(&key).copied().unwrap_or((0, 0.0, 400.0, false, false, false));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
                     layout_pos,
                     physical_pos: glyph.pos.clone(),
+                    physical_width: glyph.size.width.0,
                     tex_coords: glyph.tex_coords,
                     char_byte_offset,
                     token_id,
                     relative_pos,
                     atlas_index: glyph.atlas_index,
+                    weight,
+                    italic,
+                    underline,
+                    strikethrough,
                 });
 
                 char_index += 1;
@@ -315,7 +365,8 @@ impl TextRenderer {
             // Add newline as a glyph (invisible but maintains byte position)
             if line_idx < lines.len() - 1 {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
-                let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
+                    old_tokens.get(&key).copied().unwrap_or((0, 0.0, 400.0, false, false, false));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -323,17 +374,23 @@ impl TextRenderer {
                         x_offset * viewport.scale_factor,
                         y_pos * viewport.scale_factor,
                     ),
+                    physical_width: 0.0, // Newlines have no width
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
                     char_byte_offset: byte_offset,
                     token_id,
                     relative_pos,
                     atlas_index: 0, // Invisible glyph, no atlas needed
+                    weight,
+                    italic,
+                    underline,
+                    strikethrough,
                 });
                 byte_offset += 1;
                 char_index += 1;
             } else if text.ends_with('\n') {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
-                let (token_id, relative_pos) = old_tokens.get(&key).copied().unwrap_or((0, 0.0));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
+                    old_tokens.get(&key).copied().unwrap_or((0, 0.0, 400.0, false, false, false));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -341,11 +398,16 @@ impl TextRenderer {
                         x_offset * viewport.scale_factor,
                         y_pos * viewport.scale_factor,
                     ),
+                    physical_width: 0.0, // Newlines have no width
                     tex_coords: [0.0, 0.0, 0.0, 0.0], // Invisible
                     char_byte_offset: byte_offset,
                     token_id,
                     relative_pos,
                     atlas_index: 0, // Invisible glyph, no atlas needed
+                    weight,
+                    italic,
+                    underline,
+                    strikethrough,
                 });
                 byte_offset += 1;
                 char_index += 1;
@@ -355,10 +417,253 @@ impl TextRenderer {
         }
 
         self.layout_version = tree.version;
+
+        // Apply demo styles if enabled (parse [w700] tags and reshape)
+        if DEMO_STYLES_MODE.load(Ordering::Relaxed) {
+            self.apply_demo_styles(tree);
+            self.reshape_for_styles(tree, font_system, viewport);
+
+            // Bump version so collect_glyphs cache invalidates
+            self.layout_version = self.layout_version.wrapping_add(1);
+        }
+    }
+
+    /// Reshape lines that have mixed weight/italic based on glyph attributes
+    /// Called after update_syntax_with_theme assigns token_ids and style attributes
+    ///
+    /// This is needed for markdown bold/italic, theme-specified weights (headings=900, bold=700), etc.
+    pub fn reshape_for_styles(
+        &mut self,
+        tree: &Tree,
+        font_system: &tiny_font::SharedFontSystem,
+        viewport: &crate::coordinates::Viewport,
+    ) {
+        let text = tree.flatten_to_string();
+        let lines: Vec<&str> = text.lines().collect();
+
+        for line_idx in 0..self.line_cache.len() {
+            let line_info = &self.line_cache[line_idx];
+            let glyph_range = line_info.char_range.clone();
+
+            if glyph_range.is_empty() {
+                continue;
+            }
+
+            // Check if this line has mixed weight/italic settings
+            let mut styles_needed: ahash::HashSet<(u16, bool)> = ahash::HashSet::default();
+            for glyph_idx in glyph_range.clone() {
+                if let Some(glyph) = self.layout_cache.get(glyph_idx) {
+                    // Quantize weight to nearest 100 for cache efficiency
+                    let weight_q = ((glyph.weight / 100.0).round() * 100.0) as u16;
+                    styles_needed.insert((weight_q, glyph.italic));
+                }
+            }
+
+            // If only one style, line was already shaped correctly
+            if styles_needed.len() <= 1 {
+                continue;
+            }
+
+            // Line has mixed styles - segment into runs and reshape each
+            let line_text = if line_idx < lines.len() {
+                lines[line_idx]
+            } else {
+                continue;
+            };
+
+            // Build runs: consecutive glyphs with same (weight, italic)
+            #[derive(Debug)]
+            struct StyleRun {
+                glyph_start: usize,  // Index in layout_cache
+                glyph_end: usize,    // Exclusive
+                char_start: usize,   // Index in line_text
+                char_end: usize,     // Exclusive
+                weight: f32,
+                italic: bool,
+            }
+
+            let mut runs: Vec<StyleRun> = Vec::new();
+            let mut current_run: Option<StyleRun> = None;
+
+            for (i, glyph_idx) in glyph_range.clone().enumerate() {
+                let glyph = &self.layout_cache[glyph_idx];
+                let weight_q = ((glyph.weight / 100.0).round() * 100.0) as u16;
+
+                // Check if we need to start a new run
+                let need_new_run = if let Some(ref run) = current_run {
+                    let run_weight_q = ((run.weight / 100.0).round() * 100.0) as u16;
+                    weight_q != run_weight_q || glyph.italic != run.italic
+                } else {
+                    true
+                };
+
+                if need_new_run {
+                    // Finish previous run
+                    if let Some(run) = current_run.take() {
+                        runs.push(run);
+                    }
+
+                    // Start new run
+                    current_run = Some(StyleRun {
+                        glyph_start: glyph_idx,
+                        glyph_end: glyph_idx + 1,
+                        char_start: i,
+                        char_end: i + 1,
+                        weight: glyph.weight,
+                        italic: glyph.italic,
+                    });
+                } else {
+                    // Extend current run
+                    if let Some(ref mut run) = current_run {
+                        run.glyph_end = glyph_idx + 1;
+                        run.char_end = i + 1;
+                    }
+                }
+            }
+
+            // Don't forget last run
+            if let Some(run) = current_run {
+                runs.push(run);
+            }
+
+            // If we only have one run, nothing to do
+            if runs.len() <= 1 {
+                continue;
+            }
+
+            // Reshape each run with appropriate weight/italic
+            let y_pos = line_info.y_position;
+            let mut x_offset = 0.0;
+
+            for run in &runs {
+                // Extract text for this run from the glyphs themselves (handles tabs correctly)
+                let run_text: String = self.layout_cache[run.glyph_start..run.glyph_end]
+                    .iter()
+                    .map(|g| g.char)
+                    .collect();
+
+                // Shape with this run's weight/italic
+                let mut shaping_opts = tiny_font::ShapingOptions::default();
+                shaping_opts.font_size = viewport.metrics.font_size * viewport.scale_factor;
+                shaping_opts.weight = run.weight;
+                shaping_opts.italic = run.italic;
+
+                let shaped = font_system.layout_text_shaped_with_tabs(
+                    &run_text,
+                    viewport.metrics.font_size,
+                    viewport.scale_factor,
+                    Some(&shaping_opts),
+                );
+
+                // Replace glyphs in layout_cache for this run
+                let old_glyphs: Vec<_> = self.layout_cache[run.glyph_start..run.glyph_end].to_vec();
+
+                // Verify glyph count matches (should be same after reshaping)
+                if shaped.glyphs.len() != old_glyphs.len() {
+                    // Glyph count mismatch - skip this line to avoid corruption
+                    break;
+                }
+
+                // Update glyphs with new shapes but preserve token data AND current decorations
+                for (i, shaped_glyph) in shaped.glyphs.iter().enumerate() {
+                    let glyph_idx = run.glyph_start + i;
+                    let old_glyph = &old_glyphs[i];
+
+                    // Read CURRENT decorations from layout_cache (not old_glyphs!)
+                    // apply_demo_styles already set these before reshaping
+                    let current_underline = self.layout_cache[glyph_idx].underline;
+                    let current_strikethrough = self.layout_cache[glyph_idx].strikethrough;
+
+                    self.layout_cache[glyph_idx] = UnifiedGlyph {
+                        char: shaped_glyph.char,
+                        layout_pos: LayoutPos::new(
+                            x_offset + shaped_glyph.pos.x.0 / viewport.scale_factor,
+                            y_pos + shaped_glyph.pos.y.0 / viewport.scale_factor,
+                        ),
+                        physical_pos: PhysicalPos::new(
+                            x_offset * viewport.scale_factor + shaped_glyph.pos.x.0,
+                            y_pos * viewport.scale_factor + shaped_glyph.pos.y.0,
+                        ),
+                        physical_width: shaped_glyph.size.width.0,
+                        tex_coords: shaped_glyph.tex_coords,
+                        char_byte_offset: old_glyph.char_byte_offset,
+                        token_id: old_glyph.token_id,
+                        relative_pos: old_glyph.relative_pos,
+                        atlas_index: shaped_glyph.atlas_index,
+                        weight: run.weight,
+                        italic: run.italic,
+                        underline: current_underline,
+                        strikethrough: current_strikethrough,
+                    };
+                }
+
+                x_offset += shaped.width / viewport.scale_factor;
+            }
+        }
+    }
+
+    /// Parse and apply demo style tags from text (for theme showcase)
+    /// Looks for patterns like [w700], [italic], [underline], [strike], [w700+italic+underline], etc.
+    pub fn apply_demo_styles(&mut self, tree: &Tree) {
+        let text = tree.flatten_to_string();
+        let text = text.as_str();
+
+        // Parse each line for style tags
+        for (line_idx, line_text) in text.lines().enumerate() {
+            // Find style tag at start of line content (after box drawing chars)
+            if let Some(tag_start) = line_text.find('[') {
+                if let Some(tag_end) = line_text[tag_start..].find(']') {
+                    let tag_end = tag_start + tag_end;
+                    let tag = &line_text[tag_start + 1..tag_end];
+
+                    // Parse tag into style attributes
+                    let (weight, italic, underline, strikethrough) = parse_demo_tag(tag);
+
+                    // Find the line in line_cache
+                    if let Some(line_info) = self.line_cache.get(line_idx) {
+                        // Count glyphs BEFORE tag (box drawing chars, etc)
+                        let glyphs_before_tag = line_text[..tag_start].chars().count();
+                        // Count glyphs IN tag (including brackets)
+                        let tag_glyph_count = line_text[tag_start..=tag_end].chars().count();
+                        // Total glyphs to skip (before + tag itself)
+                        let skip_count = glyphs_before_tag + tag_glyph_count;
+
+                        // Apply styles to all glyphs on this line AFTER the tag
+                        for (i, glyph_idx) in line_info.char_range.clone().enumerate() {
+                            if i < skip_count {
+                                continue; // Skip glyphs before and including tag
+                            }
+
+                            if let Some(glyph) = self.layout_cache.get_mut(glyph_idx) {
+                                glyph.weight = weight;
+                                glyph.italic = italic;
+                                glyph.underline = underline;
+                                glyph.strikethrough = strikethrough;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Update style buffer with legacy token ranges
+    /// If theme is provided, also apply style attributes (weight, italic, underline, strikethrough)
     pub fn update_syntax(&mut self, tokens: &[TokenRange], fresh_parse: bool) {
+        self.update_syntax_with_theme(tokens, None, fresh_parse, None, None, None, None);
+    }
+
+    /// Update style buffer with token ranges and optional theme styling
+    pub fn update_syntax_with_theme(
+        &mut self,
+        tokens: &[TokenRange],
+        theme: Option<&crate::theme::Theme>,
+        fresh_parse: bool,
+        tree: Option<&Tree>,
+        font_system: Option<&tiny_font::SharedFontSystem>,
+        viewport: Option<&crate::coordinates::Viewport>,
+        language: Option<&str>,
+    ) {
         // Early exit if no tokens - preserve existing highlights (don't clear!)
         // This prevents white text when waiting for fresh parse
         if tokens.is_empty() {
@@ -367,6 +672,11 @@ impl TextRenderer {
                 for glyph in &mut self.layout_cache {
                     glyph.token_id = 0;
                     glyph.relative_pos = 0.0;
+                    // Reset style attributes to defaults
+                    glyph.weight = 400.0;
+                    glyph.italic = false;
+                    glyph.underline = false;
+                    glyph.strikethrough = false;
                 }
                 self.syntax_state.dirty_range = None;
             }
@@ -466,6 +776,11 @@ impl TextRenderer {
         for glyph in &mut self.layout_cache {
             glyph.token_id = 0;
             glyph.relative_pos = 0.0;
+            // Reset style attributes to defaults
+            glyph.weight = 400.0;
+            glyph.italic = false;
+            glyph.underline = false;
+            glyph.strikethrough = false;
         }
 
         // Apply tokens - O(n + m) single-pass merge
@@ -496,7 +811,32 @@ impl TextRenderer {
                     0.0
                 };
 
+                // Apply style attributes from theme if available
+                if let Some(theme) = theme {
+                    if let Some(style) = theme.get_token_style_for_language(token.token_id, language) {
+                        // Apply weight override (or keep default 400.0)
+                        if let Some(weight) = style.weight {
+                            self.layout_cache[glyph_idx].weight = weight;
+                        }
+                        // Apply italic override (or keep default false)
+                        if let Some(italic) = style.italic {
+                            self.layout_cache[glyph_idx].italic = italic;
+                        }
+                        // Apply decorations
+                        self.layout_cache[glyph_idx].underline = style.underline;
+                        self.layout_cache[glyph_idx].strikethrough = style.strikethrough;
+                    }
+                }
+
                 glyph_idx += 1;
+            }
+        }
+
+        // If theme has weight/italic overrides, reshape lines with mixed styles
+        // Only on fresh parse to avoid flickering during incremental edits
+        if fresh_parse {
+            if let (Some(tree), Some(font_system), Some(viewport)) = (tree, font_system, viewport) {
+                self.reshape_for_styles(tree, font_system, viewport);
             }
         }
     }
@@ -590,6 +930,7 @@ impl TextRenderer {
                 }
             }
         }
+
     }
 
     /// Get visible glyphs with their token IDs
@@ -782,6 +1123,18 @@ impl TextRenderer {
         );
 
         self.palette_texture = Some(texture);
+    }
+
+    // === Style Helper Methods ===
+
+    /// Get style attributes from a glyph as a tuple (weight, italic, underline, strikethrough)
+    pub fn get_glyph_style(&self, glyph: &UnifiedGlyph) -> (f32, bool, bool, bool) {
+        (glyph.weight, glyph.italic, glyph.underline, glyph.strikethrough)
+    }
+
+    /// Get style attributes for a specific glyph index
+    pub fn get_glyph_style_at(&self, glyph_idx: usize) -> Option<(f32, bool, bool, bool)> {
+        self.layout_cache.get(glyph_idx).map(|g| self.get_glyph_style(g))
     }
 
     // === Position Lookup Methods ===

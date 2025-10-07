@@ -78,6 +78,8 @@ pub struct TextMetrics {
     pub space_width: f32,
     /// Number of spaces per tab
     pub tab_stops: u32,
+    /// Baseline offset from line top in logical pixels (from font ascent)
+    pub baseline: f32,
 }
 
 impl TextMetrics {
@@ -87,6 +89,7 @@ impl TextMetrics {
             line_height: font_size * 1.4, // Standard line height multiplier
             space_width: font_size * 0.6, // Will be updated when font system is set
             tab_stops: 4,
+            baseline: font_size * 0.8, // Default estimate, updated from font metrics
         }
     }
 
@@ -97,6 +100,7 @@ impl TextMetrics {
             line_height,
             space_width: font_size * 0.6,
             tab_stops: 4,
+            baseline: font_size * 0.8, // Default estimate
         }
     }
 

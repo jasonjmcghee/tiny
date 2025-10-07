@@ -18,9 +18,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
 
-    let editor_logic = if args.len() > 1 {
+    // Check for --demo-styles flag
+    let demo_styles = args.contains(&"--demo-styles".to_string());
+
+    if demo_styles {
+        tiny_ui::text_renderer::DEMO_STYLES_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Find file path (skip flags)
+    let file_path = args.iter().skip(1).find(|arg| !arg.starts_with("--"));
+
+    let editor_logic = if let Some(path_str) = file_path {
         // Load file from path!
-        let path = PathBuf::from(&args[1]);
+        let path = PathBuf::from(path_str);
         match io::load(&path) {
             Ok(doc) => EditorLogic::new(doc).with_file(path),
             Err(e) => {
@@ -36,5 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EditorLogic::new(doc)
     };
 
-    TinyApp::new(editor_logic).with_config(&config).run()
+    TinyApp::new(editor_logic)
+        .with_config(&config)
+        .run()
 }
