@@ -859,6 +859,11 @@ impl InputHandler {
         self.syntax_highlighter = Some(highlighter);
     }
 
+    /// Get the syntax highlighter
+    pub fn syntax_highlighter(&self) -> Option<Arc<SyntaxHighlighter>> {
+        self.syntax_highlighter.clone()
+    }
+
     /// Check if we should send syntax updates
     pub fn should_flush(&self) -> bool {
         self.has_pending_syntax_update

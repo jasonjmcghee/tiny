@@ -128,6 +128,8 @@ pub struct TextRenderer {
     // === SYNTAX STATE ===
     /// Syntax state
     pub syntax_state: SyntaxState,
+    /// Syntax highlighter for this renderer (per-tab)
+    pub syntax_highlighter: Option<std::sync::Arc<crate::syntax::SyntaxHighlighter>>,
 
     // === CULLING ===
     /// Currently visible lines
@@ -164,6 +166,7 @@ impl TextRenderer {
                 stable_version: 0,
                 edit_deltas: Vec::new(),
             },
+            syntax_highlighter: None,
             visible_lines: 0..0,
             visible_chars: Vec::new(),
             gpu_style_buffer: None,

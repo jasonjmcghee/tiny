@@ -1343,11 +1343,13 @@ impl SharedFontSystem {
     }
 
     /// Pre-rasterize ASCII - font_size_px should include scale factor
-    /// Clears cache first since glyph positions are size-dependent
+    /// If font_size_px is 0, just clears cache without prerasterizing
     pub fn prerasterize_ascii(&self, font_size_px: f32) {
         let mut font_system = self.inner.lock();
         font_system.clear_cache();
-        font_system.prerasterize_ascii(font_size_px);
+        if font_size_px > 0.0 {
+            font_system.prerasterize_ascii(font_size_px);
+        }
     }
 
     /// Get atlas data
@@ -1383,6 +1385,11 @@ impl SharedFontSystem {
     /// Clear color dirty flag after GPU upload
     pub fn clear_color_dirty(&self) {
         self.inner.lock().clear_color_dirty()
+    }
+
+    /// Clear glyph cache (for font size changes)
+    pub fn clear_glyph_cache(&self) {
+        self.inner.lock().clear_cache()
     }
 
     /// Hit test with cluster-aware positioning for ligatures

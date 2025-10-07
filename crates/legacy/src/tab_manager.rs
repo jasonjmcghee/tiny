@@ -17,6 +17,9 @@ pub struct Tab {
     pub text_renderer: TextRenderer,
     pub display_name: String,
     pub scroll_position: Point,
+    /// The ACTUAL syntax highlighter Arc (shared with InputHandler)
+    /// This is the source of truth for parse results
+    pub syntax_arc: Option<std::sync::Arc<crate::syntax::SyntaxHighlighter>>,
 }
 
 impl Tab {
@@ -40,6 +43,14 @@ impl Tab {
             diagnostics.open_file(path.clone(), (*content).clone(), &text_renderer);
         }
 
+        // Get syntax Arc from InputHandler - this is the master that receives parse results
+        let syntax_arc = plugin.editor.input.syntax_highlighter();
+
+        if let Some(ref arc) = syntax_arc {
+            eprintln!("🆕 NEW TAB: Created with syntax_arc ptr={:p} for {}",
+                arc.as_ref() as *const _, arc.language());
+        }
+
         Self {
             plugin,
             line_numbers: LineNumbersPlugin::new(),
@@ -47,13 +58,21 @@ impl Tab {
             text_renderer,
             display_name,
             scroll_position: Point::default(),
+            syntax_arc,
         }
     }
 
     pub fn from_file(path: PathBuf) -> Result<Self, std::io::Error> {
+        Self::from_file_with_event_emitter(path, None::<fn(&str)>)
+    }
+
+    pub fn from_file_with_event_emitter<F>(path: PathBuf, emit_event: Option<F>) -> Result<Self, std::io::Error>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
         // Canonicalize path for consistent comparison across tabs
         let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
-        let plugin = TextEditorPlugin::from_file(canonical_path)?;
+        let plugin = TextEditorPlugin::from_file_with_event_emitter(canonical_path, emit_event)?;
         Ok(Self::new(plugin))
     }
 
@@ -176,9 +195,11 @@ impl TabManager {
         self.tabs.iter().position(|tab| tab.path() == Some(path))
     }
 
-    /// Open a file (or switch to it if already open)
-    /// Returns Ok(true) if a tab switch/open occurred, Ok(false) if no change
-    pub fn open_file(&mut self, path: PathBuf) -> Result<bool, std::io::Error> {
+    /// Open a file with event emitter for instant syntax highlighting
+    pub fn open_file_with_event_emitter<F>(&mut self, path: PathBuf, emit_event: Option<F>) -> Result<bool, std::io::Error>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
         // Canonicalize path for consistent comparison
         let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
 
@@ -188,10 +209,16 @@ impl TabManager {
             return Ok(switched);
         }
 
-        // Open new tab
-        let tab = Tab::from_file(canonical_path)?;
+        // Open new tab with event emitter
+        let tab = Tab::from_file_with_event_emitter(canonical_path, emit_event)?;
         self.add_tab(tab);
         Ok(true)
+    }
+
+    /// Open a file (or switch to it if already open)
+    /// Returns Ok(true) if a tab switch/open occurred, Ok(false) if no change
+    pub fn open_file(&mut self, path: PathBuf) -> Result<bool, std::io::Error> {
+        self.open_file_with_event_emitter(path, None::<fn(&str)>)
     }
 
     /// Get the number of tabs

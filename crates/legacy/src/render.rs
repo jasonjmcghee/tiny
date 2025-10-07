@@ -93,7 +93,6 @@ impl PluginState {
 }
 
 pub struct Renderer {
-    pub syntax_highlighter: Option<Arc<syntax::SyntaxHighlighter>>,
     pub font_system: Option<Arc<tiny_font::SharedFontSystem>>,
     pub theme: Option<Arc<tiny_ui::theme::Theme>>,
     pub viewport: Viewport,
@@ -110,6 +109,8 @@ pub struct Renderer {
     plugin_state: Arc<Mutex<PluginState>>,
     last_viewport_scroll: (f32, f32),
     pub service_registry: ServiceRegistry,
+    /// Track which tab we have swapped (to avoid marking dirty on swap back)
+    current_tab_renderer_id: Option<u64>,
     pub line_numbers_plugin: Option<*mut crate::line_numbers_plugin::LineNumbersPlugin>,
     pub diagnostics_plugin: Option<*mut diagnostics_plugin::DiagnosticsPlugin>,
     pub tab_bar_plugin: Option<*mut crate::tab_bar_plugin::TabBarPlugin>,
@@ -164,7 +165,6 @@ impl Renderer {
         let viewport = Viewport::new(size.0, size.1, scale_factor);
 
         Self {
-            syntax_highlighter: None,
             font_system: None,
             theme: None,
             viewport,
@@ -181,6 +181,7 @@ impl Renderer {
             plugin_state: Arc::new(Mutex::new(PluginState::new())),
             last_viewport_scroll: (0.0, 0.0),
             service_registry: ServiceRegistry::new(),
+            current_tab_renderer_id: None,
             line_numbers_plugin: None,
             diagnostics_plugin: None,
             tab_bar_plugin: None,
@@ -468,10 +469,6 @@ impl Renderer {
         }
     }
 
-    pub fn set_syntax_highlighter(&mut self, highlighter: Arc<syntax::SyntaxHighlighter>) {
-        self.syntax_highlighter = Some(highlighter);
-        self.syntax_dirty = true;
-    }
 
     pub fn set_font_system(&mut self, font_system: Arc<tiny_font::SharedFontSystem>) {
         self.viewport.set_font_system(font_system.clone());
@@ -540,10 +537,20 @@ impl Renderer {
     /// Swap the text renderer with the active tab's renderer
     /// This preserves per-tab rendering state (syntax highlighting, layout, etc.)
     pub fn swap_text_renderer(&mut self, tab_renderer: &mut crate::text_renderer::TextRenderer) {
+        // Track renderer by pointer address to detect actual tab switches
+        let incoming_id = tab_renderer as *const _ as u64;
+        let switching_tabs = self.current_tab_renderer_id != Some(incoming_id);
+
         std::mem::swap(&mut self.text_renderer, tab_renderer);
-        // Mark glyphs dirty since we switched to different content
-        self.glyphs_dirty = true;
-        self.line_numbers_dirty = true;
+
+        // Only mark dirty when switching to a different tab, not on swap-back
+        if switching_tabs {
+            self.current_tab_renderer_id = Some(incoming_id);
+            self.glyphs_dirty = true;
+            self.line_numbers_dirty = true;
+            // Force layout update for new tabs by resetting last_rendered_version
+            self.last_rendered_version = u64::MAX;
+        }
     }
 
     pub fn get_gpu_renderer(&self) -> Option<*const GpuRenderer> {
@@ -562,13 +569,12 @@ impl Renderer {
 
     /// Clear all caches (called when font size/metrics change)
     pub fn clear_all_caches(&mut self) {
-        // Force complete re-layout by marking everything dirty
         self.layout_dirty = true;
         self.syntax_dirty = true;
         self.glyphs_dirty = true;
         self.line_numbers_dirty = true;
-        self.ui_dirty = true; // Tab bar and other UI need regeneration too
-        self.last_rendered_version = 0; // Force re-render
+        self.ui_dirty = true;
+        self.last_rendered_version = 0;
         self.cached_doc_text = None;
         self.cached_doc_version = 0;
     }
@@ -627,8 +633,14 @@ impl Renderer {
 
     /// Collect all glyphs to trigger rasterization (call BEFORE starting render pass)
     pub fn collect_all_glyphs(&mut self, tree: &Tree, tab_manager: Option<&crate::tab_manager::TabManager>) {
-        let content_changed =
-            tree.version != self.last_rendered_version || self.layout_dirty || self.syntax_dirty;
+        let tree_version_changed = tree.version != self.last_rendered_version;
+
+        // Check if syntax highlighter has new results (async parse completed)
+        let syntax_updated = self.text_renderer.syntax_highlighter.as_ref()
+            .map(|h| h.cached_version() > self.text_renderer.syntax_state.stable_version)
+            .unwrap_or(false);
+
+        let content_changed = tree_version_changed || self.layout_dirty || self.syntax_dirty || syntax_updated;
 
         let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
         let scroll_changed = current_scroll != self.last_scroll;
@@ -637,7 +649,23 @@ impl Renderer {
             self.last_scroll = current_scroll;
         }
 
+        if syntax_updated {
+            eprintln!("  🎨 SYNTAX UPDATED: cached_version={}, stable_version={}",
+                self.text_renderer.syntax_highlighter.as_ref().unwrap().cached_version(),
+                self.text_renderer.syntax_state.stable_version);
+        }
+
+        eprintln!("  collect_all_glyphs: tree_v={} vs last={}, layout_dirty={}, syntax_dirty={}, syntax_updated={}, needs_collect={}",
+            tree.version, self.last_rendered_version, self.layout_dirty, self.syntax_dirty, syntax_updated,
+            content_changed || scroll_changed || self.glyphs_dirty || self.line_numbers_dirty || self.ui_dirty);
+
+        // Early exit if nothing needs collection
+        if !content_changed && !scroll_changed && !self.glyphs_dirty && !self.line_numbers_dirty && !self.ui_dirty {
+            return;
+        }
+
         if content_changed {
+            eprintln!("  Calling prepare_render because content_changed=true");
             self.prepare_render(tree);
         }
 
@@ -1065,19 +1093,24 @@ impl Renderer {
 
 
     fn prepare_render(&mut self, tree: &Tree) {
-        // TextRenderer now outputs canonical (0,0)-relative glyphs
-        // Bounds are applied when collecting glyphs for rendering
+        eprintln!("    prepare_render: text_renderer has syntax={}, layout_version={}",
+            self.text_renderer.syntax_highlighter.is_some(),
+            self.text_renderer.layout_version);
 
         if let Some(font_system) = &self.font_system {
-            // Force layout update if layout is marked dirty (e.g., after font size change)
             self.text_renderer
                 .update_layout(tree, font_system, &self.viewport, self.layout_dirty);
         }
 
-        if let Some(ref highlighter) = self.syntax_highlighter {
+        if let Some(ref highlighter) = self.text_renderer.syntax_highlighter {
+            eprintln!("    Applying syntax from highlighter: {}, Arc ptr={:p}", highlighter.language(), highlighter.as_ref() as *const _);
             // Check if tree-sitter completed a parse since last update
             let fresh_parse =
                 highlighter.cached_version() > self.text_renderer.syntax_state.stable_version;
+
+            eprintln!("    fresh_parse={}, cached_version={}, stable_version={}, has_edits={}",
+                fresh_parse, highlighter.cached_version(), self.text_renderer.syntax_state.stable_version,
+                !self.text_renderer.syntax_state.edit_deltas.is_empty());
 
             // Only update syntax if there's something new to apply:
             // - Fresh parse has new tokens from tree-sitter
@@ -1085,39 +1118,47 @@ impl Renderer {
             let needs_update =
                 fresh_parse || !self.text_renderer.syntax_state.edit_deltas.is_empty();
 
-            if needs_update {
-                let tokens: Vec<_> = if fresh_parse {
-                    // Tree-sitter has caught up - query it for fresh tokens
-                    let effects = highlighter.get_effects_in_range(0..tree.char_count());
-                    effects
-                        .into_iter()
-                        .filter_map(|e| match e.effect {
-                            text_effects::EffectType::Token(id) => {
-                                Some(text_renderer::TokenRange {
-                                    byte_range: e.range,
-                                    token_id: id,
-                                })
-                            }
-                            _ => None,
-                        })
-                        .collect()
+            eprintln!("    needs_update={}", needs_update);
+
+            // For new files, apply default styling if tree-sitter hasn't parsed yet
+            let is_initial_render = self.text_renderer.syntax_state.stable_version == 0
+                && self.text_renderer.syntax_state.stable_tokens.is_empty();
+
+            if needs_update || is_initial_render {
+                eprintln!("    Updating syntax tokens... (needs_update={}, is_initial={})", needs_update, is_initial_render);
+
+                // Always try querying highlighter - it might have tokens ready even if cached_version is 0
+                let effects = highlighter.get_effects_in_range(0..tree.char_count());
+                let tokens: Vec<_> = effects
+                    .into_iter()
+                    .filter_map(|e| match e.effect {
+                        text_effects::EffectType::Token(id) => {
+                            Some(text_renderer::TokenRange {
+                                byte_range: e.range,
+                                token_id: id,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                eprintln!("    Got {} tokens from highlighter", tokens.len());
+
+                let tokens_to_apply = if tokens.is_empty() {
+                    // No tokens yet - apply default token to all text so it's visible
+                    eprintln!("    No tokens from tree-sitter yet, using default token for all text");
+                    vec![text_renderer::TokenRange {
+                        byte_range: 0..tree.byte_count(),
+                        token_id: 0, // Default token (should be white/visible)
+                    }]
                 } else {
-                    // Use stable tokens from last parse with edit adjustment
-                    self.text_renderer
-                        .syntax_state
-                        .stable_tokens
-                        .iter()
-                        .map(|t| text_renderer::TokenRange {
-                            byte_range: t.byte_range.clone(),
-                            token_id: t.token_id,
-                        })
-                        .collect()
+                    tokens
                 };
 
                 // Apply syntax with theme for style attributes (weight, italic, underline, strikethrough)
                 let language = highlighter.language();
                 self.text_renderer.update_syntax_with_theme(
-                    &tokens,
+                    &tokens_to_apply,
                     self.theme.as_ref().map(|t| t.as_ref()),
                     fresh_parse,
                     Some(tree),
@@ -1125,11 +1166,18 @@ impl Renderer {
                     Some(&self.viewport),
                     Some(language),
                 );
+                eprintln!("    Syntax applied, glyphs now have token_ids");
+            } else {
+                eprintln!("    Skipping syntax update (no new data)");
             }
+        } else {
+            eprintln!("    No syntax highlighter - glyphs will have no style");
         }
 
         self.text_renderer
             .update_visible_range(&self.viewport, tree);
+
+        eprintln!("    prepare_render done: layout_cache has {} glyphs", self.text_renderer.layout_cache.len());
 
         if self.cached_doc_text.is_none() || tree.version != self.cached_doc_version {
             self.cached_doc_text = Some(tree.flatten_to_string());
@@ -1578,8 +1626,7 @@ impl Renderer {
                     gpu_mut.upload_style_buffer_u32(&style_buffer);
                 }
 
-                let use_themed =
-                    self.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
+                let use_themed = self.text_renderer.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
 
                 gpu_mut.draw_glyphs(
                     pass,

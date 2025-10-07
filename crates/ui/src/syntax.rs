@@ -392,6 +392,7 @@ impl SyntaxHighlighter {
         edit: Option<TextEdit>,
         reset_tree: bool,
     ) {
+        eprintln!("🔄 SYNTAX: Requesting parse for {} ({} bytes, version={})", self.name, text.len(), version);
         let _ = self.tx.send(ParseRequest {
             text: text.to_string(),
             version,
@@ -402,6 +403,15 @@ impl SyntaxHighlighter {
 
     /// Create highlighter for any language with background parsing
     pub fn new(config: LanguageConfig) -> Result<Self, tree_sitter::LanguageError> {
+        Self::new_with_event_emitter(config, None::<fn(&str)>)
+    }
+
+    /// Create highlighter with event emitter for triggering redraws
+    pub fn new_with_event_emitter<F>(config: LanguageConfig, event_emitter: Option<F>) -> Result<Self, tree_sitter::LanguageError>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        let emitter_arc = event_emitter.map(|f| Arc::new(f) as Arc<dyn Fn(&str) + Send + Sync>);
         let has_inline = config.inline_language.is_some();
 
         // Get the language spec from registry for parser setup
@@ -440,6 +450,9 @@ impl SyntaxHighlighter {
         // Get injections query from spec if available
         let injections_query_str = spec.injections_query;
 
+        // Clone emitter for background thread
+        let emitter_clone = emitter_arc;
+
         // Background parsing thread with debouncing - move parser into it
         thread::spawn(move || {
             let mut tree: Option<TSTree> = None;
@@ -459,12 +472,15 @@ impl SyntaxHighlighter {
             };
 
             while let Ok(request) = rx.recv() {
+                eprintln!("🧵 SYNTAX THREAD: Received parse request for {} ({} bytes)", language_name, request.text.len());
+
                 // Shorter debounce for initial parse, longer for subsequent
                 let debounce_ms = if is_first_parse { 10 } else { 100 };
                 std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
 
                 // Drain any additional requests that came in during debounce
                 let final_request = rx.try_iter().last().unwrap_or(request);
+                eprintln!("🧵 SYNTAX THREAD: After debounce, parsing {} bytes", final_request.text.len());
 
                 // Skip if text hasn't changed (avoid redundant parsing)
                 if final_request.text == last_text
@@ -496,6 +512,7 @@ impl SyntaxHighlighter {
                 // Parse with tree-sitter (regular or markdown)
                 let md_tree;
                 if let Some(ref mut md_p) = md_parser {
+                    eprintln!("🧵 SYNTAX THREAD: Parsing as markdown");
                     // Markdown: use MarkdownParser (returns MarkdownTree with block + inline trees)
                     md_tree = md_p.parse(final_request.text.as_bytes(), None);
                     // Extract the block tree for caching
@@ -503,12 +520,15 @@ impl SyntaxHighlighter {
                         tree = Some(md_t.block_tree().clone());
                     }
                 } else {
+                    eprintln!("🧵 SYNTAX THREAD: Parsing as {}", language_name);
                     // Regular language: use standard Parser
                     tree = parser.parse(&final_request.text, tree.as_ref());
                     md_tree = None;
+                    eprintln!("🧵 SYNTAX THREAD: Parser returned tree={}", tree.is_some());
                 }
 
                 if let Some(ref ts_tree) = tree {
+                    eprintln!("🧵 SYNTAX THREAD: Tree exists, applying highlights");
                     // Compile queries on first use (lazy initialization)
                     if query.is_none() {
                         match Query::new(&language_clone, highlights_query_clone) {
@@ -810,7 +830,16 @@ impl SyntaxHighlighter {
                     // IMPORTANT: Always increment version, never go backwards
                     // Version comparison doesn't work with undo/redo
                     let current_v = cached_version_clone.load(Ordering::Relaxed);
-                    cached_version_clone.store(current_v + 1, Ordering::Relaxed);
+                    let new_v = current_v + 1;
+                    cached_version_clone.store(new_v, Ordering::Relaxed);
+
+                    eprintln!("🧵 SYNTAX THREAD: ✅ Parse complete for {}, cached_version: {} → {}", language_name, current_v, new_v);
+
+                    // Emit ui.redraw event if emitter is available
+                    if let Some(ref emit) = emitter_clone {
+                        emit("ui.redraw");
+                        eprintln!("🧵 SYNTAX THREAD: Emitted ui.redraw event");
+                    }
 
                     // Mark first parse as complete
                     is_first_parse = false;
@@ -827,7 +856,7 @@ impl SyntaxHighlighter {
             cached_version,
             language: config.language,
             highlights_query: config.highlights_query,
-            mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)), // Default to incremental
+            mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)),
         })
     }
 
@@ -888,7 +917,7 @@ impl SyntaxHighlighter {
             cached_tree,
             cached_text,
             cached_version,
-            language: tree_sitter_rust::LANGUAGE.into(), // Dummy language, never used
+            language: tree_sitter_rust::LANGUAGE.into(),
             highlights_query: "",
             mode: Arc::new(ArcSwap::from_pointee(SyntaxMode::Incremental)),
         }

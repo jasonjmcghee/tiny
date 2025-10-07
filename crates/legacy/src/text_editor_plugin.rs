@@ -82,7 +82,22 @@ impl TextEditorPlugin {
         self.editor.setup_plugins(ctx)
     }
 
+    /// Create from file with event emitter for syntax highlighting
+    pub fn from_file_with_event_emitter<F>(path: PathBuf, emit_event: Option<F>) -> Result<Self, std::io::Error>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        Self::from_file_internal(path, emit_event)
+    }
+
     pub fn from_file(path: PathBuf) -> Result<Self, std::io::Error> {
+        Self::from_file_internal(path, None::<fn(&str)>)
+    }
+
+    fn from_file_internal<F>(path: PathBuf, emit_event: Option<F>) -> Result<Self, std::io::Error>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
         let bytes = std::fs::read(&path)?;
         let content = match simdutf8::basic::from_utf8(&bytes) {
             Ok(s) => s.to_string(),
@@ -99,22 +114,34 @@ impl TextEditorPlugin {
         content.hash(&mut hasher);
         editor.last_saved_content_hash = hasher.finish();
 
-        // Setup syntax highlighter based on file extension
-        if let Some(highlighter) = SyntaxHighlighter::from_file_path(path.to_str().unwrap_or("")) {
-            let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new(highlighter);
+        // Setup syntax highlighter based on file extension with event emitter
+        let highlighter_result = if let Some(emit) = emit_event {
+            // Detect language from path
+            let lang_config = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                tiny_ui::syntax::Languages::toml()
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                tiny_ui::syntax::Languages::rust()
+            } else {
+                tiny_ui::syntax::Languages::rust() // fallback
+            };
 
-            // Set up shared highlighter for InputHandler
-            if let Some(syntax_hl) = syntax_highlighter
-                .as_any()
-                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-            {
-                let shared_highlighter = Arc::new(syntax_hl.clone());
-                editor.editor.input.set_syntax_highlighter(shared_highlighter);
+            SyntaxHighlighter::new_with_event_emitter(lang_config, Some(emit)).ok()
+        } else {
+            SyntaxHighlighter::from_file_path(path.to_str().unwrap_or(""))
+        };
 
-                // Request initial syntax highlighting
-                syntax_hl.request_update_with_edit(&content, editor.editor.view.doc.version(), None);
-            }
+        if let Some(highlighter) = highlighter_result {
+            // Wrap in Arc FIRST - this is the master copy that receives parse results
+            let syntax_arc = Arc::new(highlighter);
 
+            // Request parse on the master Arc
+            syntax_arc.request_update_with_edit(&content, editor.editor.view.doc.version(), None);
+
+            // Store Arc in InputHandler
+            editor.editor.input.set_syntax_highlighter(syntax_arc.clone());
+
+            // Also store as Box<dyn> for compatibility
+            let syntax_highlighter: Box<dyn TextStyleProvider> = Box::new((*syntax_arc).clone());
             editor.syntax_highlighter = Some(syntax_highlighter);
         }
 

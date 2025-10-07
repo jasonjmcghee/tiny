@@ -585,19 +585,16 @@ impl TinyApp {
         new_metrics.line_height = new_font_size * line_height_multiplier;
         self.text_metrics = new_metrics;
 
-        // Update CPU renderer and clear font atlas cache
+        // Update renderer and invalidate all caches
         if let Some(cpu_renderer) = &mut self.cpu_renderer {
             cpu_renderer.clear_all_caches();
             cpu_renderer.set_font_size(new_font_size);
             cpu_renderer.set_line_height(new_font_size * line_height_multiplier);
         }
 
-        // Clear and re-rasterize font atlas at new size
+        // Clear font atlas cache so glyphs re-rasterize at new size
         if let Some(font_system) = &self.font_system {
-            if let Some(window) = &self.window {
-                let scale_factor = window.scale_factor() as f32;
-                font_system.prerasterize_ascii(new_font_size * scale_factor);
-            }
+            font_system.clear_glyph_cache();
         }
 
         self.request_redraw();
@@ -861,6 +858,7 @@ impl TinyApp {
         self.request_redraw();
     }
 
+
     /// Helper for navigation with optional redraw
     fn navigate(&mut self, nav: impl FnOnce(&mut EditorLogic) -> bool) {
         if nav(&mut self.editor) {
@@ -983,7 +981,15 @@ impl TinyApp {
                                         self.editor.file_picker.hide();
                                         self.shortcuts.set_context(ShortcutContext::Editor);
                                         self.scroll_focus.clear_focus();
-                                        let _ = self.editor.tab_manager.open_file(path);
+
+                                        // Pass wake function for instant syntax highlighting (triggers redraw)
+                                        let window = self.window.clone();
+                                        let _ = self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
+                                            if let Some(ref w) = window {
+                                                w.request_redraw();
+                                            }
+                                        }));
+
                                         if let Some(tab) = self.editor.tab_manager.active_tab() {
                                             self.focused_editable_view_id =
                                                 Some(tab.plugin.editor.id);
@@ -1150,7 +1156,14 @@ impl TinyApp {
                                 self.shortcuts.set_context(ShortcutContext::Editor);
                                 self.scroll_focus.clear_focus();
                                 self.editor.record_navigation();
-                                if self.editor.tab_manager.open_file(path).is_ok() {
+
+                                // Pass wake function for instant syntax highlighting
+                                let window = self.window.clone();
+                                if self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
+                                    if let Some(ref w) = window {
+                                        w.request_redraw();
+                                    }
+                                })).is_ok() {
                                     if let Some(tab) = self.editor.tab_manager.active_tab() {
                                         self.focused_editable_view_id = Some(tab.plugin.editor.id);
                                     }
@@ -1406,25 +1419,18 @@ impl TinyApp {
             self.editor.grep.calculate_bounds(&cpu_renderer.viewport);
         }
 
-        // Setup text styles
-        if let Some(text_styles) = self.editor.text_styles() {
-            if let Some(syntax_hl) = text_styles
-                .as_any()
-                .downcast_ref::<crate::syntax::SyntaxHighlighter>()
-            {
-                if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                    let highlighter = Arc::new(syntax_hl.clone());
-                    cpu_renderer.set_syntax_highlighter(highlighter);
-                }
-            }
-        }
-
         // Update plugins for editor
         if let Some(cpu_renderer) = self.cpu_renderer.as_mut() {
             let tab = self.editor.tab_manager.active_tab_mut();
 
-            // Swap in the active tab's text_renderer to preserve per-tab state
+            // Swap in the active tab's text_renderer
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
+
+            // Set syntax highlighter from Tab's master Arc (receives parse results)
+            if let Some(ref syntax_arc) = tab.syntax_arc {
+                cpu_renderer.text_renderer.syntax_highlighter = Some(syntax_arc.clone());
+                eprintln!("  Using Tab's syntax_arc ptr={:p}", syntax_arc.as_ref() as *const _);
+            }
 
             // Use the active tab's scroll position for rendering
             cpu_renderer.viewport.scroll = tab.scroll_position;
@@ -1753,8 +1759,7 @@ impl ApplicationHandler for TinyApp {
                 config.editor.font_italic
             );
 
-            // Prerasterize ASCII characters at physical size for crisp rendering
-            font_system.prerasterize_ascii(self.text_metrics.font_size * scale_factor);
+            // Glyphs will be rasterized on-demand during text layout
 
             // Setup CPU renderer
             let mut cpu_renderer =
