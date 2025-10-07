@@ -269,7 +269,6 @@ impl EditorLogic {
 
         // Apply pending text edits from code actions
         if let Some(edits) = tab.diagnostics.take_text_edits() {
-            eprintln!("🔍 [LSP-EDIT] Applying {} text edits to document", edits.len());
 
             // Sort edits by position (reverse order to apply from end to start)
             let mut sorted_edits = edits.clone();
@@ -325,11 +324,9 @@ impl EditorLogic {
             }
 
             tab.plugin.editor.view.doc.flush();
-            eprintln!("🔍 [LSP-EDIT] Text edits applied, document flushed");
 
             // Notify LSP of document changes
             let updated_text = tab.plugin.editor.view.doc.read().flatten_to_string();
-            eprintln!("🔍 [LSP-EDIT] Notifying diagnostics of document change (length: {})", updated_text.len());
             tab.diagnostics.document_changed(updated_text.to_string());
 
             // Trigger syntax highlighting update

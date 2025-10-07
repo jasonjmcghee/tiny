@@ -275,16 +275,10 @@ impl DiagnosticsPlugin {
                     // Store layout-space X coordinate for diagnostic hit testing
                     self.mouse_layout_x = doc_x;
 
-                    eprintln!("🔍 [DIAG-PLUGIN] Mouse at screen({:.1}, {:.1}) → doc line={}, col={}, layout_x={:.1}",
-                        x, y, line, column, doc_x);
                     self.mouse_line = Some(line);
                     self.mouse_column = Some(column);
                 }
-            } else {
-                eprintln!("🔍 [DIAG-PLUGIN] WARNING: No service registry provided!");
             }
-        } else {
-            eprintln!("🔍 [DIAG-PLUGIN] WARNING: No widget viewport provided!");
         }
 
         // Update hover state
@@ -294,11 +288,7 @@ impl DiagnosticsPlugin {
     /// Update hover state based on current mouse position
     fn update_hover_state(&mut self) {
         let (line, column) = match (self.mouse_line, self.mouse_column) {
-            (Some(l), Some(c)) => {
-                eprintln!("🔍 [DIAG-PLUGIN] update_hover_state: line={}, col={}, diagnostics={}, symbols={}",
-                    l, c, self.diagnostics.len(), self.symbols.len());
-                (l, c)
-            },
+            (Some(l), Some(c)) => (l, c),
             _ => {
                 // Mouse not over text
                 self.hover_state = HoverState::None;
@@ -312,15 +302,11 @@ impl DiagnosticsPlugin {
         // IMPORTANT: Use layout-space X coordinate, not screen coordinate!
         let mouse_x = self.mouse_layout_x;
 
-        eprintln!("🔍 [DIAG-PLUGIN] Checking diagnostics: mouse_layout_x={:.1}", mouse_x);
         for diagnostic in &self.diagnostics {
-            eprintln!("🔍 [DIAG-PLUGIN]   Diagnostic line={}, range={:.1}..{:.1}",
-                diagnostic.line, diagnostic.start_x, diagnostic.end_x);
             if diagnostic.line == line
                 && mouse_x >= diagnostic.start_x
                 && mouse_x < diagnostic.end_x
             {
-                eprintln!("🔍 [DIAG-PLUGIN] ✅ Mouse over diagnostic at line {}: {}", line, diagnostic.message);
                 self.current_popup = Some(PopupContent::Diagnostic {
                     message: diagnostic.message.clone(),
                     line: diagnostic.line,
@@ -340,9 +326,6 @@ impl DiagnosticsPlugin {
             })
         };
         let over_symbol = hovered_symbol.is_some();
-        if over_symbol {
-            eprintln!("🔍 [DIAG-PLUGIN] Mouse over symbol");
-        }
 
         // Update hover state machine
         match &self.hover_state {
@@ -542,12 +525,10 @@ impl DiagnosticsPlugin {
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
         services: Option<&tiny_sdk::ServiceRegistry>,
     ) {
-        eprintln!("🔍 [DIAG-PLUGIN] update_popup_view: Getting font service...");
         // Get font service
         let font_service = services
             .and_then(|s| s.get::<SharedFontSystem>())
             .expect("Font service required for popup rendering");
-        eprintln!("🔍 [DIAG-PLUGIN] update_popup_view: Got font service");
 
         // Get widget bounds and scroll
         let widget_bounds = widget_viewport
@@ -595,23 +576,17 @@ impl DiagnosticsPlugin {
         popup_viewport.set_font_size(self.viewport.font_size);
 
         // Create TextView
-        eprintln!("🔍 [DIAG-PLUGIN] update_popup_view: Creating TextView...");
         let mut text_view = TextView::from_text(content, popup_viewport);
         text_view.padding_x = self.config.popup_padding;
         text_view.padding_y = self.config.popup_padding;
-        eprintln!("🔍 [DIAG-PLUGIN] update_popup_view: Updating layout...");
         text_view.update_layout(&font_service);
 
-        eprintln!("🔍 [DIAG-PLUGIN] update_popup_view: Acquiring write lock to store popup...");
         *self.popup_view.write().unwrap() = Some(text_view);
-        eprintln!("🔍 [DIAG-PLUGIN] update_popup_view: Popup stored, done");
     }
 
     /// Get rounded rect for popup frame
     fn get_popup_frame(&self) -> Option<RoundedRectInstance> {
-        eprintln!("🔍 [DIAG-PLUGIN] get_popup_frame: Acquiring read lock...");
         let popup_view = self.popup_view.read().unwrap();
-        eprintln!("🔍 [DIAG-PLUGIN] get_popup_frame: Lock acquired");
         let popup_view = popup_view.as_ref()?;
         let bounds = popup_view.viewport.bounds;
 
@@ -894,8 +869,6 @@ impl Paintable for DiagnosticsPlugin {
 
         // Draw squiggly lines
         let vertices = self.create_squiggly_vertices(ctx.widget_viewport.as_ref(), services);
-        eprintln!("🔍 [DIAG-PLUGIN] paint() called, {} diagnostics, {} vertices",
-            self.diagnostics.len(), vertices.len());
         if !vertices.is_empty() {
             let vertex_data = bytemuck::cast_slice(&vertices);
             let vertex_count = vertices.len() as u32;
@@ -953,14 +926,12 @@ impl Paintable for DiagnosticsPlugin {
 
         // Show popup if we have one
         if let Some(ref popup_content) = self.current_popup {
-            eprintln!("🔍 [DIAG-PLUGIN] Rendering popup...");
             match popup_content {
                 PopupContent::Diagnostic {
                     message,
                     line,
                     anchor_x,
                 } => {
-                    eprintln!("🔍 [DIAG-PLUGIN] Creating diagnostic popup view...");
                     self.update_popup_view(
                         message,
                         *line,
@@ -968,14 +939,12 @@ impl Paintable for DiagnosticsPlugin {
                         ctx.widget_viewport.as_ref(),
                         services,
                     );
-                    eprintln!("🔍 [DIAG-PLUGIN] Popup view created");
                 }
                 PopupContent::Hover {
                     content,
                     line,
                     anchor_x,
                 } => {
-                    eprintln!("🔍 [DIAG-PLUGIN] Creating hover popup view...");
                     self.update_popup_view(
                         content,
                         *line,
@@ -983,19 +952,14 @@ impl Paintable for DiagnosticsPlugin {
                         ctx.widget_viewport.as_ref(),
                         services,
                     );
-                    eprintln!("🔍 [DIAG-PLUGIN] Popup view created");
                 }
             }
 
             // Get popup frame BEFORE acquiring any locks
-            eprintln!("🔍 [DIAG-PLUGIN] Getting popup frame...");
             let frame = self.get_popup_frame();
-            eprintln!("🔍 [DIAG-PLUGIN] Got popup frame");
 
-            eprintln!("🔍 [DIAG-PLUGIN] Acquiring popup_view lock...");
             // Render popup using TextView and rounded rect
             if let Ok(mut popup_view_guard) = self.popup_view.try_write() {
-                eprintln!("🔍 [DIAG-PLUGIN] Lock acquired, rendering popup");
                 if let Some(popup_view) = popup_view_guard.as_mut() {
                     // Draw rounded rect frame using the core rounded rect renderer
                     if let Some(frame) = frame {
@@ -1034,12 +998,7 @@ impl Paintable for DiagnosticsPlugin {
                             }
                         }
                     }
-                } else {
-                    eprintln!("🔍 [DIAG-PLUGIN] Popup view is None");
                 }
-                eprintln!("🔍 [DIAG-PLUGIN] Popup rendered, releasing lock");
-            } else {
-                eprintln!("⚠️  [DIAG-PLUGIN] Could not acquire popup_view lock (would deadlock)");
             }
         }
     }
@@ -1130,7 +1089,6 @@ impl DiagnosticsPlugin {
         start_x: f32,
         end_x: f32,
     ) {
-        eprintln!("🔍 [DIAG-PLUGIN] Adding diagnostic at line {}: {}", line, message);
         self.diagnostics.push(Diagnostic {
             line,
             column_range,
@@ -1220,7 +1178,6 @@ impl DiagnosticsPlugin {
 
     /// Clear all diagnostics
     pub fn clear_diagnostics(&mut self) {
-        eprintln!("🔍 [DIAG-PLUGIN] Clearing {} diagnostics", self.diagnostics.len());
         self.diagnostics.clear();
         self.line_texts.clear();
         self.current_popup = None;

@@ -1664,8 +1664,6 @@ impl TinyApp {
 
             // Update diagnostics manager (handles LSP polling, caching, plugin updates)
             // NOTE: cpu_renderer.text_renderer now has populated layout cache from rendering
-            eprintln!("🔍 [APP] Calling diagnostics.update() AFTER rendering, layout cache size: {}",
-                cpu_renderer.text_renderer.layout_cache.len());
             tab.diagnostics
                 .update(&tab.plugin.editor.view.doc, &cpu_renderer.text_renderer);
 

@@ -58,8 +58,6 @@ impl DiagnosticsManager {
         content: String,
         text_renderer: &crate::text_renderer::TextRenderer,
     ) {
-        eprintln!("🔍 [DIAG] open_file() called for {:?}", file_path);
-
         // Clear caches and pending state for new file
         self.definition_cache.clear();
         self.document_symbols.clear();
@@ -104,21 +102,18 @@ impl DiagnosticsManager {
 
     /// Handle document changes with incremental updates
     pub fn document_changed_incremental(&mut self, changes: Vec<crate::lsp_manager::TextChange>) {
-        eprintln!("🔍 [DIAG] document_changed_incremental() called with {} changes", changes.len());
         self.definition_cache.clear();
         self.lsp_service.document_changed_incremental(changes);
     }
 
     /// Handle document changes (legacy full text)
     pub fn document_changed(&mut self, content: String) {
-        eprintln!("🔍 [DIAG] document_changed() called, content length: {}", content.len());
         self.definition_cache.clear();
         self.lsp_service.document_changed(content);
     }
 
     /// Handle document save
     pub fn document_saved(&mut self, content: String) {
-        eprintln!("🔍 [DIAG] document_saved() called, content length: {}", content.len());
         // Save definition cache immediately when file is saved
         if self.definition_cache_modified.is_some() {
             self.save_definition_cache();
@@ -153,15 +148,6 @@ impl DiagnosticsManager {
         for result in self.lsp_service.poll_results() {
             match result {
                 LspResult::Diagnostics(diagnostics) => {
-                    eprintln!(
-                        "🔍 [DIAG] LSP returned {} diagnostics for {:?}",
-                        diagnostics.len(),
-                        self.lsp_service.current_file()
-                    );
-                    eprintln!("🔍 [DIAG] TextRenderer layout cache size: {}, line cache size: {}",
-                        text_renderer.layout_cache.len(),
-                        text_renderer.line_cache.len()
-                    );
                     self.apply_diagnostics(&diagnostics, text_renderer);
                     let content = doc.read().flatten_to_string();
                     if let Some(file_path) = self.lsp_service.current_file() {
@@ -310,25 +296,10 @@ impl DiagnosticsManager {
         diagnostics: &[ParsedDiagnostic],
         text_renderer: &crate::text_renderer::TextRenderer,
     ) {
-        eprintln!("🔍 [DIAG] apply_diagnostics() called with {} diagnostics", diagnostics.len());
-        eprintln!("🔍 [DIAG] Layout cache size: {}, line cache size: {}",
-            text_renderer.layout_cache.len(),
-            text_renderer.line_cache.len()
-        );
-
         // Skip if layout isn't ready yet (can happen during startup)
         if text_renderer.layout_cache.is_empty() {
-            eprintln!(
-                "⚠️  [DIAG] Layout cache empty, skipping diagnostic positioning (will retry next frame)"
-            );
             return;
         }
-
-        eprintln!(
-            "🔍 [DIAG] Applying {} diagnostics with layout cache size: {}",
-            diagnostics.len(),
-            text_renderer.layout_cache.len()
-        );
 
         self.plugin.clear_diagnostics();
 
