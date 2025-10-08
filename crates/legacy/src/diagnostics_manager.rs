@@ -304,7 +304,7 @@ impl DiagnosticsManager {
         self.plugin.clear_diagnostics();
 
         for diag in diagnostics {
-            // Use precise positions from layout cache
+            // Get precise positions from layout cache
             let start_x = text_renderer
                 .get_x_at_line_col(diag.line as u32, diag.column_start)
                 .expect(&format!(

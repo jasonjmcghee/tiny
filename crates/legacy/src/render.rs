@@ -674,8 +674,6 @@ impl Renderer {
         if scroll_changed {
             self.glyphs_dirty = true;
             self.last_scroll = current_scroll;
-            // Update visible range for new scroll position
-            self.text_renderer.update_visible_range(&self.viewport, tree);
         }
 
         // Early exit if nothing needs collection
@@ -690,6 +688,12 @@ impl Renderer {
 
         if content_changed {
             self.prepare_render(tree);
+        }
+
+        // Update visible range for culling
+        if content_changed || scroll_changed {
+            self.text_renderer
+                .update_visible_range(&self.viewport, tree);
         }
 
         let visible_range = self.viewport.visible_byte_range_with_tree(tree);
@@ -1093,6 +1097,8 @@ impl Renderer {
         if let Some(font_system) = &self.font_system {
             self.text_renderer
                 .update_layout(tree, font_system, &self.viewport, self.layout_dirty);
+            // Clear layout_dirty after using it - otherwise it stays true forever!
+            self.layout_dirty = false;
         }
 
         if let Some(ref highlighter) = self.text_renderer.syntax_highlighter {
@@ -1216,7 +1222,12 @@ impl Renderer {
     }
 
     /// Helper to create GlyphCollector with common setup
-    fn make_collector(&self, bounds: tiny_sdk::types::LayoutRect, scroll: tiny_sdk::LayoutPos, widget_id: u64) -> GlyphCollector {
+    fn make_collector(
+        &self,
+        bounds: tiny_sdk::types::LayoutRect,
+        scroll: tiny_sdk::LayoutPos,
+        widget_id: u64,
+    ) -> GlyphCollector {
         GlyphCollector::new(
             self.viewport.to_viewport_info(),
             &self.service_registry,
@@ -1230,7 +1241,10 @@ impl Renderer {
     }
 
     /// Helper to create PaintContext with common setup
-    fn make_paint_ctx(&self, widget_viewport: tiny_sdk::types::WidgetViewport) -> Option<PaintContext> {
+    fn make_paint_ctx(
+        &self,
+        widget_viewport: tiny_sdk::types::WidgetViewport,
+    ) -> Option<PaintContext> {
         let gpu = self.gpu_renderer?;
         let gpu_renderer = unsafe { &*gpu };
         let mut ctx = PaintContext::new(
@@ -1239,7 +1253,8 @@ impl Renderer {
             gpu_renderer.queue_arc(),
             gpu as *mut _,
             &self.service_registry,
-        ).with_widget_viewport(widget_viewport);
+        )
+        .with_widget_viewport(widget_viewport);
         ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
         Some(ctx)
     }
@@ -1249,10 +1264,16 @@ impl Renderer {
             let plugin = unsafe { &mut *plugin_ptr };
             let y = self.title_bar_height + self.tab_bar_height;
             let bounds = tiny_sdk::types::LayoutRect::new(
-                FILE_EXPLORER_WIDTH, y, plugin.width,
-                self.viewport.logical_size.height.0 - y);
-            let mut collector = self.make_collector(bounds,
-                tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0), 1);
+                FILE_EXPLORER_WIDTH,
+                y,
+                plugin.width,
+                self.viewport.logical_size.height.0 - y,
+            );
+            let mut collector = self.make_collector(
+                bounds,
+                tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0),
+                1,
+            );
             plugin.collect_glyphs(&mut collector);
             self.line_number_glyphs = collector.glyphs;
         }
@@ -1269,8 +1290,13 @@ impl Renderer {
             self.tab_bar_height = plugin.height;
 
             let bounds = tiny_sdk::types::LayoutRect::new(
-                0.0, self.title_bar_height, self.viewport.logical_size.width.0, plugin.height);
-            let mut collector = self.make_collector(bounds, tiny_sdk::types::LayoutPos::new(0.0, 0.0), 10);
+                0.0,
+                self.title_bar_height,
+                self.viewport.logical_size.width.0,
+                plugin.height,
+            );
+            let mut collector =
+                self.make_collector(bounds, tiny_sdk::types::LayoutPos::new(0.0, 0.0), 10);
 
             plugin.collect_glyphs(&mut collector, tab_manager);
             self.tab_bar_glyphs = collector.glyphs;
@@ -1375,12 +1401,17 @@ impl Renderer {
         0xFFFFFFFF // Default white if no theme
     }
 
-    fn collect_text_decorations(&mut self, glyphs: &[tiny_ui::text_renderer::UnifiedGlyph]) {
+    fn collect_text_decorations(
+        &self,
+        glyphs: &[&tiny_ui::text_renderer::UnifiedGlyph],
+    ) -> Vec<tiny_sdk::types::RectInstance> {
+        let mut decoration_rects = Vec::new();
         use tiny_sdk::types::{LayoutRect, RectInstance};
 
         // Group glyphs by line and decoration type, then create rect spans
         // Use line's canonical Y position (not glyph Y, which varies per glyph)
         let mut current_line_idx: Option<usize> = None;
+        let mut last_search_idx = 0usize; // Hint: start search near last position (locality of reference)
         let mut underline_start_x: Option<f32> = None;
         let mut underline_end_x: Option<f32> = None;
         let mut underline_token_id: u8 = 0;
@@ -1394,18 +1425,21 @@ impl Renderer {
         let underline_thickness = thickness_logical;
         let strike_thickness = thickness_logical;
 
-        for (i, glyph) in glyphs.iter().enumerate() {
+        for glyph in glyphs.iter() {
             // Work in logical pixels (LayoutRect expects logical coordinates)
             let view_x = glyph.layout_pos.x.0 - self.viewport.scroll.x.0;
             let screen_x = view_x + self.editor_bounds.x.0;
             let glyph_width_logical = glyph.physical_width / self.viewport.scale_factor;
 
-            // Find which line this glyph belongs to (use canonical Y to find line)
-            let glyph_line_idx = self.text_renderer.line_cache.iter().position(|line| {
-                let line_y = line.y_position;
-                let line_bottom = line_y + line.height;
-                glyph.layout_pos.y.0 >= line_y && glyph.layout_pos.y.0 < line_bottom
-            });
+            // Find which line this glyph belongs to using locality hint
+            // Glyphs come in visual order, so hint-based search is O(1) amortized
+            let glyph_line_idx = self.text_renderer
+                .line_cache
+                .find_by_y_position_hint(glyph.layout_pos.y.0, last_search_idx);
+
+            if let Some(idx) = glyph_line_idx {
+                last_search_idx = idx; // Update hint for next glyph
+            }
 
             // Check if we moved to a new line
             if current_line_idx != glyph_line_idx {
@@ -1424,7 +1458,7 @@ impl Renderer {
                             // Get color from theme based on token_id
                             let color = self.get_token_color(underline_token_id);
 
-                            self.text_decoration_rects.push(RectInstance {
+                            decoration_rects.push(RectInstance {
                                 rect: LayoutRect::new(
                                     start,
                                     underline_y,
@@ -1441,7 +1475,7 @@ impl Renderer {
                             // Get color from theme based on token_id
                             let color = self.get_token_color(strike_token_id);
 
-                            self.text_decoration_rects.push(RectInstance {
+                            decoration_rects.push(RectInstance {
                                 rect: LayoutRect::new(
                                     start,
                                     strike_y,
@@ -1480,7 +1514,7 @@ impl Renderer {
                             + self.viewport.metrics.baseline
                             + self.viewport.metrics.font_size * 0.1;
                         let color = self.get_token_color(underline_token_id);
-                        self.text_decoration_rects.push(RectInstance {
+                        decoration_rects.push(RectInstance {
                             rect: LayoutRect::new(
                                 underline_start_x.unwrap(),
                                 underline_y,
@@ -1510,7 +1544,7 @@ impl Renderer {
                         let line_screen_y = line_view_y + self.editor_bounds.y.0;
                         let strike_y = line_screen_y + self.viewport.metrics.line_height * 0.5;
                         let color = self.get_token_color(strike_token_id);
-                        self.text_decoration_rects.push(RectInstance {
+                        decoration_rects.push(RectInstance {
                             rect: LayoutRect::new(
                                 strike_start_x.unwrap(),
                                 strike_y,
@@ -1537,7 +1571,7 @@ impl Renderer {
                         + self.viewport.metrics.baseline
                         + self.viewport.metrics.font_size * 0.1;
                     let color = self.get_token_color(underline_token_id);
-                    self.text_decoration_rects.push(RectInstance {
+                    decoration_rects.push(RectInstance {
                         rect: LayoutRect::new(start, underline_y, end - start, underline_thickness),
                         color,
                     });
@@ -1545,24 +1579,27 @@ impl Renderer {
                 if let (Some(start), Some(end)) = (strike_start_x, strike_end_x) {
                     let strike_y = line_screen_y + self.viewport.metrics.line_height * 0.5;
                     let color = self.get_token_color(strike_token_id);
-                    self.text_decoration_rects.push(RectInstance {
+                    decoration_rects.push(RectInstance {
                         rect: LayoutRect::new(start, strike_y, end - start, strike_thickness),
                         color,
                     });
                 }
             }
         }
+
+        decoration_rects
     }
 
     fn collect_main_text_glyphs(&mut self, tree: &Tree, visible_range: std::ops::Range<usize>) {
         let visible_glyphs = self.text_renderer.get_visible_glyphs_with_style();
 
         // Collect decoration rectangles (underline, strikethrough)
-        self.collect_text_decorations(&visible_glyphs);
+        let decoration_rects = self.collect_text_decorations(&visible_glyphs);
+        self.text_decoration_rects.extend(decoration_rects);
 
         let glyph_instances: Vec<_> = visible_glyphs
-            .into_iter()
-            .map(|g| {
+            .iter()
+            .map(|&g| {
                 // Apply scroll to get view position
                 let view_x = g.layout_pos.x.0 - self.viewport.scroll.x.0;
                 let view_y = g.layout_pos.y.0 - self.viewport.scroll.y.0;

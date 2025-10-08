@@ -45,6 +45,138 @@ pub struct LineInfo {
     pub height: f32,
 }
 
+/// Efficient line cache with optimized search methods
+/// Lines are sorted by both byte_range and y_position
+#[derive(Clone, Debug, Default)]
+pub struct LineCache {
+    lines: Vec<LineInfo>,
+}
+
+impl LineCache {
+    pub fn new() -> Self {
+        Self { lines: Vec::new() }
+    }
+
+    /// Get line count
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Get line by index
+    pub fn get(&self, index: usize) -> Option<&LineInfo> {
+        self.lines.get(index)
+    }
+
+    /// Clear all lines
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+
+    /// Push a line (assumes lines are added in sorted order)
+    pub fn push(&mut self, line: LineInfo) {
+        self.lines.push(line);
+    }
+
+    /// Find visible line range by byte range (O(log n))
+    /// Returns (start_line_idx, end_line_idx)
+    pub fn find_by_byte_range(&self, byte_range: &Range<usize>) -> Range<u32> {
+        if self.lines.is_empty() {
+            return 0..0;
+        }
+
+        // Binary search for first line that ends after visible start
+        let start_line = self.lines.binary_search_by(|line| {
+            if line.byte_range.end <= byte_range.start {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }).unwrap_or_else(|i| i);
+
+        // Binary search for last line that starts before visible end
+        let end_line = self.lines.binary_search_by(|line| {
+            if line.byte_range.start < byte_range.end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }).unwrap_or_else(|i| i);
+
+        start_line as u32..end_line as u32
+    }
+
+    /// Find line by y position using binary search (O(log n))
+    pub fn find_by_y_position(&self, y: f32) -> Option<usize> {
+        self.lines.binary_search_by(|line| {
+            if y < line.y_position {
+                std::cmp::Ordering::Greater // Target is before this line
+            } else if y >= line.y_position + line.height {
+                std::cmp::Ordering::Less // Target is after this line
+            } else {
+                std::cmp::Ordering::Equal // Target is within this line
+            }
+        }).ok()
+    }
+
+    /// Find line by y position with locality hint (O(1) amortized for sequential access)
+    /// Use this when processing glyphs/elements in visual order
+    pub fn find_by_y_position_hint(&self, y: f32, hint: usize) -> Option<usize> {
+        // Fast path: check hint first
+        if let Some(line) = self.lines.get(hint) {
+            if y >= line.y_position && y < line.y_position + line.height {
+                return Some(hint);
+            }
+        }
+
+        // Scan forward from hint (common case: next line)
+        let mut idx = hint;
+        while idx < self.lines.len() {
+            let line = &self.lines[idx];
+            if y >= line.y_position && y < line.y_position + line.height {
+                return Some(idx);
+            }
+            // If we've gone past the target, fall back to binary search
+            if y < line.y_position {
+                return self.find_by_y_position(y);
+            }
+            idx += 1;
+        }
+
+        None
+    }
+
+    /// Find line by character index (glyph index) using binary search (O(log n))
+    pub fn find_by_char_index(&self, char_idx: usize) -> Option<usize> {
+        self.lines.binary_search_by(|line| {
+            if char_idx < line.char_range.start {
+                std::cmp::Ordering::Greater
+            } else if char_idx >= line.char_range.end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }).ok()
+    }
+
+    /// Iterate over all lines
+    pub fn iter(&self) -> impl Iterator<Item = &LineInfo> {
+        self.lines.iter()
+    }
+}
+
+// Allow indexing line_cache[idx]
+impl std::ops::Index<usize> for LineCache {
+    type Output = LineInfo;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.lines[index]
+    }
+}
+
 /// Token range with token ID
 #[derive(Clone, Debug)]
 pub struct TokenRange {
@@ -112,8 +244,8 @@ pub struct TextRenderer {
     // === LAYOUT WITH INTEGRATED STYLE ===
     /// All glyphs with positions and styles
     pub layout_cache: Vec<UnifiedGlyph>,
-    /// Line metadata for culling
-    pub line_cache: Vec<LineInfo>,
+    /// Line metadata for culling with optimized search
+    pub line_cache: LineCache,
     /// Cache invalidation version (increments on any layout change)
     pub layout_version: u64,
     /// Last tree version we built layout from (tracks document content)
@@ -153,7 +285,7 @@ impl TextRenderer {
     pub fn new() -> Self {
         Self {
             layout_cache: Vec::new(),
-            line_cache: Vec::new(),
+            line_cache: LineCache::new(),
             layout_version: 0,
             last_tree_version: u64::MAX, // Force initial update (no tree version will match)
             last_font_size: 0.0,
@@ -206,18 +338,7 @@ impl TextRenderer {
                     return None; // Skip unstyled glyphs
                 }
                 // Find which line this glyph is on using binary search
-                let line_idx = self
-                    .line_cache
-                    .binary_search_by(|l| {
-                        if glyph_idx < l.char_range.start {
-                            std::cmp::Ordering::Greater
-                        } else if glyph_idx >= l.char_range.end {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    })
-                    .ok()?;
+                let line_idx = self.line_cache.find_by_char_index(glyph_idx)?;
                 let line_info = self.line_cache.get(line_idx)?;
                 let pos_in_line = (glyph_idx - line_info.char_range.start) as u32;
                 Some((
@@ -242,6 +363,7 @@ impl TextRenderer {
         let text = tree.flatten_to_string();
         let text = text.as_str();
         let lines: Vec<&str> = text.lines().collect();
+        let total_lines = tree.line_count();
 
         let mut char_index = 0;
         let mut byte_offset = 0;
@@ -251,6 +373,7 @@ impl TextRenderer {
         let x_offset = 0.0;
         let mut y_pos = 0.0;
 
+        // Layout all lines
         for (line_idx, line_text) in lines.iter().enumerate() {
             let line_start_char = char_index;
             let line_start_byte = byte_offset;
@@ -335,10 +458,8 @@ impl TextRenderer {
                     (char_index - line_start_char) as u32,
                     glyph.char,
                 );
-                let (token_id, relative_pos, weight, italic, underline, strikethrough) = old_tokens
-                    .get(&key)
-                    .copied()
-                    .unwrap_or((0, 0.0, 400.0, false, false, false));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
+                    self.lookup_token_for_byte(char_byte_offset, old_tokens.get(&key));
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
@@ -394,10 +515,8 @@ impl TextRenderer {
             // Add newline as a glyph (invisible but maintains byte position)
             if line_idx < lines.len() - 1 {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
-                let (token_id, relative_pos, weight, italic, underline, strikethrough) = old_tokens
-                    .get(&key)
-                    .copied()
-                    .unwrap_or((0, 0.0, 400.0, false, false, false));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
+                    self.lookup_token_for_byte(byte_offset, old_tokens.get(&key));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -420,10 +539,8 @@ impl TextRenderer {
                 char_index += 1;
             } else if text.ends_with('\n') {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
-                let (token_id, relative_pos, weight, italic, underline, strikethrough) = old_tokens
-                    .get(&key)
-                    .copied()
-                    .unwrap_or((0, 0.0, 400.0, false, false, false));
+                let (token_id, relative_pos, weight, italic, underline, strikethrough) =
+                    self.lookup_token_for_byte(byte_offset, old_tokens.get(&key));
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -503,8 +620,10 @@ impl TextRenderer {
             }
 
             // Line has mixed styles - segment into runs and reshape each
-            let line_text = if line_idx < lines.len() {
-                lines[line_idx]
+            // Use line_number (document line) not line_idx (cache index)
+            let doc_line_num = line_info.line_number as usize;
+            let line_text = if doc_line_num < lines.len() {
+                lines[doc_line_num]
             } else {
                 continue;
             };
@@ -934,39 +1053,67 @@ impl TextRenderer {
             }
         };
     }
-    /// Update visible range for culling
+    /// Look up syntax token for a byte offset in the document
+    /// Returns (token_id, relative_pos, weight, italic, underline, strikethrough)
+    /// Theme styling will be applied later in update_syntax_with_theme
+    fn lookup_token_for_byte(
+        &self,
+        byte_offset: usize,
+        old_style: Option<&(u16, f32, f32, bool, bool, bool)>,
+    ) -> (u16, f32, f32, bool, bool, bool) {
+        // Try to find token in stable_tokens (document-wide syntax highlighting)
+        for token in &self.syntax_state.stable_tokens {
+            if byte_offset >= token.byte_range.start && byte_offset < token.byte_range.end {
+                let token_id = token.token_id as u16;
+
+                // Calculate relative position within token
+                let token_byte_length = token.byte_range.end - token.byte_range.start;
+                let byte_offset_in_token = byte_offset - token.byte_range.start;
+                let relative_pos = if token_byte_length > 0 {
+                    (byte_offset_in_token as f32) / (token_byte_length as f32)
+                } else {
+                    0.0
+                };
+
+                // Return token with default styling (theme will be applied later)
+                return (token_id, relative_pos, 400.0, false, false, false);
+            }
+        }
+
+        // Fallback to old style if available (preserving style across relayout)
+        if let Some(&style) = old_style {
+            return style;
+        }
+
+        // Default: no highlighting
+        (0, 0.0, 400.0, false, false, false)
+    }
+
     pub fn update_visible_range(&mut self, viewport: &crate::coordinates::Viewport, tree: &Tree) {
         let visible_byte_range = viewport.visible_byte_range_with_tree(tree);
 
-        // Find visible lines
-        let mut start_line = None;
-        let mut end_line = None;
+        // Find visible lines using optimized binary search
+        self.visible_lines = self.line_cache.find_by_byte_range(&visible_byte_range);
 
-        for (i, line) in self.line_cache.iter().enumerate() {
-            if line.byte_range.end > visible_byte_range.start && start_line.is_none() {
-                start_line = Some(i as u32);
-            }
-            if line.byte_range.start < visible_byte_range.end {
-                end_line = Some(i as u32 + 1);
-            }
-        }
+        // Find visible characters with horizontal culling
+        // Only include chars within the visible horizontal range
+        let visible_x_start = viewport.scroll.x.0;
+        let visible_x_end = viewport.scroll.x.0 + viewport.logical_size.width.0;
 
-        // Handle empty documents and fallback for edge cases
-        if self.line_cache.is_empty() {
-            self.visible_lines = 0..0;
-        } else if start_line.is_none() && end_line.is_none() {
-            // No lines found in visible range - show nothing
-            self.visible_lines = 0..0;
-        } else {
-            self.visible_lines = start_line.unwrap_or(0)..end_line.unwrap_or(0);
-        }
-
-        // Find visible characters (includes all chars from visible lines)
         self.visible_chars.clear();
         for line_idx in self.visible_lines.clone() {
             if let Some(line) = self.line_cache.get(line_idx as usize) {
                 for char_idx in line.char_range.clone() {
-                    self.visible_chars.push(char_idx);
+                    // Check if this character is within the horizontal viewport
+                    if let Some(glyph) = self.layout_cache.get(char_idx) {
+                        let glyph_x = glyph.layout_pos.x.0;
+                        let glyph_width = glyph.physical_width / viewport.scale_factor;
+
+                        // Include glyph if any part of it is visible
+                        if glyph_x + glyph_width >= visible_x_start && glyph_x <= visible_x_end {
+                            self.visible_chars.push(char_idx);
+                        }
+                    }
                 }
             }
         }
@@ -984,10 +1131,11 @@ impl TextRenderer {
     }
 
     /// Get visible glyphs with full style information
-    pub fn get_visible_glyphs_with_style(&self) -> Vec<UnifiedGlyph> {
+    /// Returns references to avoid expensive clones (UnifiedGlyph is ~80 bytes)
+    pub fn get_visible_glyphs_with_style(&self) -> Vec<&UnifiedGlyph> {
         self.visible_chars
             .iter()
-            .filter_map(|&idx| self.layout_cache.get(idx).cloned())
+            .filter_map(|&idx| self.layout_cache.get(idx))
             .collect()
     }
 
