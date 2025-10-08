@@ -838,6 +838,7 @@ dependencies = [
  "tiny-core",
  "tiny-font",
  "tiny-sdk",
+ "tiny-tree",
  "tiny-ui",
  "toml",
 ]

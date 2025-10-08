@@ -9,6 +9,14 @@ use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
 use tiny_sdk::wgpu::Buffer;
+use tiny_tree::Doc;
+
+/// Wrapper to make Doc pointer Send + Sync
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct DocPtr(*const Doc);
+
+unsafe impl Send for DocPtr {}
+unsafe impl Sync for DocPtr {}
 use tiny_sdk::{
     ffi::{
         BindGroupLayoutId, BufferId, PipelineId, ShaderModuleId, VertexAttributeDescriptor,
@@ -74,7 +82,7 @@ impl Default for DiagnosticsConfig {
         Self {
             popup_background_color: 0x2D2D30FF, // Dark gray
             popup_text_color: 0xCCCCCCFF,       // Light gray
-            popup_border_color: 0x464647FF,     // Border gray
+            popup_border_color: 0x46464780,     // Border gray
             popup_padding: 8.0,
         }
     }
@@ -100,6 +108,10 @@ pub struct DiagnosticsPlugin {
 
     // Symbol positions from LSP
     symbols: Vec<Symbol>,
+
+    // Document reference for overview ruler
+    doc: Option<DocPtr>,
+    total_lines: u32,
 
     // Hover state machine
     hover_state: HoverState,
@@ -191,6 +203,8 @@ impl DiagnosticsPlugin {
             config: DiagnosticsConfig::default(),
             diagnostics: Vec::new(),
             symbols: Vec::new(),
+            doc: None,
+            total_lines: 0,
             line_texts: HashMap::new(),
             hover_state: HoverState::None,
             hover_start_time: None,
@@ -507,6 +521,93 @@ impl DiagnosticsPlugin {
                 },
                 DiagnosticVertex {
                     position: [screen_x, screen_y + padding],
+                    color,
+                    line_info,
+                },
+            ]);
+        }
+
+        vertices
+    }
+
+    /// Create vertices for the overview ruler (minimap showing diagnostic positions)
+    fn create_overview_vertices(
+        &self,
+        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
+    ) -> Vec<DiagnosticVertex> {
+        let mut vertices = Vec::new();
+
+        if self.total_lines == 0 {
+            return vertices;
+        }
+
+        let scale = self.viewport.scale_factor;
+
+        // Get widget bounds
+        let widget_offset_x = widget_viewport.map(|w| w.bounds.x.0).unwrap_or(0.0);
+        let widget_offset_y = widget_viewport.map(|w| w.bounds.y.0).unwrap_or(0.0);
+        let viewport_width = widget_viewport
+            .map(|w| w.bounds.width.0)
+            .unwrap_or(self.viewport.logical_size.width.0);
+        let viewport_height = widget_viewport
+            .map(|w| w.bounds.height.0)
+            .unwrap_or(self.viewport.logical_size.height.0);
+
+        // Overview ruler dimensions
+        let ruler_width = 8.0;
+        let ruler_x = viewport_width - ruler_width - 8.0; // 2px padding from right edge
+        let marker_height = 3.0;
+
+        for diagnostic in &self.diagnostics {
+            // Calculate position based on line / total_lines
+            let line_ratio = diagnostic.line as f32 / self.total_lines as f32;
+            let marker_y = line_ratio * viewport_height;
+
+            // Convert to screen space
+            let screen_x = (ruler_x + widget_offset_x) * scale;
+            let screen_y = (marker_y + widget_offset_y) * scale;
+            let screen_width = ruler_width * scale;
+            let screen_height = marker_height * scale;
+
+            // Color based on severity
+            let color = match diagnostic.severity {
+                DiagnosticSeverity::Error => 0xFF4444a0,   // Red
+                DiagnosticSeverity::Warning => 0xFFCC00a0, // Yellow/Orange
+                DiagnosticSeverity::Info => 0x4444FFa0,    // Blue
+            };
+
+            // Create quad (2 triangles)
+            // Use line_info with width=0 to signal this is a solid rect, not a squiggly
+            let line_info = [0.0, 0.0, 0.0, -1.0]; // severity=-1 means solid rect
+
+            vertices.extend_from_slice(&[
+                DiagnosticVertex {
+                    position: [screen_x, screen_y],
+                    color,
+                    line_info,
+                },
+                DiagnosticVertex {
+                    position: [screen_x + screen_width, screen_y],
+                    color,
+                    line_info,
+                },
+                DiagnosticVertex {
+                    position: [screen_x, screen_y + screen_height],
+                    color,
+                    line_info,
+                },
+                DiagnosticVertex {
+                    position: [screen_x + screen_width, screen_y],
+                    color,
+                    line_info,
+                },
+                DiagnosticVertex {
+                    position: [screen_x + screen_width, screen_y + screen_height],
+                    color,
+                    line_info,
+                },
+                DiagnosticVertex {
+                    position: [screen_x, screen_y + screen_height],
                     color,
                     line_info,
                 },
@@ -847,6 +948,17 @@ impl Library for DiagnosticsPlugin {
                 self.set_hover_content(content, line, column);
                 Ok(Vec::new())
             }
+            "set_document" => {
+                // Format: doc_ptr (u64)
+                if args.len() < 8 {
+                    return Err(PluginError::Other("Invalid document pointer args".into()));
+                }
+
+                let doc_ptr = u64::from_le_bytes(args[0..8].try_into().unwrap());
+                let doc = unsafe { &*(doc_ptr as *const Doc) };
+                self.set_document(doc);
+                Ok(Vec::new())
+            }
             _ => Err(PluginError::Other("Unknown method".into())),
         }
     }
@@ -867,8 +979,11 @@ impl Paintable for DiagnosticsPlugin {
                 .map(|data| &*(data as *const _ as *const tiny_sdk::ServiceRegistry))
         };
 
-        // Draw squiggly lines
-        let vertices = self.create_squiggly_vertices(ctx.widget_viewport.as_ref(), services);
+        // Draw squiggly lines and overview ruler
+        let mut vertices = self.create_squiggly_vertices(ctx.widget_viewport.as_ref(), services);
+        let overview_vertices = self.create_overview_vertices(ctx.widget_viewport.as_ref());
+        vertices.extend(overview_vertices);
+
         if !vertices.is_empty() {
             let vertex_data = bytemuck::cast_slice(&vertices);
             let vertex_count = vertices.len() as u32;
@@ -1074,6 +1189,16 @@ pub extern "C" fn diagnostics_plugin_create() -> Box<dyn Plugin> {
 // === Public API ===
 
 impl DiagnosticsPlugin {
+    /// Set the document reference for overview ruler
+    pub fn set_document(&mut self, doc: &Doc) {
+        let new_ptr = DocPtr(doc as *const _);
+        self.doc = Some(new_ptr);
+
+        // Update total lines
+        let tree = doc.read();
+        self.total_lines = tree.line_count();
+    }
+
     /// Add a diagnostic (host must call set_diagnostic_positions after this)
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);

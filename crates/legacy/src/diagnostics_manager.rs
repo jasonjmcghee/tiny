@@ -124,6 +124,9 @@ impl DiagnosticsManager {
 
     /// Update diagnostics (call this every frame)
     pub fn update(&mut self, doc: &Doc, text_renderer: &crate::text_renderer::TextRenderer) {
+        // Update document reference in plugin for overview ruler
+        self.plugin.set_document(doc);
+
         // Check if plugin needs hover info (500ms timer elapsed)
         if let Some((line, column)) = self.plugin.update() {
             self.lsp_service

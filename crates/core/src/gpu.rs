@@ -251,12 +251,12 @@ fn vertex_attr(offset: u64, location: u32, format: VertexFormat) -> VertexAttrib
 
 fn glyph_vertex_attributes() -> [VertexAttribute; 6] {
     [
-        vertex_attr(0, 0, VertexFormat::Float32x2),   // position
-        vertex_attr(8, 1, VertexFormat::Float32x2),   // tex_coord
-        vertex_attr(16, 2, VertexFormat::Uint32),     // token_id
-        vertex_attr(20, 3, VertexFormat::Float32),    // relative_pos
-        vertex_attr(24, 4, VertexFormat::Uint32),     // format
-        vertex_attr(28, 5, VertexFormat::Uint32),     // atlas_index
+        vertex_attr(0, 0, VertexFormat::Float32x2), // position
+        vertex_attr(8, 1, VertexFormat::Float32x2), // tex_coord
+        vertex_attr(16, 2, VertexFormat::Uint32),   // token_id
+        vertex_attr(20, 3, VertexFormat::Float32),  // relative_pos
+        vertex_attr(24, 4, VertexFormat::Uint32),   // format
+        vertex_attr(28, 5, VertexFormat::Uint32),   // atlas_index
     ]
 }
 
@@ -1498,7 +1498,8 @@ impl GpuRenderer {
             let vertices_per_batch = batch_size / vertex_size;
 
             for chunk in vertices.chunks(vertices_per_batch) {
-                self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(chunk));
+                self.queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(chunk));
 
                 // Set scissor for this batch
                 if let Some((x, y, w, h)) = config.scissor {

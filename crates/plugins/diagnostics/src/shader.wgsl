@@ -54,6 +54,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let line_width = input.line_info.z;
     let severity = input.line_info.w;
 
+    // Check if this is a solid rect (overview ruler marker)
+    if severity < -0.5 {
+        // Solid rect - use the color passed from vertex shader
+        return input.color;
+    }
+
     // Check if we're within the line bounds
     if px < line_x || px > line_x + line_width {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);

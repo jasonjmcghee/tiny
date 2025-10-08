@@ -11,6 +11,7 @@ tiny-sdk = { path = "../../sdk" }
 tiny-core = { path = "../../core" }
 tiny-ui = { path = "../../ui" }
 tiny-font = { path = "../../font" }
+tiny-tree = { path = "../../tree" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 ahash.workspace = true
