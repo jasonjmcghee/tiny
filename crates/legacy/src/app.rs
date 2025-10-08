@@ -215,7 +215,8 @@ impl TinyApp {
         // Pre-compute logical positions to avoid borrow issues
         let logical_point = self.physical_to_logical_point(position);
         let drag_from = self
-            .mouse_state.drag_start
+            .mouse_state
+            .drag_start
             .and_then(|p| self.physical_to_logical_point(p));
 
         if let Some(point) = logical_point {
@@ -328,6 +329,32 @@ impl TinyApp {
                     .on_mouse_leave();
             }
 
+            // Update scrollbar hover state
+            let scrollbar_visibility_changed = if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                let editor_rect = tiny_core::tree::Rect {
+                    x: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.x.0),
+                    y: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.y.0),
+                    width: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.width.0),
+                    height: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.height.0),
+                };
+                cpu_renderer.scrollbar_plugin.update_mouse_position(
+                    point.x.0,
+                    point.y.0,
+                    &cpu_renderer.viewport,
+                    &editor_rect,
+                )
+            } else {
+                false
+            };
+
+            // Mark UI dirty and request redraw if scrollbar visibility changed
+            if scrollbar_visibility_changed {
+                if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                    cpu_renderer.mark_ui_dirty();
+                }
+                self.request_redraw();
+            }
+
             // Emit mouse move event for overlays (file picker, grep)
             self.event_bus.emit(
                 "app.mouse.move",
@@ -352,31 +379,70 @@ impl TinyApp {
                 }
             }
 
-            // Mouse drag - emit event
-            if self.mouse_state.pressed {
-                if let Some(from) = drag_from {
-                    // Check if drag started in titlebar area (for transparent titlebar on macOS)
-                    #[cfg(target_os = "macos")]
-                    let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
-                    #[cfg(not(target_os = "macos"))]
-                    let drag_started_in_titlebar = false;
+            // Handle scrollbar drag (independent of mouse_state.pressed)
+            let handled_scrollbar_drag = if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                if cpu_renderer.scrollbar_plugin.is_dragging {
+                    let editor_rect = tiny_core::tree::Rect {
+                        x: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.x.0),
+                        y: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.y.0),
+                        width: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.width.0),
+                        height: tiny_sdk::LogicalPixels(cpu_renderer.editor_bounds.height.0),
+                    };
 
-                    // Only emit drag event if drag didn't start in titlebar area
-                    if !drag_started_in_titlebar {
-                        if let (Some(from_local), to_local) = (editor_local_from, editor_local_to) {
-                            // Emit drag event
-                            self.event_bus.emit(
-                                "mouse.drag",
-                                json!({
-                                    "from_x": from_local.x.0,
-                                    "from_y": from_local.y.0,
-                                    "to_x": to_local.x.0,
-                                    "to_y": to_local.y.0,
-                                    "alt": self.mouse_state.modifiers.alt,
-                                }),
-                                10,
-                                "winit",
-                            );
+                    if let Some(new_scroll) = cpu_renderer.scrollbar_plugin.handle_drag(
+                        point.y.0,
+                        &cpu_renderer.viewport,
+                        &editor_rect,
+                    ) {
+                        // Emit scrollbar event
+                        self.event_bus.emit(
+                            "scrollbar.set_position",
+                            json!({"y": new_scroll}),
+                            10,
+                            "scrollbar",
+                        );
+                        let _ = self.process_event_queue();
+                        self.request_redraw();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            // Mouse drag - emit event (only if not handled by scrollbar)
+            if !handled_scrollbar_drag && self.mouse_state.pressed {
+                if let Some(from) = drag_from {
+                    if !handled_scrollbar_drag {
+                        // Check if drag started in titlebar area (for transparent titlebar on macOS)
+                        #[cfg(target_os = "macos")]
+                        let drag_started_in_titlebar = from.y.0 < self.title_bar_height;
+                        #[cfg(not(target_os = "macos"))]
+                        let drag_started_in_titlebar = false;
+
+                        // Only emit drag event if drag didn't start in titlebar area
+                        if !drag_started_in_titlebar {
+                            if let (Some(from_local), to_local) =
+                                (editor_local_from, editor_local_to)
+                            {
+                                // Emit drag event
+                                self.event_bus.emit(
+                                    "mouse.drag",
+                                    json!({
+                                        "from_x": from_local.x.0,
+                                        "from_y": from_local.y.0,
+                                        "to_x": to_local.x.0,
+                                        "to_y": to_local.y.0,
+                                        "alt": self.mouse_state.modifiers.alt,
+                                    }),
+                                    10,
+                                    "winit",
+                                );
+                            }
                         }
                     }
                 }
@@ -472,6 +538,9 @@ impl TinyApp {
 
                     // Update viewport scroll for rendering
                     cpu_renderer.viewport.scroll = tab.scroll_position;
+
+                    // Mark scroll activity to keep scrollbar visible
+                    cpu_renderer.scrollbar_plugin.mark_scroll_activity();
                 }
                 _ => {
                     // Other widgets - not yet implemented
@@ -513,8 +582,8 @@ impl TinyApp {
             window_title: "Tiny Editor".to_string(),
             window_size: (800.0, 600.0),
             text_metrics,
-            base_font_size: 14.0,      // Default base size
-            title_bar_height: 28.0,    // Logical pixels
+            base_font_size: 14.0,   // Default base size
+            title_bar_height: 28.0, // Logical pixels
             scroll_lock_enabled: true,
             current_scroll_direction: None,
             mouse_state: crate::mouse_state::MouseState::new(),
@@ -593,11 +662,6 @@ impl TinyApp {
             cpu_renderer.set_line_height(new_font_size * line_height_multiplier);
         }
 
-        // Clear font atlas cache so glyphs re-rasterize at new size
-        if let Some(font_system) = &self.font_system {
-            font_system.clear_glyph_cache();
-        }
-
         self.request_redraw();
     }
 
@@ -623,8 +687,11 @@ impl TinyApp {
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     let matches = if let Some(ref ext) = ext_filter {
-                        event.kind.is_modify() && event.paths.iter().any(|p|
-                            p.extension().map_or(false, |e| e == ext.as_str()))
+                        event.kind.is_modify()
+                            && event
+                                .paths
+                                .iter()
+                                .any(|p| p.extension().map_or(false, |e| e == ext.as_str()))
                     } else {
                         event.kind.is_modify()
                     };
@@ -634,7 +701,8 @@ impl TinyApp {
                 }
             },
             notify::Config::default(),
-        ).ok()?;
+        )
+        .ok()?;
 
         watcher.watch(&path, RecursiveMode::NonRecursive).ok()?;
 
@@ -656,17 +724,29 @@ impl TinyApp {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("crates/core/src/shaders");
         self._shader_watcher = Self::setup_file_watcher(
-            shader_path, self.shader_reload_pending.clone(), Some("wgsl"), 50);
+            shader_path,
+            self.shader_reload_pending.clone(),
+            Some("wgsl"),
+            50,
+        );
     }
 
     fn setup_config_watcher(&mut self) {
         self._config_watcher = Self::setup_file_watcher(
-            PathBuf::from("init.toml"), self.config_reload_pending.clone(), None, 200);
+            PathBuf::from("init.toml"),
+            self.config_reload_pending.clone(),
+            None,
+            200,
+        );
     }
 
     fn setup_shortcuts_watcher(&mut self) {
         self._shortcuts_watcher = Self::setup_file_watcher(
-            PathBuf::from("shortcuts.toml"), self.shortcuts_reload_pending.clone(), None, 200);
+            PathBuf::from("shortcuts.toml"),
+            self.shortcuts_reload_pending.clone(),
+            None,
+            200,
+        );
     }
 
     fn reload_shortcuts(&mut self) {
@@ -676,7 +756,9 @@ impl TinyApp {
     }
 
     fn reload_config(&mut self) {
-        let Some(config) = crate::config::AppConfig::load().ok() else { return; };
+        let Some(config) = crate::config::AppConfig::load().ok() else {
+            return;
+        };
 
         if self.window_title != config.editor.window_title {
             self.window_title = config.editor.window_title.clone();
@@ -706,7 +788,8 @@ impl TinyApp {
             }
         } else {
             let expected_line_height = self.text_metrics.font_size * config.editor.line_height;
-            let line_height_changed = (self.text_metrics.line_height - expected_line_height).abs() > 0.1;
+            let line_height_changed =
+                (self.text_metrics.line_height - expected_line_height).abs() > 0.1;
 
             if line_height_changed {
                 self.text_metrics.line_height = expected_line_height;
@@ -761,7 +844,6 @@ impl TinyApp {
         self.focused_editable_view_id = Some(editable_id);
         self.request_redraw();
     }
-
 
     /// Helper for navigation with optional redraw
     fn navigate(&mut self, nav: impl FnOnce(&mut EditorLogic) -> Result<bool>) -> Result<()> {
@@ -846,325 +928,337 @@ impl TinyApp {
         use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
 
         match event.name.as_str() {
-                    // App-level
-                    "app.font_increase" => self.adjust_font_size(true),
-                    "app.font_decrease" => self.adjust_font_size(false),
-                    "app.toggle_scroll_lock" => {
-                        self.scroll_lock_enabled = !self.scroll_lock_enabled;
-                        self.current_scroll_direction = None;
-                        println!(
-                            "Scroll lock: {}",
-                            if self.scroll_lock_enabled {
-                                "ENABLED"
-                            } else {
-                                "DISABLED"
+            // App-level
+            "app.font_increase" => self.adjust_font_size(true),
+            "app.font_decrease" => self.adjust_font_size(false),
+            "app.toggle_scroll_lock" => {
+                self.scroll_lock_enabled = !self.scroll_lock_enabled;
+                self.current_scroll_direction = None;
+                println!(
+                    "Scroll lock: {}",
+                    if self.scroll_lock_enabled {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    }
+                );
+            }
+
+            // Scrollbar events
+            "scrollbar.set_position" => {
+                if let Some(y) = event.data.get("y").and_then(|v| v.as_f64()) {
+                    let tab = self.editor.tab_manager.active_tab_mut();
+                    tab.scroll_position.y = tiny_sdk::LogicalPixels(y as f32);
+
+                    // Update renderer viewport from tab
+                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                        cpu_renderer.viewport.scroll = tab.scroll_position;
+                        // Mark scroll activity to keep scrollbar visible
+                        cpu_renderer.scrollbar_plugin.mark_scroll_activity();
+                    }
+                }
+            }
+
+            // Mouse events
+            "mouse.press" => {
+                // Extract screen coordinates for overlays, editor-local for main editor
+                let screen_x = event.data.get("screen_x").and_then(|v| v.as_f64());
+                let screen_y = event.data.get("screen_y").and_then(|v| v.as_f64());
+                let editor_x = event.data.get("x").and_then(|v| v.as_f64());
+                let editor_y = event.data.get("y").and_then(|v| v.as_f64());
+
+                let shift = event
+                    .data
+                    .get("modifiers")
+                    .and_then(|m| m.get("shift"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                // Check if click is in an overlay (use screen coordinates)
+                if self.editor.file_picker.visible {
+                    if let (Some(x), Some(y)) = (screen_x, screen_y) {
+                        use crate::filterable_dropdown::DropdownAction;
+                        let action = self
+                            .editor
+                            .file_picker
+                            .picker
+                            .handle_click(x as f32, y as f32, shift);
+                        match action {
+                            DropdownAction::Selected(path) => {
+                                // Open the file
+                                self.editor.file_picker.hide();
+                                self.scroll_focus.clear_focus();
+
+                                // Pass wake function for instant syntax highlighting (triggers redraw)
+                                let window = self.window.clone();
+                                self.editor.tab_manager.open_file_with_event_emitter(
+                                    path,
+                                    Some(move |_event: &str| {
+                                        if let Some(ref w) = window {
+                                            w.request_redraw();
+                                        }
+                                    }),
+                                )?;
+
+                                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                                }
+                                self.cursor_needs_scroll = true;
                             }
-                        );
+                            _ => {}
+                        }
+                        self.request_redraw();
+                    }
+                } else if self.editor.grep.visible {
+                    if let (Some(x), Some(y)) = (screen_x, screen_y) {
+                        use crate::filterable_dropdown::DropdownAction;
+                        let action = self
+                            .editor
+                            .grep
+                            .picker
+                            .handle_click(x as f32, y as f32, shift);
+                        match action {
+                            DropdownAction::Selected(result) => {
+                                // Jump to the result
+                                let (file, line, col) = (
+                                    result.file_path.clone(),
+                                    result.line_number.saturating_sub(1),
+                                    result.column,
+                                );
+                                self.editor.grep.hide();
+                                self.scroll_focus.clear_focus();
+                                self.editor.jump_to_location(file, line, col, true)?;
+
+                                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                                }
+                                self.cursor_needs_scroll = true;
+                            }
+                            _ => {}
+                        }
+                        self.request_redraw();
+                    }
+                } else if let (Some(x), Some(y)) = (editor_x, editor_y) {
+                    // No overlay - route to main editor (use editor-local coordinates)
+                    // Set drag state here since we're actually handling the click in the editor
+                    if let (Some(phys_x), Some(phys_y)) = (
+                        event.data.get("physical_x").and_then(|v| v.as_f64()),
+                        event.data.get("physical_y").and_then(|v| v.as_f64()),
+                    ) {
+                        self.mouse_state
+                            .start_drag(winit::dpi::PhysicalPosition::new(phys_x, phys_y));
                     }
 
-                    // Mouse events
-                    "mouse.press" => {
-                        // Extract screen coordinates for overlays, editor-local for main editor
-                        let screen_x = event.data.get("screen_x").and_then(|v| v.as_f64());
-                        let screen_y = event.data.get("screen_y").and_then(|v| v.as_f64());
-                        let editor_x = event.data.get("x").and_then(|v| v.as_f64());
-                        let editor_y = event.data.get("y").and_then(|v| v.as_f64());
-
-                        let shift = event
-                            .data
-                            .get("modifiers")
-                            .and_then(|m| m.get("shift"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-
-                        // Check if click is in an overlay (use screen coordinates)
-                        if self.editor.file_picker.visible {
-                            if let (Some(x), Some(y)) = (screen_x, screen_y) {
-                                use crate::filterable_dropdown::DropdownAction;
-                                let action = self
-                                    .editor
-                                    .file_picker
-                                    .picker
-                                    .handle_click(x as f32, y as f32, shift);
-                                match action {
-                                    DropdownAction::Selected(path) => {
-                                        // Open the file
-                                        self.editor.file_picker.hide();
-                                        self.scroll_focus.clear_focus();
-
-                                        // Pass wake function for instant syntax highlighting (triggers redraw)
-                                        let window = self.window.clone();
-                                        self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
-                                            if let Some(ref w) = window {
-                                                w.request_redraw();
-                                            }
-                                        }))?;
-
-                                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                                            self.focused_editable_view_id =
-                                                Some(tab.plugin.editor.id);
-                                        }
-                                        self.cursor_needs_scroll = true;
-                                    }
-                                    _ => {}
-                                }
-                                self.request_redraw();
-                            }
-                        } else if self.editor.grep.visible {
-                            if let (Some(x), Some(y)) = (screen_x, screen_y) {
-                                use crate::filterable_dropdown::DropdownAction;
-                                let action = self
-                                    .editor
-                                    .grep
-                                    .picker
-                                    .handle_click(x as f32, y as f32, shift);
-                                match action {
-                                    DropdownAction::Selected(result) => {
-                                        // Jump to the result
-                                        let (file, line, col) = (
-                                            result.file_path.clone(),
-                                            result.line_number.saturating_sub(1),
-                                            result.column,
-                                        );
-                                        self.editor.grep.hide();
-                                        self.scroll_focus.clear_focus();
-                                        self.editor.jump_to_location(file, line, col, true)?;
-
-                                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                                        }
-                                        self.cursor_needs_scroll = true;
-                                    }
-                                    _ => {}
-                                }
-                                self.request_redraw();
-                            }
-                        } else if let (Some(x), Some(y)) = (editor_x, editor_y) {
-                            // No overlay - route to main editor (use editor-local coordinates)
-                            // Set drag state here since we're actually handling the click in the editor
-                            if let (Some(phys_x), Some(phys_y)) = (
-                                event.data.get("physical_x").and_then(|v| v.as_f64()),
-                                event.data.get("physical_y").and_then(|v| v.as_f64()),
-                            ) {
-                                self.mouse_state.start_drag(winit::dpi::PhysicalPosition::new(phys_x, phys_y));
-                            }
-
-                            if let Some(viewport) =
-                                self.cpu_renderer.as_ref().map(|r| r.viewport.clone())
-                            {
-                                let plugin = self.editor.active_plugin_mut();
-                                if plugin.editor.input.handle_event(
-                                    &event,
-                                    &plugin.editor.view.doc,
-                                    &viewport,
-                                ) == InputAction::Redraw
-                                {
-                                    self.request_redraw();
-                                    self.cursor_needs_scroll = true;
-                                }
-                            }
+                    if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
+                        let plugin = self.editor.active_plugin_mut();
+                        if plugin.editor.input.handle_event(
+                            &event,
+                            &plugin.editor.view.doc,
+                            &viewport,
+                        ) == InputAction::Redraw
+                        {
+                            self.request_redraw();
+                            self.cursor_needs_scroll = true;
                         }
                     }
-                    "mouse.release" => self.editor.on_mouse_release(),
-                    "mouse.drag" => {
-                        if let Some(viewport) =
-                            self.cpu_renderer.as_ref().map(|r| r.viewport.clone())
-                        {
-                            let plugin = self.editor.active_plugin_mut();
-                            plugin.editor.input.handle_event(
-                                &event,
-                                &plugin.editor.view.doc,
-                                &viewport,
-                            );
-                            if let Some((dx, dy)) = plugin.editor.input.pending_scroll_delta.take()
-                            {
-                                self.event_bus.emit(
-                                    "app.drag.scroll",
-                                    json!({ "delta_x": dx, "delta_y": dy }),
-                                    15,
-                                    "mouse_drag",
-                                );
-                            }
+                }
+            }
+            "mouse.release" => self.editor.on_mouse_release(),
+            "mouse.drag" => {
+                if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
+                    let plugin = self.editor.active_plugin_mut();
+                    plugin
+                        .editor
+                        .input
+                        .handle_event(&event, &plugin.editor.view.doc, &viewport);
+                    if let Some((dx, dy)) = plugin.editor.input.pending_scroll_delta.take() {
+                        self.event_bus.emit(
+                            "app.drag.scroll",
+                            json!({ "delta_x": dx, "delta_y": dy }),
+                            15,
+                            "mouse_drag",
+                        );
+                    }
+                    self.request_redraw();
+                }
+            }
+            "app.drag.scroll" => {
+                if let (Some(dx), Some(dy)) = (
+                    event.data.get("delta_x").and_then(|v| v.as_f64()),
+                    event.data.get("delta_y").and_then(|v| v.as_f64()),
+                ) {
+                    let tab = self.editor.tab_manager.active_tab_mut();
+                    tab.scroll_position.x.0 += dx as f32;
+                    tab.scroll_position.y.0 += dy as f32;
+                    if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                        let (doc, editor_bounds) =
+                            (&tab.plugin.editor.view.doc, cpu_renderer.editor_bounds);
+                        cpu_renderer.viewport.scroll = tab.scroll_position;
+                        cpu_renderer
+                            .viewport
+                            .clamp_scroll_to_bounds(&doc.read(), editor_bounds);
+                        tab.scroll_position = cpu_renderer.viewport.scroll;
+                        self.request_redraw();
+                    }
+                }
+            }
+
+            // Navigation
+            "navigation.goto_definition" => {
+                self.editor.goto_definition()?;
+                self.cursor_needs_scroll = true;
+            }
+            "navigation.back" => self.navigate(|e| e.navigate_back())?,
+            "navigation.forward" => self.navigate(|e| e.navigate_forward())?,
+
+            // Tabs
+            "tabs.close" => {
+                self.editor.tab_manager.close_active_tab();
+                // Restore focus to newly active tab
+                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                }
+                self.editor.ui_changed = true;
+                self.request_redraw();
+            }
+
+            // File picker
+            "file_picker.open" => {
+                let picker_input_id = self.editor.file_picker.input().id;
+                self.show_overlay(|e| e.file_picker.show(), FPWidget, picker_input_id);
+            }
+            // Grep
+            "grep.open" => {
+                let grep_input_id = self.editor.grep.input().id;
+                self.show_overlay(|e| e.grep.show(String::new()), GrepWidget, grep_input_id);
+            }
+
+            // Component-emitted events
+            "ui.redraw" => {
+                self.editor.ui_changed = true;
+                self.request_redraw();
+            }
+            "file.open" => {
+                let data: FileOpenData = event_data::from_value(&event.data)?;
+                let path = std::path::PathBuf::from(data.path);
+
+                self.scroll_focus.clear_focus();
+                self.editor.record_navigation()?;
+
+                // Pass wake function for instant syntax highlighting
+                let window = self.window.clone();
+                self.editor.tab_manager.open_file_with_event_emitter(
+                    path,
+                    Some(move |_event: &str| {
+                        if let Some(ref w) = window {
+                            w.request_redraw();
+                        }
+                    }),
+                )?;
+
+                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                }
+                self.editor.ui_changed = true;
+                self.request_redraw();
+            }
+            "file.goto" => {
+                // Generic goto location (from grep, LSP, etc.)
+                let data: FileGotoData = event_data::from_value(&event.data)?;
+                let path = std::path::PathBuf::from(data.file);
+
+                self.scroll_focus.clear_focus();
+                self.editor.jump_to_location(
+                    path,
+                    data.line as usize,
+                    data.column as usize,
+                    true,
+                )?;
+
+                if let Some(tab) = self.editor.tab_manager.active_tab() {
+                    self.focused_editable_view_id = Some(tab.plugin.editor.id);
+                }
+                self.cursor_needs_scroll = true;
+                self.request_redraw();
+            }
+            "overlay.closed" => {
+                self.scroll_focus.clear_focus();
+                self.request_redraw();
+            }
+
+            // Editor events - delegate to components first, then main editor if not handled
+            "editor.code_action" => self.editor.handle_code_action_request()?,
+            name if name.starts_with("editor.") => {
+                // First, try dispatching to overlay components (file picker, grep)
+                // They handle their own text editing and return Stop if they consumed the event
+                let mut handled = false;
+                if self.editor.file_picker.visible {
+                    use crate::input::EventSubscriber;
+                    if self
+                        .editor
+                        .file_picker
+                        .handle_event(&event, &mut self.event_bus)
+                        == crate::input::PropagationControl::Stop
+                    {
+                        handled = true;
+                    }
+                }
+                if !handled && self.editor.grep.visible {
+                    use crate::input::EventSubscriber;
+                    if self.editor.grep.handle_event(&event, &mut self.event_bus)
+                        == crate::input::PropagationControl::Stop
+                    {
+                        handled = true;
+                    }
+                }
+
+                // If no overlay handled it, route to main editor
+                if !handled {
+                    let (input_handler, doc, viewport) = self.get_focused_view_mut();
+                    let action = input_handler.handle_event(&event, doc, &viewport);
+
+                    match action {
+                        InputAction::Save => {
+                            // Save only makes sense for main editor
+                            self.editor.save()?;
+                            self.request_redraw();
+                            self.update_window_title();
+                            self.cursor_needs_scroll = true;
+                        }
+                        InputAction::Undo => {
+                            // Actually perform undo on the focused view's buffer
+                            let (input_handler, doc, _) = self.get_focused_view_mut();
+                            input_handler.undo(doc);
+                            self.request_redraw();
+                            self.update_window_title();
+                            self.cursor_needs_scroll = true;
+                        }
+                        InputAction::Redo => {
+                            // Actually perform redo on the focused view's buffer
+                            let (input_handler, doc, _) = self.get_focused_view_mut();
+                            input_handler.redo(doc);
+                            self.request_redraw();
+                            self.update_window_title();
+                            self.cursor_needs_scroll = true;
+                        }
+                        InputAction::Redraw => {
+                            self.request_redraw();
+                            self.update_window_title();
+                            self.cursor_needs_scroll = true;
+                        }
+                        InputAction::None => {
+                            // Main editor - might still need a redraw for cursor movement etc
                             self.request_redraw();
                         }
                     }
-                    "app.drag.scroll" => {
-                        if let (Some(dx), Some(dy)) = (
-                            event.data.get("delta_x").and_then(|v| v.as_f64()),
-                            event.data.get("delta_y").and_then(|v| v.as_f64()),
-                        ) {
-                            let tab = self.editor.tab_manager.active_tab_mut();
-                            tab.scroll_position.x.0 += dx as f32;
-                            tab.scroll_position.y.0 += dy as f32;
-                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
-                                let (doc, editor_bounds) =
-                                    (&tab.plugin.editor.view.doc, cpu_renderer.editor_bounds);
-                                cpu_renderer.viewport.scroll = tab.scroll_position;
-                                cpu_renderer
-                                    .viewport
-                                    .clamp_scroll_to_bounds(&doc.read(), editor_bounds);
-                                tab.scroll_position = cpu_renderer.viewport.scroll;
-                                self.request_redraw();
-                            }
-                        }
-                    }
-
-                    // Navigation
-                    "navigation.goto_definition" => {
-                        self.editor.goto_definition()?;
-                        self.cursor_needs_scroll = true;
-                    }
-                    "navigation.back" => self.navigate(|e| e.navigate_back())?,
-                    "navigation.forward" => self.navigate(|e| e.navigate_forward())?,
-
-                    // Tabs
-                    "tabs.close" => {
-                        self.editor.tab_manager.close_active_tab();
-                        // Restore focus to newly active tab
-                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                        }
-                        self.editor.ui_changed = true;
-                        self.request_redraw();
-                    }
-
-                    // File picker
-                    "file_picker.open" => {
-                        let picker_input_id = self.editor.file_picker.input().id;
-                        self.show_overlay(
-                            |e| e.file_picker.show(),
-                            FPWidget,
-                            picker_input_id,
-                        );
-                    }
-                    // Grep
-                    "grep.open" => {
-                        let grep_input_id = self.editor.grep.input().id;
-                        self.show_overlay(
-                            |e| e.grep.show(String::new()),
-                            GrepWidget,
-                            grep_input_id,
-                        );
-                    }
-
-                    // Component-emitted events
-                    "ui.redraw" => {
-                        self.editor.ui_changed = true;
-                        self.request_redraw();
-                    }
-                    "file.open" => {
-                        let data: FileOpenData = event_data::from_value(&event.data)?;
-                        let path = std::path::PathBuf::from(data.path);
-
-                        self.scroll_focus.clear_focus();
-                        self.editor.record_navigation()?;
-
-                        // Pass wake function for instant syntax highlighting
-                        let window = self.window.clone();
-                        self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
-                            if let Some(ref w) = window {
-                                w.request_redraw();
-                            }
-                        }))?;
-
-                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                        }
-                        self.editor.ui_changed = true;
-                        self.request_redraw();
-                    }
-                    "file.goto" => {
-                        // Generic goto location (from grep, LSP, etc.)
-                        let data: FileGotoData = event_data::from_value(&event.data)?;
-                        let path = std::path::PathBuf::from(data.file);
-
-                        self.scroll_focus.clear_focus();
-                        self.editor.jump_to_location(path, data.line as usize, data.column as usize, true)?;
-
-                        if let Some(tab) = self.editor.tab_manager.active_tab() {
-                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                        }
-                        self.cursor_needs_scroll = true;
-                        self.request_redraw();
-                    }
-                    "overlay.closed" => {
-                        self.scroll_focus.clear_focus();
-                        self.request_redraw();
-                    }
-
-                    // Editor events - delegate to components first, then main editor if not handled
-                    "editor.code_action" => self.editor.handle_code_action_request()?,
-                    name if name.starts_with("editor.") => {
-                        // First, try dispatching to overlay components (file picker, grep)
-                        // They handle their own text editing and return Stop if they consumed the event
-                        let mut handled = false;
-                        if self.editor.file_picker.visible {
-                            use crate::input::EventSubscriber;
-                            if self
-                                .editor
-                                .file_picker
-                                .handle_event(&event, &mut self.event_bus)
-                                == crate::input::PropagationControl::Stop
-                            {
-                                handled = true;
-                            }
-                        }
-                        if !handled && self.editor.grep.visible {
-                            use crate::input::EventSubscriber;
-                            if self.editor.grep.handle_event(&event, &mut self.event_bus)
-                                == crate::input::PropagationControl::Stop
-                            {
-                                handled = true;
-                            }
-                        }
-
-                        // If no overlay handled it, route to main editor
-                        if !handled {
-                            let (input_handler, doc, viewport) = self.get_focused_view_mut();
-                            let action = input_handler.handle_event(&event, doc, &viewport);
-
-                            match action {
-                                InputAction::Save => {
-                                    // Save only makes sense for main editor
-                                    self.editor.save()?;
-                                    self.request_redraw();
-                                    self.update_window_title();
-                                    self.cursor_needs_scroll = true;
-                                }
-                                InputAction::Undo => {
-                                    // Actually perform undo on the focused view's buffer
-                                    let (input_handler, doc, _) = self.get_focused_view_mut();
-                                    input_handler.undo(doc);
-                                    self.request_redraw();
-                                    self.update_window_title();
-                                    self.cursor_needs_scroll = true;
-                                }
-                                InputAction::Redo => {
-                                    // Actually perform redo on the focused view's buffer
-                                    let (input_handler, doc, _) = self.get_focused_view_mut();
-                                    input_handler.redo(doc);
-                                    self.request_redraw();
-                                    self.update_window_title();
-                                    self.cursor_needs_scroll = true;
-                                }
-                                InputAction::Redraw => {
-                                    self.request_redraw();
-                                    self.update_window_title();
-                                    self.cursor_needs_scroll = true;
-                                }
-                                InputAction::None => {
-                                    // Main editor - might still need a redraw for cursor movement etc
-                                    self.request_redraw();
-                                }
-                            }
-                        }
-                    }
-
-                    _ => {
-                        // Dispatch to components through subscription system
-                        self.dispatch_to_components(event);
-                    }
                 }
+            }
+
+            _ => {
+                // Dispatch to components through subscription system
+                self.dispatch_to_components(event);
+            }
+        }
 
         Ok(())
     }
@@ -1199,7 +1293,8 @@ impl TinyApp {
                         if let Some(gpu_renderer) = &self.gpu_renderer {
                             let device = gpu_renderer.device_arc();
                             let queue = gpu_renderer.queue_arc();
-                            self.editor.setup_plugins_for_views(newly_initialized, device, queue)
+                            self.editor
+                                .setup_plugins_for_views(newly_initialized, device, queue)
                                 .map_err(|e| anyhow!("Failed to setup plugins: {:?}", e))?;
                         }
                     }
@@ -1224,7 +1319,8 @@ impl TinyApp {
         // Check for pending shortcuts reload
         if self.shortcuts_reload_pending.load(Ordering::Relaxed) {
             self.reload_shortcuts();
-            self.shortcuts_reload_pending.store(false, Ordering::Relaxed);
+            self.shortcuts_reload_pending
+                .store(false, Ordering::Relaxed);
         }
 
         let dt = self.update_frame_timing();
@@ -1255,7 +1351,9 @@ impl TinyApp {
                     // Get layout position with tab-aware positioning
                     let layout_pos = {
                         let tree = tab.plugin.editor.view.doc.read();
-                        cpu_renderer.viewport.doc_to_layout_with_tree(cursor_pos, &tree)
+                        cpu_renderer
+                            .viewport
+                            .doc_to_layout_with_tree(cursor_pos, &tree)
                     };
 
                     // Center for goto-definition, otherwise just ensure visible
@@ -1331,7 +1429,11 @@ impl TinyApp {
 
             // Set font system for accurate text measurement (especially tabs!)
             if let Some(ref font_system) = self.font_system {
-                tab.plugin.editor.view.viewport.set_font_system(font_system.clone());
+                tab.plugin
+                    .editor
+                    .view
+                    .viewport
+                    .set_font_system(font_system.clone());
             }
 
             // Sync cursor/selection state to main editor's plugins
@@ -1506,7 +1608,11 @@ impl TinyApp {
                 let color_atlas_data = font_system.color_atlas_data();
                 let (atlas_width, atlas_height) = font_system.atlas_size();
                 if let Some(gpu_renderer) = &mut self.gpu_renderer {
-                    gpu_renderer.upload_color_font_atlas(&color_atlas_data, atlas_width, atlas_height);
+                    gpu_renderer.upload_color_font_atlas(
+                        &color_atlas_data,
+                        atlas_width,
+                        atlas_height,
+                    );
                 }
                 font_system.clear_color_dirty();
             }
@@ -1684,7 +1790,11 @@ impl ApplicationHandler for TinyApp {
                                 if let Some(gpu_renderer) = &self.gpu_renderer {
                                     let device = gpu_renderer.device_arc();
                                     let queue = gpu_renderer.queue_arc();
-                                    let _ = self.editor.setup_plugins_for_views(newly_initialized, device, queue);
+                                    let _ = self.editor.setup_plugins_for_views(
+                                        newly_initialized,
+                                        device,
+                                        queue,
+                                    );
                                 }
                             }
                         }
@@ -1783,7 +1893,8 @@ impl ApplicationHandler for TinyApp {
                         // For regular (non-modifier) keys, use current modifier state
                         // For modifier keys themselves, we need to track release
                         let event_names = if !is_modifier_key {
-                            self.shortcuts.match_input(&self.mouse_state.modifiers, &trigger)
+                            self.shortcuts
+                                .match_input(&self.mouse_state.modifiers, &trigger)
                         } else {
                             // Skip modifier key presses - we'll handle them on release
                             Vec::new()
@@ -1821,7 +1932,8 @@ impl ApplicationHandler for TinyApp {
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 // Convert winit modifiers to accelerator format
-                self.mouse_state.set_modifiers(winit_adapter::convert_modifiers(&new_modifiers));
+                self.mouse_state
+                    .set_modifiers(winit_adapter::convert_modifiers(&new_modifiers));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -1840,7 +1952,9 @@ impl ApplicationHandler for TinyApp {
                 match state {
                     ElementState::Pressed => {
                         // Try to match shortcuts first
-                        let event_names = self.shortcuts.match_input(&self.mouse_state.modifiers, &trigger);
+                        let event_names = self
+                            .shortcuts
+                            .match_input(&self.mouse_state.modifiers, &trigger);
 
                         if !event_names.is_empty() {
                             // Shortcut matched (e.g., "cmd+click" or "click click")
@@ -1858,47 +1972,141 @@ impl ApplicationHandler for TinyApp {
                                     let is_in_titlebar = false;
 
                                     if !is_in_titlebar {
-                                        let tab_bar_start = self.title_bar_height;
-                                        let tab_bar_end = tab_bar_start + 30.0;
-                                        let in_tab_bar =
-                                            point.y.0 >= tab_bar_start && point.y.0 <= tab_bar_end;
+                                        // Check scrollbar first (higher priority than other UI)
+                                        let (handled_by_scrollbar, scrollbar_jump_scroll) =
+                                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                                                let editor_rect = tiny_core::tree::Rect {
+                                                    x: tiny_sdk::LogicalPixels(
+                                                        cpu_renderer.editor_bounds.x.0,
+                                                    ),
+                                                    y: tiny_sdk::LogicalPixels(
+                                                        cpu_renderer.editor_bounds.y.0,
+                                                    ),
+                                                    width: tiny_sdk::LogicalPixels(
+                                                        cpu_renderer.editor_bounds.width.0,
+                                                    ),
+                                                    height: tiny_sdk::LogicalPixels(
+                                                        cpu_renderer.editor_bounds.height.0,
+                                                    ),
+                                                };
 
-                                        if in_tab_bar {
-                                            let viewport_width = self
-                                                .cpu_renderer
-                                                .as_ref()
-                                                .map(|r| r.viewport.logical_size.width.0);
-                                            if let Some(viewport_width) = viewport_width {
-                                                let click_x = point.x.0;
-                                                let click_y = point.y.0 - tab_bar_start;
-                                                if self.editor.handle_tab_bar_click(
-                                                    click_x,
-                                                    click_y,
-                                                    viewport_width,
-                                                ) {
-                                                    self.request_redraw();
+                                                // Check if click is in scrollbar area at all (uses cached content_height)
+                                                let in_scrollbar = cpu_renderer
+                                                    .scrollbar_plugin
+                                                    .is_point_in_scrollbar_area(
+                                                        point.x.0,
+                                                        point.y.0,
+                                                        &editor_rect,
+                                                    );
+
+                                                if !in_scrollbar {
+                                                    (false, None)
+                                                } else {
+                                                    let content_height = cpu_renderer
+                                                        .scrollbar_plugin
+                                                        .cached_content_height;
+
+                                                    // Check if clicking on thumb (for drag)
+                                                    let over_thumb = cpu_renderer
+                                                        .scrollbar_plugin
+                                                        .is_point_over_thumb(
+                                                            point.x.0,
+                                                            point.y.0,
+                                                            &cpu_renderer.viewport,
+                                                            &editor_rect,
+                                                            content_height,
+                                                        );
+
+                                                    // Click on track (not thumb) - jump to position first
+                                                    let jump_scroll = if !over_thumb {
+                                                        cpu_renderer
+                                                            .scrollbar_plugin
+                                                            .handle_track_click(
+                                                                point.y.0,
+                                                                &cpu_renderer.viewport,
+                                                                &editor_rect,
+                                                                content_height,
+                                                            )
+                                                    } else {
+                                                        None
+                                                    };
+
+                                                    // Start drag for any click in scrollbar area (thumb or track)
+                                                    cpu_renderer.scrollbar_plugin.start_drag(
+                                                        point.y.0,
+                                                        &cpu_renderer.viewport,
+                                                    );
+
+                                                    (true, jump_scroll)
                                                 }
+                                            } else {
+                                                (false, None)
+                                            };
+
+                                        // Process jump scroll event outside of cpu_renderer borrow
+                                        if let Some(new_scroll_val) = scrollbar_jump_scroll {
+                                            self.event_bus.emit(
+                                                "scrollbar.set_position",
+                                                json!({"y": new_scroll_val}),
+                                                10,
+                                                "scrollbar",
+                                            );
+                                            let _ = self.process_event_queue();
+
+                                            // Update drag start position to the NEW scroll position (after jump)
+                                            if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                                                cpu_renderer.scrollbar_plugin.drag_start_scroll =
+                                                    new_scroll_val;
                                             }
-                                        } else {
-                                            // Mouse click - emit event (drag state set in handler if needed)
-                                            // Calculate both coordinate systems
-                                            let editor_local =
-                                                if let Some(cpu_renderer) = &self.cpu_renderer {
+                                        }
+
+                                        if handled_by_scrollbar {
+                                            self.request_redraw();
+                                        }
+
+                                        if !handled_by_scrollbar {
+                                            let tab_bar_start = self.title_bar_height;
+                                            let tab_bar_end = tab_bar_start + 30.0;
+                                            let in_tab_bar = point.y.0 >= tab_bar_start
+                                                && point.y.0 <= tab_bar_end;
+
+                                            if in_tab_bar {
+                                                let viewport_width = self
+                                                    .cpu_renderer
+                                                    .as_ref()
+                                                    .map(|r| r.viewport.logical_size.width.0);
+                                                if let Some(viewport_width) = viewport_width {
+                                                    let click_x = point.x.0;
+                                                    let click_y = point.y.0 - tab_bar_start;
+                                                    if self.editor.handle_tab_bar_click(
+                                                        click_x,
+                                                        click_y,
+                                                        viewport_width,
+                                                    ) {
+                                                        self.request_redraw();
+                                                    }
+                                                }
+                                            } else {
+                                                // Mouse click - emit event (drag state set in handler if needed)
+                                                // Calculate both coordinate systems
+                                                let editor_local = if let Some(cpu_renderer) =
+                                                    &self.cpu_renderer
+                                                {
                                                     cpu_renderer.screen_to_editor_local(point)
                                                 } else {
                                                     point
                                                 };
 
-                                            let button_name = match button {
-                                                WinitMouseButton::Left => "Left",
-                                                WinitMouseButton::Right => "Right",
-                                                WinitMouseButton::Middle => "Middle",
-                                                _ => "Unknown",
-                                            };
+                                                let button_name = match button {
+                                                    WinitMouseButton::Left => "Left",
+                                                    WinitMouseButton::Right => "Right",
+                                                    WinitMouseButton::Middle => "Middle",
+                                                    _ => "Unknown",
+                                                };
 
-                                            // Emit both screen and editor-local coordinates
-                                            // Include physical position for drag state management
-                                            self.event_bus.emit(
+                                                // Emit both screen and editor-local coordinates
+                                                // Include physical position for drag state management
+                                                self.event_bus.emit(
                                                 "mouse.press",
                                                 json!({
                                                     "x": editor_local.x.0,
@@ -1918,6 +2126,7 @@ impl ApplicationHandler for TinyApp {
                                                 10,
                                                 "winit",
                                             );
+                                            }
                                         }
                                     }
                                 }
@@ -1925,6 +2134,10 @@ impl ApplicationHandler for TinyApp {
                         }
                     }
                     ElementState::Released => {
+                        // Stop scrollbar drag
+                        if let Some(cpu_renderer) = &mut self.cpu_renderer {
+                            cpu_renderer.scrollbar_plugin.stop_drag();
+                        }
                         self.mouse_state.end_drag();
                         self.event_bus.emit("mouse.release", json!({}), 10, "winit");
                     }
@@ -1958,7 +2171,9 @@ impl ApplicationHandler for TinyApp {
                 };
 
                 // Try to match shortcuts
-                let event_names = self.shortcuts.match_input(&self.mouse_state.modifiers, &trigger);
+                let event_names = self
+                    .shortcuts
+                    .match_input(&self.mouse_state.modifiers, &trigger);
 
                 if !event_names.is_empty() {
                     // Shortcut matched
@@ -1978,7 +2193,7 @@ impl ApplicationHandler for TinyApp {
                         height: new_size.height,
                     });
                 }
-                self.render_frame().ok();
+                self.request_redraw();
             }
 
             _ => {}

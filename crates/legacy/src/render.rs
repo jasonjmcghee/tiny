@@ -147,6 +147,10 @@ pub struct Renderer {
     grep_rects: Vec<tiny_sdk::types::RectInstance>,
     /// Grep rounded rect frame
     grep_rounded_rect: Option<tiny_sdk::types::RoundedRectInstance>,
+    /// Scrollbar plugin for main editor
+    pub scrollbar_plugin: crate::scrollbar_plugin::ScrollbarPlugin,
+    /// Scrollbar rounded rects
+    scrollbar_rects: Vec<tiny_sdk::types::RoundedRectInstance>,
 
     /// Dirty flags to track what needs regeneration
     glyphs_dirty: bool,
@@ -205,6 +209,8 @@ impl Renderer {
             grep_glyphs: Vec::new(), // Vec of (glyphs, scissor_rect) tuples
             grep_rects: Vec::new(),
             grep_rounded_rect: None,
+            scrollbar_plugin: crate::scrollbar_plugin::ScrollbarPlugin::new(),
+            scrollbar_rects: Vec::new(),
             glyphs_dirty: true,
             line_numbers_dirty: true,
             ui_dirty: true,
@@ -546,13 +552,6 @@ impl Renderer {
         self.ui_dirty = true;
     }
 
-    /// Mark everything dirty (call when swapping tabs or major changes)
-    pub fn mark_all_dirty(&mut self) {
-        self.glyphs_dirty = true;
-        self.line_numbers_dirty = true;
-        self.ui_dirty = true;
-    }
-
     /// Swap the text renderer with the active tab's renderer
     /// This preserves per-tab rendering state (syntax highlighting, layout, etc.)
     pub fn swap_text_renderer(&mut self, tab_renderer: &mut crate::text_renderer::TextRenderer) {
@@ -606,17 +605,20 @@ impl Renderer {
         let size_changed = self.last_viewport_size != (width, height);
         let scale_changed = self.viewport.scale_factor != scale_factor;
 
-        // Only do expensive resize/relayout if something actually changed
         if size_changed || scale_changed {
             self.viewport.resize(width, height, scale_factor);
-            self.layout_dirty = true;
-            self.glyphs_dirty = true;
-            self.line_numbers_dirty = true;
-            self.ui_dirty = true;
+            self.update_editor_bounds(width, height);
             self.last_viewport_size = (width, height);
-        }
 
-        self.update_editor_bounds(width, height);
+            // Only mark layout/glyphs dirty if scale changed (DPI change)
+            // Pure size changes don't affect content positions
+            if scale_changed {
+                self.layout_dirty = true;
+                self.glyphs_dirty = true;
+                self.line_numbers_dirty = true;
+                self.ui_dirty = true;
+            }
+        }
     }
 
     /// Update editor bounds based on current line numbers width and other UI elements
@@ -735,6 +737,9 @@ impl Renderer {
             self.collect_grep_glyphs();
             self.ui_dirty = false;
         }
+
+        // Collect scrollbar (always, since it depends on scroll position)
+        self.collect_scrollbar_rects(tree);
 
         self.last_rendered_version = tree.version;
         self.layout_dirty = false;
@@ -885,6 +890,17 @@ impl Renderer {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // === DRAW SCROLLBAR ===
+            if !self.scrollbar_rects.is_empty() {
+                pass.set_scissor_rect(0, 0, target_w, target_h);
+                if let Some(gpu) = self.gpu_renderer {
+                    unsafe {
+                        let gpu_renderer = &mut *(gpu as *mut GpuRenderer);
+                        gpu_renderer.draw_rounded_rects(pass, &self.scrollbar_rects, scale);
                     }
                 }
             }
@@ -1433,7 +1449,8 @@ impl Renderer {
 
             // Find which line this glyph belongs to using locality hint
             // Glyphs come in visual order, so hint-based search is O(1) amortized
-            let glyph_line_idx = self.text_renderer
+            let glyph_line_idx = self
+                .text_renderer
                 .line_cache
                 .find_by_y_position_hint(glyph.layout_pos.y.0, last_search_idx);
 
@@ -1684,6 +1701,38 @@ impl Renderer {
                     }
                 }
             });
+        }
+    }
+
+    fn collect_scrollbar_rects(&mut self, tree: &Tree) {
+        self.scrollbar_rects.clear();
+
+        // Scrollbar visibility is controlled by hover state (updated in app.rs)
+
+        // Calculate content height
+        let content_height =
+            self.text_renderer.line_cache.len() as f32 * self.viewport.metrics.line_height;
+
+        // Convert editor_bounds to Rect
+        let editor_rect = tiny_core::tree::Rect {
+            x: tiny_sdk::LogicalPixels(self.editor_bounds.x.0),
+            y: tiny_sdk::LogicalPixels(self.editor_bounds.y.0),
+            width: tiny_sdk::LogicalPixels(self.editor_bounds.width.0),
+            height: tiny_sdk::LogicalPixels(self.editor_bounds.height.0),
+        };
+
+        // Collect scrollbar rects
+        let rects = self.scrollbar_plugin.collect_rounded_rects(
+            &self.viewport,
+            &editor_rect,
+            content_height,
+        );
+
+        self.scrollbar_rects = rects;
+
+        // If scrollbar needs a redraw soon (for timeout), mark ui_dirty to keep rendering
+        if self.scrollbar_plugin.needs_redraw_soon() {
+            self.ui_dirty = true;
         }
     }
 }

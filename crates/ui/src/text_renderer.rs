@@ -197,6 +197,9 @@ pub struct SyntaxState {
     pub edit_deltas: Vec<(usize, isize)>,
 }
 
+/// Maximum cached shaped lines before eviction (prevents unbounded memory growth)
+const MAX_SHAPING_CACHE_SIZE: usize = 10000;
+
 /// Cached shaping result for a single line
 #[derive(Clone)]
 struct ShapedLineCache {
@@ -279,6 +282,9 @@ pub struct TextRenderer {
     /// Per-line shaping cache: (line_text_hash, font_size_bits, scale_factor_bits) -> shaped result
     /// Avoids expensive OpenType shaping for unchanged lines
     shaping_cache: HashMap<(u64, u32, u32), ShapedLineCache>,
+
+    /// Last edit byte range (for incremental layout optimization)
+    last_edit_range: Option<Range<usize>>,
 }
 
 impl TextRenderer {
@@ -304,7 +310,173 @@ impl TextRenderer {
             gpu_style_buffer: None,
             palette_texture: None,
             shaping_cache: HashMap::default(),
+            last_edit_range: None,
         }
+    }
+
+    /// Identify which lines changed using the last edit range
+    /// Returns (first_changed_line, last_changed_line_exclusive, old_line_count, new_line_count)
+    fn find_changed_lines(&self, tree: &Tree) -> Option<(usize, usize, usize, usize)> {
+        let old_line_count = self.line_cache.len();
+        let new_line_count = tree.line_count() as usize;
+
+        if old_line_count == 0 {
+            return None; // First layout, can't be incremental
+        }
+
+        let edit_range = self.last_edit_range.as_ref()?;
+
+        // Use tree to find which lines the edit touched
+        let first_changed = tree.byte_to_line(edit_range.start) as usize;
+        let last_changed_inclusive = tree.byte_to_line(edit_range.end.saturating_sub(1).max(edit_range.start)) as usize;
+
+        // Be slightly conservative - reshape the affected line plus one more
+        // This handles cases where line breaks changed
+        let last_changed = (last_changed_inclusive + 2).min(new_line_count);
+
+        Some((first_changed, last_changed, old_line_count, new_line_count))
+    }
+
+    /// Try to do incremental layout by only reshaping changed lines
+    fn try_incremental_layout(
+        &mut self,
+        tree: &Tree,
+        font_system: &tiny_font::SharedFontSystem,
+        viewport: &crate::coordinates::Viewport,
+        first_changed: usize,
+        last_changed: usize,
+        old_line_count: usize,
+        new_line_count: usize,
+    ) -> bool {
+        let line_delta = new_line_count as isize - old_line_count as isize;
+        let text = tree.flatten_to_string();
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Find split points
+        let first_glyph = self.line_cache.get(first_changed.saturating_sub(1))
+            .map(|l| l.char_range.end).unwrap_or(0);
+        let last_old_line = last_changed.min(old_line_count);
+        let first_after_glyph = self.line_cache.get(last_old_line)
+            .map(|l| l.char_range.start).unwrap_or(self.layout_cache.len());
+
+        // Build new caches: [before, changed, shifted_after]
+        let mut new_glyphs = self.layout_cache[..first_glyph].to_vec();
+        let mut new_lines = self.line_cache.lines[..first_changed].to_vec();
+        let mut new_clusters = self.cluster_maps[..first_changed].to_vec();
+
+        // Start positions
+        let mut y = new_lines.last().map(|l| l.y_position + l.height).unwrap_or(0.0);
+        let mut byte = new_lines.last().map(|l| l.byte_range.end).unwrap_or(0);
+        let mut char_idx = new_lines.last().map(|l| l.char_range.end).unwrap_or(0);
+
+        // Reshape changed lines
+        for line_idx in first_changed..last_changed.min(lines.len()) {
+            let (glyphs, cluster) = self.shape_line(lines[line_idx], viewport, font_system);
+            let line_start_byte = byte;
+            let line_start_char = char_idx;
+
+            // Add glyphs
+            for g in &glyphs {
+                new_glyphs.push(UnifiedGlyph {
+                    char: g.char,
+                    layout_pos: LayoutPos::new(g.pos.x.0 / viewport.scale_factor, y + g.pos.y.0 / viewport.scale_factor),
+                    physical_pos: g.pos.clone(),
+                    physical_width: g.size.width.0,
+                    tex_coords: g.tex_coords,
+                    char_byte_offset: byte,
+                    token_id: 0, relative_pos: 0.0, atlas_index: g.atlas_index,
+                    weight: 400.0, italic: false, underline: false, strikethrough: false,
+                });
+                char_idx += 1;
+            }
+
+            byte += lines[line_idx].as_bytes().len();
+            new_lines.push(LineInfo {
+                line_number: line_idx as u32,
+                byte_range: line_start_byte..byte,
+                char_range: line_start_char..char_idx,
+                y_position: y, height: viewport.metrics.line_height,
+            });
+            new_clusters.push(cluster);
+
+            // Newline glyph
+            if line_idx < lines.len() - 1 {
+                new_glyphs.push(UnifiedGlyph {
+                    char: '\n', layout_pos: LayoutPos::new(0.0, y),
+                    physical_pos: PhysicalPos::new(0.0, y * viewport.scale_factor),
+                    physical_width: 0.0, tex_coords: [0.0; 4], char_byte_offset: byte,
+                    token_id: 0, relative_pos: 0.0, atlas_index: 0,
+                    weight: 400.0, italic: false, underline: false, strikethrough: false,
+                });
+                byte += 1;
+                char_idx += 1;
+            }
+            y += viewport.metrics.line_height;
+        }
+
+        // Shift and append glyphs after edit
+        if first_after_glyph < self.layout_cache.len() {
+            let old_line = &self.line_cache[last_old_line];
+            let (y_delta, byte_delta, char_delta) = (
+                y - old_line.y_position,
+                byte as isize - old_line.byte_range.start as isize,
+                char_idx as isize - old_line.char_range.start as isize,
+            );
+
+            for g in &self.layout_cache[first_after_glyph..] {
+                let mut g = g.clone();
+                g.layout_pos.y.0 += y_delta;
+                g.physical_pos.y.0 += y_delta * viewport.scale_factor;
+                g.char_byte_offset = (g.char_byte_offset as isize + byte_delta) as usize;
+                new_glyphs.push(g);
+            }
+
+            for l in &self.line_cache.lines[last_old_line..] {
+                new_lines.push(LineInfo {
+                    line_number: (l.line_number as isize + line_delta) as u32,
+                    byte_range: ((l.byte_range.start as isize + byte_delta) as usize)
+                        ..((l.byte_range.end as isize + byte_delta) as usize),
+                    char_range: ((l.char_range.start as isize + char_delta) as usize)
+                        ..((l.char_range.end as isize + char_delta) as usize),
+                    y_position: l.y_position + y_delta, height: l.height,
+                });
+            }
+            new_clusters.extend_from_slice(&self.cluster_maps[last_old_line..]);
+        }
+
+        self.layout_cache = new_glyphs;
+        self.line_cache.lines = new_lines;
+        self.cluster_maps = new_clusters;
+        true
+    }
+
+    /// Shape a single line (with caching)
+    fn shape_line(
+        &mut self,
+        text: &str,
+        viewport: &crate::coordinates::Viewport,
+        font_system: &tiny_font::SharedFontSystem,
+    ) -> (Vec<tiny_font::PositionedGlyph>, tiny_font::ClusterMap) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = ahash::AHasher::default();
+        text.hash(&mut hasher);
+        let key = (hasher.finish(), viewport.metrics.font_size.to_bits(), viewport.scale_factor.to_bits());
+
+        if let Some(cached) = self.shaping_cache.get(&key) {
+            return (cached.glyphs.clone(), cached.cluster_map.clone());
+        }
+
+        let shaped = font_system.layout_text_shaped_with_tabs(
+            text, viewport.metrics.font_size, viewport.scale_factor, None
+        );
+
+        if self.shaping_cache.len() < MAX_SHAPING_CACHE_SIZE {
+            self.shaping_cache.insert(key, ShapedLineCache {
+                glyphs: shaped.glyphs.clone(),
+                cluster_map: shaped.cluster_map.clone(),
+            });
+        }
+        (shaped.glyphs, shaped.cluster_map)
     }
 
     /// Update layout cache when text changes
@@ -327,6 +499,38 @@ impl TextRenderer {
             return;
         }
 
+        // TRY INCREMENTAL UPDATE (huge performance win for large files!)
+        if !force && !metrics_changed && tree.version == self.last_tree_version + 1 {
+            if let Some((first_changed, last_changed, old_line_count, new_line_count)) =
+                self.find_changed_lines(tree)
+            {
+                // Try incremental update if only a few lines changed
+                let changed_line_count = last_changed - first_changed;
+                if changed_line_count < 10 {
+                    // Worth doing incremental update
+                    if self.try_incremental_layout(
+                        tree,
+                        font_system,
+                        viewport,
+                        first_changed,
+                        last_changed,
+                        old_line_count,
+                        new_line_count,
+                    ) {
+                        // Success! Update version and return
+                        self.last_tree_version = tree.version;
+                        self.last_font_size = viewport.metrics.font_size;
+                        self.last_line_height = viewport.metrics.line_height;
+                        self.last_scale_factor = viewport.scale_factor;
+                        self.last_edit_range = None;
+                        return;
+                    }
+                    // Fall through to full rebuild if incremental failed
+                }
+            }
+        }
+
+        // FULL REBUILD PATH (fallback)
         // Build map of (line, pos_in_line, char) → (token_id, relative_pos, weight, italic, underline, strikethrough) for preservation
         // This keeps colors stable when layout rebuilds (e.g., after undo)
         let old_tokens: HashMap<(u32, u32, char), (u16, f32, f32, bool, bool, bool)> = self
@@ -408,8 +612,7 @@ impl TextRenderer {
                     );
 
                     // Store in cache (limit cache size to prevent unbounded growth)
-                    const MAX_CACHE_SIZE: usize = 10000;
-                    if self.shaping_cache.len() < MAX_CACHE_SIZE {
+                    if self.shaping_cache.len() < MAX_SHAPING_CACHE_SIZE {
                         self.shaping_cache.insert(
                             cache_key,
                             ShapedLineCache {
@@ -1047,11 +1250,14 @@ impl TextRenderer {
 
         // Expand the dirty range to include this edit
         self.syntax_state.dirty_range = match self.syntax_state.dirty_range.take() {
-            None => Some(edit_range),
+            None => Some(edit_range.clone()),
             Some(existing) => {
                 Some(existing.start.min(edit_range.start)..existing.end.max(edit_range.end))
             }
         };
+
+        // Store last edit for incremental layout optimization
+        self.last_edit_range = Some(edit_range);
     }
     /// Look up syntax token for a byte offset in the document
     /// Returns (token_id, relative_pos, weight, italic, underline, strikethrough)

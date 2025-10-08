@@ -503,13 +503,22 @@ impl FontSystem {
 
         match load_font_from_path(path, 0) {
             Ok((font_data, font_ref)) => {
-                eprintln!("✅ Loaded {} font", name);
+                eprintln!("✅ Loaded {} font (lazy)", name);
                 (Some(font_data), Some(font_ref))
             }
             Err(_) => {
                 eprintln!("⚠️ No emoji font loaded - emojis will render as placeholders");
                 (None, None)
             }
+        }
+    }
+
+    /// Ensure emoji font is loaded (lazy loading on first use)
+    fn ensure_emoji_font_loaded(&mut self) {
+        if self.emoji_font_ref.is_none() {
+            let (emoji_font_data, emoji_font_ref) = Self::load_emoji_font();
+            self.emoji_font_data = emoji_font_data;
+            self.emoji_font_ref = emoji_font_ref;
         }
     }
 
@@ -547,8 +556,9 @@ impl FontSystem {
         // Load system Unicode fallback font for missing symbols
         let (system_fallback_data, system_fallback_ref) = Self::load_unicode_fallback_font();
 
-        // Load emoji font for color emoji fallback
-        let (emoji_font_data, emoji_font_ref) = Self::load_emoji_font();
+        // Emoji font will be loaded lazily on first use
+        let emoji_font_data = None;
+        let emoji_font_ref = None;
 
         let mut shaper = Shaper::new();
         let rasterizer = Rasterizer::new();
@@ -666,6 +676,11 @@ impl FontSystem {
         font_size_px: f32,
         options: Option<&ShapingOptions>,
     ) -> (ShapingResult, ClusterMap, String) {
+        // Lazily load emoji font if text contains emoji
+        if contains_emoji(text) {
+            self.ensure_emoji_font_loaded();
+        }
+
         let opts = options.unwrap_or(&self.shaping_options);
         let mut opts_with_size = opts.clone();
         opts_with_size.font_size = font_size_px;
@@ -932,6 +947,11 @@ impl FontSystem {
         font_size_px: f32,
         options: Option<&ShapingOptions>,
     ) -> ShapedTextLayout {
+        // Lazily load emoji font if text contains emoji
+        if contains_emoji(text) {
+            self.ensure_emoji_font_loaded();
+        }
+
         // Get font metrics from main font for baseline
         let opts = options.unwrap_or(&self.shaping_options);
 

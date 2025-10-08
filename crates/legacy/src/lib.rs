@@ -28,6 +28,7 @@ pub use diagnostics_plugin;
 pub mod editable_text_view;
 pub mod mouse_state;
 pub mod render;
+pub mod scrollbar_plugin;
 pub mod shortcuts;
 pub mod tab_bar_plugin;
 pub mod tab_manager;
