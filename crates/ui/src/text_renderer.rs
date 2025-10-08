@@ -577,6 +577,50 @@ impl TextRenderer {
         let x_offset = 0.0;
         let mut y_pos = 0.0;
 
+        // Single-pass token merge optimization (O(n + m) instead of O(n log m))
+        // Track which token we're currently in as we process glyphs
+        let mut token_idx = 0;
+
+        // Helper closure to lookup token for a byte offset using single-pass merge
+        let mut lookup_token = |byte_offset: usize,
+                                 key: (u32, u32, char)|
+         -> (u16, f32, f32, bool, bool, bool) {
+            // Advance token_idx to find the token containing this byte offset
+            while token_idx < self.syntax_state.stable_tokens.len() {
+                let token = &self.syntax_state.stable_tokens[token_idx];
+                if byte_offset < token.byte_range.start {
+                    break;
+                } else if byte_offset >= token.byte_range.end {
+                    token_idx += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Check if byte_offset is within current token
+            if token_idx < self.syntax_state.stable_tokens.len() {
+                let token = &self.syntax_state.stable_tokens[token_idx];
+                if byte_offset >= token.byte_range.start && byte_offset < token.byte_range.end {
+                    // Glyph is within token
+                    let token_id = token.token_id as u16;
+                    let token_byte_length = token.byte_range.end - token.byte_range.start;
+                    let byte_offset_in_token = byte_offset - token.byte_range.start;
+                    let relative_pos = if token_byte_length > 0 {
+                        (byte_offset_in_token as f32) / (token_byte_length as f32)
+                    } else {
+                        0.0
+                    };
+                    return (token_id, relative_pos, 400.0, false, false, false);
+                }
+            }
+
+            // Fallback to old style or default
+            old_tokens
+                .get(&key)
+                .copied()
+                .unwrap_or((0, 0.0, 400.0, false, false, false))
+        };
+
         // Layout all lines
         for (line_idx, line_text) in lines.iter().enumerate() {
             let line_start_char = char_index;
@@ -655,14 +699,14 @@ impl TextRenderer {
                     byte_offset
                 };
 
-                // Try to preserve token from old layout
+                // Lookup token using single-pass merge
                 let key = (
                     line_idx as u32,
                     (char_index - line_start_char) as u32,
                     glyph.char,
                 );
                 let (token_id, relative_pos, weight, italic, underline, strikethrough) =
-                    self.lookup_token_for_byte(char_byte_offset, old_tokens.get(&key));
+                    lookup_token(char_byte_offset, key);
 
                 self.layout_cache.push(UnifiedGlyph {
                     char: glyph.char,
@@ -719,7 +763,7 @@ impl TextRenderer {
             if line_idx < lines.len() - 1 {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
                 let (token_id, relative_pos, weight, italic, underline, strikethrough) =
-                    self.lookup_token_for_byte(byte_offset, old_tokens.get(&key));
+                    lookup_token(byte_offset, key);
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -743,7 +787,7 @@ impl TextRenderer {
             } else if text.ends_with('\n') {
                 let key = (line_idx as u32, (char_index - line_start_char) as u32, '\n');
                 let (token_id, relative_pos, weight, italic, underline, strikethrough) =
-                    self.lookup_token_for_byte(byte_offset, old_tokens.get(&key));
+                    lookup_token(byte_offset, key);
                 self.layout_cache.push(UnifiedGlyph {
                     char: '\n',
                     layout_pos: LayoutPos::new(x_offset, y_pos),
@@ -1258,41 +1302,6 @@ impl TextRenderer {
 
         // Store last edit for incremental layout optimization
         self.last_edit_range = Some(edit_range);
-    }
-    /// Look up syntax token for a byte offset in the document
-    /// Returns (token_id, relative_pos, weight, italic, underline, strikethrough)
-    /// Theme styling will be applied later in update_syntax_with_theme
-    fn lookup_token_for_byte(
-        &self,
-        byte_offset: usize,
-        old_style: Option<&(u16, f32, f32, bool, bool, bool)>,
-    ) -> (u16, f32, f32, bool, bool, bool) {
-        // Try to find token in stable_tokens (document-wide syntax highlighting)
-        for token in &self.syntax_state.stable_tokens {
-            if byte_offset >= token.byte_range.start && byte_offset < token.byte_range.end {
-                let token_id = token.token_id as u16;
-
-                // Calculate relative position within token
-                let token_byte_length = token.byte_range.end - token.byte_range.start;
-                let byte_offset_in_token = byte_offset - token.byte_range.start;
-                let relative_pos = if token_byte_length > 0 {
-                    (byte_offset_in_token as f32) / (token_byte_length as f32)
-                } else {
-                    0.0
-                };
-
-                // Return token with default styling (theme will be applied later)
-                return (token_id, relative_pos, 400.0, false, false, false);
-            }
-        }
-
-        // Fallback to old style if available (preserving style across relayout)
-        if let Some(&style) = old_style {
-            return style;
-        }
-
-        // Default: no highlighting
-        (0, 0.0, 400.0, false, false, false)
     }
 
     pub fn update_visible_range(&mut self, viewport: &crate::coordinates::Viewport, tree: &Tree) {
