@@ -1,11 +1,14 @@
-//! Winit adapter - converts winit events to accelerators
+//! Winit adapter - converts winit events to internal semantic events
 
 use crate::accelerator::{Modifiers, Trigger};
 use crate::input::EventBus;
+use crate::mouse_state::MouseState;
 use crate::shortcuts::ShortcutRegistry;
 use serde_json::json;
+use winit::dpi::PhysicalPosition;
 use winit::event::{
-    ElementState, Modifiers as WinitModifiers, MouseButton as WinitMouseButton, WindowEvent,
+    ElementState, MouseScrollDelta, Modifiers as WinitModifiers, MouseButton as WinitMouseButton,
+    WindowEvent,
 };
 use winit::keyboard::{Key, NamedKey};
 
@@ -60,15 +63,113 @@ pub fn convert_key(key: &Key) -> Option<Trigger> {
     }
 }
 
-/// Handle a winit WindowEvent and emit appropriate events
-/// Returns true if the event was handled
+/// Handle a winit WindowEvent and emit appropriate semantic events
+/// Returns true if the event was handled and should not propagate further
 pub fn handle_window_event(
     event: &WindowEvent,
     shortcuts: &mut ShortcutRegistry,
     bus: &mut EventBus,
-    current_modifiers: &Modifiers,
+    mouse_state: &mut MouseState,
 ) -> bool {
     match event {
+        WindowEvent::ModifiersChanged(winit_mods) => {
+            // Update mouse state with new modifiers
+            mouse_state.set_modifiers(convert_modifiers(winit_mods));
+            true
+        }
+
+        WindowEvent::CursorMoved { position, .. } => {
+            // Update mouse state and emit event
+            mouse_state.set_position(*position);
+            bus.emit(
+                "mouse.moved",
+                json!({
+                    "x": position.x,
+                    "y": position.y,
+                }),
+                10,
+                "winit",
+            );
+            true
+        }
+
+        WindowEvent::MouseInput { state, button, .. } => {
+            let event_name = match (button, state) {
+                (WinitMouseButton::Left, ElementState::Pressed) => {
+                    if let Some(pos) = mouse_state.position {
+                        mouse_state.start_drag(pos);
+                    }
+                    "mouse.press"
+                }
+                (WinitMouseButton::Left, ElementState::Released) => {
+                    mouse_state.end_drag();
+                    "mouse.release"
+                }
+                (WinitMouseButton::Right, ElementState::Pressed) => "mouse.right_press",
+                (WinitMouseButton::Right, ElementState::Released) => "mouse.right_release",
+                _ => return false,
+            };
+
+            // Check for shortcuts first (e.g., cmd+click)
+            let trigger = match button {
+                WinitMouseButton::Left => Trigger::MouseButton(crate::accelerator::MouseButton::Left),
+                WinitMouseButton::Right => Trigger::MouseButton(crate::accelerator::MouseButton::Right),
+                _ => return false,
+            };
+
+            let shortcut_events = shortcuts.match_input(&mouse_state.modifiers, &trigger);
+            if !shortcut_events.is_empty() {
+                for event in shortcut_events {
+                    bus.emit(event, json!({}), 10, "shortcuts");
+                }
+                return true;
+            }
+
+            // No shortcut, emit mouse event
+            if let Some(position) = mouse_state.position {
+                bus.emit(
+                    event_name,
+                    json!({
+                        "x": position.x,
+                        "y": position.y,
+                        "modifiers": {
+                            "cmd": mouse_state.modifiers.cmd,
+                            "ctrl": mouse_state.modifiers.ctrl,
+                            "alt": mouse_state.modifiers.alt,
+                            "shift": mouse_state.modifiers.shift,
+                        }
+                    }),
+                    10,
+                    "winit",
+                );
+            }
+            true
+        }
+
+        WindowEvent::MouseWheel { delta, .. } => {
+            let (delta_x, delta_y) = match delta {
+                MouseScrollDelta::LineDelta(x, y) => (*x as f64 * 20.0, *y as f64 * 20.0),
+                MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+            };
+
+            bus.emit(
+                "mouse.wheel",
+                json!({
+                    "delta_x": delta_x,
+                    "delta_y": delta_y,
+                    "modifiers": {
+                        "cmd": mouse_state.modifiers.cmd,
+                        "ctrl": mouse_state.modifiers.ctrl,
+                        "alt": mouse_state.modifiers.alt,
+                        "shift": mouse_state.modifiers.shift,
+                    }
+                }),
+                10,
+                "winit",
+            );
+            true
+        }
+
         WindowEvent::KeyboardInput {
             event: key_event, ..
         } => {
@@ -91,7 +192,7 @@ pub fn handle_window_event(
             // Convert key to trigger (normalized for shortcut matching)
             if let Some(trigger) = convert_key(&key_event.logical_key) {
                 // Try to match shortcut
-                let events = shortcuts.match_input(current_modifiers, &trigger);
+                let events = shortcuts.match_input(&mouse_state.modifiers, &trigger);
 
                 // If matched, emit events
                 if !events.is_empty() {
@@ -103,9 +204,9 @@ pub fn handle_window_event(
 
                 // If no shortcut matched, check for plain character insertion
                 if let Some(original) = original_char {
-                    if !current_modifiers.cmd
-                        && !current_modifiers.ctrl
-                        && !current_modifiers.alt
+                    if !mouse_state.modifiers.cmd
+                        && !mouse_state.modifiers.ctrl
+                        && !mouse_state.modifiers.alt
                         && !original.chars().any(|c| c.is_control())
                     {
                         // Plain character - emit insert event with ORIGINAL character (preserves shift)
@@ -121,16 +222,6 @@ pub fn handle_window_event(
             }
 
             false
-        }
-
-        WindowEvent::MouseInput { state, button, .. } => {
-            if *button == WinitMouseButton::Left && *state == ElementState::Pressed {
-                // Emit mouse press event (will be handled separately)
-                // This is just for detection, actual position comes from CursorMoved
-                true
-            } else {
-                false
-            }
         }
 
         _ => false,

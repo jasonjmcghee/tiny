@@ -26,6 +26,7 @@ pub mod lsp_manager;
 pub mod lsp_service;
 pub use diagnostics_plugin;
 pub mod editable_text_view;
+pub mod mouse_state;
 pub mod render;
 pub mod shortcuts;
 pub mod tab_bar_plugin;

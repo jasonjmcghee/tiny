@@ -145,15 +145,8 @@ pub struct TinyApp {
     scroll_lock_enabled: bool, // true = lock to one direction at a time
     current_scroll_direction: Option<ScrollDirection>, // which direction is currently locked
 
-    // Track cursor position for clicks
-    cursor_position: Option<PhysicalPosition<f64>>,
-
-    // Track modifier keys (accelerator format)
-    modifiers: Modifiers,
-
-    // Track mouse drag
-    mouse_pressed: bool,
-    drag_start: Option<PhysicalPosition<f64>>,
+    // Mouse and keyboard state
+    mouse_state: crate::mouse_state::MouseState,
 
     // Track if cursor moved for scrolling
     cursor_needs_scroll: bool,
@@ -217,12 +210,12 @@ impl TinyApp {
 
     /// Handle cursor movement (mouse move)
     fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
-        self.cursor_position = Some(position);
+        self.mouse_state.set_position(position);
 
         // Pre-compute logical positions to avoid borrow issues
         let logical_point = self.physical_to_logical_point(position);
         let drag_from = self
-            .drag_start
+            .mouse_state.drag_start
             .and_then(|p| self.physical_to_logical_point(p));
 
         if let Some(point) = logical_point {
@@ -285,7 +278,7 @@ impl TinyApp {
                 return;
             };
 
-            let cmd_held = self.modifiers.cmd;
+            let cmd_held = self.mouse_state.modifiers.cmd;
 
             // Check if mouse is within editor bounds
             let in_editor = point.x.0 >= editor_bounds.x.0
@@ -360,7 +353,7 @@ impl TinyApp {
             }
 
             // Mouse drag - emit event
-            if self.mouse_pressed {
+            if self.mouse_state.pressed {
                 if let Some(from) = drag_from {
                     // Check if drag started in titlebar area (for transparent titlebar on macOS)
                     #[cfg(target_os = "macos")]
@@ -379,7 +372,7 @@ impl TinyApp {
                                     "from_y": from_local.y.0,
                                     "to_x": to_local.x.0,
                                     "to_y": to_local.y.0,
-                                    "alt": self.modifiers.alt,
+                                    "alt": self.mouse_state.modifiers.alt,
                                 }),
                                 10,
                                 "winit",
@@ -522,12 +515,9 @@ impl TinyApp {
             text_metrics,
             base_font_size: 14.0,      // Default base size
             title_bar_height: 28.0,    // Logical pixels
-            scroll_lock_enabled: true, // Enabled by default
+            scroll_lock_enabled: true,
             current_scroll_direction: None,
-            cursor_position: None,
-            modifiers: Modifiers::default(),
-            mouse_pressed: false,
-            drag_start: None,
+            mouse_state: crate::mouse_state::MouseState::new(),
             cursor_needs_scroll: false,
             continuous_rendering: false,
             last_frame_time: std::time::Instant::now(),
@@ -611,134 +601,72 @@ impl TinyApp {
         self.request_redraw();
     }
 
-    fn setup_shader_watcher(&mut self) {
+    /// Generic file watcher helper - reduces code duplication
+    fn setup_file_watcher(
+        path: PathBuf,
+        reload_flag: Arc<AtomicBool>,
+        extension_filter: Option<&str>,
+        debounce_ms: u64,
+    ) -> Option<notify::RecommendedWatcher> {
         use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
         use std::sync::mpsc::channel;
         use std::time::{Duration, Instant};
 
+        if !path.exists() && extension_filter.is_none() {
+            return None;
+        }
+
         let (tx, rx) = channel();
+        let ext_filter = extension_filter.map(|s| s.to_string());
 
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
-                    if event.kind.is_modify()
-                        && event.paths.iter().any(|p| p.extension().map_or(false, |ext| ext == "wgsl"))
-                    {
+                    let matches = if let Some(ref ext) = ext_filter {
+                        event.kind.is_modify() && event.paths.iter().any(|p|
+                            p.extension().map_or(false, |e| e == ext.as_str()))
+                    } else {
+                        event.kind.is_modify()
+                    };
+                    if matches {
                         let _ = tx.send(());
                     }
                 }
             },
             notify::Config::default(),
-        ).ok();
+        ).ok()?;
 
-        let Some(mut watcher) = watcher else { return; };
+        watcher.watch(&path, RecursiveMode::NonRecursive).ok()?;
 
+        std::thread::spawn(move || {
+            let mut last_reload = Instant::now();
+            for _ in rx {
+                if last_reload.elapsed() > Duration::from_millis(debounce_ms) {
+                    reload_flag.store(true, Ordering::Relaxed);
+                    last_reload = Instant::now();
+                }
+            }
+        });
+
+        Some(watcher)
+    }
+
+    fn setup_shader_watcher(&mut self) {
         let shader_path = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("crates/core/src/shaders");
-
-        if watcher.watch(&shader_path, RecursiveMode::NonRecursive).is_err() {
-            return;
-        }
-
-        let reload_flag = self.shader_reload_pending.clone();
-        std::thread::spawn(move || {
-            let mut last_reload = Instant::now();
-            for _ in rx {
-                if last_reload.elapsed() > Duration::from_millis(50) {
-                    reload_flag.store(true, Ordering::Relaxed);
-                    last_reload = Instant::now();
-                }
-            }
-        });
-
-        self._shader_watcher = Some(watcher);
+        self._shader_watcher = Self::setup_file_watcher(
+            shader_path, self.shader_reload_pending.clone(), Some("wgsl"), 50);
     }
 
     fn setup_config_watcher(&mut self) {
-        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-        use std::sync::mpsc::channel;
-        use std::time::{Duration, Instant};
-
-        let config_path = std::path::PathBuf::from("init.toml");
-        if !config_path.exists() {
-            return;
-        }
-
-        let (tx, rx) = channel();
-
-        let mut watcher = RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if event.kind.is_modify() {
-                        let _ = tx.send(());
-                    }
-                }
-            },
-            notify::Config::default(),
-        ).ok();
-
-        let Some(mut watcher) = watcher else { return; };
-
-        if watcher.watch(&config_path, RecursiveMode::NonRecursive).is_err() {
-            return;
-        }
-
-        let reload_flag = self.config_reload_pending.clone();
-        std::thread::spawn(move || {
-            let mut last_reload = Instant::now();
-            for _ in rx {
-                if last_reload.elapsed() > Duration::from_millis(200) {
-                    reload_flag.store(true, Ordering::Relaxed);
-                    last_reload = Instant::now();
-                }
-            }
-        });
-
-        self._config_watcher = Some(watcher);
+        self._config_watcher = Self::setup_file_watcher(
+            PathBuf::from("init.toml"), self.config_reload_pending.clone(), None, 200);
     }
 
     fn setup_shortcuts_watcher(&mut self) {
-        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-        use std::sync::mpsc::channel;
-        use std::time::{Duration, Instant};
-
-        let shortcuts_path = std::path::PathBuf::from("shortcuts.toml");
-        if !shortcuts_path.exists() {
-            return;
-        }
-
-        let (tx, rx) = channel();
-
-        let mut watcher = RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if event.kind.is_modify() {
-                        let _ = tx.send(());
-                    }
-                }
-            },
-            notify::Config::default(),
-        ).ok();
-
-        let Some(mut watcher) = watcher else { return; };
-
-        if watcher.watch(&shortcuts_path, RecursiveMode::NonRecursive).is_err() {
-            return;
-        }
-
-        let reload_flag = self.shortcuts_reload_pending.clone();
-        std::thread::spawn(move || {
-            let mut last_reload = Instant::now();
-            for _ in rx {
-                if last_reload.elapsed() > Duration::from_millis(200) {
-                    reload_flag.store(true, Ordering::Relaxed);
-                    last_reload = Instant::now();
-                }
-            }
-        });
-
-        self._shortcuts_watcher = Some(watcher);
+        self._shortcuts_watcher = Self::setup_file_watcher(
+            PathBuf::from("shortcuts.toml"), self.shortcuts_reload_pending.clone(), None, 200);
     }
 
     fn reload_shortcuts(&mut self) {
@@ -1018,9 +946,7 @@ impl TinyApp {
                                 event.data.get("physical_x").and_then(|v| v.as_f64()),
                                 event.data.get("physical_y").and_then(|v| v.as_f64()),
                             ) {
-                                self.mouse_pressed = true;
-                                self.drag_start =
-                                    Some(winit::dpi::PhysicalPosition::new(phys_x, phys_y));
+                                self.mouse_state.start_drag(winit::dpi::PhysicalPosition::new(phys_x, phys_y));
                             }
 
                             if let Some(viewport) =
@@ -1857,7 +1783,7 @@ impl ApplicationHandler for TinyApp {
                         // For regular (non-modifier) keys, use current modifier state
                         // For modifier keys themselves, we need to track release
                         let event_names = if !is_modifier_key {
-                            self.shortcuts.match_input(&self.modifiers, &trigger)
+                            self.shortcuts.match_input(&self.mouse_state.modifiers, &trigger)
                         } else {
                             // Skip modifier key presses - we'll handle them on release
                             Vec::new()
@@ -1872,9 +1798,9 @@ impl ApplicationHandler for TinyApp {
                             // No shortcut matched - check for plain character input
                             if let Some(ch) = original_char {
                                 // Plain character with no cmd/ctrl/alt (shift is OK)
-                                if !self.modifiers.cmd
-                                    && !self.modifiers.ctrl
-                                    && !self.modifiers.alt
+                                if !self.mouse_state.modifiers.cmd
+                                    && !self.mouse_state.modifiers.ctrl
+                                    && !self.mouse_state.modifiers.alt
                                 {
                                     // Emit event for focused view to handle
                                     self.event_bus.emit(
@@ -1895,7 +1821,7 @@ impl ApplicationHandler for TinyApp {
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 // Convert winit modifiers to accelerator format
-                self.modifiers = winit_adapter::convert_modifiers(&new_modifiers);
+                self.mouse_state.set_modifiers(winit_adapter::convert_modifiers(&new_modifiers));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -1914,7 +1840,7 @@ impl ApplicationHandler for TinyApp {
                 match state {
                     ElementState::Pressed => {
                         // Try to match shortcuts first
-                        let event_names = self.shortcuts.match_input(&self.modifiers, &trigger);
+                        let event_names = self.shortcuts.match_input(&self.mouse_state.modifiers, &trigger);
 
                         if !event_names.is_empty() {
                             // Shortcut matched (e.g., "cmd+click" or "click click")
@@ -1923,7 +1849,7 @@ impl ApplicationHandler for TinyApp {
                             }
                         } else {
                             // No shortcut - emit default mouse press event
-                            if let Some(position) = self.cursor_position {
+                            if let Some(position) = self.mouse_state.position {
                                 if let Some(point) = self.physical_to_logical_point(position) {
                                     // Check titlebar and tab bar
                                     #[cfg(target_os = "macos")]
@@ -1983,10 +1909,10 @@ impl ApplicationHandler for TinyApp {
                                                     "physical_y": position.y,
                                                     "button": button_name,
                                                     "modifiers": {
-                                                        "shift": self.modifiers.shift,
-                                                        "ctrl": self.modifiers.ctrl,
-                                                        "alt": self.modifiers.alt,
-                                                        "cmd": self.modifiers.cmd,
+                                                        "shift": self.mouse_state.modifiers.shift,
+                                                        "ctrl": self.mouse_state.modifiers.ctrl,
+                                                        "alt": self.mouse_state.modifiers.alt,
+                                                        "cmd": self.mouse_state.modifiers.cmd,
                                                     }
                                                 }),
                                                 10,
@@ -1999,8 +1925,7 @@ impl ApplicationHandler for TinyApp {
                         }
                     }
                     ElementState::Released => {
-                        self.mouse_pressed = false;
-                        self.drag_start = None;
+                        self.mouse_state.end_drag();
                         self.event_bus.emit("mouse.release", json!({}), 10, "winit");
                     }
                 }
@@ -2033,7 +1958,7 @@ impl ApplicationHandler for TinyApp {
                 };
 
                 // Try to match shortcuts
-                let event_names = self.shortcuts.match_input(&self.modifiers, &trigger);
+                let event_names = self.shortcuts.match_input(&self.mouse_state.modifiers, &trigger);
 
                 if !event_names.is_empty() {
                     // Shortcut matched

@@ -817,18 +817,7 @@ impl Renderer {
                         widget_id: 2,
                     };
                     // Only paint selection (z_index < 0)
-                    if let Some(gpu) = self.gpu_renderer {
-                        let gpu_renderer = unsafe { &*gpu };
-                        let mut ctx = PaintContext::new(
-                            self.viewport.to_viewport_info(),
-                            gpu_renderer.device_arc(),
-                            gpu_renderer.queue_arc(),
-                            gpu as *mut _,
-                            &self.service_registry,
-                        )
-                        .with_widget_viewport(editor_viewport);
-                        ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
+                    if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
                         // Paint selection only (background)
                         if let Some(ref plugin) = tab.plugin.editor.selection_plugin {
                             if let Some(paintable) = plugin.as_paintable() {
@@ -865,18 +854,7 @@ impl Renderer {
                     widget_id: 2,
                 };
 
-                if let Some(gpu) = self.gpu_renderer {
-                    let gpu_renderer = unsafe { &*gpu };
-                    let mut ctx = PaintContext::new(
-                        self.viewport.to_viewport_info(),
-                        gpu_renderer.device_arc(),
-                        gpu_renderer.queue_arc(),
-                        gpu as *mut _,
-                        &self.service_registry,
-                    )
-                    .with_widget_viewport(editor_viewport);
-                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
+                if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
                     let diagnostics = unsafe { &*diagnostics_ptr };
                     // DiagnosticsPlugin implements Paintable directly
                     use tiny_sdk::Paintable as _;
@@ -894,18 +872,7 @@ impl Renderer {
                         widget_id: 2,
                     };
 
-                    if let Some(gpu) = self.gpu_renderer {
-                        let gpu_renderer = unsafe { &*gpu };
-                        let mut ctx = PaintContext::new(
-                            self.viewport.to_viewport_info(),
-                            gpu_renderer.device_arc(),
-                            gpu_renderer.queue_arc(),
-                            gpu as *mut _,
-                            &self.service_registry,
-                        )
-                        .with_widget_viewport(editor_viewport);
-                        ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
+                    if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
                         // Paint cursor only (foreground)
                         if let Some(ref plugin) = tab.plugin.editor.cursor_plugin {
                             if let Some(paintable) = plugin.as_paintable() {
@@ -1199,26 +1166,14 @@ impl Renderer {
                     |z: i32| z >= 0
                 };
 
-                if let Some(gpu) = self.gpu_renderer {
-                    let gpu_renderer = unsafe { &*gpu };
+                let editor_viewport = tiny_sdk::types::WidgetViewport {
+                    bounds: self.editor_bounds,
+                    scroll: self.viewport.scroll,
+                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                    widget_id: 2,
+                };
 
-                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
-                        scroll: self.viewport.scroll,
-                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 2,
-                    };
-
-                    let mut ctx = PaintContext::new(
-                        self.viewport.to_viewport_info(),
-                        gpu_renderer.device_arc(),
-                        gpu_renderer.queue_arc(),
-                        gpu as *mut _,
-                        &self.service_registry,
-                    )
-                    .with_widget_viewport(editor_viewport);
-                    ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
-
+                if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
                     for key in loader.list_plugins() {
                         if let Some(plugin) = loader.get_plugin(&key) {
                             if let Some(paintable) = plugin.instance.as_paintable() {
@@ -1260,32 +1215,44 @@ impl Renderer {
         }
     }
 
+    /// Helper to create GlyphCollector with common setup
+    fn make_collector(&self, bounds: tiny_sdk::types::LayoutRect, scroll: tiny_sdk::LayoutPos, widget_id: u64) -> GlyphCollector {
+        GlyphCollector::new(
+            self.viewport.to_viewport_info(),
+            &self.service_registry,
+            tiny_sdk::types::WidgetViewport {
+                bounds,
+                scroll,
+                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                widget_id,
+            },
+        )
+    }
+
+    /// Helper to create PaintContext with common setup
+    fn make_paint_ctx(&self, widget_viewport: tiny_sdk::types::WidgetViewport) -> Option<PaintContext> {
+        let gpu = self.gpu_renderer?;
+        let gpu_renderer = unsafe { &*gpu };
+        let mut ctx = PaintContext::new(
+            self.viewport.to_viewport_info(),
+            gpu_renderer.device_arc(),
+            gpu_renderer.queue_arc(),
+            gpu as *mut _,
+            &self.service_registry,
+        ).with_widget_viewport(widget_viewport);
+        ctx.gpu_context = Some(gpu_renderer.get_plugin_context());
+        Some(ctx)
+    }
+
     fn collect_line_number_glyphs(&mut self) {
         if let Some(plugin_ptr) = self.line_numbers_plugin {
             let plugin = unsafe { &mut *plugin_ptr };
-
-            let line_numbers_y = self.title_bar_height + self.tab_bar_height;
-
-            let line_numbers_bounds = tiny_sdk::types::LayoutRect::new(
-                FILE_EXPLORER_WIDTH,
-                line_numbers_y,
-                plugin.width,
-                self.viewport.logical_size.height.0 - line_numbers_y,
-            );
-
-            let widget_viewport = tiny_sdk::types::WidgetViewport {
-                bounds: line_numbers_bounds,
-                scroll: tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0),
-                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                widget_id: 1,
-            };
-
-            let mut collector = GlyphCollector::new(
-                self.viewport.to_viewport_info(),
-                &self.service_registry,
-                widget_viewport,
-            );
-
+            let y = self.title_bar_height + self.tab_bar_height;
+            let bounds = tiny_sdk::types::LayoutRect::new(
+                FILE_EXPLORER_WIDTH, y, plugin.width,
+                self.viewport.logical_size.height.0 - y);
+            let mut collector = self.make_collector(bounds,
+                tiny_sdk::types::LayoutPos::new(0.0, self.viewport.scroll.y.0), 1);
             plugin.collect_glyphs(&mut collector);
             self.line_number_glyphs = collector.glyphs;
         }
@@ -1301,36 +1268,19 @@ impl Renderer {
             // Store the calculated height for use in draw code
             self.tab_bar_height = plugin.height;
 
-            let tab_bar_bounds = tiny_sdk::types::LayoutRect::new(
-                0.0,
-                self.title_bar_height,
-                self.viewport.logical_size.width.0,
-                plugin.height, // Use dynamic height from plugin
-            );
-
-            let widget_viewport = tiny_sdk::types::WidgetViewport {
-                bounds: tab_bar_bounds,
-                scroll: tiny_sdk::types::LayoutPos::new(0.0, 0.0), // No scroll for tab bar
-                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                widget_id: 10,
-            };
-
-            let mut collector = GlyphCollector::new(
-                self.viewport.to_viewport_info(),
-                &self.service_registry,
-                widget_viewport,
-            );
+            let bounds = tiny_sdk::types::LayoutRect::new(
+                0.0, self.title_bar_height, self.viewport.logical_size.width.0, plugin.height);
+            let mut collector = self.make_collector(bounds, tiny_sdk::types::LayoutPos::new(0.0, 0.0), 10);
 
             plugin.collect_glyphs(&mut collector, tab_manager);
             self.tab_bar_glyphs = collector.glyphs;
 
             // Collect background rectangles
-            let viewport_width = self.viewport.logical_size.width.0;
-            let mut rects = plugin.collect_rects(tab_manager, viewport_width);
+            let mut rects = plugin.collect_rects(tab_manager, self.viewport.logical_size.width.0);
             // Transform rects to screen coordinates
             for rect in &mut rects {
-                rect.rect.x.0 += tab_bar_bounds.x.0;
-                rect.rect.y.0 += tab_bar_bounds.y.0;
+                rect.rect.x.0 += bounds.x.0;
+                rect.rect.y.0 += bounds.y.0;
             }
             self.tab_bar_rects = rects;
         }
