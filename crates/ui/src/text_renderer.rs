@@ -89,37 +89,45 @@ impl LineCache {
         }
 
         // Binary search for first line that ends after visible start
-        let start_line = self.lines.binary_search_by(|line| {
-            if line.byte_range.end <= byte_range.start {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        }).unwrap_or_else(|i| i);
+        let start_line = self
+            .lines
+            .binary_search_by(|line| {
+                if line.byte_range.end <= byte_range.start {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+            .unwrap_or_else(|i| i);
 
         // Binary search for last line that starts before visible end
-        let end_line = self.lines.binary_search_by(|line| {
-            if line.byte_range.start < byte_range.end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        }).unwrap_or_else(|i| i);
+        let end_line = self
+            .lines
+            .binary_search_by(|line| {
+                if line.byte_range.start < byte_range.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+            .unwrap_or_else(|i| i);
 
         start_line as u32..end_line as u32
     }
 
     /// Find line by y position using binary search (O(log n))
     pub fn find_by_y_position(&self, y: f32) -> Option<usize> {
-        self.lines.binary_search_by(|line| {
-            if y < line.y_position {
-                std::cmp::Ordering::Greater // Target is before this line
-            } else if y >= line.y_position + line.height {
-                std::cmp::Ordering::Less // Target is after this line
-            } else {
-                std::cmp::Ordering::Equal // Target is within this line
-            }
-        }).ok()
+        self.lines
+            .binary_search_by(|line| {
+                if y < line.y_position {
+                    std::cmp::Ordering::Greater // Target is before this line
+                } else if y >= line.y_position + line.height {
+                    std::cmp::Ordering::Less // Target is after this line
+                } else {
+                    std::cmp::Ordering::Equal // Target is within this line
+                }
+            })
+            .ok()
     }
 
     /// Find line by y position with locality hint (O(1) amortized for sequential access)
@@ -151,15 +159,17 @@ impl LineCache {
 
     /// Find line by character index (glyph index) using binary search (O(log n))
     pub fn find_by_char_index(&self, char_idx: usize) -> Option<usize> {
-        self.lines.binary_search_by(|line| {
-            if char_idx < line.char_range.start {
-                std::cmp::Ordering::Greater
-            } else if char_idx >= line.char_range.end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).ok()
+        self.lines
+            .binary_search_by(|line| {
+                if char_idx < line.char_range.start {
+                    std::cmp::Ordering::Greater
+                } else if char_idx >= line.char_range.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
     }
 
     /// Iterate over all lines
@@ -328,7 +338,8 @@ impl TextRenderer {
 
         // Use tree to find which lines the edit touched
         let first_changed = tree.byte_to_line(edit_range.start) as usize;
-        let last_changed_inclusive = tree.byte_to_line(edit_range.end.saturating_sub(1).max(edit_range.start)) as usize;
+        let last_changed_inclusive =
+            tree.byte_to_line(edit_range.end.saturating_sub(1).max(edit_range.start)) as usize;
 
         // Be slightly conservative - reshape the affected line plus one more
         // This handles cases where line breaks changed
@@ -353,11 +364,17 @@ impl TextRenderer {
         let lines: Vec<&str> = text.lines().collect();
 
         // Find split points
-        let first_glyph = self.line_cache.get(first_changed.saturating_sub(1))
-            .map(|l| l.char_range.end).unwrap_or(0);
+        let first_glyph = self
+            .line_cache
+            .get(first_changed.saturating_sub(1))
+            .map(|l| l.char_range.end)
+            .unwrap_or(0);
         let last_old_line = last_changed.min(old_line_count);
-        let first_after_glyph = self.line_cache.get(last_old_line)
-            .map(|l| l.char_range.start).unwrap_or(self.layout_cache.len());
+        let first_after_glyph = self
+            .line_cache
+            .get(last_old_line)
+            .map(|l| l.char_range.start)
+            .unwrap_or(self.layout_cache.len());
 
         // Build new caches: [before, changed, shifted_after]
         let mut new_glyphs = self.layout_cache[..first_glyph].to_vec();
@@ -365,7 +382,10 @@ impl TextRenderer {
         let mut new_clusters = self.cluster_maps[..first_changed].to_vec();
 
         // Start positions
-        let mut y = new_lines.last().map(|l| l.y_position + l.height).unwrap_or(0.0);
+        let mut y = new_lines
+            .last()
+            .map(|l| l.y_position + l.height)
+            .unwrap_or(0.0);
         let mut byte = new_lines.last().map(|l| l.byte_range.end).unwrap_or(0);
         let mut char_idx = new_lines.last().map(|l| l.char_range.end).unwrap_or(0);
 
@@ -379,13 +399,21 @@ impl TextRenderer {
             for g in &glyphs {
                 new_glyphs.push(UnifiedGlyph {
                     char: g.char,
-                    layout_pos: LayoutPos::new(g.pos.x.0 / viewport.scale_factor, y + g.pos.y.0 / viewport.scale_factor),
+                    layout_pos: LayoutPos::new(
+                        g.pos.x.0 / viewport.scale_factor,
+                        y + g.pos.y.0 / viewport.scale_factor,
+                    ),
                     physical_pos: g.pos.clone(),
                     physical_width: g.size.width.0,
                     tex_coords: g.tex_coords,
                     char_byte_offset: byte,
-                    token_id: 0, relative_pos: 0.0, atlas_index: g.atlas_index,
-                    weight: 400.0, italic: false, underline: false, strikethrough: false,
+                    token_id: 0,
+                    relative_pos: 0.0,
+                    atlas_index: g.atlas_index,
+                    weight: 400.0,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
                 });
                 char_idx += 1;
             }
@@ -395,18 +423,27 @@ impl TextRenderer {
                 line_number: line_idx as u32,
                 byte_range: line_start_byte..byte,
                 char_range: line_start_char..char_idx,
-                y_position: y, height: viewport.metrics.line_height,
+                y_position: y,
+                height: viewport.metrics.line_height,
             });
             new_clusters.push(cluster);
 
             // Newline glyph
             if line_idx < lines.len() - 1 {
                 new_glyphs.push(UnifiedGlyph {
-                    char: '\n', layout_pos: LayoutPos::new(0.0, y),
+                    char: '\n',
+                    layout_pos: LayoutPos::new(0.0, y),
                     physical_pos: PhysicalPos::new(0.0, y * viewport.scale_factor),
-                    physical_width: 0.0, tex_coords: [0.0; 4], char_byte_offset: byte,
-                    token_id: 0, relative_pos: 0.0, atlas_index: 0,
-                    weight: 400.0, italic: false, underline: false, strikethrough: false,
+                    physical_width: 0.0,
+                    tex_coords: [0.0; 4],
+                    char_byte_offset: byte,
+                    token_id: 0,
+                    relative_pos: 0.0,
+                    atlas_index: 0,
+                    weight: 400.0,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
                 });
                 byte += 1;
                 char_idx += 1;
@@ -438,7 +475,8 @@ impl TextRenderer {
                         ..((l.byte_range.end as isize + byte_delta) as usize),
                     char_range: ((l.char_range.start as isize + char_delta) as usize)
                         ..((l.char_range.end as isize + char_delta) as usize),
-                    y_position: l.y_position + y_delta, height: l.height,
+                    y_position: l.y_position + y_delta,
+                    height: l.height,
                 });
             }
             new_clusters.extend_from_slice(&self.cluster_maps[last_old_line..]);
@@ -460,21 +498,31 @@ impl TextRenderer {
         use std::hash::{Hash, Hasher};
         let mut hasher = ahash::AHasher::default();
         text.hash(&mut hasher);
-        let key = (hasher.finish(), viewport.metrics.font_size.to_bits(), viewport.scale_factor.to_bits());
+        let key = (
+            hasher.finish(),
+            viewport.metrics.font_size.to_bits(),
+            viewport.scale_factor.to_bits(),
+        );
 
         if let Some(cached) = self.shaping_cache.get(&key) {
             return (cached.glyphs.clone(), cached.cluster_map.clone());
         }
 
         let shaped = font_system.layout_text_shaped_with_tabs(
-            text, viewport.metrics.font_size, viewport.scale_factor, None
+            text,
+            viewport.metrics.font_size,
+            viewport.scale_factor,
+            None,
         );
 
         if self.shaping_cache.len() < MAX_SHAPING_CACHE_SIZE {
-            self.shaping_cache.insert(key, ShapedLineCache {
-                glyphs: shaped.glyphs.clone(),
-                cluster_map: shaped.cluster_map.clone(),
-            });
+            self.shaping_cache.insert(
+                key,
+                ShapedLineCache {
+                    glyphs: shaped.glyphs.clone(),
+                    cluster_map: shaped.cluster_map.clone(),
+                },
+            );
         }
         (shaped.glyphs, shaped.cluster_map)
     }
@@ -499,38 +547,6 @@ impl TextRenderer {
             return;
         }
 
-        // TRY INCREMENTAL UPDATE (huge performance win for large files!)
-        if !force && !metrics_changed && tree.version == self.last_tree_version + 1 {
-            if let Some((first_changed, last_changed, old_line_count, new_line_count)) =
-                self.find_changed_lines(tree)
-            {
-                // Try incremental update if only a few lines changed
-                let changed_line_count = last_changed - first_changed;
-                if changed_line_count < 10 {
-                    // Worth doing incremental update
-                    if self.try_incremental_layout(
-                        tree,
-                        font_system,
-                        viewport,
-                        first_changed,
-                        last_changed,
-                        old_line_count,
-                        new_line_count,
-                    ) {
-                        // Success! Update version and return
-                        self.last_tree_version = tree.version;
-                        self.last_font_size = viewport.metrics.font_size;
-                        self.last_line_height = viewport.metrics.line_height;
-                        self.last_scale_factor = viewport.scale_factor;
-                        self.last_edit_range = None;
-                        return;
-                    }
-                    // Fall through to full rebuild if incremental failed
-                }
-            }
-        }
-
-        // FULL REBUILD PATH (fallback)
         // Build map of (line, pos_in_line, char) → (token_id, relative_pos, weight, italic, underline, strikethrough) for preservation
         // This keeps colors stable when layout rebuilds (e.g., after undo)
         let old_tokens: HashMap<(u32, u32, char), (u16, f32, f32, bool, bool, bool)> = self
@@ -582,44 +598,43 @@ impl TextRenderer {
         let mut token_idx = 0;
 
         // Helper closure to lookup token for a byte offset using single-pass merge
-        let mut lookup_token = |byte_offset: usize,
-                                 key: (u32, u32, char)|
-         -> (u16, f32, f32, bool, bool, bool) {
-            // Advance token_idx to find the token containing this byte offset
-            while token_idx < self.syntax_state.stable_tokens.len() {
-                let token = &self.syntax_state.stable_tokens[token_idx];
-                if byte_offset < token.byte_range.start {
-                    break;
-                } else if byte_offset >= token.byte_range.end {
-                    token_idx += 1;
-                } else {
-                    break;
-                }
-            }
-
-            // Check if byte_offset is within current token
-            if token_idx < self.syntax_state.stable_tokens.len() {
-                let token = &self.syntax_state.stable_tokens[token_idx];
-                if byte_offset >= token.byte_range.start && byte_offset < token.byte_range.end {
-                    // Glyph is within token
-                    let token_id = token.token_id as u16;
-                    let token_byte_length = token.byte_range.end - token.byte_range.start;
-                    let byte_offset_in_token = byte_offset - token.byte_range.start;
-                    let relative_pos = if token_byte_length > 0 {
-                        (byte_offset_in_token as f32) / (token_byte_length as f32)
+        let mut lookup_token =
+            |byte_offset: usize, key: (u32, u32, char)| -> (u16, f32, f32, bool, bool, bool) {
+                // Advance token_idx to find the token containing this byte offset
+                while token_idx < self.syntax_state.stable_tokens.len() {
+                    let token = &self.syntax_state.stable_tokens[token_idx];
+                    if byte_offset < token.byte_range.start {
+                        break;
+                    } else if byte_offset >= token.byte_range.end {
+                        token_idx += 1;
                     } else {
-                        0.0
-                    };
-                    return (token_id, relative_pos, 400.0, false, false, false);
+                        break;
+                    }
                 }
-            }
 
-            // Fallback to old style or default
-            old_tokens
-                .get(&key)
-                .copied()
-                .unwrap_or((0, 0.0, 400.0, false, false, false))
-        };
+                // Check if byte_offset is within current token
+                if token_idx < self.syntax_state.stable_tokens.len() {
+                    let token = &self.syntax_state.stable_tokens[token_idx];
+                    if byte_offset >= token.byte_range.start && byte_offset < token.byte_range.end {
+                        // Glyph is within token
+                        let token_id = token.token_id as u16;
+                        let token_byte_length = token.byte_range.end - token.byte_range.start;
+                        let byte_offset_in_token = byte_offset - token.byte_range.start;
+                        let relative_pos = if token_byte_length > 0 {
+                            (byte_offset_in_token as f32) / (token_byte_length as f32)
+                        } else {
+                            0.0
+                        };
+                        return (token_id, relative_pos, 400.0, false, false, false);
+                    }
+                }
+
+                // Fallback to old style or default
+                old_tokens
+                    .get(&key)
+                    .copied()
+                    .unwrap_or((0, 0.0, 400.0, false, false, false))
+            };
 
         // Layout all lines
         for (line_idx, line_text) in lines.iter().enumerate() {

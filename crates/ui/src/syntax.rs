@@ -482,28 +482,11 @@ impl SyntaxHighlighter {
                 None
             };
 
-            while let Ok(request) = rx.recv() {
-                // Shorter debounce for initial parse, longer for subsequent
-                let debounce_ms = if is_first_parse { 10 } else { 100 };
-                std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
-
-                // Drain any additional requests that came in during debounce
-                let final_request = rx.try_iter().last().unwrap_or(request);
-
-                // Skip if text hasn't changed (avoid redundant parsing)
-                if final_request.text == last_text
-                    && final_request.edit.is_none()
-                    && !final_request.reset_tree
-                {
-                    continue;
-                }
-                last_text = final_request.text.clone();
-
-                // Reset tree if requested (needed when multiple edits accumulate)
-                if final_request.reset_tree {
+            while let Ok(mut request) = rx.recv() {
+                // Apply edit to tree IMMEDIATELY (before debounce) - cheap operation!
+                if request.reset_tree {
                     tree = None;
-                } else if let Some(edit) = &final_request.edit {
-                    // Apply edit to existing tree for incremental parsing
+                } else if let Some(edit) = &request.edit {
                     if let Some(ref mut existing_tree) = tree {
                         let ts_edit = InputEdit {
                             start_byte: edit.start_byte,
@@ -516,6 +499,42 @@ impl SyntaxHighlighter {
                         existing_tree.edit(&ts_edit);
                     }
                 }
+
+                // NOW debounce (only the expensive re-parse)
+                let debounce_ms = if is_first_parse { 10 } else { 100 };
+                std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
+
+                // Drain any additional requests that came in during debounce
+                // and apply their edits immediately too!
+                for additional_request in rx.try_iter() {
+                    request = additional_request;
+                    if request.reset_tree {
+                        tree = None;
+                    } else if let Some(edit) = &request.edit {
+                        if let Some(ref mut existing_tree) = tree {
+                            let ts_edit = InputEdit {
+                                start_byte: edit.start_byte,
+                                old_end_byte: edit.old_end_byte,
+                                new_end_byte: edit.new_end_byte,
+                                start_position: edit.start_position,
+                                old_end_position: edit.old_end_position,
+                                new_end_position: edit.new_end_position,
+                            };
+                            existing_tree.edit(&ts_edit);
+                        }
+                    }
+                }
+
+                let final_request = request;
+
+                // Skip if text hasn't changed (avoid redundant parsing)
+                if final_request.text == last_text
+                    && final_request.edit.is_none()
+                    && !final_request.reset_tree
+                {
+                    continue;
+                }
+                last_text = final_request.text.clone();
 
                 // Parse with tree-sitter (regular or markdown)
                 let md_tree;
