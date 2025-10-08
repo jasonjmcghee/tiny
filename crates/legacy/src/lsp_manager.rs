@@ -3,6 +3,7 @@
 //! Currently supports rust-analyzer, designed to be extensible to other language servers
 
 use ahash::AHasher;
+use anyhow::{bail, Context, Result};
 use lsp_types::{
     ClientCapabilities, Diagnostic as LspDiagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
@@ -256,14 +257,8 @@ impl LspManager {
         let workspace_root_clone = workspace_root.clone();
         let state_clone = state.clone();
 
-        // Spawn background thread for LSP communication
         thread::spawn(move || {
-            if let Err(e) = run_lsp_client(
-                request_rx,
-                response_tx,
-                workspace_root_clone,
-                state_clone,
-            ) {
+            if let Err(e) = run_lsp_client(request_rx, response_tx, workspace_root_clone, state_clone) {
                 eprintln!("LSP client error: {}", e);
             }
         });
@@ -410,46 +405,24 @@ impl LspManager {
         let mut instance_guard = instance_lock.lock().unwrap();
 
         if let Some(ref existing) = *instance_guard {
-            // Check if we can reuse the existing instance (same workspace)
             if existing.workspace_root == workspace_root {
-                eprintln!(
-                    "LSP: Reusing existing instance for workspace: {:?}",
-                    workspace_root
-                );
                 return Ok(existing.clone());
             }
-            // Different workspace, shutdown the old one
-            eprintln!("LSP: Shutting down old instance, workspace changed");
             existing.shutdown();
         }
 
-        // Create new instance
-        eprintln!(
-            "LSP: Creating new LSP instance for workspace: {:?}",
-            workspace_root
-        );
         let new_manager = Arc::new(Self::new_for_rust(workspace_root)?);
         *instance_guard = Some(new_manager.clone());
-
         Ok(new_manager)
     }
 
     /// Pre-warm the LSP for faster startup
     pub fn prewarm_for_workspace(workspace_root: Option<PathBuf>) {
-        eprintln!("LSP: Starting pre-warm for workspace: {:?}", workspace_root);
-        std::thread::spawn(
-            move || match Self::get_or_create_global(workspace_root.clone()) {
-                Ok(_manager) => {
-                    eprintln!(
-                        "LSP: Successfully pre-warmed rust-analyzer for {:?}",
-                        workspace_root
-                    );
-                }
-                Err(e) => {
-                    eprintln!("LSP: Failed to pre-warm: {}", e);
-                }
-            },
-        );
+        std::thread::spawn(move || {
+            if let Err(e) = Self::get_or_create_global(workspace_root) {
+                eprintln!("LSP: Failed to pre-warm: {}", e);
+            }
+        });
     }
 
     /// Load cached diagnostics if available and valid
@@ -457,35 +430,38 @@ impl LspManager {
         file_path: &PathBuf,
         content: &str,
     ) -> Option<Vec<ParsedDiagnostic>> {
+        Self::load_cached_diagnostics_impl(file_path, content).ok()
+    }
+
+    fn load_cached_diagnostics_impl(
+        file_path: &PathBuf,
+        content: &str,
+    ) -> Result<Vec<ParsedDiagnostic>> {
         let cache_key = Self::compute_cache_key(file_path, content)?;
         let cache_file = Self::get_cache_path(&cache_key);
 
         if !cache_file.exists() {
-            return None;
+            bail!("Cache file does not exist");
         }
 
-        let (mod_time, cached) = std::fs::metadata(file_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|mod_time| {
-                std::fs::read_to_string(&cache_file)
-                    .ok()
-                    .and_then(|content| serde_json::from_str::<CachedDiagnostics>(&content).ok())
-                    .map(|cached| (mod_time, cached))
-            })?;
+        let mod_time = std::fs::metadata(file_path)
+            .context("Failed to read file metadata")?
+            .modified()
+            .context("Failed to get modification time")?;
+
+        let cache_content = std::fs::read_to_string(&cache_file)
+            .context("Failed to read cache file")?;
+        let cached: CachedDiagnostics = serde_json::from_str(&cache_content)
+            .context("Failed to parse cached diagnostics")?;
 
         // Cache is valid if file hasn't been modified and content hash matches
-        if cached.modification_time <= mod_time
-            && cached.content_hash == Self::hash_content(content)
+        if cached.modification_time > mod_time
+            || cached.content_hash != Self::hash_content(content)
         {
-            eprintln!(
-                "LSP: Loaded {} cached diagnostics for {:?}",
-                cached.diagnostics.len(),
-                file_path
-            );
-            return Some(cached.diagnostics);
+            bail!("Cache is stale");
         }
-        None
+
+        Ok(cached.diagnostics)
     }
 
     /// Save diagnostics to cache
@@ -497,16 +473,21 @@ impl LspManager {
         file_path: &PathBuf,
         content: &str,
         diagnostics: &[ParsedDiagnostic],
-    ) -> Option<()> {
-        let cache_key = Self::compute_cache_key(file_path, content)?;
+    ) -> Result<()> {
+        let cache_key = Self::compute_cache_key(file_path, content)
+            .context("Failed to compute cache key")?;
         let cache_file = Self::get_cache_path(&cache_key);
 
         // Create cache directory if it doesn't exist
         if let Some(parent) = cache_file.parent() {
-            std::fs::create_dir_all(parent).ok()?;
+            std::fs::create_dir_all(parent)
+                .context("Failed to create cache directory")?;
         }
 
-        let mod_time = std::fs::metadata(file_path).ok()?.modified().ok()?;
+        let mod_time = std::fs::metadata(file_path)
+            .context("Failed to read file metadata")?
+            .modified()
+            .context("Failed to get modification time")?;
 
         let cached = CachedDiagnostics {
             diagnostics: diagnostics.to_vec(),
@@ -516,17 +497,20 @@ impl LspManager {
             cached_at: SystemTime::now(),
         };
 
-        let json = serde_json::to_string_pretty(&cached).ok()?;
-        std::fs::write(&cache_file, json).ok()
+        let json = serde_json::to_string_pretty(&cached)
+            .context("Failed to serialize diagnostics")?;
+        std::fs::write(&cache_file, json)
+            .context("Failed to write cache file")?;
+        Ok(())
     }
 
     /// Compute cache key from file path and content
-    fn compute_cache_key(file_path: &PathBuf, content: &str) -> Option<String> {
+    fn compute_cache_key(file_path: &PathBuf, content: &str) -> Result<String> {
         let mut hasher = AHasher::default();
         file_path.hash(&mut hasher);
         content.hash(&mut hasher);
         let hash = hasher.finish();
-        Some(format!("{:x}", hash))
+        Ok(format!("{:x}", hash))
     }
 
     /// Hash content for cache validation
@@ -559,29 +543,37 @@ impl LspManager {
         file_path: &PathBuf,
         content: &str,
     ) -> Option<ahash::AHashMap<(usize, usize), Vec<CachedLocation>>> {
+        Self::load_cached_definitions_impl(file_path, content).ok()
+    }
+
+    fn load_cached_definitions_impl(
+        file_path: &PathBuf,
+        content: &str,
+    ) -> Result<ahash::AHashMap<(usize, usize), Vec<CachedLocation>>> {
         let cache_key = Self::compute_cache_key(file_path, content)?;
         let cache_file = Self::get_definitions_cache_path(&cache_key);
 
         if !cache_file.exists() {
-            return None;
+            bail!("Cache file does not exist");
         }
 
-        let (mod_time, cached) = std::fs::metadata(file_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|mod_time| {
-                std::fs::read_to_string(&cache_file)
-                    .ok()
-                    .and_then(|content| serde_json::from_str::<CachedDefinitions>(&content).ok())
-                    .map(|cached| (mod_time, cached))
-            })?;
+        let mod_time = std::fs::metadata(file_path)
+            .context("Failed to read file metadata")?
+            .modified()
+            .context("Failed to get modification time")?;
 
-        if cached.modification_time <= mod_time
-            && cached.content_hash == Self::hash_content(content)
+        let cache_content = std::fs::read_to_string(&cache_file)
+            .context("Failed to read cache file")?;
+        let cached: CachedDefinitions = serde_json::from_str(&cache_content)
+            .context("Failed to parse cached definitions")?;
+
+        if cached.modification_time > mod_time
+            || cached.content_hash != Self::hash_content(content)
         {
-            return Some(cached.definitions);
+            bail!("Cache is stale");
         }
-        None
+
+        Ok(cached.definitions)
     }
 
     /// Save definitions to cache
@@ -597,15 +589,19 @@ impl LspManager {
         file_path: &PathBuf,
         content: &str,
         definitions: &ahash::AHashMap<(usize, usize), Vec<CachedLocation>>,
-    ) -> Option<()> {
+    ) -> Result<()> {
         let cache_key = Self::compute_cache_key(file_path, content)?;
         let cache_file = Self::get_definitions_cache_path(&cache_key);
 
         if let Some(parent) = cache_file.parent() {
-            std::fs::create_dir_all(parent).ok()?;
+            std::fs::create_dir_all(parent)
+                .context("Failed to create cache directory")?;
         }
 
-        let mod_time = std::fs::metadata(file_path).ok()?.modified().ok()?;
+        let mod_time = std::fs::metadata(file_path)
+            .context("Failed to read file metadata")?
+            .modified()
+            .context("Failed to get modification time")?;
 
         let cached = CachedDefinitions {
             definitions: definitions.clone(),
@@ -615,8 +611,11 @@ impl LspManager {
             cached_at: SystemTime::now(),
         };
 
-        let json = serde_json::to_string_pretty(&cached).ok()?;
-        std::fs::write(&cache_file, json).ok()
+        let json = serde_json::to_string_pretty(&cached)
+            .context("Failed to serialize definitions")?;
+        std::fs::write(&cache_file, json)
+            .context("Failed to write cache file")?;
+        Ok(())
     }
 }
 
@@ -835,17 +834,11 @@ fn run_lsp_client(
     workspace_root: Option<PathBuf>,
     state: Arc<RwLock<LspState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Start rust-analyzer process
-    eprintln!("LSP: Starting rust-analyzer process...");
     let mut child = Command::new("rust-analyzer")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    eprintln!(
-        "LSP: rust-analyzer process started with PID: {:?}",
-        child.id()
-    );
 
     let mut stdin = child.stdin.take().expect("Failed to get stdin");
     let stdout = child.stdout.take().expect("Failed to get stdout");

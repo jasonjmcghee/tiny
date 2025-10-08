@@ -3085,6 +3085,7 @@ name = "tiny-editor"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "anyhow",
  "arboard",
  "arc-swap",
  "bytemuck",
@@ -3120,6 +3121,7 @@ name = "tiny-font"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "anyhow",
  "parking_lot",
  "swash 0.1.19",
  "tiny-sdk",

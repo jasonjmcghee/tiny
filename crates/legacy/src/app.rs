@@ -5,16 +5,18 @@
 use crate::{
     accelerator::{Modifiers, MouseButton, Trigger, WheelDirection},
     coordinates::TextMetrics,
-    input::{EventBus, InputAction},
+    event_data::{self, FileGotoData, FileOpenData},
+    input::{Event, EventBus, InputAction},
     lsp_manager::LspManager,
     render::Renderer,
     scroll::{ScrollFocusManager, Scrollable, WidgetId},
-    shortcuts::{ShortcutContext, ShortcutRegistry},
+    shortcuts::ShortcutRegistry,
     tab_manager::TabManager,
     winit_adapter,
 };
 
 pub use crate::editor_logic::EditorLogic;
+use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{
@@ -111,6 +113,8 @@ pub struct TinyApp {
     shader_reload_pending: Arc<AtomicBool>,
     _config_watcher: Option<notify::RecommendedWatcher>,
     config_reload_pending: Arc<AtomicBool>,
+    _shortcuts_watcher: Option<notify::RecommendedWatcher>,
+    shortcuts_reload_pending: Arc<AtomicBool>,
 
     // Application-specific logic
     editor: EditorLogic,
@@ -168,6 +172,26 @@ pub struct TinyApp {
 }
 
 impl TinyApp {
+    /// Find workspace root by walking up directories looking for Cargo.toml
+    /// Returns the topmost Cargo.toml found (workspace root)
+    fn find_workspace_root() -> Result<PathBuf> {
+        let dir = std::env::current_dir()?;
+        let mut current = dir.as_path();
+        let mut found_cargo_toml = None;
+
+        loop {
+            if current.join("Cargo.toml").exists() {
+                found_cargo_toml = Some(current.to_path_buf());
+            }
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+
+        found_cargo_toml.ok_or_else(|| anyhow!("No Cargo.toml found"))
+    }
+
     fn physical_to_logical_point(&self, position: PhysicalPosition<f64>) -> Option<Point> {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor() as f32;
@@ -469,22 +493,7 @@ impl TinyApp {
 
     pub fn new(editor: EditorLogic) -> Self {
         // Pre-warm LSP in the background for faster startup
-        // Look for workspace root from current directory (find deepest Cargo.toml)
-        let workspace_root = std::env::current_dir().ok().and_then(|dir| {
-            let mut current = dir.as_path();
-            let mut found_cargo_toml = None;
-            loop {
-                if current.join("Cargo.toml").exists() {
-                    found_cargo_toml = Some(current.to_path_buf());
-                    // Keep looking for a higher-level Cargo.toml (workspace root)
-                }
-                match current.parent() {
-                    Some(parent) => current = parent,
-                    None => break,
-                }
-            }
-            found_cargo_toml
-        });
+        let workspace_root = Self::find_workspace_root().ok();
         LspManager::prewarm_for_workspace(workspace_root);
 
         let event_bus = EventBus::new();
@@ -502,6 +511,8 @@ impl TinyApp {
             shader_reload_pending: Arc::new(AtomicBool::new(false)),
             _config_watcher: None,
             config_reload_pending: Arc::new(AtomicBool::new(false)),
+            _shortcuts_watcher: None,
+            shortcuts_reload_pending: Arc::new(AtomicBool::new(false)),
             editor,
             event_bus,
             shortcuts,
@@ -607,63 +618,40 @@ impl TinyApp {
 
         let (tx, rx) = channel();
 
-        // Create watcher
-        let mut watcher = match RecommendedWatcher::new(
+        let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
-                    // Only care about modifications to .wgsl files
                     if event.kind.is_modify()
-                        && event
-                            .paths
-                            .iter()
-                            .any(|p| p.extension().map_or(false, |ext| ext == "wgsl"))
+                        && event.paths.iter().any(|p| p.extension().map_or(false, |ext| ext == "wgsl"))
                     {
                         let _ = tx.send(());
                     }
                 }
             },
             notify::Config::default(),
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "Failed to create file watcher: {}. Shader hot-reload disabled.",
-                    e
-                );
-                return;
-            }
-        };
+        ).ok();
 
-        // Watch the shaders directory
+        let Some(mut watcher) = watcher else { return; };
+
         let shader_path = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("crates/core/src/shaders");
 
-        if let Err(e) = watcher.watch(&shader_path, RecursiveMode::NonRecursive) {
-            eprintln!(
-                "Failed to watch shader directory {:?}: {}. Shader hot-reload disabled.",
-                shader_path, e
-            );
+        if watcher.watch(&shader_path, RecursiveMode::NonRecursive).is_err() {
             return;
         }
 
-        eprintln!("Shader hot-reload enabled! Watching: {:?}", shader_path);
-
-        // Simple debounce thread
         let reload_flag = self.shader_reload_pending.clone();
         std::thread::spawn(move || {
             let mut last_reload = Instant::now();
             for _ in rx {
-                // Simple 200ms debounce
                 if last_reload.elapsed() > Duration::from_millis(50) {
                     reload_flag.store(true, Ordering::Relaxed);
                     last_reload = Instant::now();
-                    eprintln!("Shader change detected, triggering reload...");
                 }
             }
         });
 
-        // Store the watcher (it needs to stay alive)
         self._shader_watcher = Some(watcher);
     }
 
@@ -673,15 +661,13 @@ impl TinyApp {
         use std::time::{Duration, Instant};
 
         let config_path = std::path::PathBuf::from("init.toml");
-
         if !config_path.exists() {
-            eprintln!("No init.toml found - config hot-reload disabled");
             return;
         }
 
         let (tx, rx) = channel();
 
-        let mut watcher = match RecommendedWatcher::new(
+        let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     if event.kind.is_modify() {
@@ -690,28 +676,14 @@ impl TinyApp {
                 }
             },
             notify::Config::default(),
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "Failed to create config watcher: {}. Config hot-reload disabled.",
-                    e
-                );
-                return;
-            }
-        };
+        ).ok();
 
-        if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
-            eprintln!(
-                "Failed to watch init.toml: {}. Config hot-reload disabled.",
-                e
-            );
+        let Some(mut watcher) = watcher else { return; };
+
+        if watcher.watch(&config_path, RecursiveMode::NonRecursive).is_err() {
             return;
         }
 
-        eprintln!("Config hot-reload enabled! Watching: {:?}", config_path);
-
-        // Debounce thread
         let reload_flag = self.config_reload_pending.clone();
         std::thread::spawn(move || {
             let mut last_reload = Instant::now();
@@ -719,7 +691,6 @@ impl TinyApp {
                 if last_reload.elapsed() > Duration::from_millis(200) {
                     reload_flag.store(true, Ordering::Relaxed);
                     last_reload = Instant::now();
-                    eprintln!("Config change detected, triggering reload...");
                 }
             }
         });
@@ -727,19 +698,58 @@ impl TinyApp {
         self._config_watcher = Some(watcher);
     }
 
-    fn reload_config(&mut self) {
-        let config = match crate::config::AppConfig::load() {
-            Ok(config) => config,
-            Err(e) => {
-                eprintln!("❌ Failed to parse config: {}", e);
-                eprintln!("   Using previous values (config not applied)");
-                return; // Keep current settings, don't crash
+    fn setup_shortcuts_watcher(&mut self) {
+        use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+
+        let shortcuts_path = std::path::PathBuf::from("shortcuts.toml");
+        if !shortcuts_path.exists() {
+            return;
+        }
+
+        let (tx, rx) = channel();
+
+        let mut watcher = RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if event.kind.is_modify() {
+                        let _ = tx.send(());
+                    }
+                }
+            },
+            notify::Config::default(),
+        ).ok();
+
+        let Some(mut watcher) = watcher else { return; };
+
+        if watcher.watch(&shortcuts_path, RecursiveMode::NonRecursive).is_err() {
+            return;
+        }
+
+        let reload_flag = self.shortcuts_reload_pending.clone();
+        std::thread::spawn(move || {
+            let mut last_reload = Instant::now();
+            for _ in rx {
+                if last_reload.elapsed() > Duration::from_millis(200) {
+                    reload_flag.store(true, Ordering::Relaxed);
+                    last_reload = Instant::now();
+                }
             }
-        };
+        });
 
-        eprintln!("✅ Reloaded config from init.toml");
+        self._shortcuts_watcher = Some(watcher);
+    }
 
-        // Update window title if changed
+    fn reload_shortcuts(&mut self) {
+        println!("Reloading shortcuts.toml");
+        self.shortcuts.reload();
+        self.request_redraw();
+    }
+
+    fn reload_config(&mut self) {
+        let Some(config) = crate::config::AppConfig::load().ok() else { return; };
+
         if self.window_title != config.editor.window_title {
             self.window_title = config.editor.window_title.clone();
             if let Some(window) = &self.window {
@@ -747,18 +757,12 @@ impl TinyApp {
             }
         }
 
-        // Update font settings if BASE font size changed in config
-        // Compare with base_font_size, NOT text_metrics.font_size (which may be manually zoomed)
         let base_font_size_changed = (self.base_font_size - config.editor.font_size).abs() > 0.1;
 
         if base_font_size_changed {
-            // Calculate current zoom ratio (how much user has zoomed)
             let zoom_ratio = self.text_metrics.font_size / self.base_font_size;
-
-            // Update base font size
             self.base_font_size = config.editor.font_size;
 
-            // Apply zoom ratio to new base size to preserve manual zoom
             let new_font_size = config.editor.font_size * zoom_ratio;
             let new_line_height = new_font_size * config.editor.line_height;
 
@@ -766,44 +770,29 @@ impl TinyApp {
             new_metrics.line_height = new_line_height;
             self.text_metrics = new_metrics;
 
-            eprintln!(
-                "Updated base font size: {:.1} -> {:.1} (current: {:.1}, zoom: {:.2}x)",
-                self.base_font_size / zoom_ratio,
-                config.editor.font_size,
-                new_font_size,
-                zoom_ratio
-            );
-
-            // Update renderer with new metrics
             if let Some(renderer) = &mut self.cpu_renderer {
-                renderer.clear_all_caches(); // Clear before changing metrics
+                renderer.clear_all_caches();
                 renderer.set_font_size(new_font_size);
                 renderer.set_line_height(new_line_height);
                 renderer.mark_ui_dirty();
             }
         } else {
-            // Base didn't change, but line height multiplier might have
             let expected_line_height = self.text_metrics.font_size * config.editor.line_height;
-            let line_height_changed =
-                (self.text_metrics.line_height - expected_line_height).abs() > 0.1;
+            let line_height_changed = (self.text_metrics.line_height - expected_line_height).abs() > 0.1;
 
             if line_height_changed {
                 self.text_metrics.line_height = expected_line_height;
                 if let Some(renderer) = &mut self.cpu_renderer {
-                    renderer.clear_all_caches(); // Clear before changing line height
+                    renderer.clear_all_caches();
                     renderer.set_line_height(expected_line_height);
                     renderer.mark_ui_dirty();
                 }
             }
         }
 
-        // Update scroll lock setting
         self.scroll_lock_enabled = config.editor.scroll_lock_enabled;
-
-        // Update title bar height
         self.title_bar_height = config.editor.title_bar_height;
 
-        // Update font weight and italic settings
         if let Some(font_system) = &self.font_system {
             let current_weight = font_system.default_weight();
             let current_italic = font_system.default_italic();
@@ -813,28 +802,17 @@ impl TinyApp {
 
             if weight_changed {
                 font_system.set_default_weight(config.editor.font_weight);
-                eprintln!(
-                    "Updated font weight: {} -> {}",
-                    current_weight, config.editor.font_weight
-                );
             }
 
             if italic_changed {
                 font_system.set_default_italic(config.editor.font_italic);
-                eprintln!(
-                    "Updated font italic: {} -> {}",
-                    current_italic, config.editor.font_italic
-                );
             }
 
-            // If font appearance changed, force complete re-layout
             if weight_changed || italic_changed {
                 if let Some(renderer) = &mut self.cpu_renderer {
-                    // Clear all layout caches - text will be re-shaped with new weight/italic
                     renderer.clear_all_caches();
                     renderer.mark_ui_dirty();
                 }
-                // Force editor to re-layout
                 self.editor.ui_changed = true;
             }
         }
@@ -846,13 +824,11 @@ impl TinyApp {
     fn show_overlay(
         &mut self,
         show: impl FnOnce(&mut EditorLogic),
-        ctx: ShortcutContext,
         focus: WidgetId,
         editable_id: u64,
     ) {
         show(&mut self.editor);
         self.editor.ui_changed = true;
-        self.shortcuts.set_context(ctx);
         self.scroll_focus.set_focus(focus);
         self.focused_editable_view_id = Some(editable_id);
         self.request_redraw();
@@ -860,11 +836,12 @@ impl TinyApp {
 
 
     /// Helper for navigation with optional redraw
-    fn navigate(&mut self, nav: impl FnOnce(&mut EditorLogic) -> bool) {
-        if nav(&mut self.editor) {
+    fn navigate(&mut self, nav: impl FnOnce(&mut EditorLogic) -> Result<bool>) -> Result<()> {
+        if nav(&mut self.editor)? {
             self.request_redraw();
             self.cursor_needs_scroll = true;
         }
+        Ok(())
     }
 
     /// Dispatch event through subscription system
@@ -921,7 +898,7 @@ impl TinyApp {
         )
     }
 
-    fn process_event_queue(&mut self) {
+    fn process_event_queue(&mut self) -> Result<()> {
         // Process events in a loop to handle events emitted during event processing
         // This ensures ui.redraw events from hover handlers are processed immediately
         loop {
@@ -931,10 +908,16 @@ impl TinyApp {
             }
 
             for event in events {
-                use ShortcutContext::{FilePicker, Grep};
-                use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
+                self.process_single_event(&event)?;
+            }
+        }
+        Ok(())
+    }
 
-                match event.name.as_str() {
+    fn process_single_event(&mut self, event: &Event) -> Result<()> {
+        use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
+
+        match event.name.as_str() {
                     // App-level
                     "app.font_increase" => self.adjust_font_size(true),
                     "app.font_decrease" => self.adjust_font_size(false),
@@ -979,16 +962,15 @@ impl TinyApp {
                                     DropdownAction::Selected(path) => {
                                         // Open the file
                                         self.editor.file_picker.hide();
-                                        self.shortcuts.set_context(ShortcutContext::Editor);
                                         self.scroll_focus.clear_focus();
 
                                         // Pass wake function for instant syntax highlighting (triggers redraw)
                                         let window = self.window.clone();
-                                        let _ = self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
+                                        self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
                                             if let Some(ref w) = window {
                                                 w.request_redraw();
                                             }
-                                        }));
+                                        }))?;
 
                                         if let Some(tab) = self.editor.tab_manager.active_tab() {
                                             self.focused_editable_view_id =
@@ -1017,16 +999,13 @@ impl TinyApp {
                                             result.column,
                                         );
                                         self.editor.grep.hide();
-                                        self.shortcuts.set_context(ShortcutContext::Editor);
                                         self.scroll_focus.clear_focus();
-                                        if self.editor.jump_to_location(file, line, col, true) {
-                                            if let Some(tab) = self.editor.tab_manager.active_tab()
-                                            {
-                                                self.focused_editable_view_id =
-                                                    Some(tab.plugin.editor.id);
-                                            }
-                                            self.cursor_needs_scroll = true;
+                                        self.editor.jump_to_location(file, line, col, true)?;
+
+                                        if let Some(tab) = self.editor.tab_manager.active_tab() {
+                                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
                                         }
+                                        self.cursor_needs_scroll = true;
                                     }
                                     _ => {}
                                 }
@@ -1106,11 +1085,11 @@ impl TinyApp {
 
                     // Navigation
                     "navigation.goto_definition" => {
-                        self.editor.goto_definition();
+                        self.editor.goto_definition()?;
                         self.cursor_needs_scroll = true;
                     }
-                    "navigation.back" => self.navigate(|e| e.navigate_back()),
-                    "navigation.forward" => self.navigate(|e| e.navigate_forward()),
+                    "navigation.back" => self.navigate(|e| e.navigate_back())?,
+                    "navigation.forward" => self.navigate(|e| e.navigate_forward())?,
 
                     // Tabs
                     "tabs.close" => {
@@ -1128,7 +1107,6 @@ impl TinyApp {
                         let picker_input_id = self.editor.file_picker.input().id;
                         self.show_overlay(
                             |e| e.file_picker.show(),
-                            FilePicker,
                             FPWidget,
                             picker_input_id,
                         );
@@ -1138,7 +1116,6 @@ impl TinyApp {
                         let grep_input_id = self.editor.grep.input().id;
                         self.show_overlay(
                             |e| e.grep.show(String::new()),
-                            Grep,
                             GrepWidget,
                             grep_input_id,
                         );
@@ -1150,63 +1127,47 @@ impl TinyApp {
                         self.request_redraw();
                     }
                     "file.open" => {
-                        if let Some(path_val) = event.data.get("path") {
-                            if let Some(path_str) = path_val.as_str() {
-                                let path = std::path::PathBuf::from(path_str);
-                                self.shortcuts.set_context(ShortcutContext::Editor);
-                                self.scroll_focus.clear_focus();
-                                self.editor.record_navigation();
+                        let data: FileOpenData = event_data::from_value(&event.data)?;
+                        let path = std::path::PathBuf::from(data.path);
 
-                                // Pass wake function for instant syntax highlighting
-                                let window = self.window.clone();
-                                if self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
-                                    if let Some(ref w) = window {
-                                        w.request_redraw();
-                                    }
-                                })).is_ok() {
-                                    if let Some(tab) = self.editor.tab_manager.active_tab() {
-                                        self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                                    }
-                                    self.editor.ui_changed = true;
-                                    self.request_redraw();
-                                }
+                        self.scroll_focus.clear_focus();
+                        self.editor.record_navigation()?;
+
+                        // Pass wake function for instant syntax highlighting
+                        let window = self.window.clone();
+                        self.editor.tab_manager.open_file_with_event_emitter(path, Some(move |_event: &str| {
+                            if let Some(ref w) = window {
+                                w.request_redraw();
                             }
+                        }))?;
+
+                        if let Some(tab) = self.editor.tab_manager.active_tab() {
+                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
                         }
+                        self.editor.ui_changed = true;
+                        self.request_redraw();
                     }
                     "file.goto" => {
                         // Generic goto location (from grep, LSP, etc.)
-                        if let (Some(file), Some(line), Some(col)) = (
-                            event.data.get("file"),
-                            event.data.get("line").and_then(|v| v.as_u64()),
-                            event.data.get("column").and_then(|v| v.as_u64()),
-                        ) {
-                            if let Some(path_str) = file.as_str() {
-                                let path = std::path::PathBuf::from(path_str);
-                                self.shortcuts.set_context(ShortcutContext::Editor);
-                                self.scroll_focus.clear_focus();
-                                if self.editor.jump_to_location(
-                                    path,
-                                    line as usize,
-                                    col as usize,
-                                    true,
-                                ) {
-                                    if let Some(tab) = self.editor.tab_manager.active_tab() {
-                                        self.focused_editable_view_id = Some(tab.plugin.editor.id);
-                                    }
-                                    self.cursor_needs_scroll = true;
-                                }
-                                self.request_redraw();
-                            }
+                        let data: FileGotoData = event_data::from_value(&event.data)?;
+                        let path = std::path::PathBuf::from(data.file);
+
+                        self.scroll_focus.clear_focus();
+                        self.editor.jump_to_location(path, data.line as usize, data.column as usize, true)?;
+
+                        if let Some(tab) = self.editor.tab_manager.active_tab() {
+                            self.focused_editable_view_id = Some(tab.plugin.editor.id);
                         }
+                        self.cursor_needs_scroll = true;
+                        self.request_redraw();
                     }
                     "overlay.closed" => {
-                        self.shortcuts.set_context(ShortcutContext::Editor);
                         self.scroll_focus.clear_focus();
                         self.request_redraw();
                     }
 
                     // Editor events - delegate to components first, then main editor if not handled
-                    "editor.code_action" => self.editor.handle_code_action_request(),
+                    "editor.code_action" => self.editor.handle_code_action_request()?,
                     name if name.starts_with("editor.") => {
                         // First, try dispatching to overlay components (file picker, grep)
                         // They handle their own text editing and return Stop if they consumed the event
@@ -1239,10 +1200,7 @@ impl TinyApp {
                             match action {
                                 InputAction::Save => {
                                     // Save only makes sense for main editor
-                                    let _ = self
-                                        .editor
-                                        .save()
-                                        .map_err(|e| eprintln!("Failed to save: {}", e));
+                                    self.editor.save()?;
                                     self.request_redraw();
                                     self.update_window_title();
                                     self.cursor_needs_scroll = true;
@@ -1278,11 +1236,11 @@ impl TinyApp {
 
                     _ => {
                         // Dispatch to components through subscription system
-                        self.dispatch_to_components(&event);
+                        self.dispatch_to_components(event);
                     }
                 }
-            }
-        }
+
+        Ok(())
     }
 
     fn update_frame_timing(&mut self) -> f32 {
@@ -1299,10 +1257,10 @@ impl TinyApp {
         }
     }
 
-    fn render_frame(&mut self) {
+    fn render_frame(&mut self) -> Result<()> {
         // Process all queued events at the beginning of the frame
         // This ensures events are handled before rendering
-        self.process_event_queue();
+        self.process_event_queue()?;
 
         // Lazy initialize EditableTextView plugins (for new tabs/views only)
         if let Some(ref cpu_renderer) = self.cpu_renderer {
@@ -1315,11 +1273,8 @@ impl TinyApp {
                         if let Some(gpu_renderer) = &self.gpu_renderer {
                             let device = gpu_renderer.device_arc();
                             let queue = gpu_renderer.queue_arc();
-                            let _ = self.editor.setup_plugins_for_views(
-                                newly_initialized,
-                                device,
-                                queue,
-                            );
+                            self.editor.setup_plugins_for_views(newly_initialized, device, queue)
+                                .map_err(|e| anyhow!("Failed to setup plugins: {:?}", e))?;
                         }
                     }
                 }
@@ -1340,6 +1295,12 @@ impl TinyApp {
             self.config_reload_pending.store(false, Ordering::Relaxed);
         }
 
+        // Check for pending shortcuts reload
+        if self.shortcuts_reload_pending.load(Ordering::Relaxed) {
+            self.reload_shortcuts();
+            self.shortcuts_reload_pending.store(false, Ordering::Relaxed);
+        }
+
         let dt = self.update_frame_timing();
         let cursor_moved = self.editor.on_update();
         if cursor_moved {
@@ -1349,10 +1310,7 @@ impl TinyApp {
         // NOTE: diagnostics.update() is called AFTER rendering (around line 1675)
         // when layout cache is populated. Don't call it here!
 
-        // Update plugins through orchestrator
-        if let Err(e) = self.orchestrator.update_all(dt) {
-            eprintln!("Plugin update error: {}", e);
-        }
+        self.orchestrator.update_all(dt).ok();
 
         // Request next frame if continuous rendering is enabled
         if self.continuous_rendering {
@@ -1362,7 +1320,7 @@ impl TinyApp {
         // Handle cursor scroll when selection actually changed
         if self.cursor_needs_scroll {
             self.cursor_needs_scroll = false;
-            if let Some(cursor_pos) = self.editor.get_cursor_doc_pos() {
+            if let Ok(Some(cursor_pos)) = self.editor.get_cursor_doc_pos() {
                 if let Some(cpu_renderer) = &mut self.cpu_renderer {
                     let tab = self.editor.tab_manager.active_tab_mut();
                     // Set viewport to current tab scroll before scrolling
@@ -1390,7 +1348,7 @@ impl TinyApp {
 
         // Check if we have all required components
         if self.window.is_none() || self.gpu_renderer.is_none() || self.cpu_renderer.is_none() {
-            return;
+            return Ok(());
         }
 
         // Get window info without holding a borrow
@@ -1426,10 +1384,8 @@ impl TinyApp {
             // Swap in the active tab's text_renderer
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
 
-            // Set syntax highlighter from Tab's master Arc (receives parse results)
             if let Some(ref syntax_arc) = tab.syntax_arc {
                 cpu_renderer.text_renderer.syntax_highlighter = Some(syntax_arc.clone());
-                eprintln!("  Using Tab's syntax_arc ptr={:p}", syntax_arc.as_ref() as *const _);
             }
 
             // Use the active tab's scroll position for rendering
@@ -1522,11 +1478,7 @@ impl TinyApp {
                                 queue: gpu_renderer.queue_arc(),
                                 registry: tiny_sdk::PluginRegistry::empty(),
                             };
-                            if let Err(e) = diagnostics.setup(&mut setup_ctx) {
-                                eprintln!("Failed to initialize diagnostics plugin: {:?}", e);
-                            } else {
-                                eprintln!("Diagnostics plugin initialized successfully");
-                            }
+                            let _ = diagnostics.setup(&mut setup_ctx);
                         }
                     }
                 }
@@ -1542,7 +1494,7 @@ impl TinyApp {
             }
         }
 
-        let doc = self.editor.doc();
+        let doc = self.editor.doc()?;
         let doc_read = doc.read();
 
         // Get renderer state for uniforms
@@ -1666,6 +1618,8 @@ impl TinyApp {
             // Save any scroll changes back to the tab
             tab.scroll_position = cpu_renderer.viewport.scroll;
         }
+
+        Ok(())
     }
 }
 
@@ -1787,6 +1741,9 @@ impl ApplicationHandler for TinyApp {
             // Setup config hot-reloading
             self.setup_config_watcher();
 
+            // Setup shortcuts hot-reloading
+            self.setup_shortcuts_watcher();
+
             self.editor.on_ready();
 
             // Initialize cursor/selection plugins for all EditableTextViews
@@ -1801,22 +1758,11 @@ impl ApplicationHandler for TinyApp {
                                 if let Some(gpu_renderer) = &self.gpu_renderer {
                                     let device = gpu_renderer.device_arc();
                                     let queue = gpu_renderer.queue_arc();
-                                    if let Err(e) = self.editor.setup_plugins_for_views(
-                                        newly_initialized,
-                                        device,
-                                        queue,
-                                    ) {
-                                        eprintln!(
-                                            "Failed to setup EditableTextView plugins: {:?}",
-                                            e
-                                        );
-                                    }
+                                    let _ = self.editor.setup_plugins_for_views(newly_initialized, device, queue);
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to initialize EditableTextView plugins: {}", e);
-                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -2061,7 +2007,7 @@ impl ApplicationHandler for TinyApp {
             }
 
             WindowEvent::RedrawRequested => {
-                self.render_frame();
+                self.render_frame().ok();
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2107,8 +2053,7 @@ impl ApplicationHandler for TinyApp {
                         height: new_size.height,
                     });
                 }
-                // Render immediately to prevent stretching during resize
-                self.render_frame();
+                self.render_frame().ok();
             }
 
             _ => {}

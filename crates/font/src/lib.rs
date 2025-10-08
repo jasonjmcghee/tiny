@@ -24,6 +24,7 @@ pub use rasterize::{FontMetrics, RasterResult, Rasterizer};
 pub use shaping::{RunFontType, ShapedGlyph, Shaper, ShapingOptions, ShapingResult, TextRun};
 
 use ahash::HashMap;
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use swash::FontRef;
@@ -155,6 +156,17 @@ pub struct FontSystem {
     shaping_options: ShapingOptions,
     /// Current frame counter for LRU eviction
     current_frame: u64,
+}
+
+/// Helper to load a font from a file path
+/// Returns Arc and FontRef on success
+fn load_font_from_path(path: &str, index: usize) -> Result<(Arc<Vec<u8>>, FontRef<'static>)> {
+    let font_data_vec = std::fs::read(path).context("Failed to read font file")?;
+    let font_data = Arc::new(font_data_vec);
+    let font_data_ref: &'static [u8] =
+        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
+    let font_ref = FontRef::from_index(font_data_ref, index).context("Failed to parse font")?;
+    Ok((font_data, font_ref))
 }
 
 impl FontSystem {
@@ -449,69 +461,28 @@ impl FontSystem {
     /// Tries to find a monospace font with good Unicode symbol coverage
     fn load_unicode_fallback_font() -> (Option<Arc<Vec<u8>>>, Option<FontRef<'static>>) {
         #[cfg(target_os = "macos")]
-        {
-            // Try Menlo (macOS monospace with decent Unicode coverage)
-            let paths = [
-                "/System/Library/Fonts/Menlo.ttc",
-                "/System/Library/Fonts/Monaco.dfont",
-                "/System/Library/Fonts/Helvetica.ttc", // Last resort
-            ];
-
-            for path in &paths {
-                if let Ok(font_data_vec) = std::fs::read(path) {
-                    let font_data = Arc::new(font_data_vec);
-                    let font_data_ref: &'static [u8] =
-                        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
-
-                    if let Some(font_ref) = FontRef::from_index(font_data_ref, 0) {
-                        eprintln!("✅ Loaded system fallback font: {}", path);
-                        return (Some(font_data), Some(font_ref));
-                    }
-                }
-            }
-        }
+        let paths = [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.dfont",
+            "/System/Library/Fonts/Helvetica.ttc", // Last resort
+        ];
 
         #[cfg(target_os = "windows")]
-        {
-            // Try fonts with good Unicode coverage on Windows
-            let paths = [
-                "C:\\Windows\\Fonts\\consola.ttf", // Consolas
-                "C:\\Windows\\Fonts\\arial.ttf",   // Arial has good coverage
-            ];
-
-            for path in &paths {
-                if let Ok(font_data_vec) = std::fs::read(path) {
-                    let font_data = Arc::new(font_data_vec);
-                    let font_data_ref: &'static [u8] =
-                        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
-
-                    if let Some(font_ref) = FontRef::from_index(font_data_ref, 0) {
-                        eprintln!("✅ Loaded system fallback font: {}", path);
-                        return (Some(font_data), Some(font_ref));
-                    }
-                }
-            }
-        }
+        let paths = [
+            "C:\\Windows\\Fonts\\consola.ttf", // Consolas
+            "C:\\Windows\\Fonts\\arial.ttf",   // Arial has good coverage
+        ];
 
         #[cfg(target_os = "linux")]
-        {
-            // Try DejaVu Sans Mono - excellent Unicode coverage
-            let paths = [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            ];
+        let paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        ];
 
-            for path in &paths {
-                if let Ok(font_data_vec) = std::fs::read(path) {
-                    let font_data = Arc::new(font_data_vec);
-                    let font_data_ref: &'static [u8] =
-                        unsafe { std::slice::from_raw_parts(font_data.as_ptr(), font_data.len()) };
-
-                    if let Some(font_ref) = FontRef::from_index(font_data_ref, 0) {
-                        eprintln!("✅ Loaded system fallback font: {}", path);
-                        return (Some(font_data), Some(font_ref));
-                    }
-                }
+        for path in &paths {
+            if let Ok((font_data, font_ref)) = load_font_from_path(path, 0) {
+                eprintln!("✅ Loaded system fallback font: {}", path);
+                return (Some(font_data), Some(font_ref));
             }
         }
 
@@ -522,59 +493,24 @@ impl FontSystem {
     /// Load system emoji font (platform-specific)
     fn load_emoji_font() -> (Option<Arc<Vec<u8>>>, Option<FontRef<'static>>) {
         #[cfg(target_os = "macos")]
-        {
-            let emoji_path = "/System/Library/Fonts/Apple Color Emoji.ttc";
-            if let Ok(emoji_data_vec) = std::fs::read(emoji_path) {
-                let emoji_data = Arc::new(emoji_data_vec);
-
-                // SAFETY: Leak the Arc to get a 'static reference
-                let emoji_data_ref: &'static [u8] =
-                    unsafe { std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len()) };
-
-                // Apple Color Emoji is a TrueType Collection (.ttc), try index 0
-                if let Some(emoji_font_ref) = FontRef::from_index(emoji_data_ref, 0) {
-                    eprintln!("✅ Loaded Apple Color Emoji font");
-                    return (Some(emoji_data), Some(emoji_font_ref));
-                } else {
-                    eprintln!("⚠️ Failed to parse Apple Color Emoji font");
-                }
-            } else {
-                eprintln!("⚠️ Could not load Apple Color Emoji from {}", emoji_path);
-            }
-        }
+        let (path, name) = ("/System/Library/Fonts/Apple Color Emoji.ttc", "Apple Color Emoji");
 
         #[cfg(target_os = "windows")]
-        {
-            let emoji_path = "C:\\Windows\\Fonts\\seguiemj.ttf";
-            if let Ok(emoji_data_vec) = std::fs::read(emoji_path) {
-                let emoji_data = Arc::new(emoji_data_vec);
-                let emoji_data_ref: &'static [u8] =
-                    unsafe { std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len()) };
-
-                if let Some(emoji_font_ref) = FontRef::from_index(emoji_data_ref, 0) {
-                    eprintln!("✅ Loaded Segoe UI Emoji font");
-                    return (Some(emoji_data), Some(emoji_font_ref));
-                }
-            }
-        }
+        let (path, name) = ("C:\\Windows\\Fonts\\seguiemj.ttf", "Segoe UI Emoji");
 
         #[cfg(target_os = "linux")]
-        {
-            let emoji_path = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
-            if let Ok(emoji_data_vec) = std::fs::read(emoji_path) {
-                let emoji_data = Arc::new(emoji_data_vec);
-                let emoji_data_ref: &'static [u8] =
-                    unsafe { std::slice::from_raw_parts(emoji_data.as_ptr(), emoji_data.len()) };
+        let (path, name) = ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", "Noto Color Emoji");
 
-                if let Some(emoji_font_ref) = FontRef::from_index(emoji_data_ref, 0) {
-                    eprintln!("✅ Loaded Noto Color Emoji font");
-                    return (Some(emoji_data), Some(emoji_font_ref));
-                }
+        match load_font_from_path(path, 0) {
+            Ok((font_data, font_ref)) => {
+                eprintln!("✅ Loaded {} font", name);
+                (Some(font_data), Some(font_ref))
+            }
+            Err(_) => {
+                eprintln!("⚠️ No emoji font loaded - emojis will render as placeholders");
+                (None, None)
             }
         }
-
-        eprintln!("⚠️ No emoji font loaded - emojis will render as placeholders");
-        (None, None)
     }
 
     /// Create new font system

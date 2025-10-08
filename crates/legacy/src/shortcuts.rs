@@ -5,28 +5,39 @@
 
 use crate::accelerator::{Accelerator, AcceleratorMatcher, Modifiers, Trigger};
 use crate::input::EventBus;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-/// Context for shortcut matching (determines which shortcuts are active)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShortcutContext {
-    /// File picker is active
-    FilePicker,
-    /// Grep search is active
-    Grep,
-    /// Editor is active (default)
-    Editor,
-    /// Global shortcuts (always active)
-    Global,
+/// TOML configuration structure
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ShortcutsConfig {
+    #[serde(default)]
+    shortcuts: HashMap<String, ShortcutValue>,
 }
 
-/// Maps accelerators to event names (with context support)
+/// A shortcut value can be either a single string or an array of strings
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ShortcutValue {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl ShortcutValue {
+    fn as_vec(&self) -> Vec<String> {
+        match self {
+            ShortcutValue::Single(s) => vec![s.clone()],
+            ShortcutValue::Multiple(v) => v.clone(),
+        }
+    }
+}
+
+/// Maps accelerators to event names
 pub struct ShortcutRegistry {
-    /// Shortcuts grouped by context
-    shortcuts: HashMap<ShortcutContext, Vec<(Accelerator, Vec<String>)>>,
-    /// Current active context
-    current_context: ShortcutContext,
+    /// Shortcuts map: accelerator -> list of event names
+    shortcuts: Vec<(Accelerator, Vec<String>)>,
     /// Accelerator matcher for tracking sequences
     matcher: AcceleratorMatcher,
 }
@@ -34,23 +45,27 @@ pub struct ShortcutRegistry {
 impl ShortcutRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
-            shortcuts: HashMap::new(),
-            current_context: ShortcutContext::Editor,
+            shortcuts: Vec::new(),
             matcher: AcceleratorMatcher::new(),
         };
 
-        // Register default shortcuts
-        registry.register_defaults();
+        // Load shortcuts from file
+        registry.load_shortcuts();
         registry
     }
 
+    /// Reload shortcuts from shortcuts.toml
+    pub fn reload(&mut self) {
+        // Clear existing shortcuts
+        self.shortcuts.clear();
+        self.matcher.reset();
+
+        // Load from file
+        self.load_shortcuts();
+    }
+
     /// Register a shortcut that triggers an event
-    pub fn register(
-        &mut self,
-        context: ShortcutContext,
-        accelerator: &str,
-        event_name: impl Into<String>,
-    ) {
+    fn register(&mut self, accelerator: &str, event_name: impl Into<String>) {
         let acc = match Accelerator::parse(accelerator) {
             Ok(a) => a,
             Err(e) => {
@@ -59,143 +74,78 @@ impl ShortcutRegistry {
             }
         };
 
-        let shortcuts = self.shortcuts.entry(context).or_insert_with(Vec::new);
-
         // Find existing entry or create new one
-        if let Some((_, events)) = shortcuts.iter_mut().find(|(a, _)| a == &acc) {
+        if let Some((_, events)) = self.shortcuts.iter_mut().find(|(a, _)| a == &acc) {
             events.push(event_name.into());
         } else {
-            shortcuts.push((acc, vec![event_name.into()]));
+            self.shortcuts.push((acc, vec![event_name.into()]));
         }
-    }
-
-    /// Set the active context
-    pub fn set_context(&mut self, context: ShortcutContext) {
-        self.current_context = context;
-        self.matcher.reset(); // Reset matcher when context changes
-    }
-
-    /// Get the current context
-    pub fn context(&self) -> ShortcutContext {
-        self.current_context
     }
 
     /// Try to match an input against registered shortcuts
     /// Returns list of event names to emit
     pub fn match_input(&mut self, modifiers: &Modifiers, trigger: &Trigger) -> Vec<String> {
-        // Collect all candidates from current context and global
-        let mut candidates = Vec::new();
-
-        // Add global shortcuts
-        if let Some(global) = self.shortcuts.get(&ShortcutContext::Global) {
-            for (acc, _) in global {
-                candidates.push(acc.clone());
-            }
-        }
-
-        // Add context-specific shortcuts
-        if let Some(context) = self.shortcuts.get(&self.current_context) {
-            for (acc, _) in context {
-                candidates.push(acc.clone());
-            }
-        }
+        // Collect all accelerators as candidates
+        let candidates: Vec<Accelerator> = self.shortcuts.iter().map(|(acc, _)| acc.clone()).collect();
 
         // Try to match
         if let Some(matched) = self.matcher.feed(modifiers, trigger, &candidates) {
             // Find all events for this accelerator
             let mut events = Vec::new();
-
-            // Check global
-            if let Some(global) = self.shortcuts.get(&ShortcutContext::Global) {
-                for (acc, event_names) in global {
-                    if acc == &matched {
-                        events.extend(event_names.clone());
-                    }
+            for (acc, event_names) in &self.shortcuts {
+                if acc == &matched {
+                    events.extend(event_names.clone());
                 }
             }
-
-            // Check context
-            if let Some(context) = self.shortcuts.get(&self.current_context) {
-                for (acc, event_names) in context {
-                    if acc == &matched {
-                        events.extend(event_names.clone());
-                    }
-                }
-            }
-
             return events;
         }
 
         Vec::new()
     }
 
-    /// Register default shortcuts from static table
-    fn register_defaults(&mut self) {
-        use ShortcutContext::*;
+    /// Load shortcuts from shortcuts.toml
+    fn load_shortcuts(&mut self) {
+        let config_path = PathBuf::from("shortcuts.toml");
 
-        // Static table of (context, accelerator, event_name)
-        const SHORTCUTS: &[(&str, &str, &str)] = &[
-            // Global shortcuts
-            ("Global", "cmd+=", "app.font_increase"),
-            ("Global", "cmd+-", "app.font_decrease"),
-            ("Global", "f12", "app.toggle_scroll_lock"),
+        let config = match Self::load_config(&config_path) {
+            Some(c) => c,
+            None => {
+                eprintln!("⚠️  Failed to load shortcuts.toml - no shortcuts will be available");
+                return;
+            }
+        };
 
-            // Editor shortcuts
-            ("Editor", "cmd+s", "editor.save"),
-            // Editing commands - Global so they work in all text inputs
-            ("Global", "cmd+z", "editor.undo"),
-            ("Global", "cmd+shift+z", "editor.redo"),
-            ("Global", "cmd+c", "editor.copy"),
-            ("Global", "cmd+x", "editor.cut"),
-            ("Global", "cmd+v", "editor.paste"),
-            ("Global", "cmd+a", "editor.select_all"),
-            ("Editor", "cmd+b", "navigation.goto_definition"),
-            ("Editor", "cmd+[", "navigation.back"),
-            ("Editor", "cmd+]", "navigation.forward"),
-            ("Editor", "cmd+w", "tabs.close"),
-            ("Editor", "alt+enter", "editor.code_action"),
-            // Text editing - Global so they work in all text inputs
-            ("Global", "space", "editor.insert_space"),
-            ("Global", "backspace", "editor.delete_backward"),
-            ("Global", "delete", "editor.delete_forward"),
-            ("Global", "left", "editor.move_left"),
-            ("Global", "right", "editor.move_right"),
-            // Editor-specific (newlines and tabs don't make sense in single-line inputs)
-            ("Editor", "enter", "editor.insert_newline"),
-            ("Editor", "tab", "editor.insert_tab"),
-            ("Editor", "up", "editor.move_up"),
-            ("Editor", "down", "editor.move_down"),
-            ("Editor", "shift+left", "editor.extend_left"),
-            ("Editor", "shift+right", "editor.extend_right"),
-            ("Editor", "shift+up", "editor.extend_up"),
-            ("Editor", "shift+down", "editor.extend_down"),
-            ("Editor", "home", "editor.move_line_start"),
-            ("Editor", "end", "editor.move_line_end"),
-            ("Editor", "shift+home", "editor.extend_line_start"),
-            ("Editor", "shift+end", "editor.extend_line_end"),
-            ("Editor", "pageup", "editor.page_up"),
-            ("Editor", "pagedown", "editor.page_down"),
-            ("Editor", "shift+pageup", "editor.extend_page_up"),
-            ("Editor", "shift+pagedown", "editor.extend_page_down"),
-            ("Editor", "shift shift", "file_picker.open"),
-            ("Editor", "cmd+shift+f", "grep.open"),
+        // Register all shortcuts
+        // Note: event_name is the key, shortcuts are the values
+        for (event_name, shortcuts) in config.shortcuts {
+            for accelerator in shortcuts.as_vec() {
+                self.register(&accelerator, &event_name);
+            }
+        }
+    }
 
-            // Navigation keys - generic events, focused component decides behavior
-            ("Global", "up", "navigate.up"),
-            ("Global", "down", "navigate.down"),
-            ("Global", "escape", "action.cancel"),
-            ("Global", "enter", "action.submit"),
-        ];
+    /// Load shortcuts configuration from a TOML file
+    fn load_config(path: &Path) -> Option<ShortcutsConfig> {
+        if !path.exists() {
+            eprintln!("ℹ️  No {} found - no shortcuts will be loaded", path.display());
+            return None;
+        }
 
-        for &(ctx_str, accel, event) in SHORTCUTS {
-            let context = match ctx_str {
-                "Global" => Global,
-                "Editor" => Editor,
-                "FilePicker" => FilePicker,
-                "Grep" => Grep,
-                _ => continue,
-            };
-            self.register(context, accel, event);
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("❌ Failed to read {}: {}", path.display(), e);
+                return None;
+            }
+        };
+
+        match toml::from_str::<ShortcutsConfig>(&content) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                eprintln!("❌ TOML syntax error in {}: {}", path.display(), e);
+                eprintln!("   No shortcuts will be loaded");
+                None
+            }
         }
     }
 }
@@ -213,8 +163,11 @@ mod tests {
 
     #[test]
     fn test_register_and_match() {
-        let mut registry = ShortcutRegistry::new();
-        registry.register(ShortcutContext::Editor, "cmd+k", "test.event");
+        let mut registry = ShortcutRegistry {
+            shortcuts: Vec::new(),
+            matcher: AcceleratorMatcher::new(),
+        };
+        registry.register("cmd+k", "test.event");
 
         let mut mods = Modifiers::default();
         mods.cmd = true;
@@ -224,21 +177,27 @@ mod tests {
     }
 
     #[test]
-    fn test_context_switching() {
-        let mut registry = ShortcutRegistry::new();
-        registry.register(ShortcutContext::Editor, "enter", "editor.enter");
-        registry.register(ShortcutContext::FilePicker, "enter", "picker.select");
+    fn test_multiple_shortcuts_same_event() {
+        let mut registry = ShortcutRegistry {
+            shortcuts: Vec::new(),
+            matcher: AcceleratorMatcher::new(),
+        };
+        registry.register("cmd+k", "test.event");
+        registry.register("cmd+shift+k", "test.event");
 
-        // In editor context
-        registry.set_context(ShortcutContext::Editor);
-        let events =
-            registry.match_input(&Modifiers::default(), &Trigger::Named("Enter".to_string()));
-        assert_eq!(events, vec!["editor.insert_newline".to_string()]); // From defaults
+        let mut mods = Modifiers::default();
+        mods.cmd = true;
+        let events = registry.match_input(&mods, &Trigger::Char("k".to_string()));
 
-        // In file picker context
-        registry.set_context(ShortcutContext::FilePicker);
-        let events =
-            registry.match_input(&Modifiers::default(), &Trigger::Named("Enter".to_string()));
-        assert_eq!(events, vec!["file_picker.select".to_string()]);
+        assert_eq!(events, vec!["test.event".to_string()]);
+    }
+
+    #[test]
+    fn test_load_from_toml() {
+        // This test requires shortcuts.toml to exist
+        let registry = ShortcutRegistry::new();
+
+        // Verify that at least some shortcuts were loaded
+        assert!(!registry.shortcuts.is_empty());
     }
 }

@@ -12,6 +12,7 @@ pub mod app;
 pub mod config;
 pub mod diagnostics_manager;
 pub mod editor_logic;
+pub mod event_data;
 pub mod file_picker_plugin;
 pub mod filterable_dropdown;
 pub mod overlay_picker;

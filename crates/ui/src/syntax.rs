@@ -69,7 +69,10 @@ impl LanguageSpec {
             ParserSetup::Wasm { .. } => {
                 // For WASM, we need to load it - use the global loader
                 let parser = self.setup_parser().expect("Failed to setup parser");
-                parser.language().expect("Parser has no language set").clone()
+                parser
+                    .language()
+                    .expect("Parser has no language set")
+                    .clone()
             }
         }
     }
@@ -392,7 +395,12 @@ impl SyntaxHighlighter {
         edit: Option<TextEdit>,
         reset_tree: bool,
     ) {
-        eprintln!("🔄 SYNTAX: Requesting parse for {} ({} bytes, version={})", self.name, text.len(), version);
+        eprintln!(
+            "🔄 SYNTAX: Requesting parse for {} ({} bytes, version={})",
+            self.name,
+            text.len(),
+            version
+        );
         let _ = self.tx.send(ParseRequest {
             text: text.to_string(),
             version,
@@ -407,7 +415,10 @@ impl SyntaxHighlighter {
     }
 
     /// Create highlighter with event emitter for triggering redraws
-    pub fn new_with_event_emitter<F>(config: LanguageConfig, event_emitter: Option<F>) -> Result<Self, tree_sitter::LanguageError>
+    pub fn new_with_event_emitter<F>(
+        config: LanguageConfig,
+        event_emitter: Option<F>,
+    ) -> Result<Self, tree_sitter::LanguageError>
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
@@ -472,15 +483,12 @@ impl SyntaxHighlighter {
             };
 
             while let Ok(request) = rx.recv() {
-                eprintln!("🧵 SYNTAX THREAD: Received parse request for {} ({} bytes)", language_name, request.text.len());
-
                 // Shorter debounce for initial parse, longer for subsequent
                 let debounce_ms = if is_first_parse { 10 } else { 100 };
                 std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
 
                 // Drain any additional requests that came in during debounce
                 let final_request = rx.try_iter().last().unwrap_or(request);
-                eprintln!("🧵 SYNTAX THREAD: After debounce, parsing {} bytes", final_request.text.len());
 
                 // Skip if text hasn't changed (avoid redundant parsing)
                 if final_request.text == last_text
@@ -512,7 +520,6 @@ impl SyntaxHighlighter {
                 // Parse with tree-sitter (regular or markdown)
                 let md_tree;
                 if let Some(ref mut md_p) = md_parser {
-                    eprintln!("🧵 SYNTAX THREAD: Parsing as markdown");
                     // Markdown: use MarkdownParser (returns MarkdownTree with block + inline trees)
                     md_tree = md_p.parse(final_request.text.as_bytes(), None);
                     // Extract the block tree for caching
@@ -520,15 +527,12 @@ impl SyntaxHighlighter {
                         tree = Some(md_t.block_tree().clone());
                     }
                 } else {
-                    eprintln!("🧵 SYNTAX THREAD: Parsing as {}", language_name);
                     // Regular language: use standard Parser
                     tree = parser.parse(&final_request.text, tree.as_ref());
                     md_tree = None;
-                    eprintln!("🧵 SYNTAX THREAD: Parser returned tree={}", tree.is_some());
                 }
 
                 if let Some(ref ts_tree) = tree {
-                    eprintln!("🧵 SYNTAX THREAD: Tree exists, applying highlights");
                     // Compile queries on first use (lazy initialization)
                     if query.is_none() {
                         match Query::new(&language_clone, highlights_query_clone) {
@@ -613,13 +617,17 @@ impl SyntaxHighlighter {
 
                                         // Also highlight the language tag itself
                                         effects.push(TextEffect {
-                                            range: capture.node.start_byte()..capture.node.end_byte(),
-                                            effect: EffectType::Token(Self::token_type_to_id(TokenType::Type)),
+                                            range: capture.node.start_byte()
+                                                ..capture.node.end_byte(),
+                                            effect: EffectType::Token(Self::token_type_to_id(
+                                                TokenType::Type,
+                                            )),
                                             priority: priority::SYNTAX + 1,
                                         });
                                     }
                                 } else if capture_name == "injection.content" {
-                                    injection_range = Some(capture.node.start_byte()..capture.node.end_byte());
+                                    injection_range =
+                                        Some(capture.node.start_byte()..capture.node.end_byte());
                                 }
                             }
 
@@ -649,14 +657,21 @@ impl SyntaxHighlighter {
                                     "punctuation.special" => {
                                         // Differentiate markers by type
                                         match node_type {
-                                            "atx_h1_marker" | "setext_h1_underline" => Some(TokenType::Keyword),
-                                            "atx_h2_marker" | "setext_h2_underline" => Some(TokenType::Type),
+                                            "atx_h1_marker" | "setext_h1_underline" => {
+                                                Some(TokenType::Keyword)
+                                            }
+                                            "atx_h2_marker" | "setext_h2_underline" => {
+                                                Some(TokenType::Type)
+                                            }
                                             "atx_h3_marker" => Some(TokenType::Function),
                                             "atx_h4_marker" => Some(TokenType::Constant),
                                             "atx_h5_marker" => Some(TokenType::Namespace),
                                             "atx_h6_marker" => Some(TokenType::Property),
-                                            "list_marker_plus" | "list_marker_minus" | "list_marker_star" => Some(TokenType::Operator),
-                                            "list_marker_dot" | "list_marker_parenthesis" => Some(TokenType::EnumMember),
+                                            "list_marker_plus" | "list_marker_minus"
+                                            | "list_marker_star" => Some(TokenType::Operator),
+                                            "list_marker_dot" | "list_marker_parenthesis" => {
+                                                Some(TokenType::EnumMember)
+                                            }
                                             "thematic_break" => Some(TokenType::Delimiter),
                                             "block_quote_marker" => Some(TokenType::CommentDoc),
                                             _ => Some(TokenType::Punctuation),
@@ -665,7 +680,9 @@ impl SyntaxHighlighter {
                                     "punctuation.delimiter" => {
                                         // Code block delimiters (```) and language tags
                                         match node_type {
-                                            "fenced_code_block_delimiter" => Some(TokenType::Operator), // ```
+                                            "fenced_code_block_delimiter" => {
+                                                Some(TokenType::Operator)
+                                            } // ```
                                             _ => Some(TokenType::Punctuation),
                                         }
                                     }
@@ -687,10 +704,18 @@ impl SyntaxHighlighter {
                                                     match marker_kind {
                                                         "atx_h1_marker" => Some(TokenType::Keyword),
                                                         "atx_h2_marker" => Some(TokenType::Type),
-                                                        "atx_h3_marker" => Some(TokenType::Function),
-                                                        "atx_h4_marker" => Some(TokenType::Constant),
-                                                        "atx_h5_marker" => Some(TokenType::Namespace),
-                                                        "atx_h6_marker" => Some(TokenType::Property),
+                                                        "atx_h3_marker" => {
+                                                            Some(TokenType::Function)
+                                                        }
+                                                        "atx_h4_marker" => {
+                                                            Some(TokenType::Constant)
+                                                        }
+                                                        "atx_h5_marker" => {
+                                                            Some(TokenType::Namespace)
+                                                        }
+                                                        "atx_h6_marker" => {
+                                                            Some(TokenType::Property)
+                                                        }
                                                         _ => Some(TokenType::Keyword),
                                                     }
                                                 } else {
@@ -743,7 +768,8 @@ impl SyntaxHighlighter {
                     for (lang, range) in injections {
                         if let Some(mut injection_parser) = Self::create_injection_parser(&lang) {
                             let code_text = &final_request.text[range.clone()];
-                            if let Some(injection_tree) = injection_parser.0.parse(code_text, None) {
+                            if let Some(injection_tree) = injection_parser.0.parse(code_text, None)
+                            {
                                 let mut injection_cursor = QueryCursor::new();
                                 let mut injection_matches = injection_cursor.matches(
                                     &injection_parser.1,
@@ -753,13 +779,18 @@ impl SyntaxHighlighter {
 
                                 while let Some(match_) = injection_matches.next() {
                                     for capture in match_.captures {
-                                        let capture_name = &injection_parser.1.capture_names()[capture.index as usize];
-                                        if let Some(token) = Self::capture_name_to_token_type(capture_name) {
+                                        let capture_name = &injection_parser.1.capture_names()
+                                            [capture.index as usize];
+                                        if let Some(token) =
+                                            Self::capture_name_to_token_type(capture_name)
+                                        {
                                             // Adjust byte offsets to be relative to the full document
                                             effects.push(TextEffect {
                                                 range: (range.start + capture.node.start_byte())
                                                     ..(range.start + capture.node.end_byte()),
-                                                effect: EffectType::Token(Self::token_type_to_id(token)),
+                                                effect: EffectType::Token(Self::token_type_to_id(
+                                                    token,
+                                                )),
                                                 priority: priority::SYNTAX + 1, // Higher priority than base markdown
                                             });
                                         }
@@ -783,32 +814,49 @@ impl SyntaxHighlighter {
 
                             while let Some(match_) = inline_matches.next() {
                                 for capture in match_.captures {
-                                    let capture_name = &inline_capture_names[capture.index as usize];
+                                    let capture_name =
+                                        &inline_capture_names[capture.index as usize];
                                     let node_type = capture.node.kind();
 
                                     // Special handling for inline markdown elements
                                     let (token_type, effect_priority) = match *capture_name {
                                         "punctuation.delimiter" => {
                                             let token = match node_type {
-                                                "emphasis_delimiter" => Some(TokenType::Operator),       // * or _ for italic
-                                                "code_span_delimiter" => Some(TokenType::String),        // `
+                                                "emphasis_delimiter" => Some(TokenType::Operator), // * or _ for italic
+                                                "code_span_delimiter" => Some(TokenType::String), // `
                                                 _ => Some(TokenType::Punctuation),
                                             };
                                             (token, priority::SYNTAX + 1) // Higher priority - overrides content
                                         }
-                                        "text.literal" => (Some(TokenType::String), priority::SYNTAX),           // `code spans`
-                                        "text.emphasis" => (Some(TokenType::Variable), priority::SYNTAX),        // *italic text*
-                                        "text.strong" => (Some(TokenType::Method), priority::SYNTAX),            // **bold text**
-                                        "text.uri" => (Some(TokenType::Constant), priority::SYNTAX),             // URLs
-                                        "text.reference" => (Some(TokenType::Attribute), priority::SYNTAX),      // [link text]
-                                        "string.escape" => (Some(TokenType::StringEscape), priority::SYNTAX + 1), // Escape sequences
-                                        _ => (Self::capture_name_to_token_type(capture_name), priority::SYNTAX),
+                                        "text.literal" => {
+                                            (Some(TokenType::String), priority::SYNTAX)
+                                        } // `code spans`
+                                        "text.emphasis" => {
+                                            (Some(TokenType::Variable), priority::SYNTAX)
+                                        } // *italic text*
+                                        "text.strong" => {
+                                            (Some(TokenType::Method), priority::SYNTAX)
+                                        } // **bold text**
+                                        "text.uri" => (Some(TokenType::Constant), priority::SYNTAX), // URLs
+                                        "text.reference" => {
+                                            (Some(TokenType::Attribute), priority::SYNTAX)
+                                        } // [link text]
+                                        "string.escape" => {
+                                            (Some(TokenType::StringEscape), priority::SYNTAX + 1)
+                                        } // Escape sequences
+                                        _ => (
+                                            Self::capture_name_to_token_type(capture_name),
+                                            priority::SYNTAX,
+                                        ),
                                     };
 
                                     if let Some(token) = token_type {
                                         effects.push(TextEffect {
-                                            range: capture.node.start_byte()..capture.node.end_byte(),
-                                            effect: EffectType::Token(Self::token_type_to_id(token)),
+                                            range: capture.node.start_byte()
+                                                ..capture.node.end_byte(),
+                                            effect: EffectType::Token(Self::token_type_to_id(
+                                                token,
+                                            )),
                                             priority: effect_priority,
                                         });
                                     }
@@ -833,12 +881,9 @@ impl SyntaxHighlighter {
                     let new_v = current_v + 1;
                     cached_version_clone.store(new_v, Ordering::Relaxed);
 
-                    eprintln!("🧵 SYNTAX THREAD: ✅ Parse complete for {}, cached_version: {} → {}", language_name, current_v, new_v);
-
                     // Emit ui.redraw event if emitter is available
                     if let Some(ref emit) = emitter_clone {
                         emit("ui.redraw");
-                        eprintln!("🧵 SYNTAX THREAD: Emitted ui.redraw event");
                     }
 
                     // Mark first parse as complete
@@ -952,16 +997,18 @@ impl SyntaxHighlighter {
             "constant.builtin" => return Some(TokenType::Number),
 
             // Markdown-specific captures
-            "text.title" | "text.title.1" | "text.title.2" | "text.title.3" |
-            "text.title.4" | "text.title.5" | "text.title.6" => return Some(TokenType::Keyword),
+            "text.title" | "text.title.1" | "text.title.2" | "text.title.3" | "text.title.4"
+            | "text.title.5" | "text.title.6" => return Some(TokenType::Keyword),
             "text.literal" | "text.literal.block" => return Some(TokenType::String),
             "text.uri" => return Some(TokenType::Constant),
             "text.reference" => return Some(TokenType::Attribute),
             "text.emphasis" => return Some(TokenType::Variable),
             "text.strong" => return Some(TokenType::Method),
             "text.strike" => return Some(TokenType::Comment),
-            "punctuation.list_marker" | "punctuation.special" => return Some(TokenType::Punctuation),
-            "none" => return None, // Explicitly ignored captures
+            "punctuation.list_marker" | "punctuation.special" => {
+                return Some(TokenType::Punctuation)
+            }
+            "none" => return None,              // Explicitly ignored captures
             "injection.content" => return None, // Handled separately
 
             _ => {}
@@ -1260,9 +1307,9 @@ impl SyntaxHighlighter {
         for effect in effects {
             // Only skip if we have the EXACT same range and priority (duplicate)
             let is_duplicate = result.iter().any(|existing: &TextEffect| {
-                existing.range == effect.range &&
-                existing.priority == effect.priority &&
-                existing.effect == effect.effect
+                existing.range == effect.range
+                    && existing.priority == effect.priority
+                    && existing.effect == effect.effect
             });
 
             if !is_duplicate {

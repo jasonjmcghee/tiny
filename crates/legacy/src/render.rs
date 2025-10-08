@@ -1,10 +1,13 @@
 //! Renderer manages widget rendering and viewport transformations
 
 use crate::{
-    coordinates::Viewport, syntax,
+    config::{AppConfig, PluginConfig},
+    coordinates::Viewport,
+    syntax,
     text_effects::{self, TextStyleProvider},
     text_renderer::{self, TextRenderer},
 };
+use anyhow::{bail, Context, Result};
 use bytemuck;
 use notify::{Event, RecursiveMode, Watcher};
 use std::sync::{Arc, Mutex};
@@ -217,10 +220,8 @@ impl Renderer {
 
         // Update baseline from font metrics when font size changes
         if let Some(ref font_system) = self.font_system {
-            self.viewport.metrics.baseline = font_system.get_baseline(
-                self.viewport.metrics.font_size,
-                self.viewport.scale_factor
-            );
+            self.viewport.metrics.baseline = font_system
+                .get_baseline(self.viewport.metrics.font_size, self.viewport.scale_factor);
         }
 
         self.layout_dirty = true;
@@ -267,9 +268,9 @@ impl Renderer {
     }
 
     fn initialize_plugins(&mut self, gpu_renderer: &GpuRenderer) {
-        let app_config = crate::config::AppConfig::load().unwrap_or_else(|e| {
+        let app_config = AppConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load init.toml: {}, using defaults", e);
-            crate::config::AppConfig::default()
+            AppConfig::default()
         });
 
         let plugin_dir = std::path::PathBuf::from(&app_config.plugins.plugin_dir);
@@ -301,7 +302,6 @@ impl Renderer {
                 continue;
             }
 
-            eprintln!("Initialized {} plugin with GPU resources", plugin_name);
             if plugin_name == "selection" || plugin_name == "cursor" {
                 let mut state = self.plugin_state.lock().unwrap();
                 state.viewport_info = PluginState::from_viewport(&self.viewport);
@@ -316,7 +316,7 @@ impl Renderer {
 
     fn setup_hot_reload(
         &mut self,
-        config: &crate::config::AppConfig,
+        config: &AppConfig,
         loader_arc: &Arc<Mutex<PluginLoader>>,
         gpu_renderer: &GpuRenderer,
     ) {
@@ -339,11 +339,28 @@ impl Renderer {
     fn setup_lib_watcher(
         &mut self,
         plugin_name: &str,
-        plugin_config: &crate::config::PluginConfig,
-        app_config: &crate::config::AppConfig,
+        plugin_config: &PluginConfig,
+        app_config: &AppConfig,
         loader_arc: Arc<Mutex<PluginLoader>>,
         gpu_renderer: &GpuRenderer,
     ) {
+        let _ = self.setup_lib_watcher_impl(
+            plugin_name,
+            plugin_config,
+            app_config,
+            loader_arc,
+            gpu_renderer,
+        );
+    }
+
+    fn setup_lib_watcher_impl(
+        &mut self,
+        plugin_name: &str,
+        plugin_config: &PluginConfig,
+        app_config: &AppConfig,
+        loader_arc: Arc<Mutex<PluginLoader>>,
+        gpu_renderer: &GpuRenderer,
+    ) -> Result<()> {
         let lib_path = plugin_config.lib_path(plugin_name, &app_config.plugins.plugin_dir);
         let lib_path_buf = std::path::PathBuf::from(&lib_path);
         let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
@@ -353,36 +370,37 @@ impl Renderer {
         let queue = gpu_renderer.queue_arc();
         let plugin_state = self.plugin_state.clone();
 
-        let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                if event.kind.is_create() || event.kind.is_modify() {
-                    Self::handle_lib_reload(
-                        &loader_arc,
-                        &plugin_name,
-                        &lib_path,
-                        &config_path,
-                        device.clone(),
-                        queue.clone(),
-                        plugin_state.clone(),
-                    );
-                }
-            }
-        });
-
-        if let Ok(mut watcher) = watcher {
-            if watcher
-                .watch(&lib_path_buf, RecursiveMode::NonRecursive)
-                .is_err()
-            {
-                if let Some(parent) = lib_path_buf.parent() {
-                    if watcher.watch(parent, RecursiveMode::NonRecursive).is_ok() {
-                        self.lib_watchers.push(watcher);
+        let mut watcher =
+            notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if event.kind.is_create() || event.kind.is_modify() {
+                        Self::handle_lib_reload(
+                            &loader_arc,
+                            &plugin_name,
+                            &lib_path,
+                            &config_path,
+                            device.clone(),
+                            queue.clone(),
+                            plugin_state.clone(),
+                        );
                     }
                 }
-            } else {
-                self.lib_watchers.push(watcher);
-            }
+            })
+            .context("Failed to create lib watcher")?;
+
+        // Try watching the file directly first, fallback to parent directory
+        if watcher
+            .watch(&lib_path_buf, RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            let parent = lib_path_buf.parent().context("No parent directory")?;
+            watcher
+                .watch(parent, RecursiveMode::NonRecursive)
+                .context("Failed to watch parent directory")?;
         }
+
+        self.lib_watchers.push(watcher);
+        Ok(())
     }
 
     fn handle_lib_reload(
@@ -415,12 +433,8 @@ impl Renderer {
                 return;
             }
             if loader.initialize_plugin(plugin_name, device, queue).is_ok() {
-                eprintln!("Successfully hot-reloaded plugin: {}", plugin_name);
-
-                // Restore plugin state after hot-reload
                 if let Ok(state) = plugin_state.lock() {
                     state.sync_to_plugin(&mut loader, plugin_name);
-                    eprintln!("Restored state to {} plugin after hot-reload", plugin_name);
                 }
             }
         }
@@ -429,56 +443,61 @@ impl Renderer {
     fn setup_config_watcher(
         &mut self,
         plugin_name: &str,
-        plugin_config: &crate::config::PluginConfig,
-        app_config: &crate::config::AppConfig,
+        plugin_config: &PluginConfig,
+        app_config: &AppConfig,
         loader_arc: Arc<Mutex<PluginLoader>>,
     ) {
+        let _ = self.setup_config_watcher_impl(plugin_name, plugin_config, app_config, loader_arc);
+    }
+
+    fn setup_config_watcher_impl(
+        &mut self,
+        plugin_name: &str,
+        plugin_config: &PluginConfig,
+        app_config: &AppConfig,
+        loader_arc: Arc<Mutex<PluginLoader>>,
+    ) -> Result<()> {
         let config_path = plugin_config.config_path(plugin_name, &app_config.plugins.plugin_dir);
         let config_path_buf = std::path::PathBuf::from(&config_path);
 
         if !config_path_buf.exists() {
-            return;
+            bail!("Config path does not exist");
         }
 
         let plugin_name = plugin_name.to_string();
-        let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                if event.kind.is_modify() {
-                    if let Ok(data) = std::fs::read_to_string(&event.paths[0]) {
-                        if let Ok(mut loader) = loader_arc.lock() {
-                            if let Some(plugin) = loader.get_plugin_mut(&plugin_name) {
-                                if let Some(cfg) = plugin.instance.as_configurable() {
-                                    if cfg.config_updated(&data).is_ok() {
-                                        eprintln!("Updated config for plugin: {}", plugin_name);
+        let mut watcher =
+            notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if event.kind.is_modify() {
+                        if let Ok(data) = std::fs::read_to_string(&event.paths[0]) {
+                            if let Ok(mut loader) = loader_arc.lock() {
+                                if let Some(plugin) = loader.get_plugin_mut(&plugin_name) {
+                                    if let Some(cfg) = plugin.instance.as_configurable() {
+                                        let _ = cfg.config_updated(&data);
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
-        });
+            })
+            .context("Failed to create config watcher")?;
 
-        if let Ok(mut watcher) = watcher {
-            if watcher
-                .watch(&config_path_buf, RecursiveMode::NonRecursive)
-                .is_ok()
-            {
-                self.config_watchers.push(watcher);
-            }
-        }
+        watcher
+            .watch(&config_path_buf, RecursiveMode::NonRecursive)
+            .context("Failed to watch config file")?;
+
+        self.config_watchers.push(watcher);
+        Ok(())
     }
-
 
     pub fn set_font_system(&mut self, font_system: Arc<tiny_font::SharedFontSystem>) {
         self.viewport.set_font_system(font_system.clone());
         self.service_registry.register(font_system.clone());
 
         // Update baseline from font metrics
-        self.viewport.metrics.baseline = font_system.get_baseline(
-            self.viewport.metrics.font_size,
-            self.viewport.scale_factor
-        );
+        self.viewport.metrics.baseline =
+            font_system.get_baseline(self.viewport.metrics.font_size, self.viewport.scale_factor);
 
         self.font_system = Some(font_system);
         self.layout_dirty = true;
@@ -632,40 +651,44 @@ impl Renderer {
     }
 
     /// Collect all glyphs to trigger rasterization (call BEFORE starting render pass)
-    pub fn collect_all_glyphs(&mut self, tree: &Tree, tab_manager: Option<&crate::tab_manager::TabManager>) {
+    pub fn collect_all_glyphs(
+        &mut self,
+        tree: &Tree,
+        tab_manager: Option<&crate::tab_manager::TabManager>,
+    ) {
         let tree_version_changed = tree.version != self.last_rendered_version;
 
         // Check if syntax highlighter has new results (async parse completed)
-        let syntax_updated = self.text_renderer.syntax_highlighter.as_ref()
+        let syntax_updated = self
+            .text_renderer
+            .syntax_highlighter
+            .as_ref()
             .map(|h| h.cached_version() > self.text_renderer.syntax_state.stable_version)
             .unwrap_or(false);
 
-        let content_changed = tree_version_changed || self.layout_dirty || self.syntax_dirty || syntax_updated;
+        let content_changed =
+            tree_version_changed || self.layout_dirty || self.syntax_dirty || syntax_updated;
 
         let current_scroll = (self.viewport.scroll.x.0, self.viewport.scroll.y.0);
         let scroll_changed = current_scroll != self.last_scroll;
         if scroll_changed {
             self.glyphs_dirty = true;
             self.last_scroll = current_scroll;
+            // Update visible range for new scroll position
+            self.text_renderer.update_visible_range(&self.viewport, tree);
         }
-
-        if syntax_updated {
-            eprintln!("  🎨 SYNTAX UPDATED: cached_version={}, stable_version={}",
-                self.text_renderer.syntax_highlighter.as_ref().unwrap().cached_version(),
-                self.text_renderer.syntax_state.stable_version);
-        }
-
-        eprintln!("  collect_all_glyphs: tree_v={} vs last={}, layout_dirty={}, syntax_dirty={}, syntax_updated={}, needs_collect={}",
-            tree.version, self.last_rendered_version, self.layout_dirty, self.syntax_dirty, syntax_updated,
-            content_changed || scroll_changed || self.glyphs_dirty || self.line_numbers_dirty || self.ui_dirty);
 
         // Early exit if nothing needs collection
-        if !content_changed && !scroll_changed && !self.glyphs_dirty && !self.line_numbers_dirty && !self.ui_dirty {
+        if !content_changed
+            && !scroll_changed
+            && !self.glyphs_dirty
+            && !self.line_numbers_dirty
+            && !self.ui_dirty
+        {
             return;
         }
 
         if content_changed {
-            eprintln!("  Calling prepare_render because content_changed=true");
             self.prepare_render(tree);
         }
 
@@ -682,7 +705,10 @@ impl Renderer {
             let old_editor_bounds_x = self.editor_bounds.x.0;
             self.collect_line_number_glyphs();
             if self.line_numbers_dirty {
-                let (w, h) = (self.viewport.logical_size.width.0, self.viewport.logical_size.height.0);
+                let (w, h) = (
+                    self.viewport.logical_size.width.0,
+                    self.viewport.logical_size.height.0,
+                );
                 self.update_editor_bounds(w, h);
                 if (old_editor_bounds_x - self.editor_bounds.x.0).abs() > 0.01 {
                     self.accumulated_glyphs.clear();
@@ -819,7 +845,11 @@ impl Renderer {
             if !self.text_decoration_rects.is_empty() {
                 if let Some(gpu_ptr) = self.gpu_renderer {
                     let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
-                    gpu_mut.draw_rects(pass, &self.text_decoration_rects, self.viewport.scale_factor);
+                    gpu_mut.draw_rects(
+                        pass,
+                        &self.text_decoration_rects,
+                        self.viewport.scale_factor,
+                    );
                 }
             }
 
@@ -863,13 +893,6 @@ impl Renderer {
                         content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
                         widget_id: 2,
                     };
-
-                    // Debug: Print editor bounds vs TextView bounds
-                    if tab.plugin.editor.id == 0 {
-                        eprintln!("PAINT: editor_bounds=({:.1}, {:.1}), TextView.bounds=({:.1}, {:.1})",
-                            editor_viewport.bounds.x.0, editor_viewport.bounds.y.0,
-                            tab.plugin.editor.view.viewport.bounds.x.0, tab.plugin.editor.view.viewport.bounds.y.0);
-                    }
 
                     if let Some(gpu) = self.gpu_renderer {
                         let gpu_renderer = unsafe { &*gpu };
@@ -1024,7 +1047,11 @@ impl Renderer {
                         widget_id: 100,
                     };
                     pass.set_scissor_rect(0, 0, target_w, target_h);
-                    self.paint_editable_view_plugins(&plugin.picker.dropdown.input, input_viewport, pass);
+                    self.paint_editable_view_plugins(
+                        &plugin.picker.dropdown.input,
+                        input_viewport,
+                        pass,
+                    );
                 }
             }
 
@@ -1073,7 +1100,11 @@ impl Renderer {
                         widget_id: 101,
                     };
                     pass.set_scissor_rect(0, 0, target_w, target_h);
-                    self.paint_editable_view_plugins(&plugin.picker.dropdown.input, input_viewport, pass);
+                    self.paint_editable_view_plugins(
+                        &plugin.picker.dropdown.input,
+                        input_viewport,
+                        pass,
+                    );
                 }
             }
         }
@@ -1091,26 +1122,16 @@ impl Renderer {
         }
     }
 
-
     fn prepare_render(&mut self, tree: &Tree) {
-        eprintln!("    prepare_render: text_renderer has syntax={}, layout_version={}",
-            self.text_renderer.syntax_highlighter.is_some(),
-            self.text_renderer.layout_version);
-
         if let Some(font_system) = &self.font_system {
             self.text_renderer
                 .update_layout(tree, font_system, &self.viewport, self.layout_dirty);
         }
 
         if let Some(ref highlighter) = self.text_renderer.syntax_highlighter {
-            eprintln!("    Applying syntax from highlighter: {}, Arc ptr={:p}", highlighter.language(), highlighter.as_ref() as *const _);
             // Check if tree-sitter completed a parse since last update
             let fresh_parse =
                 highlighter.cached_version() > self.text_renderer.syntax_state.stable_version;
-
-            eprintln!("    fresh_parse={}, cached_version={}, stable_version={}, has_edits={}",
-                fresh_parse, highlighter.cached_version(), self.text_renderer.syntax_state.stable_version,
-                !self.text_renderer.syntax_state.edit_deltas.is_empty());
 
             // Only update syntax if there's something new to apply:
             // - Fresh parse has new tokens from tree-sitter
@@ -1118,35 +1139,26 @@ impl Renderer {
             let needs_update =
                 fresh_parse || !self.text_renderer.syntax_state.edit_deltas.is_empty();
 
-            eprintln!("    needs_update={}", needs_update);
-
             // For new files, apply default styling if tree-sitter hasn't parsed yet
             let is_initial_render = self.text_renderer.syntax_state.stable_version == 0
                 && self.text_renderer.syntax_state.stable_tokens.is_empty();
 
             if needs_update || is_initial_render {
-                eprintln!("    Updating syntax tokens... (needs_update={}, is_initial={})", needs_update, is_initial_render);
-
                 // Always try querying highlighter - it might have tokens ready even if cached_version is 0
                 let effects = highlighter.get_effects_in_range(0..tree.char_count());
                 let tokens: Vec<_> = effects
                     .into_iter()
                     .filter_map(|e| match e.effect {
-                        text_effects::EffectType::Token(id) => {
-                            Some(text_renderer::TokenRange {
-                                byte_range: e.range,
-                                token_id: id,
-                            })
-                        }
+                        text_effects::EffectType::Token(id) => Some(text_renderer::TokenRange {
+                            byte_range: e.range,
+                            token_id: id,
+                        }),
                         _ => None,
                     })
                     .collect();
 
-                eprintln!("    Got {} tokens from highlighter", tokens.len());
-
                 let tokens_to_apply = if tokens.is_empty() {
                     // No tokens yet - apply default token to all text so it's visible
-                    eprintln!("    No tokens from tree-sitter yet, using default token for all text");
                     vec![text_renderer::TokenRange {
                         byte_range: 0..tree.byte_count(),
                         token_id: 0, // Default token (should be white/visible)
@@ -1166,18 +1178,11 @@ impl Renderer {
                     Some(&self.viewport),
                     Some(language),
                 );
-                eprintln!("    Syntax applied, glyphs now have token_ids");
-            } else {
-                eprintln!("    Skipping syntax update (no new data)");
             }
-        } else {
-            eprintln!("    No syntax highlighter - glyphs will have no style");
         }
 
         self.text_renderer
             .update_visible_range(&self.viewport, tree);
-
-        eprintln!("    prepare_render done: layout_cache has {} glyphs", self.text_renderer.layout_cache.len());
 
         if self.cached_doc_text.is_none() || tree.version != self.cached_doc_version {
             self.cached_doc_text = Some(tree.flatten_to_string());
@@ -1300,7 +1305,7 @@ impl Renderer {
                 0.0,
                 self.title_bar_height,
                 self.viewport.logical_size.width.0,
-                plugin.height,  // Use dynamic height from plugin
+                plugin.height, // Use dynamic height from plugin
             );
 
             let widget_viewport = tiny_sdk::types::WidgetViewport {
@@ -1410,7 +1415,10 @@ impl Renderer {
                     let g = (color[1] * 255.0) as u8;
                     let b = (color[2] * 255.0) as u8;
                     let a = (color[3] * 255.0) as u8;
-                    return ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32);
+                    return ((r as u32) << 24)
+                        | ((g as u32) << 16)
+                        | ((b as u32) << 8)
+                        | (a as u32);
                 }
             }
         }
@@ -1418,7 +1426,7 @@ impl Renderer {
     }
 
     fn collect_text_decorations(&mut self, glyphs: &[tiny_ui::text_renderer::UnifiedGlyph]) {
-        use tiny_sdk::types::{RectInstance, LayoutRect};
+        use tiny_sdk::types::{LayoutRect, RectInstance};
 
         // Group glyphs by line and decoration type, then create rect spans
         // Use line's canonical Y position (not glyph Y, which varies per glyph)
@@ -1431,7 +1439,8 @@ impl Renderer {
         let mut strike_token_id: u8 = 0;
 
         // Thickness: 10% of font size, minimum 1px (in logical pixels)
-        let thickness_logical = (self.viewport.metrics.font_size * 0.1).max(1.0 / self.viewport.scale_factor);
+        let thickness_logical =
+            (self.viewport.metrics.font_size * 0.1).max(1.0 / self.viewport.scale_factor);
         let underline_thickness = thickness_logical;
         let strike_thickness = thickness_logical;
 
@@ -1442,12 +1451,11 @@ impl Renderer {
             let glyph_width_logical = glyph.physical_width / self.viewport.scale_factor;
 
             // Find which line this glyph belongs to (use canonical Y to find line)
-            let glyph_line_idx = self.text_renderer.line_cache.iter()
-                .position(|line| {
-                    let line_y = line.y_position;
-                    let line_bottom = line_y + line.height;
-                    glyph.layout_pos.y.0 >= line_y && glyph.layout_pos.y.0 < line_bottom
-                });
+            let glyph_line_idx = self.text_renderer.line_cache.iter().position(|line| {
+                let line_y = line.y_position;
+                let line_bottom = line_y + line.height;
+                glyph.layout_pos.y.0 >= line_y && glyph.layout_pos.y.0 < line_bottom
+            });
 
             // Check if we moved to a new line
             if current_line_idx != glyph_line_idx {
@@ -1459,13 +1467,20 @@ impl Renderer {
 
                         if let (Some(start), Some(end)) = (underline_start_x, underline_end_x) {
                             // Underline: baseline + small offset (10% of font size)
-                            let underline_y = line_screen_y + self.viewport.metrics.baseline + self.viewport.metrics.font_size * 0.1;
+                            let underline_y = line_screen_y
+                                + self.viewport.metrics.baseline
+                                + self.viewport.metrics.font_size * 0.1;
 
                             // Get color from theme based on token_id
                             let color = self.get_token_color(underline_token_id);
 
                             self.text_decoration_rects.push(RectInstance {
-                                rect: LayoutRect::new(start, underline_y, end - start, underline_thickness),
+                                rect: LayoutRect::new(
+                                    start,
+                                    underline_y,
+                                    end - start,
+                                    underline_thickness,
+                                ),
                                 color,
                             });
                         }
@@ -1477,7 +1492,12 @@ impl Renderer {
                             let color = self.get_token_color(strike_token_id);
 
                             self.text_decoration_rects.push(RectInstance {
-                                rect: LayoutRect::new(start, strike_y, end - start, strike_thickness),
+                                rect: LayoutRect::new(
+                                    start,
+                                    strike_y,
+                                    end - start,
+                                    strike_thickness,
+                                ),
                                 color,
                             });
                         }
@@ -1506,11 +1526,17 @@ impl Renderer {
                     if let Some(line_info) = self.text_renderer.line_cache.get(line_idx) {
                         let line_view_y = line_info.y_position - self.viewport.scroll.y.0;
                         let line_screen_y = line_view_y + self.editor_bounds.y.0;
-                        let underline_y = line_screen_y + self.viewport.metrics.baseline + self.viewport.metrics.font_size * 0.1;
+                        let underline_y = line_screen_y
+                            + self.viewport.metrics.baseline
+                            + self.viewport.metrics.font_size * 0.1;
                         let color = self.get_token_color(underline_token_id);
                         self.text_decoration_rects.push(RectInstance {
-                            rect: LayoutRect::new(underline_start_x.unwrap(), underline_y,
-                                                 underline_end_x.unwrap() - underline_start_x.unwrap(), underline_thickness),
+                            rect: LayoutRect::new(
+                                underline_start_x.unwrap(),
+                                underline_y,
+                                underline_end_x.unwrap() - underline_start_x.unwrap(),
+                                underline_thickness,
+                            ),
                             color,
                         });
                     }
@@ -1535,8 +1561,12 @@ impl Renderer {
                         let strike_y = line_screen_y + self.viewport.metrics.line_height * 0.5;
                         let color = self.get_token_color(strike_token_id);
                         self.text_decoration_rects.push(RectInstance {
-                            rect: LayoutRect::new(strike_start_x.unwrap(), strike_y,
-                                                 strike_end_x.unwrap() - strike_start_x.unwrap(), strike_thickness),
+                            rect: LayoutRect::new(
+                                strike_start_x.unwrap(),
+                                strike_y,
+                                strike_end_x.unwrap() - strike_start_x.unwrap(),
+                                strike_thickness,
+                            ),
                             color,
                         });
                     }
@@ -1553,7 +1583,9 @@ impl Renderer {
                 let line_screen_y = line_view_y + self.editor_bounds.y.0;
 
                 if let (Some(start), Some(end)) = (underline_start_x, underline_end_x) {
-                    let underline_y = line_screen_y + self.viewport.metrics.baseline + self.viewport.metrics.font_size * 0.1;
+                    let underline_y = line_screen_y
+                        + self.viewport.metrics.baseline
+                        + self.viewport.metrics.font_size * 0.1;
                     let color = self.get_token_color(underline_token_id);
                     self.text_decoration_rects.push(RectInstance {
                         rect: LayoutRect::new(start, underline_y, end - start, underline_thickness),
@@ -1626,7 +1658,8 @@ impl Renderer {
                     gpu_mut.upload_style_buffer_u32(&style_buffer);
                 }
 
-                let use_themed = self.text_renderer.syntax_highlighter.is_some() && gpu_renderer.has_styled_pipeline();
+                let use_themed = self.text_renderer.syntax_highlighter.is_some()
+                    && gpu_renderer.has_styled_pipeline();
 
                 gpu_mut.draw_glyphs(
                     pass,

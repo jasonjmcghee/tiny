@@ -1,6 +1,7 @@
 //! Configuration management for Tiny Editor
 
 use ahash::AHashMap as HashMap;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -171,81 +172,59 @@ fn default_plugin_dir() -> String {
 
 impl AppConfig {
     /// Load configuration from init.toml
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load() -> Result<Self> {
         let config_path = PathBuf::from("init.toml");
 
-        if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
+        if !config_path.exists() {
+            return Ok(AppConfig::default());
+        }
 
-            // Parse as raw TOML value first
-            let toml_value: toml::Value = match toml::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("❌ TOML syntax error in init.toml: {}", e);
-                    eprintln!("   The file has invalid TOML syntax (missing quotes, brackets, etc.)");
-                    eprintln!("   Using default configuration");
-                    return Ok(AppConfig::default());
-                }
-            };
+        let content = std::fs::read_to_string(&config_path).context("Failed to read init.toml")?;
+        let toml_value: toml::Value = toml::from_str(&content).context("Invalid TOML syntax in init.toml")?;
 
-            // Extract sections with individual error handling
-            let mut config = AppConfig::default();
+        let mut config = AppConfig::default();
 
-            // Try to parse editor section field-by-field for maximum resilience
-            if let Some(editor_table) = toml_value.get("editor").and_then(|v| v.as_table()) {
-                tiny_sdk::parse_fields!(config.editor, editor_table, {
-                    window_title: default_window_title(),
-                    window_width: default_window_width(),
-                    window_height: default_window_height(),
-                    font_size: default_font_size(),
-                    line_height: default_line_height(),
-                    theme: default_theme(),
-                    title_bar_height: default_title_bar_height(),
-                    scroll_lock_enabled: default_scroll_lock_enabled(),
-                    continuous_rendering: false,
-                    font_weight: default_font_weight(),
-                    font_italic: false,
-                });
-            }
+        if let Some(editor_table) = toml_value.get("editor").and_then(|v| v.as_table()) {
+            tiny_sdk::parse_fields!(config.editor, editor_table, {
+                window_title: default_window_title(),
+                window_width: default_window_width(),
+                window_height: default_window_height(),
+                font_size: default_font_size(),
+                line_height: default_line_height(),
+                theme: default_theme(),
+                title_bar_height: default_title_bar_height(),
+                scroll_lock_enabled: default_scroll_lock_enabled(),
+                continuous_rendering: false,
+                font_weight: default_font_weight(),
+                font_italic: false,
+            });
+        }
 
-            // Try to parse plugins section field-by-field
-            if let Some(plugins_table) = toml_value.get("plugins").and_then(|v| v.as_table()) {
-                tiny_sdk::parse_fields!(config.plugins, plugins_table, {
-                    plugin_dir: default_plugin_dir(),
-                    enabled: Vec::new(),
-                });
-            }
+        if let Some(plugins_table) = toml_value.get("plugins").and_then(|v| v.as_table()) {
+            tiny_sdk::parse_fields!(config.plugins, plugins_table, {
+                plugin_dir: default_plugin_dir(),
+                enabled: Vec::new(),
+            });
+        }
 
-            // Try to parse development section field-by-field
-            if let Some(dev_table) = toml_value.get("development").and_then(|v| v.as_table()) {
-                tiny_sdk::parse_fields!(config.development, dev_table, {
-                    debug: false,
-                    show_fps: false,
-                });
-            }
+        if let Some(dev_table) = toml_value.get("development").and_then(|v| v.as_table()) {
+            tiny_sdk::parse_fields!(config.development, dev_table, {
+                debug: false,
+                show_fps: false,
+            });
+        }
 
-            // Extract individual plugin configs from [plugins.{name}] sections
-            if let Some(plugins_table) = toml_value.get("plugins").and_then(|v| v.as_table()) {
-                for (key, value) in plugins_table {
-                    // Skip the main plugins fields (plugin_dir, enabled)
-                    if key != "plugin_dir" && key != "enabled" {
-                        if let Ok(plugin_config) = value.clone().try_into::<PluginConfig>() {
-                            config.plugins.plugins.insert(key.clone(), plugin_config);
-                            eprintln!("Loaded config for plugin: {}", key);
-                        }
+        if let Some(plugins_table) = toml_value.get("plugins").and_then(|v| v.as_table()) {
+            for (key, value) in plugins_table {
+                if key != "plugin_dir" && key != "enabled" {
+                    if let Ok(plugin_config) = value.clone().try_into::<PluginConfig>() {
+                        config.plugins.plugins.insert(key.clone(), plugin_config);
                     }
                 }
             }
-
-            eprintln!(
-                "Loaded configuration from init.toml with {} plugins",
-                config.plugins.plugins.len()
-            );
-            Ok(config)
-        } else {
-            eprintln!("No init.toml found, using defaults");
-            Ok(AppConfig::default())
         }
+
+        Ok(config)
     }
 }
 

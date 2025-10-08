@@ -6,6 +6,7 @@ use crate::{
     text_effects::TextStyleProvider,
 };
 use ahash::AHasher;
+use anyhow::{Context, Result};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use tiny_core::tree::{Doc, Point};
@@ -86,8 +87,8 @@ impl EditorLogic {
     }
 
     /// Get the active tab's plugin
-    fn active_editor(&self) -> &TextEditorPlugin {
-        &self.tab_manager.active_tab().expect("No active tab").plugin
+    fn active_editor(&self) -> Result<&TextEditorPlugin> {
+        Ok(&self.tab_manager.active_tab().context("No active tab")?.plugin)
     }
 
     /// Get the active tab's plugin mutably
@@ -96,9 +97,12 @@ impl EditorLogic {
     }
 
     /// Handle code action request (Alt+Enter)
-    pub fn handle_code_action_request(&mut self) {
+    pub fn handle_code_action_request(&mut self) -> Result<()> {
         let tab = self.tab_manager.active_tab_mut();
-        let cursor_pos = tab.plugin.editor.input.selections()[0].cursor;
+        let cursor_pos = tab.plugin.editor.input.selections()
+            .first()
+            .context("No active selection")?
+            .cursor;
 
         // Convert cursor position to UTF-16
         let tree = tab.plugin.editor.view.doc.read();
@@ -112,6 +116,8 @@ impl EditorLogic {
                 line: cursor_utf16.row as usize,
                 column: cursor_utf16.column as usize,
             });
+
+        Ok(())
     }
 
     /// Handle tab bar click at the given position (relative to tab bar top-left)
@@ -187,14 +193,13 @@ impl EditorLogic {
         // Cmd+Click triggers go-to-definition
         if cmd_held {
             eprintln!("DEBUG: Cmd+Click detected at {:?}", pos);
-            // Get document position at click location
-            let tab = self.tab_manager.active_tab();
-            if let Some(tab) = tab {
+
+            if self.tab_manager.active_tab().is_some() {
                 let doc_pos = viewport.layout_to_doc(pos);
                 eprintln!("DEBUG: Cmd+Click at doc pos: {:?}", doc_pos);
 
                 // Request go-to-definition at click location
-                self.goto_definition();
+                let _ = self.goto_definition();
                 self.widgets_dirty = true;
                 return true;
             }
@@ -226,23 +231,23 @@ impl EditorLogic {
     }
 
     /// Get document to render
-    pub fn doc(&self) -> &Doc {
-        &self.active_editor().editor.view.doc
+    pub fn doc(&self) -> Result<&Doc> {
+        Ok(&self.active_editor()?.editor.view.doc)
     }
 
     /// Get cursor document position for scrolling
-    pub fn get_cursor_doc_pos(&self) -> Option<DocPos> {
-        self.active_editor().get_cursor_doc_pos()
+    pub fn get_cursor_doc_pos(&self) -> Result<Option<DocPos>> {
+        Ok(self.active_editor()?.get_cursor_doc_pos())
     }
 
     /// Get current selections for rendering
-    pub fn selections(&self) -> &[input::Selection] {
-        self.active_editor().selections()
+    pub fn selections(&self) -> Result<&[input::Selection]> {
+        Ok(self.active_editor()?.selections())
     }
 
     /// Get text style provider for syntax highlighting
-    pub fn text_styles(&self) -> Option<&dyn TextStyleProvider> {
-        self.active_editor().syntax_highlighter.as_deref()
+    pub fn text_styles(&self) -> Result<Option<&dyn TextStyleProvider>> {
+        Ok(self.active_editor()?.syntax_highlighter.as_deref())
     }
 
     /// Called after setup is complete
@@ -268,222 +273,221 @@ impl EditorLogic {
         let tab = self.tab_manager.active_tab_mut();
 
         // Apply pending text edits from code actions
-        if let Some(edits) = tab.diagnostics.take_text_edits() {
+        let edits = match tab.diagnostics.take_text_edits() {
+            Some(e) => e,
+            None => return cursor_moved,
+        };
 
-            // Sort edits by position (reverse order to apply from end to start)
-            let mut sorted_edits = edits.clone();
-            sorted_edits.sort_by(|a, b| {
-                b.range_utf16
-                    .0
-                    .line
-                    .cmp(&a.range_utf16.0.line)
-                    .then(b.range_utf16.0.column.cmp(&a.range_utf16.0.column))
-            });
+        // Sort edits by position (reverse order to apply from end to start)
+        let mut sorted_edits = edits.clone();
+        sorted_edits.sort_by(|a, b| {
+            b.range_utf16
+                .0
+                .line
+                .cmp(&a.range_utf16.0.line)
+                .then(b.range_utf16.0.column.cmp(&a.range_utf16.0.column))
+        });
 
-            // Convert UTF-16 positions to byte offsets and apply edits
-            for edit in sorted_edits {
-                let tree = tab.plugin.editor.view.doc.read();
+        // Convert UTF-16 positions to byte offsets and apply edits
+        for edit in sorted_edits {
+            let tree = tab.plugin.editor.view.doc.read();
 
-                let start_utf16 = tiny_tree::PointUtf16::new(
-                    edit.range_utf16.0.line as u32,
-                    edit.range_utf16.0.column as u32,
-                );
-                let end_utf16 = tiny_tree::PointUtf16::new(
-                    edit.range_utf16.1.line as u32,
-                    edit.range_utf16.1.column as u32,
-                );
+            let start_utf16 = tiny_tree::PointUtf16::new(
+                edit.range_utf16.0.line as u32,
+                edit.range_utf16.0.column as u32,
+            );
+            let end_utf16 = tiny_tree::PointUtf16::new(
+                edit.range_utf16.1.line as u32,
+                edit.range_utf16.1.column as u32,
+            );
 
-                let start_byte = tree.point_utf16_to_byte(start_utf16);
-                let end_byte = tree.point_utf16_to_byte(end_utf16);
-                drop(tree);
+            let start_byte = tree.point_utf16_to_byte(start_utf16);
+            let end_byte = tree.point_utf16_to_byte(end_utf16);
+            drop(tree);
 
-                eprintln!(
-                    "DEBUG: Edit range UTF-16 ({},{}) to ({},{}) = bytes {} to {}",
-                    edit.range_utf16.0.line,
-                    edit.range_utf16.0.column,
-                    edit.range_utf16.1.line,
-                    edit.range_utf16.1.column,
-                    start_byte,
-                    end_byte
-                );
+            eprintln!(
+                "DEBUG: Edit range UTF-16 ({},{}) to ({},{}) = bytes {} to {}",
+                edit.range_utf16.0.line,
+                edit.range_utf16.0.column,
+                edit.range_utf16.1.line,
+                edit.range_utf16.1.column,
+                start_byte,
+                end_byte
+            );
 
-                // Apply the edit
-                if start_byte == end_byte {
-                    // Insert
-                    tab.plugin.editor.view.doc.edit(tiny_tree::Edit::Insert {
-                        pos: start_byte,
-                        content: tiny_tree::Content::Text(edit.new_text),
-                    });
-                } else {
-                    // Replace
-                    tab.plugin.editor.view.doc.edit(tiny_tree::Edit::Replace {
-                        range: start_byte..end_byte,
-                        content: tiny_tree::Content::Text(edit.new_text),
-                    });
-                }
+            // Apply the edit
+            if start_byte == end_byte {
+                // Insert
+                tab.plugin.editor.view.doc.edit(tiny_tree::Edit::Insert {
+                    pos: start_byte,
+                    content: tiny_tree::Content::Text(edit.new_text),
+                });
+            } else {
+                // Replace
+                tab.plugin.editor.view.doc.edit(tiny_tree::Edit::Replace {
+                    range: start_byte..end_byte,
+                    content: tiny_tree::Content::Text(edit.new_text),
+                });
             }
-
-            tab.plugin.editor.view.doc.flush();
-
-            // Notify LSP of document changes
-            let updated_text = tab.plugin.editor.view.doc.read().flatten_to_string();
-            tab.diagnostics.document_changed(updated_text.to_string());
-
-            // Trigger syntax highlighting update
-            if let Some(ref syntax_highlighter) = tab.plugin.syntax_highlighter {
-                if let Some(syntax_hl) = syntax_highlighter
-                    .as_any()
-                    .downcast_ref::<syntax::SyntaxHighlighter>()
-                {
-                    syntax_hl.request_update_with_edit(
-                        &updated_text,
-                        tab.plugin.editor.view.doc.version(),
-                        None
-                    );
-                }
-            }
-
-            self.ui_changed = true;
         }
+
+        tab.plugin.editor.view.doc.flush();
+
+        // Notify LSP of document changes
+        let updated_text = tab.plugin.editor.view.doc.read().flatten_to_string();
+        tab.diagnostics.document_changed(updated_text.to_string());
+
+        // Trigger syntax highlighting update
+        if let Some(ref syntax_highlighter) = tab.plugin.syntax_highlighter {
+            if let Some(syntax_hl) = syntax_highlighter
+                .as_any()
+                .downcast_ref::<syntax::SyntaxHighlighter>()
+            {
+                syntax_hl.request_update_with_edit(
+                    &updated_text,
+                    tab.plugin.editor.view.doc.version(),
+                    None
+                );
+            }
+        }
+
+        self.ui_changed = true;
 
         // Check for go-to-definition results
         let tab = self.tab_manager.active_tab_mut();
-        if let Some(locations) = tab.diagnostics.take_goto_definition() {
-            eprintln!(
-                "DEBUG: on_update got {} goto_definition location(s)",
-                locations.len()
-            );
-            if let Some(location) = locations.first() {
-                eprintln!(
-                    "DEBUG: Navigating to {:?} at line {}, UTF-16 col {}",
-                    location.file_path, location.position.line, location.position.column
-                );
+        let locations = match tab.diagnostics.take_goto_definition() {
+            Some(locs) => locs,
+            None => {
+                // Continue with cmd_hover_range update
+                let tab = self.tab_manager.active_tab_mut();
+                if let Some((line, column)) = tab.diagnostics.cmd_hover_position() {
+                    // Find word boundaries at hover position
+                    let doc = &tab.plugin.editor.view.doc;
+                    let tree = doc.read();
+                    let line_text = tree.line_text(line as u32);
+                    let word_range = find_word_at_position(&line_text, column);
 
-                // Use the unified jump_to_location_utf16 method
-                if self.jump_to_location_utf16(
-                    location.file_path.clone(),
-                    location.position.line as u32,
-                    location.position.column as u32,
-                    true, // center on screen
-                ) {
-                    cursor_moved = true;
+                    tab.plugin.cmd_hover_range = word_range.map(|(start, end)| {
+                        (line as u32, start as u32, end as u32)
+                    });
+
+                    self.ui_changed = tab.plugin.cmd_hover_range.is_some();
+                } else if tab.plugin.cmd_hover_range.is_some() {
+                    tab.plugin.cmd_hover_range = None;
+                    self.ui_changed = true;
                 }
-            }
-        }
 
-        // Update cmd_hover_range for underline rendering
-        let tab = self.tab_manager.active_tab_mut();
-        if let Some((line, column)) = tab.diagnostics.cmd_hover_position() {
-            // Find word boundaries at hover position
-            let doc = &tab.plugin.editor.view.doc;
-            let tree = doc.read();
-            let line_text = tree.line_text(line as u32);
-            let word_range = find_word_at_position(&line_text, column);
-            if let Some((start, end)) = word_range {
-                tab.plugin.cmd_hover_range = Some((line as u32, start as u32, end as u32));
-                self.ui_changed = true;
-            } else {
-                tab.plugin.cmd_hover_range = None;
+                return cursor_moved;
             }
-        } else {
-            let tab = self.tab_manager.active_tab_mut();
-            if tab.plugin.cmd_hover_range.is_some() {
-                tab.plugin.cmd_hover_range = None;
-                self.ui_changed = true;
-            }
+        };
+
+        eprintln!(
+            "DEBUG: on_update got {} goto_definition location(s)",
+            locations.len()
+        );
+
+        let location = match locations.first() {
+            Some(loc) => loc,
+            None => return cursor_moved,
+        };
+
+        eprintln!(
+            "DEBUG: Navigating to {:?} at line {}, UTF-16 col {}",
+            location.file_path, location.position.line, location.position.column
+        );
+
+        // Use the unified jump_to_location_utf16 method
+        if self.jump_to_location_utf16(
+            location.file_path.clone(),
+            location.position.line as u32,
+            location.position.column as u32,
+            true, // center on screen
+        ) {
+            cursor_moved = true;
         }
 
         cursor_moved
     }
 
     /// Record current location in global navigation history
-    pub fn record_navigation(&mut self) {
-        let plugin = self.active_editor();
+    pub fn record_navigation(&mut self) -> Result<()> {
+        let plugin = self.active_editor()?;
         let location = history::FileLocation {
             path: plugin.file_path.clone(),
             position: plugin.editor.input.primary_cursor_doc_pos(&plugin.editor.view.doc),
         };
         self.global_nav_history.checkpoint_if_changed(location);
+        Ok(())
     }
 
     /// Navigate back in global history (across files)
-    pub fn navigate_back(&mut self) -> bool {
+    pub fn navigate_back(&mut self) -> Result<bool> {
         let current_location = history::FileLocation {
-            path: self.active_editor().file_path.clone(),
+            path: self.active_editor()?.file_path.clone(),
             position: self
-                .active_editor()
+                .active_editor()?
                 .editor
                 .input
-                .primary_cursor_doc_pos(&self.active_editor().editor.view.doc),
+                .primary_cursor_doc_pos(&self.active_editor()?.editor.view.doc),
         };
 
-        if let Some(target) = self.global_nav_history.undo(current_location) {
-            self.navigate_to_location(target)
-        } else {
-            false
-        }
+        let target = self.global_nav_history.undo(current_location)
+            .context("No previous location in history")?;
+
+        self.navigate_to_location(target)
     }
 
     /// Navigate forward in global history (across files)
-    pub fn navigate_forward(&mut self) -> bool {
+    pub fn navigate_forward(&mut self) -> Result<bool> {
         let current_location = history::FileLocation {
-            path: self.active_editor().file_path.clone(),
+            path: self.active_editor()?.file_path.clone(),
             position: self
-                .active_editor()
+                .active_editor()?
                 .editor
                 .input
-                .primary_cursor_doc_pos(&self.active_editor().editor.view.doc),
+                .primary_cursor_doc_pos(&self.active_editor()?.editor.view.doc),
         };
 
-        if let Some(target) = self.global_nav_history.redo(current_location) {
-            self.navigate_to_location(target)
-        } else {
-            false
-        }
+        let target = self.global_nav_history.redo(current_location)
+            .context("No next location in history")?;
+
+        self.navigate_to_location(target)
     }
 
     /// Navigate to a specific file and position
-    fn navigate_to_location(&mut self, location: history::FileLocation) -> bool {
+    fn navigate_to_location(&mut self, location: history::FileLocation) -> Result<bool> {
         // Open file if needed (without recording - we're already in a navigation)
         if let Some(ref path) = location.path {
-            match self.tab_manager.open_file(path.clone()) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Failed to open file for navigation: {}", e);
-                    return false;
-                }
-            }
+            self.tab_manager.open_file(path.clone())
+                .context("Failed to open file for navigation")?;
         }
 
         // Set cursor position in active tab
         let plugin = self.active_plugin_mut();
         plugin.editor.input.set_cursor(location.position);
         self.ui_changed = true;
-        true
+        Ok(true)
     }
 
     /// Jump to a specific location (file path + line + column in UTF-8)
     /// This is the unified method for goto_definition, grep results, etc.
-    /// Returns true if successful, false if file couldn't be opened
     pub fn jump_to_location(
         &mut self,
         file_path: PathBuf,
         line: usize,
         column: usize,
         center: bool,
-    ) -> bool {
+    ) -> Result<()> {
         // Record current location before jumping
-        self.record_navigation();
+        self.record_navigation()?;
 
         // Canonicalize path to ensure it matches existing tabs
-        let canonical_path =
-            std::fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
+        let canonical_path = std::fs::canonicalize(&file_path)
+            .unwrap_or_else(|_| file_path.clone());
 
         // Open file (will switch to existing tab if already open)
-        if let Err(e) = self.tab_manager.open_file(canonical_path) {
-            eprintln!("Failed to open file for jump_to_location: {}", e);
-            return false;
-        }
+        self.tab_manager.open_file(canonical_path)
+            .context("Failed to open file for jump_to_location")?;
 
         // Set cursor to the position (already in UTF-8 doc coords)
         let plugin = self.active_plugin_mut();
@@ -498,7 +502,7 @@ impl EditorLogic {
             self.cursor_needs_centering = true;
         }
 
-        true
+        Ok(())
     }
 
     /// Jump to a location specified in UTF-16 coordinates (for LSP)
@@ -510,11 +514,11 @@ impl EditorLogic {
         center: bool,
     ) -> bool {
         // Record current location before jumping
-        self.record_navigation();
+        let _ = self.record_navigation();
 
         // Canonicalize path to ensure it matches existing tabs
-        let canonical_path =
-            std::fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
+        let canonical_path = std::fs::canonicalize(&file_path)
+            .unwrap_or_else(|_| file_path.clone());
 
         // Open file (will switch to existing tab if already open)
         if let Err(e) = self.tab_manager.open_file(canonical_path) {
@@ -524,7 +528,13 @@ impl EditorLogic {
 
         // Convert UTF-16 position to byte-based DocPos
         let (line, byte_column) = {
-            let tab = self.tab_manager.active_tab().expect("No active tab");
+            let tab = match self.tab_manager.active_tab() {
+                Some(t) => t,
+                None => {
+                    eprintln!("No active tab available");
+                    return false;
+                }
+            };
             let tree = tab.plugin.editor.view.doc.read();
             let utf16_point = tiny_tree::PointUtf16::new(line_utf16, column_utf16);
             tree.point_utf16_to_doc_pos(utf16_point)
@@ -547,8 +557,8 @@ impl EditorLogic {
     }
 
     /// Go to definition at current cursor position
-    pub fn goto_definition(&mut self) {
-        self.record_navigation();
+    pub fn goto_definition(&mut self) -> Result<()> {
+        self.record_navigation()?;
 
         let tab = self.tab_manager.active_tab_mut();
         let plugin = &tab.plugin;
@@ -567,6 +577,8 @@ impl EditorLogic {
         // Send the exact cursor position - let rust-analyzer figure out the identifier
         tab.diagnostics
             .request_goto_definition(cursor_utf16.row as usize, cursor_utf16.column as usize);
+
+        Ok(())
     }
 }
 
@@ -583,11 +595,12 @@ impl EditorLogic {
                 // Remove the empty initial tab if it exists
                 if self.tab_manager.len() > 1 {
                     // Find and remove the first tab if it's untitled and empty
-                    if let Some(first_tab) = self.tab_manager.tabs().get(0) {
-                        if first_tab.path().is_none() {
-                            // Close the empty tab (index 0)
-                            self.tab_manager.close_tab(0);
-                        }
+                    if self.tab_manager.tabs().get(0)
+                        .and_then(|t| t.path())
+                        .is_none()
+                    {
+                        // Close the empty tab (index 0)
+                        self.tab_manager.close_tab(0);
                     }
                 }
             }
@@ -600,49 +613,49 @@ impl EditorLogic {
 
     /// Check if document has unsaved changes by comparing content hash
     pub fn is_modified(&self) -> bool {
-        self.active_editor().is_modified()
+        self.active_editor().map(|e| e.is_modified()).unwrap_or(false)
     }
 
-    pub fn save(&mut self) -> std::io::Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         let tab = self.tab_manager.active_tab_mut();
         let plugin = &mut tab.plugin;
-        if let Some(ref path) = plugin.file_path {
-            io::autosave(&plugin.editor.view.doc, path)?;
 
-            // Update saved content hash
-            let current_text = plugin.editor.view.doc.read().flatten_to_string();
-            let mut hasher = AHasher::default();
-            current_text.hash(&mut hasher);
-            plugin.last_saved_content_hash = hasher.finish();
+        let path = plugin.file_path.as_ref()
+            .context("No file path set")?;
 
-            // Notify diagnostics manager of save
-            tab.diagnostics.document_saved(current_text.to_string());
+        io::autosave(&plugin.editor.view.doc, path)
+            .context("Failed to save file")?;
 
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No file path set",
-            ))
-        }
+        // Update saved content hash
+        let current_text = plugin.editor.view.doc.read().flatten_to_string();
+        let mut hasher = AHasher::default();
+        current_text.hash(&mut hasher);
+        plugin.last_saved_content_hash = hasher.finish();
+
+        // Notify diagnostics manager of save
+        tab.diagnostics.document_saved(current_text.to_string());
+
+        Ok(())
     }
 
     pub fn title(&self) -> String {
-        let plugin = self.active_editor();
-        let filename = if let Some(ref path) = plugin.file_path {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("Untitled")
-                .to_string()
-        } else {
-            "Demo Text".to_string()
+        let plugin = match self.active_editor() {
+            Ok(p) => p,
+            Err(_) => return "No active tab".to_string(),
         };
+
+        let filename = plugin.file_path.as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Untitled")
+            .to_string();
 
         let modified_marker = if self.is_modified() {
             " (modified)"
         } else {
             ""
         };
+
         format!("{}{}", filename, modified_marker)
     }
 

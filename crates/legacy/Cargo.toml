@@ -33,6 +33,7 @@ arc-swap = "1.7"  # Lock-free Arc swapping for RCU pattern
 lsp-server = "0.7"  # LSP client (official reference impl)
 lsp-types = "0.97"
 url = "2.5"  # URL parsing for LSP
+anyhow = "1.0"  # Error handling
 
 # System integration
 arboard = "3.4"  # Clipboard support

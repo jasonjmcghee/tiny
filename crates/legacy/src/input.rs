@@ -416,7 +416,10 @@ impl InputHandler {
         match event.name.as_str() {
             // Text insertion
             "editor.insert_char" => {
-                if let Some(ch) = event.data.get("char").and_then(|v| v.as_str()) {
+                let ch = event.data.get("char")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !ch.is_empty() {
                     self.insert_text(doc, ch)
                 } else {
                     InputAction::None
@@ -487,13 +490,12 @@ impl InputHandler {
 
     /// Handle mouse press events
     fn handle_mouse_press(&mut self, event: &Event, doc: &Doc, viewport: &Viewport) -> InputAction {
-        let (x, y) = match (
-            event.data.get("x").and_then(|v| v.as_f64()),
-            event.data.get("y").and_then(|v| v.as_f64()),
-        ) {
-            (Some(x), Some(y)) => (x, y),
-            _ => return InputAction::None,
-        };
+        let x = event.data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = event.data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        if x == 0.0 && y == 0.0 && event.data.get("x").is_none() {
+            return InputAction::None;
+        }
 
         let modifiers = event.data.get("modifiers");
         let shift_held = modifiers
@@ -534,15 +536,14 @@ impl InputHandler {
         doc: &Doc,
         viewport: &Viewport,
     ) -> InputAction {
-        let (from_x, from_y, to_x, to_y) = match (
-            event.data.get("from_x").and_then(|v| v.as_f64()),
-            event.data.get("from_y").and_then(|v| v.as_f64()),
-            event.data.get("to_x").and_then(|v| v.as_f64()),
-            event.data.get("to_y").and_then(|v| v.as_f64()),
-        ) {
-            (Some(fx), Some(fy), Some(tx), Some(ty)) => (fx, fy, tx, ty),
-            _ => return InputAction::None,
-        };
+        let from_x = event.data.get("from_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let from_y = event.data.get("from_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let to_x = event.data.get("to_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let to_y = event.data.get("to_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        if event.data.get("from_x").is_none() {
+            return InputAction::None;
+        }
 
         let alt_held = event
             .data
@@ -576,9 +577,7 @@ impl InputHandler {
         if extending_selection {
             // When extending, use selection anchor if available, or current cursor if not
             if self.selection_anchor.is_none() {
-                if let Some(sel) = self.selections.first() {
-                    self.selection_anchor = Some(sel.anchor);
-                }
+                self.selection_anchor = self.selections.first().map(|sel| sel.anchor);
             }
 
             // Update cursor while keeping anchor
@@ -802,18 +801,21 @@ impl InputHandler {
         self.goal_column = None;
         let tree = doc.read();
 
-        if let Some(sel) = self.selections.first() {
-            let new_pos = DocPos {
-                line: sel.cursor.line,
-                column: if to_end {
-                    tree.line_char_count(sel.cursor.line) as u32
-                } else {
-                    0
-                },
-                byte_offset: 0,
-            };
-            self.move_cursor_to(new_pos, extending_selection);
-        }
+        let sel = match self.selections.first() {
+            Some(sel) => sel,
+            None => return InputAction::None,
+        };
+
+        let new_pos = DocPos {
+            line: sel.cursor.line,
+            column: if to_end {
+                tree.line_char_count(sel.cursor.line) as u32
+            } else {
+                0
+            },
+            byte_offset: 0,
+        };
+        self.move_cursor_to(new_pos, extending_selection);
 
         InputAction::Redraw
     }
@@ -828,28 +830,31 @@ impl InputHandler {
 
         const PAGE_SIZE: u32 = 20;
 
-        if let Some(sel) = self.selections.first() {
-            let tree = doc.read();
-            let total_lines = tree.line_count();
+        let sel = match self.selections.first() {
+            Some(sel) => sel,
+            None => return InputAction::None,
+        };
 
-            let new_line = if up {
-                sel.cursor.line.saturating_sub(PAGE_SIZE)
-            } else {
-                (sel.cursor.line + PAGE_SIZE).min(total_lines.saturating_sub(1))
-            };
+        let tree = doc.read();
+        let total_lines = tree.line_count();
 
-            let line_length = tree.line_char_count(new_line) as u32;
-            let new_pos = DocPos {
-                line: new_line,
-                column: self
-                    .goal_column
-                    .unwrap_or(sel.cursor.column)
-                    .min(line_length),
-                byte_offset: 0,
-            };
+        let new_line = if up {
+            sel.cursor.line.saturating_sub(PAGE_SIZE)
+        } else {
+            (sel.cursor.line + PAGE_SIZE).min(total_lines.saturating_sub(1))
+        };
 
-            self.move_cursor_to(new_pos, extending_selection);
-        }
+        let line_length = tree.line_char_count(new_line) as u32;
+        let new_pos = DocPos {
+            line: new_line,
+            column: self
+                .goal_column
+                .unwrap_or(sel.cursor.column)
+                .min(line_length),
+            byte_offset: 0,
+        };
+
+        self.move_cursor_to(new_pos, extending_selection);
 
         InputAction::Redraw
     }
@@ -916,19 +921,22 @@ impl InputHandler {
             return;
         }
 
-        if let Some(ref syntax_hl) = self.syntax_highlighter {
-            let text_after = doc.read().flatten_to_string();
+        let syntax_hl = match self.syntax_highlighter.as_ref() {
+            Some(hl) => hl,
+            None => return,
+        };
 
-            // If we have multiple edits, we can't send them all to tree-sitter
-            // (it only accepts one InputEdit at a time), so reset the tree and do a fresh parse
-            if self.pending_text_edits.len() == 1 {
-                // Single edit - use incremental parsing
-                let edit = &self.pending_text_edits[0];
-                syntax_hl.request_update_with_edit(&text_after, doc.version(), Some(edit.clone()));
-            } else {
-                // Multiple edits - reset tree and do fresh parse
-                syntax_hl.request_update_with_reset(&text_after, doc.version(), None, true);
-            }
+        let text_after = doc.read().flatten_to_string();
+
+        // If we have multiple edits, we can't send them all to tree-sitter
+        // (it only accepts one InputEdit at a time), so reset the tree and do a fresh parse
+        if self.pending_text_edits.len() == 1 {
+            // Single edit - use incremental parsing
+            let edit = &self.pending_text_edits[0];
+            syntax_hl.request_update_with_edit(&text_after, doc.version(), Some(edit.clone()));
+        } else {
+            // Multiple edits - reset tree and do fresh parse
+            syntax_hl.request_update_with_reset(&text_after, doc.version(), None, true);
         }
 
         // Clear the pending syntax updates
@@ -972,9 +980,7 @@ impl InputHandler {
             self.pending_renderer_edits.push(edit.clone());
 
             // Apply incremental edit to renderer for stable typing
-            if let Some(renderer) = renderer.as_deref_mut() {
-                renderer.apply_incremental_edit(edit);
-            }
+            renderer.as_deref_mut().map(|r| r.apply_incremental_edit(edit));
         }
 
         // Apply all pending edits
@@ -1028,14 +1034,13 @@ impl InputHandler {
         const CLICK_POS_TOLERANCE: u32 = 2; // Allow 2 character tolerance for position
 
         let now = Instant::now();
-        let is_multi_click = if let (Some(last_time), Some(last_pos)) =
-            (self.last_click_time, self.last_click_pos)
-        {
-            now.duration_since(last_time) < DOUBLE_CLICK_TIME
-                && last_pos.line == doc_pos.line
-                && last_pos.column.abs_diff(doc_pos.column) <= CLICK_POS_TOLERANCE
-        } else {
-            false
+        let is_multi_click = match (self.last_click_time, self.last_click_pos) {
+            (Some(last_time), Some(last_pos)) => {
+                now.duration_since(last_time) < DOUBLE_CLICK_TIME
+                    && last_pos.line == doc_pos.line
+                    && last_pos.column.abs_diff(doc_pos.column) <= CLICK_POS_TOLERANCE
+            }
+            _ => false,
         };
 
         if is_multi_click {
@@ -1068,29 +1073,22 @@ impl InputHandler {
         // Normal click handling
         if shift_held {
             // Shift-click: extend selection from current position to click point
-            if let Some(sel) = self.selections.first() {
-                // Use existing anchor or cursor as the selection start
-                let anchor = if sel.anchor != sel.cursor {
+            let anchor = self.selections.first().map_or(doc_pos, |sel| {
+                if sel.anchor != sel.cursor {
                     // Already have a selection, keep its anchor
                     sel.anchor
                 } else {
                     // No selection yet, use current cursor as anchor
                     sel.cursor
-                };
-                // Don't set selection_anchor here - that's only for keyboard-based selection extension
-                self.selections = vec![Selection {
-                    cursor: doc_pos,
-                    anchor,
-                    id: self.next_id,
-                }];
-            } else {
-                // No existing selection, create one
-                self.selections = vec![Selection {
-                    cursor: doc_pos,
-                    anchor: doc_pos,
-                    id: self.next_id,
-                }];
-            }
+                }
+            });
+
+            // Don't set selection_anchor here - that's only for keyboard-based selection extension
+            self.selections = vec![Selection {
+                cursor: doc_pos,
+                anchor,
+                id: self.next_id,
+            }];
         } else if alt_held {
             // Alt-click: add a new cursor
             self.selections.push(Selection {
@@ -1198,15 +1196,21 @@ impl InputHandler {
 
     /// Copy selection to clipboard
     pub fn copy(&mut self, doc: &Doc) {
-        if let Some(sel) = self.selections.first().filter(|s| !s.is_cursor()) {
-            let text = doc.read().flatten_to_string();
-            let range = sel.byte_range(doc);
-            if range.end <= text.len() {
-                let selected = &text[range];
-                self.clipboard = Some(selected.to_string());
-                let _ = Clipboard::new().and_then(|mut c| c.set_text(selected));
-            }
+        let sel = match self.selections.first().filter(|s| !s.is_cursor()) {
+            Some(sel) => sel,
+            None => return,
+        };
+
+        let text = doc.read().flatten_to_string();
+        let range = sel.byte_range(doc);
+
+        if range.end > text.len() {
+            return;
         }
+
+        let selected = &text[range];
+        self.clipboard = Some(selected.to_string());
+        let _ = Clipboard::new().and_then(|mut c| c.set_text(selected));
     }
 
     /// Cut selection to clipboard
@@ -1237,30 +1241,33 @@ impl InputHandler {
             .and_then(|mut c| c.get_text().ok())
             .or_else(|| self.clipboard.clone());
 
-        if let Some(text) = text {
-            self.save_snapshot_to_history(doc);
+        let text = match text {
+            Some(t) => t,
+            None => return,
+        };
 
-            for sel in &self.selections {
-                if !sel.is_cursor() {
-                    self.pending_edits.push(Edit::Delete {
-                        range: sel.byte_range(doc),
-                    });
-                }
-                let tree = doc.read();
-                self.pending_edits.push(Edit::Insert {
-                    pos: tree.doc_pos_to_byte(sel.min_pos()),
-                    content: Content::Text(text.clone()),
+        self.save_snapshot_to_history(doc);
+
+        for sel in &self.selections {
+            if !sel.is_cursor() {
+                self.pending_edits.push(Edit::Delete {
+                    range: sel.byte_range(doc),
                 });
             }
+            let tree = doc.read();
+            self.pending_edits.push(Edit::Insert {
+                pos: tree.doc_pos_to_byte(sel.min_pos()),
+                content: Content::Text(text.clone()),
+            });
+        }
 
-            self.flush_pending_edits(doc);
+        self.flush_pending_edits(doc);
 
-            let advance_chars = text.chars().count() as u32;
-            for sel in &mut self.selections {
-                sel.cursor = sel.min_pos();
-                sel.cursor.column += advance_chars;
-                sel.anchor = sel.cursor;
-            }
+        let advance_chars = text.chars().count() as u32;
+        for sel in &mut self.selections {
+            sel.cursor = sel.min_pos();
+            sel.cursor.column += advance_chars;
+            sel.anchor = sel.cursor;
         }
     }
 
@@ -1486,26 +1493,28 @@ impl InputHandler {
             selections: self.selections.clone(),
         };
 
-        if let Some(prev) = self.history.undo(current_snapshot) {
-            doc.replace_tree(prev.tree.clone());
-            self.selections = prev.selections;
-            self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let prev = match self.history.undo(current_snapshot) {
+            Some(p) => p,
+            None => return false,
+        };
 
-            // Clear accumulated renderer edits - they're invalid for the undone tree
-            self.pending_renderer_edits.clear();
+        doc.replace_tree(prev.tree.clone());
+        self.selections = prev.selections;
+        self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
 
-            // Reset checkpoint time so next edit starts a new undo group
-            self.last_checkpoint_time = None;
+        // Clear accumulated renderer edits - they're invalid for the undone tree
+        self.pending_renderer_edits.clear();
 
-            // Request syntax update after undo (tree has changed significantly)
-            if let Some(ref syntax_hl) = self.syntax_highlighter {
-                let text = doc.read().flatten_to_string();
-                syntax_hl.request_update_with_reset(&text, doc.version(), None, true);
-            }
+        // Reset checkpoint time so next edit starts a new undo group
+        self.last_checkpoint_time = None;
 
-            return true;
+        // Request syntax update after undo (tree has changed significantly)
+        if let Some(ref syntax_hl) = self.syntax_highlighter {
+            let text = doc.read().flatten_to_string();
+            syntax_hl.request_update_with_reset(&text, doc.version(), None, true);
         }
-        false
+
+        true
     }
 
     /// Helper to convert byte offset to LSP Position
@@ -1569,26 +1578,28 @@ impl InputHandler {
             selections: self.selections.clone(),
         };
 
-        if let Some(next) = self.history.redo(current_snapshot) {
-            doc.replace_tree(next.tree.clone());
-            self.selections = next.selections;
-            self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let next = match self.history.redo(current_snapshot) {
+            Some(n) => n,
+            None => return false,
+        };
 
-            // Clear accumulated renderer edits - they're invalid for the redone tree
-            self.pending_renderer_edits.clear();
+        doc.replace_tree(next.tree.clone());
+        self.selections = next.selections;
+        self.next_id = self.selections.iter().map(|s| s.id).max().unwrap_or(0) + 1;
 
-            // Reset checkpoint time so next edit starts a new undo group
-            self.last_checkpoint_time = None;
+        // Clear accumulated renderer edits - they're invalid for the redone tree
+        self.pending_renderer_edits.clear();
 
-            // Request syntax update after redo (tree has changed significantly)
-            if let Some(ref syntax_hl) = self.syntax_highlighter {
-                let text = doc.read().flatten_to_string();
-                syntax_hl.request_update_with_reset(&text, doc.version(), None, true);
-            }
+        // Reset checkpoint time so next edit starts a new undo group
+        self.last_checkpoint_time = None;
 
-            return true;
+        // Request syntax update after redo (tree has changed significantly)
+        if let Some(ref syntax_hl) = self.syntax_highlighter {
+            let text = doc.read().flatten_to_string();
+            syntax_hl.request_update_with_reset(&text, doc.version(), None, true);
         }
-        false
+
+        true
     }
 }
 
