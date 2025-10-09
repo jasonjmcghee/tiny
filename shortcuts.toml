@@ -1,0 +1,465 @@
+# Keyboard Shortcuts Configuration
+# Format: "event.name" = "shortcut" or ["shortcut1", "shortcut2"]
+#
+# Each event can have one or more keyboard shortcuts.
+# Shortcuts use format: [modifier+]key where modifiers are cmd, ctrl, alt, shift
+#
+# All shortcuts emit events - components listen and stop propagation if they handle them.
+
+[shortcuts]
+# Font controls
+"app.font_increase" = "cmd+="
+"app.font_decrease" = "cmd+-"
+"app.font_reset" = "cmd+0"
+"app.toggle_scroll_lock" = "f12"
+
+# Editing commands (work in all text inputs)
+"editor.undo" = "cmd+z"
+"editor.redo" = "cmd+shift+z"
+"editor.copy" = "cmd+c"
+"editor.cut" = "cmd+x"
+"editor.paste" = "cmd+v"
+"editor.select_all" = "cmd+a"
+"editor.duplicate_line" = "cmd+d"
+"editor.delete_line" = "cmd+backspace"
+
+# Text editing basics (work in all text inputs)
+"editor.insert_space" = "space"
+"editor.delete_backward" = "backspace"
+"editor.delete_forward" = "delete"
+"editor.move_left" = "left"
+"editor.move_right" = "right"
+
+# Navigation keys - generic events, focused component decides behavior
+"navigate.up" = "up"
+"navigate.down" = "down"
+"action.cancel" = "escape"
+"action.submit" = "enter"
+
+# File operations
+"editor.save" = "cmd+s"
+"editor.save_all" = "cmd+alt+s"
+"tabs.close" = "cmd+w"
+"tabs.close_all" = "cmd+shift+w"
+"tabs.reopen" = "cmd+shift+t"
+"file.new" = "cmd+n"
+"file.rename" = "shift+f6"
+"file.delete" = "delete"
+
+# Code navigation
+"navigation.goto_definition" = "cmd+b"
+"navigation.goto_implementation" = "cmd+alt+b"
+"navigation.goto_type_definition" = "cmd+shift+b"
+"navigation.goto_declaration" = "cmd+shift+b"
+"navigation.back" = "cmd+["
+"navigation.forward" = "cmd+]"
+"navigation.goto_line" = "cmd+l"
+"navigation.goto_symbol" = "cmd+alt+o"
+"navigation.goto_file" = "cmd+shift+o"
+"navigation.recent_files" = "cmd+e"
+"navigation.recent_locations" = "cmd+shift+e"
+"navigation.next_error" = "f2"
+"navigation.prev_error" = "shift+f2"
+"navigation.next_method" = "alt+down"
+"navigation.prev_method" = "alt+up"
+
+# Code actions
+"editor.code_action" = "alt+enter"
+"editor.show_quick_fixes" = "alt+enter"
+"editor.show_intention_actions" = "alt+enter"
+"editor.generate" = "cmd+n"
+"editor.surround_with" = "cmd+alt+t"
+"editor.unwrap" = "cmd+shift+delete"
+
+# Text input
+"editor.insert_newline" = "enter"
+"editor.insert_tab" = "tab"
+"editor.unindent" = "shift+tab"
+"editor.insert_newline_above" = "cmd+alt+enter"
+"editor.insert_newline_below" = "shift+enter"
+"editor.split_line" = "cmd+enter"
+
+# Arrow keys
+"editor.move_up" = "up"
+"editor.move_down" = "down"
+
+# Selection
+"editor.extend_left" = "shift+left"
+"editor.extend_right" = "shift+right"
+"editor.extend_up" = "shift+up"
+"editor.extend_down" = "shift+down"
+"editor.select_word" = "alt+up"
+"editor.extend_selection" = "alt+up"
+"editor.shrink_selection" = "alt+down"
+"editor.select_next_occurrence" = "cmd+g"
+"editor.select_all_occurrences" = "cmd+shift+g"
+"editor.unselect_occurrence" = "cmd+shift+g"
+
+# Word navigation
+"editor.move_word_left" = "alt+left"
+"editor.move_word_right" = "alt+right"
+"editor.extend_word_left" = "shift+alt+left"
+"editor.extend_word_right" = "shift+alt+right"
+"editor.delete_word_left" = "alt+backspace"
+"editor.delete_word_right" = "alt+delete"
+
+# Line navigation
+"editor.move_line_start" = "home"
+"editor.move_line_end" = "end"
+"editor.move_line_start_smart" = "cmd+left"
+"editor.move_line_end_smart" = "cmd+right"
+"editor.extend_line_start" = "shift+home"
+"editor.extend_line_end" = "shift+end"
+"editor.extend_line_start_smart" = "cmd+shift+left"
+"editor.extend_line_end_smart" = "cmd+shift+right"
+
+# Document navigation
+"editor.move_document_start" = "cmd+home"
+"editor.move_document_end" = "cmd+end"
+"editor.extend_document_start" = "cmd+shift+home"
+"editor.extend_document_end" = "cmd+shift+end"
+"editor.scroll_up" = "cmd+up"
+"editor.scroll_down" = "cmd+down"
+
+# Page navigation
+"editor.page_up" = "pageup"
+"editor.page_down" = "pagedown"
+"editor.extend_page_up" = "shift+pageup"
+"editor.extend_page_down" = "shift+pagedown"
+
+# Line manipulation
+"editor.move_line_up" = "alt+shift+up"
+"editor.move_line_down" = "alt+shift+down"
+"editor.join_lines" = "cmd+shift+j"
+"editor.toggle_comment" = "cmd+/"
+"editor.toggle_block_comment" = "cmd+alt+/"
+
+# Code formatting
+"editor.format_document" = "cmd+alt+l"
+"editor.format_selection" = "cmd+alt+shift+l"
+"editor.optimize_imports" = "cmd+alt+o"
+"editor.auto_indent" = "cmd+alt+i"
+
+# Search
+"editor.search" = "cmd+f"
+"editor.replace" = "cmd+r"
+"editor.find_next" = "cmd+g"
+"editor.find_previous" = "cmd+shift+g"
+"editor.find_in_path" = "cmd+shift+f"
+"editor.replace_in_path" = "cmd+shift+r"
+
+# Refactoring
+"refactor.rename" = "shift+f6"
+"refactor.extract_method" = "cmd+alt+m"
+"refactor.extract_variable" = "cmd+alt+v"
+"refactor.extract_constant" = "cmd+alt+c"
+"refactor.extract_field" = "cmd+alt+f"
+"refactor.extract_parameter" = "cmd+alt+p"
+"refactor.inline" = "cmd+alt+n"
+"refactor.change_signature" = "cmd+f6"
+"refactor.move" = "f6"
+"refactor.copy" = "f5"
+"refactor.safe_delete" = "cmd+delete"
+
+# Open pickers
+"file_picker.open" = "shift shift"
+"command_palette.open" = "cmd+shift+p"
+"symbol_picker.open" = "cmd+alt+shift+n"
+"action_picker.open" = "cmd+shift+a"
+"grep.open" = "cmd+shift+f"
+"quick_switch.open" = "ctrl+tab"
+
+# View controls
+"view.toggle_sidebar" = "cmd+1"
+"view.toggle_terminal" = "alt+f12"
+"view.toggle_debug" = "cmd+5"
+"view.toggle_run" = "cmd+4"
+"view.toggle_structure" = "cmd+7"
+"view.toggle_problems" = "cmd+6"
+"view.fullscreen" = "cmd+ctrl+f"
+"view.distraction_free" = "cmd+shift+f12"
+"view.presentation_mode" = "cmd+alt+shift+p"
+
+# Tab navigation
+"tabs.next" = "cmd+shift+]"
+"tabs.previous" = "cmd+shift+["
+"tabs.goto_1" = "cmd+1"
+"tabs.goto_2" = "cmd+2"
+"tabs.goto_3" = "cmd+3"
+"tabs.goto_4" = "cmd+4"
+"tabs.goto_5" = "cmd+5"
+"tabs.goto_6" = "cmd+6"
+"tabs.goto_7" = "cmd+7"
+"tabs.goto_8" = "cmd+8"
+"tabs.goto_9" = "cmd+9"
+"tabs.goto_last" = "cmd+9"
+
+# Build & Run
+"build.project" = "cmd+f9"
+"build.run" = "shift+f10"
+"build.debug" = "shift+f9"
+"build.stop" = "cmd+f2"
+"build.run_context" = "ctrl+shift+r"
+"build.debug_context" = "ctrl+shift+d"
+
+# Debug
+"debug.toggle_breakpoint" = "cmd+f8"
+"debug.step_over" = "f8"
+"debug.step_into" = "f7"
+"debug.step_out" = "shift+f8"
+"debug.resume" = "cmd+alt+r"
+"debug.evaluate" = "alt+f8"
+"debug.toggle_breakpoint_enabled" = "cmd+shift+f8"
+
+# VCS/Git
+"vcs.commit" = "cmd+k"
+"vcs.push" = "cmd+shift+k"
+"vcs.update" = "cmd+t"
+"vcs.show_diff" = "cmd+d"
+"vcs.show_history" = "cmd+alt+h"
+"vcs.annotate" = "cmd+alt+a"
+"vcs.rollback" = "cmd+alt+z"
+
+# Bookmarks
+"bookmark.toggle" = "f3"
+"bookmark.toggle_with_mnemonic" = "alt+f3"
+"bookmark.show_all" = "cmd+f3"
+"bookmark.next" = "cmd+alt+down"
+"bookmark.prev" = "cmd+alt+up"
+
+# Tool windows
+"tool.hide_all" = "cmd+shift+f12"
+"tool.maximize" = "cmd+shift+f12"
+"tool.stretch_width" = "cmd+alt+shift+left"
+"tool.shrink_width" = "cmd+alt+shift+right"
+
+# Quick documentation
+"documentation.show" = "f1"
+"documentation.quick" = "ctrl+j"
+"parameter_info.show" = "cmd+p"
+
+# Macro
+"macro.start_recording" = "cmd+alt+r"
+"macro.stop_recording" = "cmd+alt+r"
+"macro.play" = "cmd+alt+p"
+
+# Multiple cursors
+"cursor.add_above" = "cmd+alt+up"
+"cursor.add_below" = "cmd+alt+down"
+"cursor.add_at_click" = "alt+click"
+"cursor.remove" = "escape"
+
+# Folding
+"fold.collapse" = "cmd+-"
+"fold.expand" = "cmd+="
+"fold.collapse_all" = "cmd+shift+-"
+"fold.expand_all" = "cmd+shift+="
+"fold.collapse_recursively" = "cmd+alt+-"
+"fold.expand_recursively" = "cmd+alt+="
+
+# Vim mode toggle
+"vim.toggle" = "cmd+alt+v"
+
+[vim.normal]
+# Motion
+"motion.left" = "h"
+"motion.down" = "j"
+"motion.up" = "k"
+"motion.right" = "l"
+"motion.word_forward" = "w"
+"motion.word_backward" = "b"
+"motion.word_end" = "e"
+"motion.word_forward_big" = "W"
+"motion.word_backward_big" = "B"
+"motion.word_end_big" = "E"
+"motion.line_start" = "0"
+"motion.line_first_non_blank" = "^"
+"motion.line_end" = "$"
+"motion.goto_line" = "G"
+"motion.goto_line_first" = "g g"
+"motion.half_page_up" = "ctrl+u"
+"motion.half_page_down" = "ctrl+d"
+"motion.full_page_up" = "ctrl+b"
+"motion.full_page_down" = "ctrl+f"
+"motion.screen_top" = "H"
+"motion.screen_middle" = "M"
+"motion.screen_bottom" = "L"
+"motion.matching_bracket" = "%"
+"motion.find_char" = "f"
+"motion.find_char_backward" = "F"
+"motion.till_char" = "t"
+"motion.till_char_backward" = "T"
+"motion.repeat_find" = ";"
+"motion.repeat_find_reverse" = ","
+"motion.paragraph_forward" = "}"
+"motion.paragraph_backward" = "{"
+"motion.sentence_forward" = ")"
+"motion.sentence_backward" = "("
+
+# Editing
+"editor.insert_mode" = "i"
+"editor.insert_mode_start" = "I"
+"editor.append_mode" = "a"
+"editor.append_mode_end" = "A"
+"editor.open_line_below" = "o"
+"editor.open_line_above" = "O"
+"editor.change_line" = "c c"
+"editor.change_to_end" = "C"
+"editor.delete_line" = "d d"
+"editor.delete_to_end" = "D"
+"editor.delete_char" = "x"
+"editor.delete_char_backward" = "X"
+"editor.replace_char" = "r"
+"editor.replace_mode" = "R"
+"editor.join_lines" = "J"
+"editor.yank_line" = "y y"
+"editor.yank_to_end" = "Y"
+"editor.paste_after" = "p"
+"editor.paste_before" = "P"
+"editor.undo" = "u"
+"editor.redo" = "ctrl+r"
+"editor.repeat" = "."
+"editor.substitute_char" = "s"
+"editor.substitute_line" = "S"
+
+# Delete motions
+"editor.delete.word" = "d w"
+"editor.delete.word_backward" = "d b"
+"editor.delete.word_end" = "d e"
+"editor.delete.word_big" = "d W"
+"editor.delete.line_end" = "d $"
+"editor.delete.line_start" = "d 0"
+"editor.delete.line_first_non_blank" = "d ^"
+"editor.delete.inner_word" = "d i w"
+"editor.delete.around_word" = "d a w"
+"editor.delete.inner_paragraph" = "d i p"
+"editor.delete.around_paragraph" = "d a p"
+"editor.delete.inner_paren" = "d i ("
+"editor.delete.around_paren" = "d a ("
+"editor.delete.inner_bracket" = "d i ["
+"editor.delete.around_bracket" = "d a ["
+"editor.delete.inner_brace" = "d i {"
+"editor.delete.around_brace" = "d a {"
+"editor.delete.inner_angle" = "d i <"
+"editor.delete.around_angle" = "d a <"
+"editor.delete.inner_quote" = "d i \""
+"editor.delete.around_quote" = "d a \""
+"editor.delete.inner_single_quote" = "d i '"
+"editor.delete.around_single_quote" = "d a '"
+"editor.delete.inner_backtick" = "d i `"
+"editor.delete.around_backtick" = "d a `"
+"editor.delete.inner_tag" = "d i t"
+"editor.delete.around_tag" = "d a t"
+
+# Change motions
+"editor.change.word" = "c w"
+"editor.change.word_backward" = "c b"
+"editor.change.word_end" = "c e"
+"editor.change.word_big" = "c W"
+"editor.change.line_end" = "c $"
+"editor.change.line_start" = "c 0"
+"editor.change.inner_word" = "c i w"
+"editor.change.around_word" = "c a w"
+"editor.change.inner_paren" = "c i ("
+"editor.change.around_paren" = "c a ("
+"editor.change.inner_bracket" = "c i ["
+"editor.change.around_bracket" = "c a ["
+"editor.change.inner_brace" = "c i {"
+"editor.change.around_brace" = "c a {"
+"editor.change.inner_quote" = "c i \""
+"editor.change.around_quote" = "c a \""
+
+# Yank motions
+"editor.yank.word" = "y w"
+"editor.yank.word_backward" = "y b"
+"editor.yank.line_end" = "y $"
+"editor.yank.line_start" = "y 0"
+"editor.yank.inner_word" = "y i w"
+"editor.yank.around_word" = "y a w"
+"editor.yank.inner_paren" = "y i ("
+"editor.yank.around_paren" = "y a ("
+"editor.yank.inner_bracket" = "y i ["
+"editor.yank.around_bracket" = "y a ["
+"editor.yank.inner_brace" = "y i {"
+"editor.yank.around_brace" = "y a {"
+
+# Visual mode
+"visual.mode" = "v"
+"visual.line_mode" = "V"
+"visual.block_mode" = "ctrl+v"
+
+# Search
+"search.forward" = "/"
+"search.backward" = "?"
+"search.next" = "n"
+"search.previous" = "N"
+"search.word_under_cursor" = "*"
+"search.word_under_cursor_backward" = "#"
+
+# Marks and jumps
+"mark.set" = "m"
+"mark.goto" = "'"
+"mark.goto_exact" = "`"
+"jump.prev" = "ctrl+o"
+"jump.next" = "ctrl+i"
+"jump.change_prev" = "g ;"
+"jump.change_next" = "g ,"
+
+# Indentation
+"indent.increase" = ">"
+"indent.decrease" = "<"
+"indent.line_increase" = "> >"
+"indent.line_decrease" = "< <"
+
+# Case
+"case.toggle" = "~"
+"case.upper" = "g U"
+"case.lower" = "g u"
+"case.upper_line" = "g U U"
+"case.lower_line" = "g u u"
+
+# Macros
+"macro.record" = "q"
+"macro.play" = "@"
+"macro.replay_last" = "@ @"
+
+# Registers
+"register.select" = "\""
+
+# Scrolling
+"scroll.center_cursor" = "z z"
+"scroll.top_cursor" = "z t"
+"scroll.bottom_cursor" = "z b"
+
+# Ex commands
+"ex.command" = ":"
+"ex.write" = ": w"
+"ex.quit" = ": q"
+"ex.write_quit" = ": w q"
+"ex.quit_all" = ": q a"
+"ex.force_quit" = ": q !"
+
+[vim.insert]
+"editor.escape" = "escape"
+"editor.escape_alt" = "ctrl+["
+"editor.escape_alt2" = "ctrl+c"
+
+[vim.visual]
+"visual.delete" = "d"
+"visual.change" = "c"
+"visual.yank" = "y"
+"visual.paste" = "p"
+"visual.indent" = ">"
+"visual.unindent" = "<"
+"visual.join" = "J"
+"visual.upper" = "U"
+"visual.lower" = "u"
+"visual.toggle_case" = "~"
+"visual.escape" = "escape"
+"visual.to_normal" = "v"
+
+[vim.command]
+"command.execute" = "enter"
+"command.cancel" = "escape"
+"command.history_prev" = "up"
+"command.history_next" = "down"
