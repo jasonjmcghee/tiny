@@ -97,19 +97,21 @@ impl ServiceRegistry {
     /// Get a service by type
     pub fn get<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         let type_id = TypeId::of::<T>();
-        // eprintln!(
-        //     "Looking for service with TypeId: {:?} for type: {}",
-        //     type_id,
-        //     std::any::type_name::<T>()
-        // );
-        // eprintln!("Registry contains {} services", self.services.len());
-        // for (id, _) in &self.services {
-        //     eprintln!("  - Service TypeId: {:?}", id);
-        // }
+        let result =
+            self.services
+                .get(&type_id)
+                .and_then(|service| match service.clone().downcast::<T>() {
+                    Ok(arc) => Some(arc),
+                    Err(_) => {
+                        eprintln!("[ServiceRegistry] Downcast FAILED!");
+                        None
+                    }
+                });
 
-        self.services
-            .get(&type_id)
-            .and_then(|service| service.clone().downcast::<T>().ok())
+        if result.is_none() {
+            eprintln!("[ServiceRegistry] get() returning None");
+        }
+        result
     }
 
     /// Check if a service is registered

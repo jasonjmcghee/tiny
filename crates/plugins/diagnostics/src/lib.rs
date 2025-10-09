@@ -23,7 +23,7 @@ use tiny_sdk::{
         VertexFormat,
     },
     types::RoundedRectInstance,
-    Capability, Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
+    Configurable, Initializable, LayoutPos, Library, PaintContext, Paintable, Plugin,
     PluginError, SetupContext, ViewportInfo,
 };
 use tiny_ui::{TextView, Viewport};
@@ -75,6 +75,9 @@ pub struct DiagnosticsConfig {
     pub popup_text_color: u32,
     pub popup_border_color: u32,
     pub popup_padding: f32,
+    pub error_color: u32,
+    pub warning_color: u32,
+    pub info_color: u32,
 }
 
 impl Default for DiagnosticsConfig {
@@ -82,8 +85,11 @@ impl Default for DiagnosticsConfig {
         Self {
             popup_background_color: 0x2D2D30FF, // Dark gray
             popup_text_color: 0xCCCCCCFF,       // Light gray
-            popup_border_color: 0x46464780,     // Border gray
+            popup_border_color: 0x464647FF,     // Border gray
             popup_padding: 8.0,
+            error_color: 0xFF4444A0,            // Red
+            warning_color: 0xFFCC00A0,          // Yellow/Orange
+            info_color: 0x4444FFA0,             // Blue
         }
     }
 }
@@ -121,8 +127,6 @@ pub struct DiagnosticsPlugin {
     // Line text cache for accurate width calculation
     line_texts: HashMap<usize, String>,
 
-    // Current mouse position (screen coordinates)
-    mouse_position: (f32, f32),
     // Mouse position in layout/document space (for diagnostic hit testing)
     mouse_layout_x: f32,
     mouse_line: Option<usize>,
@@ -139,6 +143,9 @@ pub struct DiagnosticsPlugin {
 
     // Cache tracking for invalidation
     last_font_size: f32,
+
+    // Font system for text layout (stored to avoid ServiceRegistry TypeId issues)
+    font_system: Option<Arc<SharedFontSystem>>,
 
     // GPU resources (RwLock for interior mutability in paint())
     vertex_buffer: RwLock<Option<Buffer>>,
@@ -209,7 +216,6 @@ impl DiagnosticsPlugin {
             hover_state: HoverState::None,
             hover_start_time: None,
             last_hover_request: None,
-            mouse_position: (0.0, 0.0),
             mouse_layout_x: 0.0,
             mouse_line: None,
             mouse_column: None,
@@ -229,6 +235,7 @@ impl DiagnosticsPlugin {
                 global_margin: LayoutPos::new(0.0, 0.0),
             },
             last_font_size: 14.0,
+            font_system: None,
             vertex_buffer: RwLock::new(None),
             vertex_buffer_id: RwLock::new(None),
             custom_pipeline_id: None,
@@ -252,51 +259,6 @@ impl DiagnosticsPlugin {
         // Clear diagnostics when positions become invalid
         // Host must re-add diagnostics with new positions from updated layout
         self.diagnostics.clear();
-    }
-
-    /// Update mouse position for hover detection (in editor-local coordinates)
-    pub fn set_mouse_position(
-        &mut self,
-        x: f32,
-        y: f32,
-        widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
-        services: Option<&tiny_sdk::ServiceRegistry>,
-    ) {
-        self.mouse_position = (x, y);
-
-        // Calculate document position from mouse coordinates
-        if let Some(widget_viewport) = widget_viewport {
-            let widget_offset_y = widget_viewport.bounds.y.0;
-            let widget_scroll_y = widget_viewport.scroll.y.0;
-            let widget_offset_x = widget_viewport.bounds.x.0;
-            let widget_scroll_x = widget_viewport.scroll.x.0;
-
-            // Convert mouse position to document coordinates
-            let local_mouse_x = x - widget_offset_x;
-            let local_mouse_y = y - widget_offset_y;
-
-            // Calculate line number
-            let doc_y = local_mouse_y + widget_scroll_y;
-            let line = (doc_y / self.viewport.line_height) as usize;
-
-            // Calculate column using font metrics
-            if let Some(services) = services {
-                if let Some(font_service) = services.get::<SharedFontSystem>() {
-                    let char_width = font_service.char_width_coef() * self.viewport.font_size;
-                    let doc_x = local_mouse_x + widget_scroll_x;
-                    let column = (doc_x / char_width) as usize;
-
-                    // Store layout-space X coordinate for diagnostic hit testing
-                    self.mouse_layout_x = doc_x;
-
-                    self.mouse_line = Some(line);
-                    self.mouse_column = Some(column);
-                }
-            }
-        }
-
-        // Update hover state
-        self.update_hover_state();
     }
 
     /// Update hover state based on current mouse position
@@ -554,8 +516,8 @@ impl DiagnosticsPlugin {
             .unwrap_or(self.viewport.logical_size.height.0);
 
         // Overview ruler dimensions
-        let ruler_width = 8.0;
-        let ruler_x = viewport_width - ruler_width - 8.0; // 2px padding from right edge
+        let ruler_width = 16.0;
+        let ruler_x = viewport_width - ruler_width - 4.0; // 2px padding from right edge
         let marker_height = 3.0;
 
         for diagnostic in &self.diagnostics {
@@ -569,11 +531,11 @@ impl DiagnosticsPlugin {
             let screen_width = ruler_width * scale;
             let screen_height = marker_height * scale;
 
-            // Color based on severity
+            // Color based on severity (from config)
             let color = match diagnostic.severity {
-                DiagnosticSeverity::Error => 0xFF4444a0,   // Red
-                DiagnosticSeverity::Warning => 0xFFCC00a0, // Yellow/Orange
-                DiagnosticSeverity::Info => 0x4444FFa0,    // Blue
+                DiagnosticSeverity::Error => self.config.error_color,
+                DiagnosticSeverity::Warning => self.config.warning_color,
+                DiagnosticSeverity::Info => self.config.info_color,
             };
 
             // Create quad (2 triangles)
@@ -624,12 +586,12 @@ impl DiagnosticsPlugin {
         anchor_line: usize,
         anchor_x: f32, // Precise X position in layout space (REQUIRED)
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
-        services: Option<&tiny_sdk::ServiceRegistry>,
+        _services: Option<&tiny_sdk::ServiceRegistry>,
     ) {
-        // Get font service
-        let font_service = services
-            .and_then(|s| s.get::<SharedFontSystem>())
-            .expect("Font service required for popup rendering");
+        // Get font service from stored reference (avoids ServiceRegistry TypeId mismatch)
+        let font_service = self.font_system.as_ref().expect(
+            "Font system must be set via set_font_system Library call before popup rendering",
+        );
 
         // Get widget bounds and scroll
         let widget_bounds = widget_viewport
@@ -787,59 +749,67 @@ impl Library for DiagnosticsPlugin {
     fn call(&mut self, method: &str, args: &[u8]) -> Result<Vec<u8>, PluginError> {
         match method {
             "set_viewport_info" => {
-                let viewport_info_size = std::mem::size_of::<ViewportInfo>();
-                if args.len() < viewport_info_size {
-                    return Err(PluginError::Other("Invalid viewport args".into()));
-                }
-
-                let viewport_info: &ViewportInfo =
-                    bytemuck::from_bytes(&args[0..viewport_info_size]);
-                self.set_viewport_info(*viewport_info);
+                let viewport_info = bytemuck::pod_read_unaligned::<ViewportInfo>(args);
+                self.set_viewport_info(viewport_info);
                 Ok(Vec::new())
             }
-            "set_mouse_position" => {
-                if args.len() < 8 {
-                    return Err(PluginError::Other("Invalid mouse position args".into()));
+            "detect_hover" => {
+                // Format: line (u32), column (u32), layout_x (f32)
+                #[repr(C)]
+                #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+                struct DetectHoverArgs {
+                    line: u32,
+                    column: u32,
+                    layout_x: f32,
                 }
 
-                let x = f32::from_le_bytes(args[0..4].try_into().unwrap());
-                let y = f32::from_le_bytes(args[4..8].try_into().unwrap());
-                // Store the mouse position directly since we need cached viewport/services from paint()
-                self.mouse_position = (x, y);
-                // Note: actual hover detection will happen in paint() when we have viewport/services
+                let detect_args = bytemuck::pod_read_unaligned::<DetectHoverArgs>(args);
+
+                self.mouse_line = Some(detect_args.line as usize);
+                self.mouse_column = Some(detect_args.column as usize);
+                self.mouse_layout_x = detect_args.layout_x;
+
+                self.update_hover_state();
                 Ok(Vec::new())
             }
             "add_diagnostic" => {
-                // Format: line (u32), col_start (u32), col_end (u32), severity (u8),
-                //         start_x (f32), end_x (f32), message_len (u32), message (bytes)
-                if args.len() < 25 {
-                    return Err(PluginError::Other("Invalid diagnostic args".into()));
+                #[repr(C)]
+                #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+                struct DiagnosticHeader {
+                    line: u32,
+                    col_start: u32,
+                    col_end: u32,
+                    severity: u8,
+                    _pad: [u8; 3],
+                    start_x: f32,
+                    end_x: f32,
+                    message_len: u32,
                 }
 
-                let line: u32 = *bytemuck::from_bytes(&args[0..4]);
-                let col_start: u32 = *bytemuck::from_bytes(&args[4..8]);
-                let col_end: u32 = *bytemuck::from_bytes(&args[8..12]);
-                let severity = match args[12] {
+                const HEADER_SIZE: usize = std::mem::size_of::<DiagnosticHeader>();
+
+                let header = bytemuck::pod_read_unaligned::<DiagnosticHeader>(&args[0..HEADER_SIZE]);
+
+                let severity = match header.severity {
                     0 => DiagnosticSeverity::Error,
                     1 => DiagnosticSeverity::Warning,
                     _ => DiagnosticSeverity::Info,
                 };
-                let start_x: f32 = *bytemuck::from_bytes(&args[13..17]);
-                let end_x: f32 = *bytemuck::from_bytes(&args[17..21]);
-                let message_len: u32 = *bytemuck::from_bytes(&args[21..25]);
 
-                if args.len() < 25 + message_len as usize {
+                if args.len() < HEADER_SIZE + header.message_len as usize {
                     return Err(PluginError::Other("Invalid message length".into()));
                 }
 
-                let message =
-                    String::from_utf8_lossy(&args[25..25 + message_len as usize]).to_string();
+                let message = String::from_utf8_lossy(
+                    &args[HEADER_SIZE..HEADER_SIZE + header.message_len as usize],
+                )
+                .to_string();
 
                 self.diagnostics.push(Diagnostic {
-                    line: line as usize,
-                    column_range: (col_start as usize, col_end as usize),
-                    start_x,
-                    end_x,
+                    line: header.line as usize,
+                    column_range: (header.col_start as usize, header.col_end as usize),
+                    start_x: header.start_x,
+                    end_x: header.end_x,
                     message,
                     severity,
                 });
@@ -877,7 +847,7 @@ impl Library for DiagnosticsPlugin {
                     return Err(PluginError::Other("Invalid symbols args".into()));
                 }
 
-                let count: u32 = *bytemuck::from_bytes(&args[0..4]);
+                let count = u32::from_le_bytes(args[0..4].try_into().unwrap());
                 self.symbols.clear();
                 self.symbols.reserve(count as usize);
 
@@ -887,12 +857,12 @@ impl Library for DiagnosticsPlugin {
                         return Err(PluginError::Other("Invalid symbol data".into()));
                     }
 
-                    let line: u32 = *bytemuck::from_bytes(&args[offset..offset + 4]);
-                    let col_start: u32 = *bytemuck::from_bytes(&args[offset + 4..offset + 8]);
-                    let col_end: u32 = *bytemuck::from_bytes(&args[offset + 8..offset + 12]);
-                    let start_x: f32 = *bytemuck::from_bytes(&args[offset + 12..offset + 16]);
-                    let end_x: f32 = *bytemuck::from_bytes(&args[offset + 16..offset + 20]);
-                    let kind_len: u32 = *bytemuck::from_bytes(&args[offset + 20..offset + 24]);
+                    let line = u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap());
+                    let col_start = u32::from_le_bytes(args[offset + 4..offset + 8].try_into().unwrap());
+                    let col_end = u32::from_le_bytes(args[offset + 8..offset + 12].try_into().unwrap());
+                    let start_x = f32::from_le_bytes(args[offset + 12..offset + 16].try_into().unwrap());
+                    let end_x = f32::from_le_bytes(args[offset + 16..offset + 20].try_into().unwrap());
+                    let kind_len = u32::from_le_bytes(args[offset + 20..offset + 24].try_into().unwrap());
 
                     offset += 24;
                     if args.len() < offset + kind_len as usize {
@@ -908,7 +878,7 @@ impl Library for DiagnosticsPlugin {
                             "Invalid symbol name length header".into(),
                         ));
                     }
-                    let name_len: u32 = *bytemuck::from_bytes(&args[offset..offset + 4]);
+                    let name_len = u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap());
                     offset += 4;
 
                     if args.len() < offset + name_len as usize {
@@ -959,6 +929,35 @@ impl Library for DiagnosticsPlugin {
                 self.set_document(doc);
                 Ok(Vec::new())
             }
+            "set_font_system" => {
+                // Format: font_system_ptr (u64)
+                if args.len() < 8 {
+                    return Err(PluginError::Other(
+                        "Invalid font system pointer args".into(),
+                    ));
+                }
+
+                let ptr = u64::from_le_bytes(args[0..8].try_into().unwrap());
+                if ptr == 0 {
+                    self.font_system = None;
+                } else {
+                    let font_system = unsafe { &*(ptr as *const Arc<SharedFontSystem>) };
+                    self.font_system = Some(font_system.clone());
+                }
+                Ok(Vec::new())
+            }
+            "check_hover_request" => {
+                // Check if plugin wants to request hover info
+                // Returns 8 bytes: line (u32), column (u32) if hover should be requested, empty otherwise
+                if let Some((line, column)) = self.update() {
+                    let mut result = Vec::with_capacity(8);
+                    result.extend_from_slice(&(line as u32).to_le_bytes());
+                    result.extend_from_slice(&(column as u32).to_le_bytes());
+                    Ok(result)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
             _ => Err(PluginError::Other("Unknown method".into())),
         }
     }
@@ -990,53 +989,57 @@ impl Paintable for DiagnosticsPlugin {
             let required_size = vertex_data.len() as u64;
 
             // Recreate buffer if it's too small
-            if let Some(device) = &self.device {
-                let needs_new_buffer = {
-                    let buffer = self.vertex_buffer.read().unwrap();
-                    buffer.is_none()
-                        || buffer
-                            .as_ref()
-                            .map(|b| b.size() < required_size)
-                            .unwrap_or(true)
-                };
+            let device = self.device.as_ref()
+                .expect("Device must be set after initialization");
 
-                if needs_new_buffer {
-                    // Create new buffer with exact size needed (plus some padding)
-                    let buffer_size = (required_size + 1024).max(required_size * 2); // Add padding for growth
-                    let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Diagnostics Vertex Buffer (Dynamic)"),
-                        size: buffer_size,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    *self.vertex_buffer.write().unwrap() = Some(new_buffer);
+            let needs_new_buffer = {
+                let buffer = self.vertex_buffer.read()
+                    .expect("Failed to acquire read lock on vertex_buffer");
+                buffer.is_none()
+                    || buffer
+                        .as_ref()
+                        .map(|b| b.size() < required_size)
+                        .unwrap_or(true)
+            };
 
-                    let new_buffer_id = BufferId::create(
-                        buffer_size,
-                        wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    );
-                    *self.vertex_buffer_id.write().unwrap() = Some(new_buffer_id);
-                }
+            if needs_new_buffer {
+                // Create new buffer with exact size needed (plus some padding)
+                let buffer_size = (required_size + 1024).max(required_size * 2); // Add padding for growth
+                let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Diagnostics Vertex Buffer (Dynamic)"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                *self.vertex_buffer.write()
+                    .expect("Failed to acquire write lock on vertex_buffer") = Some(new_buffer);
+
+                let new_buffer_id = BufferId::create(
+                    buffer_size,
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                );
+                *self.vertex_buffer_id.write()
+                    .expect("Failed to acquire write lock on vertex_buffer_id") = Some(new_buffer_id);
             }
 
-            if let Some(buffer_id) = self.vertex_buffer_id.read().unwrap().as_ref() {
-                buffer_id.write(0, vertex_data);
+            let buffer_id_guard = self.vertex_buffer_id.read()
+                .expect("Failed to acquire read lock on vertex_buffer_id");
 
-                if let Some(ref gpu_ctx) = ctx.gpu_context {
-                    if let Some(pipeline_id) = self.custom_pipeline_id {
-                        gpu_ctx.set_pipeline(render_pass, pipeline_id);
-                        gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
-                        gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
-                        gpu_ctx.draw(render_pass, vertex_count, 1);
-                    } else {
-                        eprintln!("No custom_pipeline_id set!");
-                    }
-                } else {
-                    eprintln!("No gpu_context!");
-                }
-            } else {
-                eprintln!("No vertex_buffer_id!");
-            }
+            let buffer_id = buffer_id_guard.as_ref()
+                .expect("Vertex buffer ID must be set after initialization");
+
+            buffer_id.write(0, vertex_data);
+
+            let gpu_ctx = ctx.gpu_context.as_ref()
+                .expect("GPU context must be available during paint");
+
+            let pipeline_id = self.custom_pipeline_id
+                .expect("Custom pipeline must be set after initialization");
+
+            gpu_ctx.set_pipeline(render_pass, pipeline_id);
+            gpu_ctx.set_bind_group(render_pass, 0, gpu_ctx.uniform_bind_group_id);
+            gpu_ctx.set_vertex_buffer(render_pass, 0, *buffer_id);
+            gpu_ctx.draw(render_pass, vertex_count, 1);
         }
 
         // Show popup if we have one
@@ -1074,45 +1077,44 @@ impl Paintable for DiagnosticsPlugin {
             let frame = self.get_popup_frame();
 
             // Render popup using TextView and rounded rect
-            if let Ok(mut popup_view_guard) = self.popup_view.try_write() {
-                if let Some(popup_view) = popup_view_guard.as_mut() {
-                    // Draw rounded rect frame using the core rounded rect renderer
-                    if let Some(frame) = frame {
-                        unsafe {
-                            if !ctx.gpu_renderer.is_null() {
-                                let gpu_renderer =
-                                    &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
-                                gpu_renderer.draw_rounded_rects(
-                                    render_pass,
-                                    &[frame],
-                                    self.viewport.scale_factor,
-                                );
-                            }
-                        }
-                    }
+            let mut popup_view_guard = self.popup_view.try_write()
+                .expect("Failed to acquire write lock on popup_view during paint");
 
-                    // Draw popup text using TextView
-                    if let Some(font_service) = services.and_then(|s| s.get::<SharedFontSystem>()) {
-                        let glyphs = popup_view.collect_glyphs(&font_service);
+            let popup_view = popup_view_guard.as_mut()
+                .expect("Popup view must be set before rendering");
 
-                        if !glyphs.is_empty() {
-                            unsafe {
-                                if !ctx.gpu_renderer.is_null() {
-                                    let gpu_renderer =
-                                        &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
-                                    gpu_renderer.draw_glyphs(
-                                        render_pass,
-                                        &glyphs,
-                                        tiny_core::gpu::DrawConfig {
-                                            buffer_name: "diagnostics",
-                                            use_themed: true,
-                                            scissor: Some(popup_view.get_scissor_rect()),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
+            // Draw rounded rect frame using the core rounded rect renderer
+            if let Some(frame) = frame {
+                unsafe {
+                    assert!(!ctx.gpu_renderer.is_null(), "GPU renderer must not be null during paint");
+                    let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
+                    gpu_renderer.draw_rounded_rects(
+                        render_pass,
+                        &[frame],
+                        self.viewport.scale_factor,
+                    );
+                }
+            }
+
+            // Draw popup text using TextView
+            let font_service = self.font_system.as_ref()
+                .expect("Font system must be set via set_font_system Library call before popup rendering");
+
+            let glyphs = popup_view.collect_glyphs(font_service);
+
+            if !glyphs.is_empty() {
+                unsafe {
+                    assert!(!ctx.gpu_renderer.is_null(), "GPU renderer must not be null during paint");
+                    let gpu_renderer = &mut *(ctx.gpu_renderer as *mut tiny_core::GpuRenderer);
+                    gpu_renderer.draw_glyphs(
+                        render_pass,
+                        &glyphs,
+                        tiny_core::gpu::DrawConfig {
+                            buffer_name: "diagnostics_popup",
+                            use_themed: true,
+                            scissor: Some(popup_view.get_scissor_rect()),
+                        },
+                    );
                 }
             }
         }
@@ -1133,6 +1135,12 @@ impl Configurable for DiagnosticsPlugin {
             popup_border_color: u32,
             #[serde(default = "default_popup_padding")]
             popup_padding: f32,
+            #[serde(default = "default_error_color")]
+            error_color: u32,
+            #[serde(default = "default_warning_color")]
+            warning_color: u32,
+            #[serde(default = "default_info_color")]
+            info_color: u32,
         }
 
         fn default_popup_bg() -> u32 {
@@ -1146,6 +1154,15 @@ impl Configurable for DiagnosticsPlugin {
         }
         fn default_popup_padding() -> f32 {
             8.0
+        }
+        fn default_error_color() -> u32 {
+            0xFF4444A0
+        }
+        fn default_warning_color() -> u32 {
+            0xFFCC00A0
+        }
+        fn default_info_color() -> u32 {
+            0x4444FFA0
         }
 
         // Parse TOML value first (handles syntax errors gracefully)
@@ -1166,6 +1183,9 @@ impl Configurable for DiagnosticsPlugin {
                 popup_text_color: default_popup_text(),
                 popup_border_color: default_popup_border(),
                 popup_padding: default_popup_padding(),
+                error_color: default_error_color(),
+                warning_color: default_warning_color(),
+                info_color: default_info_color(),
             });
 
             // Apply parsed values
@@ -1173,6 +1193,9 @@ impl Configurable for DiagnosticsPlugin {
             self.config.popup_text_color = temp_config.popup_text_color;
             self.config.popup_border_color = temp_config.popup_border_color;
             self.config.popup_padding = temp_config.popup_padding;
+            self.config.error_color = temp_config.error_color;
+            self.config.warning_color = temp_config.warning_color;
+            self.config.info_color = temp_config.info_color;
         }
 
         Ok(())
@@ -1246,7 +1269,8 @@ impl DiagnosticsPlugin {
         } = self.hover_state
         {
             if let Some(start_time) = self.hover_start_time {
-                if start_time.elapsed().as_millis() >= 500 {
+                let elapsed = start_time.elapsed().as_millis();
+                if elapsed >= 500 {
                     // 500ms elapsed, request hover info
                     self.hover_state = HoverState::RequestingHover {
                         line,

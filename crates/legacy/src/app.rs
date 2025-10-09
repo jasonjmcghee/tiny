@@ -21,7 +21,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tiny_font::SharedFontSystem;
 use winit::{
@@ -122,6 +122,9 @@ pub struct TinyApp {
     // Event bus for event-driven architecture
     event_bus: EventBus,
 
+    // Plugin event channel receiver (for events from watcher threads)
+    plugin_event_rx: Option<std::sync::mpsc::Receiver<String>>,
+
     // Shortcut registry for accelerator handling
     shortcuts: ShortcutRegistry,
 
@@ -145,8 +148,11 @@ pub struct TinyApp {
     scroll_lock_enabled: bool, // true = lock to one direction at a time
     current_scroll_direction: Option<ScrollDirection>, // which direction is currently locked
 
-    // Mouse and keyboard state
-    mouse_state: crate::mouse_state::MouseState,
+    // Mouse and keyboard state (inlined from MouseState)
+    mouse_position: Option<PhysicalPosition<f64>>,
+    mouse_pressed: bool,
+    mouse_drag_start: Option<PhysicalPosition<f64>>,
+    modifiers: Modifiers,
 
     // Track if cursor moved for scrolling
     cursor_needs_scroll: bool,
@@ -210,13 +216,12 @@ impl TinyApp {
 
     /// Handle cursor movement (mouse move)
     fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
-        self.mouse_state.set_position(position);
+        self.mouse_position = Some(position);
 
         // Pre-compute logical positions to avoid borrow issues
         let logical_point = self.physical_to_logical_point(position);
         let drag_from = self
-            .mouse_state
-            .drag_start
+            .mouse_drag_start
             .and_then(|p| self.physical_to_logical_point(p));
 
         if let Some(point) = logical_point {
@@ -257,29 +262,22 @@ impl TinyApp {
 
             self.scroll_focus.update_focus(point, &widget_bounds);
             // Extract all needed data from cpu_renderer first
-            let (
-                editor_bounds,
-                viewport_scroll,
-                viewport,
-                diagnostics_ptr,
-                editor_local_from,
-                editor_local_to,
-            ) = if let Some(cpu_renderer) = &self.cpu_renderer {
-                let from_local = drag_from.map(|f| cpu_renderer.screen_to_editor_local(f));
-                let to_local = cpu_renderer.screen_to_editor_local(point);
-                (
-                    cpu_renderer.editor_bounds,
-                    cpu_renderer.viewport.scroll,
-                    cpu_renderer.viewport.clone(),
-                    cpu_renderer.diagnostics_plugin,
-                    from_local,
-                    to_local,
-                )
-            } else {
-                return;
-            };
+            let (editor_bounds, viewport_scroll, viewport, editor_local_from, editor_local_to) =
+                if let Some(cpu_renderer) = &self.cpu_renderer {
+                    let from_local = drag_from.map(|f| cpu_renderer.screen_to_editor_local(f));
+                    let to_local = cpu_renderer.screen_to_editor_local(point);
+                    (
+                        cpu_renderer.editor_bounds,
+                        cpu_renderer.viewport.scroll,
+                        cpu_renderer.viewport.clone(),
+                        from_local,
+                        to_local,
+                    )
+                } else {
+                    return;
+                };
 
-            let cmd_held = self.mouse_state.modifiers.cmd;
+            let cmd_held = self.modifiers.cmd;
 
             // Check if mouse is within editor bounds
             let in_editor = point.x.0 >= editor_bounds.x.0
@@ -287,41 +285,17 @@ impl TinyApp {
                 && point.y.0 >= editor_bounds.y.0
                 && point.y.0 <= editor_bounds.y.0 + editor_bounds.height.0;
 
-            // Get hover position if in editor
-            let hover_position = if in_editor {
-                if let Some(diagnostics_ptr) = diagnostics_ptr {
-                    let diagnostics_plugin = unsafe { &mut *diagnostics_ptr };
-                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: editor_bounds,
-                        scroll: viewport_scroll,
-                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 3,
-                    };
-                    // Need to access service_registry from cpu_renderer
-                    if let Some(cpu_renderer) = &self.cpu_renderer {
-                        diagnostics_plugin.set_mouse_position(
-                            point.x.0,
-                            point.y.0,
-                            Some(&editor_viewport),
-                            Some(&cpu_renderer.service_registry),
-                        );
-                    }
-                    diagnostics_plugin.get_mouse_document_position()
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Now handle editor operations without holding cpu_renderer borrow
-            if let Some((line, column)) = hover_position {
+            // Store mouse position for hover detection
+            if in_editor {
                 self.editor
                     .tab_manager
                     .active_tab_mut()
                     .diagnostics
-                    .on_mouse_move(line, column, cmd_held);
-            } else if !in_editor {
+                    .set_mouse_screen_pos(point.x.0, point.y.0);
+            }
+
+            // Clear mouse position when leaving editor
+            if !in_editor {
                 self.editor
                     .tab_manager
                     .active_tab_mut()
@@ -415,7 +389,7 @@ impl TinyApp {
             };
 
             // Mouse drag - emit event (only if not handled by scrollbar)
-            if !handled_scrollbar_drag && self.mouse_state.pressed {
+            if !handled_scrollbar_drag && self.mouse_pressed {
                 if let Some(from) = drag_from {
                     if !handled_scrollbar_drag {
                         // Check if drag started in titlebar area (for transparent titlebar on macOS)
@@ -437,7 +411,7 @@ impl TinyApp {
                                         "from_y": from_local.y.0,
                                         "to_x": to_local.x.0,
                                         "to_y": to_local.y.0,
-                                        "alt": self.mouse_state.modifiers.alt,
+                                        "alt": self.modifiers.alt,
                                     }),
                                     10,
                                     "winit",
@@ -577,6 +551,7 @@ impl TinyApp {
             shortcuts_reload_pending: Arc::new(AtomicBool::new(false)),
             editor,
             event_bus,
+            plugin_event_rx: None,
             shortcuts,
             orchestrator: PluginOrchestrator::new(),
             window_title: "Tiny Editor".to_string(),
@@ -586,7 +561,10 @@ impl TinyApp {
             title_bar_height: 28.0, // Logical pixels
             scroll_lock_enabled: true,
             current_scroll_direction: None,
-            mouse_state: crate::mouse_state::MouseState::new(),
+            mouse_position: None,
+            mouse_pressed: false,
+            mouse_drag_start: None,
+            modifiers: Modifiers::default(),
             cursor_needs_scroll: false,
             continuous_rendering: false,
             last_frame_time: std::time::Instant::now(),
@@ -908,7 +886,47 @@ impl TinyApp {
         )
     }
 
+    /// Handle plugin library reload - recreate all instances of this plugin
+    fn handle_plugin_reload(&mut self, plugin_name: &str) -> Result<()> {
+        if let Some(ref cpu_renderer) = self.cpu_renderer {
+            if let Some(loader_arc) = cpu_renderer.get_plugin_loader() {
+                if let Ok(mut loader) = loader_arc.try_lock() {
+                    let views = self.editor.reinitialize_plugin(&mut loader, plugin_name);
+                    drop(loader);
+
+                    if !views.is_empty() {
+                        if let Some(gpu_renderer) = &self.gpu_renderer {
+                            let device = gpu_renderer.device_arc();
+                            let queue = gpu_renderer.queue_arc();
+                            let _ = self.editor.setup_plugins_for_views(views, device, queue);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle plugin config update - propagate config to all instances via listener callbacks
+    fn handle_plugin_config_update(&mut self, plugin_name: &str) -> Result<()> {
+        // The config has already been updated in the loader's main instance
+        // and stored for new instances. The loader's config_listeners will
+        // automatically propagate the update to all existing instances.
+        // We just need to trigger a redraw (already done by the watcher).
+
+        // Future: If we need per-view config overrides, handle them here
+        Ok(())
+    }
+
     fn process_event_queue(&mut self) -> Result<()> {
+        // First, drain plugin events from watcher threads and emit to event bus
+        if let Some(ref rx) = self.plugin_event_rx {
+            while let Ok(event_name) = rx.try_recv() {
+                self.event_bus
+                    .emit(&event_name, json!({}), 10, "plugin_watcher");
+            }
+        }
+
         // Process events in a loop to handle events emitted during event processing
         // This ensures ui.redraw events from hover handlers are processed immediately
         loop {
@@ -926,6 +944,35 @@ impl TinyApp {
 
     fn process_single_event(&mut self, event: &Event) -> Result<()> {
         use WidgetId::{FilePicker as FPWidget, Grep as GrepWidget};
+
+        // Handle plugin-related events (plugin-agnostic)
+        if event.name.starts_with("plugin.") {
+            // Extract plugin name and event type from "plugin.{name}.{event_type}"
+            if let Some(rest) = event.name.strip_prefix("plugin.") {
+                if let Some((plugin_name, event_type)) = rest.rsplit_once('.') {
+                    match event_type {
+                        "reloaded" => {
+                            eprintln!(
+                                "🔄 Plugin library reloaded: {} - reinitializing instances",
+                                plugin_name
+                            );
+                            self.handle_plugin_reload(plugin_name)?;
+                        }
+                        "config_updated" => {
+                            eprintln!(
+                                "⚙️  Plugin config updated: {} - propagating to instances",
+                                plugin_name
+                            );
+                            self.handle_plugin_config_update(plugin_name)?;
+                        }
+                        _ => {
+                            eprintln!("⚠️  Unknown plugin event type: {}", event_type);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         match event.name.as_str() {
             // App-level
@@ -1045,8 +1092,9 @@ impl TinyApp {
                         event.data.get("physical_x").and_then(|v| v.as_f64()),
                         event.data.get("physical_y").and_then(|v| v.as_f64()),
                     ) {
-                        self.mouse_state
-                            .start_drag(winit::dpi::PhysicalPosition::new(phys_x, phys_y));
+                        let pos = winit::dpi::PhysicalPosition::new(phys_x, phys_y);
+                        self.mouse_pressed = true;
+                        self.mouse_drag_start = Some(pos);
                     }
 
                     if let Some(viewport) = self.cpu_renderer.as_ref().map(|r| r.viewport.clone()) {
@@ -1190,26 +1238,26 @@ impl TinyApp {
             "editor.code_action" => self.editor.handle_code_action_request()?,
             name if name.starts_with("editor.") => {
                 // First, try dispatching to overlay components (file picker, grep)
-                // They handle their own text editing and return Stop if they consumed the event
+                // They check is_active() internally and return Stop if they consumed the event
+                use crate::input::EventSubscriber;
                 let mut handled = false;
-                if self.editor.file_picker.visible {
-                    use crate::input::EventSubscriber;
-                    if self
-                        .editor
-                        .file_picker
-                        .handle_event(&event, &mut self.event_bus)
-                        == crate::input::PropagationControl::Stop
-                    {
-                        handled = true;
-                    }
+
+                // File picker gets first priority
+                if self
+                    .editor
+                    .file_picker
+                    .handle_event(&event, &mut self.event_bus)
+                    == crate::input::PropagationControl::Stop
+                {
+                    handled = true;
                 }
-                if !handled && self.editor.grep.visible {
-                    use crate::input::EventSubscriber;
-                    if self.editor.grep.handle_event(&event, &mut self.event_bus)
+
+                // Grep gets second priority
+                if !handled
+                    && self.editor.grep.handle_event(&event, &mut self.event_bus)
                         == crate::input::PropagationControl::Stop
-                    {
-                        handled = true;
-                    }
+                {
+                    handled = true;
                 }
 
                 // If no overlay handled it, route to main editor
@@ -1220,7 +1268,10 @@ impl TinyApp {
                     match action {
                         InputAction::Save => {
                             // Save only makes sense for main editor
-                            self.editor.save()?;
+                            match self.editor.save() {
+                                Ok(_) => eprintln!("💾 Save succeeded"),
+                                Err(e) => eprintln!("❌ Save failed: {:?}", e),
+                            }
                             self.request_redraw();
                             self.update_window_title();
                             self.cursor_needs_scroll = true;
@@ -1285,9 +1336,9 @@ impl TinyApp {
         // Lazy initialize EditableTextView plugins (for new tabs/views only)
         if let Some(ref cpu_renderer) = self.cpu_renderer {
             if let Some(loader_arc) = cpu_renderer.get_plugin_loader() {
-                let loader = loader_arc.lock().unwrap();
+                let mut loader = loader_arc.lock().unwrap();
                 // Returns list of newly-initialized views that need GPU setup
-                if let Ok(newly_initialized) = self.editor.initialize_all_plugins(&loader) {
+                if let Ok(newly_initialized) = self.editor.initialize_all_plugins(&mut loader) {
                     if !newly_initialized.is_empty() {
                         drop(loader); // Release lock
                         if let Some(gpu_renderer) = &self.gpu_renderer {
@@ -1486,31 +1537,7 @@ impl TinyApp {
                 self.editor.ui_changed = false;
             }
 
-            // Set diagnostics plugin for rendering (will be updated after layout is computed)
-            cpu_renderer
-                .set_diagnostics_plugin(tab.diagnostics.plugin_mut(), &tab.plugin.editor.view.doc);
-
-            // Initialize diagnostics plugin with GPU resources if needed
-            // Check if THIS specific plugin instance needs initialization
-            unsafe {
-                if let Some(diagnostics_ptr) = cpu_renderer.diagnostics_plugin {
-                    let diagnostics = &mut *diagnostics_ptr;
-
-                    // Check if this plugin instance has GPU resources already
-                    if !diagnostics.is_initialized() {
-                        if let Some(gpu) = cpu_renderer.get_gpu_renderer() {
-                            let gpu_renderer = &*gpu;
-                            use tiny_sdk::Initializable;
-                            let mut setup_ctx = tiny_sdk::SetupContext {
-                                device: gpu_renderer.device_arc(),
-                                queue: gpu_renderer.queue_arc(),
-                                registry: tiny_sdk::PluginRegistry::empty(),
-                            };
-                            let _ = diagnostics.setup(&mut setup_ctx);
-                        }
-                    }
-                }
-            }
+            // Diagnostics plugin is now managed through collect_paint_ops like cursor/selection
 
             // Set up global margin (only once)
             static mut GLOBAL_MARGIN_INITIALIZED: bool = false;
@@ -1642,8 +1669,19 @@ impl TinyApp {
 
             // Update diagnostics manager (handles LSP polling, caching, plugin updates)
             // NOTE: cpu_renderer.text_renderer now has populated layout cache from rendering
-            tab.diagnostics
-                .update(&tab.plugin.editor.view.doc, &cpu_renderer.text_renderer);
+            let editor_viewport = tiny_sdk::types::WidgetViewport {
+                bounds: cpu_renderer.editor_bounds,
+                scroll: cpu_renderer.viewport.scroll,
+                content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                widget_id: 3,
+            };
+            tab.diagnostics.update(
+                &tab.plugin.editor.view.doc,
+                &cpu_renderer.text_renderer,
+                &editor_viewport,
+                None, // Use stored mouse position
+                cpu_renderer.viewport.metrics.line_height,
+            );
 
             // Swap the text_renderer back to the tab and save scroll position
             cpu_renderer.swap_text_renderer(&mut tab.text_renderer);
@@ -1760,6 +1798,23 @@ impl ApplicationHandler for TinyApp {
             // Clone window for background threads before storing
             let window_for_events = window.clone();
             let window_for_cursor = window.clone();
+            let window_for_renderer = window.clone();
+            let window_for_grep = window.clone();
+
+            // Set up renderer redraw notifier BEFORE storing (so it's available when plugins initialize)
+            cpu_renderer.set_redraw_notifier(move || {
+                window_for_renderer.request_redraw();
+            });
+
+            // Set up grep redraw notifier (for background search results)
+            self.editor.grep.set_redraw_notifier(Arc::new(move || {
+                window_for_grep.request_redraw();
+            }));
+
+            // Set up plugin event channel for watcher threads to send events
+            let (plugin_event_tx, plugin_event_rx) = Renderer::create_plugin_event_channel();
+            cpu_renderer.set_plugin_event_channel(plugin_event_tx);
+            self.plugin_event_rx = Some(plugin_event_rx);
 
             // Store everything
             self.window = Some(window);
@@ -1781,8 +1836,8 @@ impl ApplicationHandler for TinyApp {
             // Initialize cursor/selection plugins for all EditableTextViews
             if let Some(ref cpu_renderer) = self.cpu_renderer {
                 if let Some(loader_arc) = cpu_renderer.get_plugin_loader() {
-                    let loader = loader_arc.lock().unwrap();
-                    match self.editor.initialize_all_plugins(&loader) {
+                    let mut loader = loader_arc.lock().unwrap();
+                    match self.editor.initialize_all_plugins(&mut loader) {
                         Ok(newly_initialized) => {
                             // Setup GPU resources for newly initialized views
                             drop(loader); // Release lock before setup
@@ -1893,8 +1948,9 @@ impl ApplicationHandler for TinyApp {
                         // For regular (non-modifier) keys, use current modifier state
                         // For modifier keys themselves, we need to track release
                         let event_names = if !is_modifier_key {
-                            self.shortcuts
-                                .match_input(&self.mouse_state.modifiers, &trigger)
+                            let matched_events =
+                                self.shortcuts.match_input(&self.modifiers, &trigger);
+                            matched_events
                         } else {
                             // Skip modifier key presses - we'll handle them on release
                             Vec::new()
@@ -1909,9 +1965,9 @@ impl ApplicationHandler for TinyApp {
                             // No shortcut matched - check for plain character input
                             if let Some(ch) = original_char {
                                 // Plain character with no cmd/ctrl/alt (shift is OK)
-                                if !self.mouse_state.modifiers.cmd
-                                    && !self.mouse_state.modifiers.ctrl
-                                    && !self.mouse_state.modifiers.alt
+                                if !self.modifiers.cmd
+                                    && !self.modifiers.ctrl
+                                    && !self.modifiers.alt
                                 {
                                     // Emit event for focused view to handle
                                     self.event_bus.emit(
@@ -1926,14 +1982,19 @@ impl ApplicationHandler for TinyApp {
                     }
                 }
 
-                // Request immediate redraw to process events
+                // Process keyboard events immediately for responsive shortcuts
+                // This ensures Cmd+C, Cmd+S, etc. work on the first keypress
+                if let Err(e) = self.process_event_queue() {
+                    eprintln!("Error processing keyboard event: {:?}", e);
+                }
+
+                // Request redraw to show the results
                 self.request_redraw();
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 // Convert winit modifiers to accelerator format
-                self.mouse_state
-                    .set_modifiers(winit_adapter::convert_modifiers(&new_modifiers));
+                self.modifiers = winit_adapter::convert_modifiers(&new_modifiers);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -1952,9 +2013,7 @@ impl ApplicationHandler for TinyApp {
                 match state {
                     ElementState::Pressed => {
                         // Try to match shortcuts first
-                        let event_names = self
-                            .shortcuts
-                            .match_input(&self.mouse_state.modifiers, &trigger);
+                        let event_names = self.shortcuts.match_input(&self.modifiers, &trigger);
 
                         if !event_names.is_empty() {
                             // Shortcut matched (e.g., "cmd+click" or "click click")
@@ -1963,7 +2022,7 @@ impl ApplicationHandler for TinyApp {
                             }
                         } else {
                             // No shortcut - emit default mouse press event
-                            if let Some(position) = self.mouse_state.position {
+                            if let Some(position) = self.mouse_position {
                                 if let Some(point) = self.physical_to_logical_point(position) {
                                     // Check titlebar and tab bar
                                     #[cfg(target_os = "macos")]
@@ -2107,25 +2166,25 @@ impl ApplicationHandler for TinyApp {
                                                 // Emit both screen and editor-local coordinates
                                                 // Include physical position for drag state management
                                                 self.event_bus.emit(
-                                                "mouse.press",
-                                                json!({
-                                                    "x": editor_local.x.0,
-                                                    "y": editor_local.y.0,
-                                                    "screen_x": point.x.0,
-                                                    "screen_y": point.y.0,
-                                                    "physical_x": position.x,
-                                                    "physical_y": position.y,
-                                                    "button": button_name,
-                                                    "modifiers": {
-                                                        "shift": self.mouse_state.modifiers.shift,
-                                                        "ctrl": self.mouse_state.modifiers.ctrl,
-                                                        "alt": self.mouse_state.modifiers.alt,
-                                                        "cmd": self.mouse_state.modifiers.cmd,
-                                                    }
-                                                }),
-                                                10,
-                                                "winit",
-                                            );
+                                                    "mouse.press",
+                                                    json!({
+                                                        "x": editor_local.x.0,
+                                                        "y": editor_local.y.0,
+                                                        "screen_x": point.x.0,
+                                                        "screen_y": point.y.0,
+                                                        "physical_x": position.x,
+                                                        "physical_y": position.y,
+                                                        "button": button_name,
+                                                        "modifiers": {
+                                                            "shift": self.modifiers.shift,
+                                                            "ctrl": self.modifiers.ctrl,
+                                                            "alt": self.modifiers.alt,
+                                                            "cmd": self.modifiers.cmd,
+                                                        }
+                                                    }),
+                                                    10,
+                                                    "winit",
+                                                );
                                             }
                                         }
                                     }
@@ -2138,7 +2197,8 @@ impl ApplicationHandler for TinyApp {
                         if let Some(cpu_renderer) = &mut self.cpu_renderer {
                             cpu_renderer.scrollbar_plugin.stop_drag();
                         }
-                        self.mouse_state.end_drag();
+                        self.mouse_pressed = false;
+                        self.mouse_drag_start = None;
                         self.event_bus.emit("mouse.release", json!({}), 10, "winit");
                     }
                 }
@@ -2171,9 +2231,7 @@ impl ApplicationHandler for TinyApp {
                 };
 
                 // Try to match shortcuts
-                let event_names = self
-                    .shortcuts
-                    .match_input(&self.mouse_state.modifiers, &trigger);
+                let event_names = self.shortcuts.match_input(&self.modifiers, &trigger);
 
                 if !event_names.is_empty() {
                     // Shortcut matched

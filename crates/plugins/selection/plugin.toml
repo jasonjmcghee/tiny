@@ -20,6 +20,11 @@ paint = true
 # Default is semi-transparent blue
 color = 0x4080FF40
 
+# Active line color (RGBA in hex, format: 0xRRGGBBAA)
+# Used to highlight the current line when there's just a cursor (no selection)
+# Default is 10% white
+active_line_color = 0xFFFFFF04
+
 [exports]
 # Entry point function name in the compiled library
 entry_point = "selection_plugin_create"

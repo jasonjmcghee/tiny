@@ -112,10 +112,13 @@ pub struct Renderer {
     plugin_state: Arc<Mutex<PluginState>>,
     last_viewport_scroll: (f32, f32),
     pub service_registry: ServiceRegistry,
+    /// Callback to request redraw (used by config watchers)
+    redraw_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Channel to send plugin events from watcher threads
+    plugin_event_tx: Option<std::sync::mpsc::Sender<String>>,
     /// Track which tab we have swapped (to avoid marking dirty on swap back)
     current_tab_renderer_id: Option<u64>,
     pub line_numbers_plugin: Option<*mut crate::line_numbers_plugin::LineNumbersPlugin>,
-    pub diagnostics_plugin: Option<*mut diagnostics_plugin::DiagnosticsPlugin>,
     pub tab_bar_plugin: Option<*mut crate::tab_bar_plugin::TabBarPlugin>,
     pub file_picker_plugin: Option<*mut crate::file_picker_plugin::FilePickerPlugin>,
     pub grep_plugin: Option<*mut crate::grep_plugin::GrepPlugin>,
@@ -188,9 +191,10 @@ impl Renderer {
             plugin_state: Arc::new(Mutex::new(PluginState::new())),
             last_viewport_scroll: (0.0, 0.0),
             service_registry: ServiceRegistry::new(),
+            redraw_notifier: None,
+            plugin_event_tx: None,
             current_tab_renderer_id: None,
             line_numbers_plugin: None,
-            diagnostics_plugin: None,
             tab_bar_plugin: None,
             file_picker_plugin: None,
             grep_plugin: None,
@@ -375,6 +379,8 @@ impl Renderer {
         let device = gpu_renderer.device_arc();
         let queue = gpu_renderer.queue_arc();
         let plugin_state = self.plugin_state.clone();
+        let redraw_notifier = self.redraw_notifier.clone();
+        let event_tx = self.plugin_event_tx.clone();
 
         let mut watcher =
             notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
@@ -388,6 +394,8 @@ impl Renderer {
                             device.clone(),
                             queue.clone(),
                             plugin_state.clone(),
+                            redraw_notifier.clone(),
+                            event_tx.clone(),
                         );
                     }
                 }
@@ -417,6 +425,8 @@ impl Renderer {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         plugin_state: Arc<Mutex<PluginState>>,
+        redraw_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+        event_tx: Option<std::sync::mpsc::Sender<String>>,
     ) {
         // Wait for file to be ready
         for _ in 0..10 {
@@ -428,7 +438,8 @@ impl Renderer {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        if let Ok(mut loader) = loader_arc.lock() {
+        // Use try_lock to avoid deadlock if loader is busy during initialization
+        if let Ok(mut loader) = loader_arc.try_lock() {
             if loader.unload_plugin(plugin_name).is_err() {
                 return;
             }
@@ -441,6 +452,21 @@ impl Renderer {
             if loader.initialize_plugin(plugin_name, device, queue).is_ok() {
                 if let Ok(state) = plugin_state.lock() {
                     state.sync_to_plugin(&mut loader, plugin_name);
+                }
+                // Drop loader lock before sending events
+                drop(loader);
+
+                // Send event for this specific plugin reload
+                eprintln!("📦 Plugin library reloaded: {} - sending event", plugin_name);
+                if let Some(ref tx) = event_tx {
+                    let event_name = format!("plugin.{}.reloaded", plugin_name);
+                    let _ = tx.send(event_name);
+                }
+
+                // Request redraw after successful reload
+                if let Some(ref notifier) = redraw_notifier {
+                    eprintln!("🔄 Requesting redraw for lib reload: {}", plugin_name);
+                    notifier();
                 }
             }
         }
@@ -470,16 +496,67 @@ impl Renderer {
             bail!("Config path does not exist");
         }
 
+        eprintln!("📁 Setting up config watcher for '{}': {}", plugin_name, config_path);
+
         let plugin_name = plugin_name.to_string();
+        let plugin_state = self.plugin_state.clone();
+        let redraw_notifier = self.redraw_notifier.clone();
+        let event_tx = self.plugin_event_tx.clone();
         let mut watcher =
             notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 if let Ok(event) = res {
-                    if event.kind.is_modify() {
-                        if let Ok(data) = std::fs::read_to_string(&event.paths[0]) {
-                            if let Ok(mut loader) = loader_arc.lock() {
-                                if let Some(plugin) = loader.get_plugin_mut(&plugin_name) {
-                                    if let Some(cfg) = plugin.instance.as_configurable() {
-                                        let _ = cfg.config_updated(&data);
+                    // Handle both modify and create events (editors often use atomic writes)
+                    if event.kind.is_modify() || event.kind.is_create() {
+                        eprintln!("Config file changed (kind: {:?}): {:?}", event.kind, event.paths);
+                        if let Some(path) = event.paths.first() {
+                            if let Ok(data) = std::fs::read_to_string(path) {
+                                // Use try_lock to avoid deadlock if loader is busy during initialization
+                                if let Ok(mut loader) = loader_arc.try_lock() {
+                                    // Store config data so new instances get it
+                                    loader.store_plugin_config(&plugin_name, data.clone());
+
+                                    // Update the loader's main instance
+                                    let success = if let Some(plugin) = loader.get_plugin_mut(&plugin_name) {
+                                        if let Some(cfg) = plugin.instance.as_configurable() {
+                                            match cfg.config_updated(&data) {
+                                                Ok(_) => {
+                                                    eprintln!("✅ Config updated successfully for {}", plugin_name);
+                                                    // Sync plugin state
+                                                    if let Ok(state) = plugin_state.lock() {
+                                                        state.sync_to_plugin(&mut loader, &plugin_name);
+                                                    }
+                                                    true
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("❌ Config update failed for {}: {:?}", plugin_name, e);
+                                                    false
+                                                }
+                                            }
+                                        } else {
+                                            eprintln!("⚠️  Plugin {} doesn't implement Configurable", plugin_name);
+                                            false
+                                        }
+                                    } else {
+                                        eprintln!("⚠️  Plugin {} not found in loader", plugin_name);
+                                        false
+                                    };
+
+                                    // Drop loader lock before emitting events
+                                    drop(loader);
+
+                                    if success {
+                                        // Send event for config update (plugin-agnostic)
+                                        eprintln!("📦 Plugin config updated: {} - sending event", plugin_name);
+                                        if let Some(ref tx) = event_tx {
+                                            let event_name = format!("plugin.{}.config_updated", plugin_name);
+                                            let _ = tx.send(event_name);
+                                        }
+
+                                        // Request redraw
+                                        if let Some(ref notifier) = redraw_notifier {
+                                            eprintln!("🔄 Requesting redraw for config update: {}", plugin_name);
+                                            notifier();
+                                        }
                                     }
                                 }
                             }
@@ -513,6 +590,24 @@ impl Renderer {
         self.theme = Some(Arc::new(theme));
     }
 
+    /// Set callback to request redraw (for config watchers and async operations)
+    pub fn set_redraw_notifier<F>(&mut self, notifier: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.redraw_notifier = Some(Arc::new(notifier));
+    }
+
+    /// Set channel sender for plugin events
+    pub fn set_plugin_event_channel(&mut self, tx: std::sync::mpsc::Sender<String>) {
+        self.plugin_event_tx = Some(tx);
+    }
+
+    /// Get receiver for plugin events (call this to create the channel)
+    pub fn create_plugin_event_channel() -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<String>) {
+        std::sync::mpsc::channel()
+    }
+
     pub fn set_line_numbers_plugin(
         &mut self,
         plugin: &mut crate::line_numbers_plugin::LineNumbersPlugin,
@@ -520,16 +615,6 @@ impl Renderer {
     ) {
         plugin.set_document(doc);
         self.line_numbers_plugin = Some(plugin as *mut _);
-    }
-
-    pub fn set_diagnostics_plugin(
-        &mut self,
-        plugin: &mut diagnostics_plugin::DiagnosticsPlugin,
-        _doc: &tree::Doc,
-    ) {
-        // Update the plugin's viewport info with the correct scale factor
-        plugin.set_viewport_info(self.viewport.to_viewport_info());
-        self.diagnostics_plugin = Some(plugin as *mut _);
     }
 
     pub fn set_tab_bar_plugin(&mut self, plugin: &mut crate::tab_bar_plugin::TabBarPlugin) {
@@ -816,81 +901,90 @@ impl Renderer {
 
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
 
-            // Paint main editor's selection (background)
-            if let Some(tab_mgr) = tab_manager {
-                if let Some(tab) = tab_mgr.active_tab() {
-                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
-                        scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
-                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 2,
-                    };
-                    // Only paint selection (z_index < 0)
-                    if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
-                        // Paint selection only (background)
-                        if let Some(ref plugin) = tab.plugin.editor.selection_plugin {
-                            if let Some(paintable) = plugin.as_paintable() {
-                                if paintable.z_index() < 0 {
-                                    paintable.paint(&ctx, pass);
-                                }
-                            }
-                        }
+            // === PAINT EDITOR IN Z-INDEX ORDER ===
+            // Generic plugin rendering: collect all paintables, sort by z_index, paint
+
+            // Collect (z_index, paint_fn) tuples
+            let mut paint_ops: Vec<(i32, Box<dyn FnOnce(&mut wgpu::RenderPass)>)> = Vec::new();
+
+            // Text decorations (z_index = -5)
+            if !self.text_decoration_rects.is_empty() {
+                let gpu_ptr = self.gpu_renderer;
+                let rects = self.text_decoration_rects.clone();
+                let scale = self.viewport.scale_factor;
+                paint_ops.push((-5, Box::new(move |pass| {
+                    if let Some(gpu_ptr) = gpu_ptr {
+                        let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
+                        gpu_mut.draw_rects(pass, &rects, scale);
                     }
-                }
+                })));
             }
 
-            // Draw text decorations (underline, strikethrough) BEFORE text
-            if !self.text_decoration_rects.is_empty() {
-                if let Some(gpu_ptr) = self.gpu_renderer {
-                    let gpu_mut = unsafe { &mut *(gpu_ptr as *mut GpuRenderer) };
-                    gpu_mut.draw_rects(
-                        pass,
-                        &self.text_decoration_rects,
-                        self.viewport.scale_factor,
+            // Main text (z_index = 0)
+            if !self.accumulated_glyphs.is_empty() {
+                let gpu_ptr = self.gpu_renderer;
+                let glyphs = self.accumulated_glyphs.clone();
+                let has_syntax = self.text_renderer.syntax_highlighter.is_some();
+                paint_ops.push((0, Box::new(move |pass| {
+                    if let Some(gpu) = gpu_ptr {
+                        unsafe {
+                            let gpu_renderer = &*(gpu);
+                            let gpu_mut = &mut *(gpu as *mut GpuRenderer);
+
+                            if gpu_renderer.has_styled_pipeline() {
+                                let style_buffer: Vec<u32> = glyphs.iter().map(|g| g.token_id as u32).collect();
+                                gpu_mut.upload_style_buffer_u32(&style_buffer);
+                            }
+
+                            let use_themed = has_syntax && gpu_renderer.has_styled_pipeline();
+
+                            gpu_mut.draw_glyphs(
+                                pass,
+                                &glyphs,
+                                tiny_core::gpu::DrawConfig {
+                                    buffer_name: "main_text",
+                                    use_themed,
+                                    scissor: None,
+                                },
+                            );
+                        }
+                    }
+                })));
+            }
+
+            // Collect ALL plugins from active tab (generic - works with any plugin structure)
+            if let Some(tab_mgr) = tab_manager {
+                if let Some(tab) = tab_mgr.active_tab() {
+                    // Ask tab to provide all its paintable plugins
+                    tab.collect_paint_ops(
+                        &mut paint_ops,
+                        self.editor_bounds,
+                        self.viewport.scroll,
+                        |viewport| self.make_paint_ctx(viewport),
                     );
                 }
             }
 
-            // Draw main text
-            self.draw_all_accumulated_glyphs(pass);
-
-            // Paint diagnostics plugin (squiggly lines under text, before cursor)
-            if let Some(diagnostics_ptr) = self.diagnostics_plugin {
-                let editor_viewport = tiny_sdk::types::WidgetViewport {
-                    bounds: self.editor_bounds,
-                    scroll: self.viewport.scroll, // Diagnostics need scroll to convert layout → view
-                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                    widget_id: 2,
-                };
-
-                if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
-                    let diagnostics = unsafe { &*diagnostics_ptr };
-                    // DiagnosticsPlugin implements Paintable directly
-                    use tiny_sdk::Paintable as _;
-                    diagnostics.paint(&ctx, pass);
-                }
+            // Sort by z_index and paint
+            paint_ops.sort_by_key(|(z, _)| *z);
+            for (_, paint_fn) in paint_ops {
+                paint_fn(pass);
             }
 
-            // Paint main editor's cursor (foreground)
+            // === PAINT DIAGNOSTICS (separate due to lifetime constraints) ===
             if let Some(tab_mgr) = tab_manager {
                 if let Some(tab) = tab_mgr.active_tab() {
-                    let editor_viewport = tiny_sdk::types::WidgetViewport {
-                        bounds: self.editor_bounds,
-                        scroll: tiny_sdk::LayoutPos::new(0.0, 0.0), // Scroll already applied in view coords
-                        content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
-                        widget_id: 2,
-                    };
+                    // Get font system from service registry (works on host side)
+                    let font_system = self.service_registry.get::<tiny_font::SharedFontSystem>()
+                        .expect("SharedFontSystem must be registered before painting diagnostics");
 
-                    if let Some(ctx) = self.make_paint_ctx(editor_viewport) {
-                        // Paint cursor only (foreground)
-                        if let Some(ref plugin) = tab.plugin.editor.cursor_plugin {
-                            if let Some(paintable) = plugin.as_paintable() {
-                                if paintable.z_index() >= 0 {
-                                    paintable.paint(&ctx, pass);
-                                }
-                            }
-                        }
-                    }
+                    tab.paint_diagnostics(
+                        pass,
+                        self.editor_bounds,
+                        self.viewport.scroll,
+                        |viewport| self.make_paint_ctx(viewport),
+                        &font_system,
+                    );
                 }
             }
 
@@ -1642,41 +1736,6 @@ impl Renderer {
         self.accumulated_glyphs.extend(glyph_instances);
     }
 
-    fn draw_all_accumulated_glyphs(&mut self, pass: &mut wgpu::RenderPass) {
-        if self.accumulated_glyphs.is_empty() {
-            return;
-        }
-
-        if let Some(gpu) = self.gpu_renderer {
-            unsafe {
-                let gpu_renderer = &*(gpu);
-                let gpu_mut = &mut *(gpu as *mut GpuRenderer);
-
-                // Upload style buffer for all glyphs
-                if gpu_renderer.has_styled_pipeline() {
-                    let style_buffer: Vec<u32> = self
-                        .accumulated_glyphs
-                        .iter()
-                        .map(|g| g.token_id as u32)
-                        .collect();
-                    gpu_mut.upload_style_buffer_u32(&style_buffer);
-                }
-
-                let use_themed = self.text_renderer.syntax_highlighter.is_some()
-                    && gpu_renderer.has_styled_pipeline();
-
-                gpu_mut.draw_glyphs(
-                    pass,
-                    &self.accumulated_glyphs,
-                    tiny_core::gpu::DrawConfig {
-                        buffer_name: "main_text",
-                        use_themed,
-                        scissor: None, // Scissor already set by caller
-                    },
-                );
-            }
-        }
-    }
 
     fn walk_visible_range_no_glyphs(
         &mut self,

@@ -64,12 +64,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Check if pixel should be visible based on selection shape
     var visible = false;
 
+    // Check if this is a cursor (start == end)
+    let is_cursor = abs(input.start_pos.x - input.end_pos.x) < 0.1 &&
+                    abs(input.start_pos.y - input.end_pos.y) < 0.1;
+
     // For single line selections
     if abs(input.start_pos.y - input.end_pos.y) < 0.1 {
-        // Single line selection - simple range check
-        if py >= input.start_pos.y && py < input.start_pos.y + input.line_height &&
-           px >= input.start_pos.x && px <= input.end_pos.x {
-            visible = true;
+        if is_cursor {
+            // Cursor - highlight full line width
+            if py >= input.start_pos.y && py < input.start_pos.y + input.line_height &&
+               px >= input.margin_left && px <= input.margin_right {
+                visible = true;
+            }
+        } else {
+            // Single line selection - simple range check
+            if py >= input.start_pos.y && py < input.start_pos.y + input.line_height &&
+               px >= input.start_pos.x && px <= input.end_pos.x {
+                visible = true;
+            }
         }
     } else {
         // Multi-line selection - check which part of the selection we're in
@@ -92,18 +104,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if visible {
-        // Debug: show UV coordinates instead of color
-        // Calculate UV within the bounding box
-        let min_x = min(input.start_pos.x, input.margin_left);
-        let max_x = max(input.end_pos.x, input.margin_right);
-        let min_y = input.start_pos.y;
-        let max_y = input.end_pos.y + input.line_height;
-
-        let u = (px - min_x) / (max_x - min_x);
-        let v = (py - min_y) / (max_y - min_y);
-
-        return vec4<f32>(u, v, 1.0, 0.2);
-        // return input.color;
+        return input.color;
     } else {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0); // Transparent
     }

@@ -86,7 +86,8 @@ impl ShortcutRegistry {
     /// Returns list of event names to emit
     pub fn match_input(&mut self, modifiers: &Modifiers, trigger: &Trigger) -> Vec<String> {
         // Collect all accelerators as candidates
-        let candidates: Vec<Accelerator> = self.shortcuts.iter().map(|(acc, _)| acc.clone()).collect();
+        let candidates: Vec<Accelerator> =
+            self.shortcuts.iter().map(|(acc, _)| acc.clone()).collect();
 
         // Try to match
         if let Some(matched) = self.matcher.feed(modifiers, trigger, &candidates) {
@@ -127,7 +128,10 @@ impl ShortcutRegistry {
     /// Load shortcuts configuration from a TOML file
     fn load_config(path: &Path) -> Option<ShortcutsConfig> {
         if !path.exists() {
-            eprintln!("ℹ️  No {} found - no shortcuts will be loaded", path.display());
+            eprintln!(
+                "ℹ️  No {} found - no shortcuts will be loaded",
+                path.display()
+            );
             return None;
         }
 

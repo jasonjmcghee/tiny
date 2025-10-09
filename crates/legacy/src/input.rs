@@ -245,7 +245,11 @@ impl EventBus {
 /// Stops delivery when a subscriber returns PropagationControl::Stop
 /// Only delivers to active subscribers
 /// Subscribers can emit follow-up events via event_bus
-pub fn dispatch_event(event: &Event, subscribers: &mut [&mut dyn EventSubscriber], event_bus: &mut EventBus) {
+pub fn dispatch_event(
+    event: &Event,
+    subscribers: &mut [&mut dyn EventSubscriber],
+    event_bus: &mut EventBus,
+) {
     // Sort by priority (higher priority = earlier delivery)
     let mut indexed: Vec<(usize, i32)> = subscribers
         .iter()
@@ -416,7 +420,9 @@ impl InputHandler {
         match event.name.as_str() {
             // Text insertion
             "editor.insert_char" => {
-                let ch = event.data.get("char")
+                let ch = event
+                    .data
+                    .get("char")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !ch.is_empty() {
@@ -536,10 +542,26 @@ impl InputHandler {
         doc: &Doc,
         viewport: &Viewport,
     ) -> InputAction {
-        let from_x = event.data.get("from_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let from_y = event.data.get("from_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let to_x = event.data.get("to_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let to_y = event.data.get("to_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let from_x = event
+            .data
+            .get("from_x")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let from_y = event
+            .data
+            .get("from_y")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let to_x = event
+            .data
+            .get("to_x")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let to_y = event
+            .data
+            .get("to_y")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         if event.data.get("from_x").is_none() {
             return InputAction::None;
@@ -645,7 +667,10 @@ impl InputHandler {
                 .map(|s| s.cursor)
                 .unwrap_or_default();
 
-            eprintln!("⬅️➡️ move_cursor: current pos line={}, column={}", new_pos.line, new_pos.column);
+            eprintln!(
+                "⬅️➡️ move_cursor: current pos line={}, column={}",
+                new_pos.line, new_pos.column
+            );
             if dx < 0 {
                 if new_pos.column > 0 {
                     new_pos.column -= 1;
@@ -980,7 +1005,9 @@ impl InputHandler {
             self.pending_renderer_edits.push(edit.clone());
 
             // Apply incremental edit to renderer for stable typing
-            renderer.as_deref_mut().map(|r| r.apply_incremental_edit(edit));
+            renderer
+                .as_deref_mut()
+                .map(|r| r.apply_incremental_edit(edit));
         }
 
         // Apply all pending edits
@@ -1019,10 +1046,16 @@ impl InputHandler {
             x: pos.x + viewport.scroll.x,
             y: pos.y + viewport.scroll.y,
         };
-        eprintln!("🖱️  on_mouse_click: pos=({}, {}), layout_pos=({}, {})", pos.x.0, pos.y.0, layout_pos.x.0, layout_pos.y.0);
+        eprintln!(
+            "🖱️  on_mouse_click: pos=({}, {}), layout_pos=({}, {})",
+            pos.x.0, pos.y.0, layout_pos.x.0, layout_pos.y.0
+        );
         let tree = doc.read();
         let doc_pos = viewport.layout_to_doc_with_tree(layout_pos, &tree);
-        eprintln!("🖱️  on_mouse_click: resulted in doc_pos line={}, column={}", doc_pos.line, doc_pos.column);
+        eprintln!(
+            "🖱️  on_mouse_click: resulted in doc_pos line={}, column={}",
+            doc_pos.line, doc_pos.column
+        );
 
         // Save to nav history if jumping >5 lines
         if current_pos.line.abs_diff(doc_pos.line) > 5 {
@@ -1365,9 +1398,7 @@ impl InputHandler {
 
         // If not the last line, include the newline character
         if click_pos.line < tree.line_count() - 1 {
-            // Move to start of next line to include the newline
-            line_end.line += 1;
-            line_end.column = 0;
+            line_end.column += 1;
         }
 
         // Create selection for the entire line
@@ -1437,11 +1468,11 @@ impl InputHandler {
         });
 
         // Collect selection positions in view coordinates (with scroll applied)
+        // Include cursors so the selection plugin can highlight the current line
         let tree = doc.read();
         let selection_positions: Vec<(tiny_sdk::ViewPos, tiny_sdk::ViewPos)> = self
             .selections
             .iter()
-            .filter(|sel| !sel.is_cursor())
             .map(|sel| {
                 // Return normalized start/end positions
                 let (start, end) = if sel.min_pos() == sel.cursor {

@@ -114,6 +114,12 @@ impl EventSubscriber for FilePickerPlugin {
 
         // Handle events: execute logic AND stop propagation
         match event.name.as_str() {
+            // Handle Enter key specially - emit action.submit instead of inserting newline
+            "editor.insert_newline" => {
+                // Single-line input - Enter should submit, not insert newline
+                event_bus.emit("action.submit", json!({}), 10, "file_picker");
+                PropagationControl::Stop
+            }
             // Handle text editing events internally
             event_name if event_name.starts_with("editor.") => {
                 let input = self.input_mut();

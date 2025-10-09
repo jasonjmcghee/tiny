@@ -39,7 +39,7 @@ impl EditorLogic {
     /// Initialize cursor/selection plugins for all EditableTextViews
     /// Safe to call multiple times - will skip already-initialized views
     /// Returns list of newly-initialized views that need GPU setup
-    pub fn initialize_all_plugins(&mut self, plugin_loader: &tiny_core::plugin_loader::PluginLoader) -> Result<Vec<*mut crate::editable_text_view::EditableTextView>, String> {
+    pub fn initialize_all_plugins(&mut self, plugin_loader: &mut tiny_core::plugin_loader::PluginLoader) -> Result<Vec<*mut crate::editable_text_view::EditableTextView>, String> {
         let mut newly_initialized = Vec::new();
 
         // Initialize plugins for all tabs (including newly opened ones)
@@ -47,6 +47,10 @@ impl EditorLogic {
             if !tab.plugin.editor.has_plugins() {
                 tab.plugin.initialize_plugins(plugin_loader)?;
                 newly_initialized.push(&mut tab.plugin.editor as *mut _);
+            }
+            // Also initialize diagnostics plugin if needed
+            if !tab.diagnostics.has_plugin() {
+                tab.diagnostics.initialize_plugin(plugin_loader)?;
             }
         }
 
@@ -65,22 +69,67 @@ impl EditorLogic {
         Ok(newly_initialized)
     }
 
-    /// Setup plugins with GPU resources for specific EditableTextViews
-    pub fn setup_plugins_for_views(&mut self, views: Vec<*mut crate::editable_text_view::EditableTextView>, device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Result<(), tiny_sdk::PluginError> {
-        if views.is_empty() {
-            return Ok(());
+    /// Reinitialize a specific plugin (used after that plugin's library hot-reloads)
+    /// Plugin-agnostic: works for any plugin by delegating to EditableTextView
+    pub fn reinitialize_plugin(&mut self, plugin_loader: &mut tiny_core::plugin_loader::PluginLoader, plugin_name: &str) -> Vec<*mut crate::editable_text_view::EditableTextView> {
+        let mut views = Vec::new();
+
+        // Handle diagnostics plugin separately (it's managed by DiagnosticsManager)
+        if plugin_name == "diagnostics" {
+            for tab in self.tab_manager.tabs_mut() {
+                if tab.diagnostics.has_plugin() {
+                    match tab.diagnostics.reinitialize_plugin(plugin_loader) {
+                        Ok(()) => {
+                            eprintln!("Reinitialized diagnostics plugin for tab");
+                        }
+                        Err(e) => eprintln!("Failed to reinitialize diagnostics plugin: {}", e),
+                    }
+                }
+            }
+            return views;
         }
 
+        // Reinitialize for all tabs
+        for tab in self.tab_manager.tabs_mut() {
+            if let Ok(_) = tab.plugin.editor.reinitialize_single_plugin(plugin_loader, plugin_name) {
+                views.push(&mut tab.plugin.editor as *mut _);
+            }
+        }
+
+        // Reinitialize for file picker input
+        if let Ok(_) = self.file_picker.picker.dropdown.input.reinitialize_single_plugin(plugin_loader, plugin_name) {
+            views.push(&mut self.file_picker.picker.dropdown.input as *mut _);
+        }
+
+        // Reinitialize for grep input
+        if let Ok(_) = self.grep.picker.dropdown.input.reinitialize_single_plugin(plugin_loader, plugin_name) {
+            views.push(&mut self.grep.picker.dropdown.input as *mut _);
+        }
+
+        views
+    }
+
+    /// Setup plugins with GPU resources for specific EditableTextViews
+    pub fn setup_plugins_for_views(&mut self, views: Vec<*mut crate::editable_text_view::EditableTextView>, device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Result<(), tiny_sdk::PluginError> {
         let registry = tiny_sdk::PluginRegistry::empty();
         let mut ctx = tiny_sdk::SetupContext {
-            device,
-            queue,
+            device: device.clone(),
+            queue: queue.clone(),
             registry,
         };
 
-        for view_ptr in views {
-            let view = unsafe { &mut *view_ptr };
-            view.setup_plugins(&mut ctx)?;
+        if !views.is_empty() {
+            for view_ptr in views {
+                let view = unsafe { &mut *view_ptr };
+                view.setup_plugins(&mut ctx)?;
+            }
+        }
+
+        // Setup diagnostics plugins for all tabs
+        for tab in self.tab_manager.tabs_mut() {
+            if tab.diagnostics.has_plugin() {
+                tab.diagnostics.setup_plugin(&mut ctx)?;
+            }
         }
 
         Ok(())

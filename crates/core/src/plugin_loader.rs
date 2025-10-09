@@ -4,7 +4,7 @@
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tiny_sdk::{GlyphInstances, Hook, Library, Paintable, Plugin, PluginError, Updatable};
 
 /// Plugin configuration loaded from plugin.toml
@@ -34,6 +34,10 @@ pub struct LoadedPlugin {
     pub instance: Box<dyn Plugin>,
     /// Dynamic library handle (kept alive)
     _lib: Option<libloading::Library>,
+    /// Latest config data for propagating to new instances
+    config_data: Option<String>,
+    /// Callbacks to notify when config changes (for propagating to all instances)
+    config_listeners: Vec<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// Plugin loader that manages dynamic libraries
@@ -253,6 +257,8 @@ impl PluginLoader {
                 config,
                 instance,
                 _lib: Some(lib),
+                config_data: None,
+                config_listeners: Vec::new(),
             },
         );
 
@@ -261,12 +267,18 @@ impl PluginLoader {
     }
 
     /// Create a new instance of an already-loaded plugin
-    /// This allows multiple instances of the same plugin (e.g., multiple cursors)
-    /// The library must already be loaded for this to work
-    pub fn create_plugin_instance(&self, name: &str) -> Result<Box<dyn Plugin>, PluginError> {
+    /// Returns Arc<Mutex> wrapper so config updates can be propagated
+    pub fn create_plugin_instance(
+        &mut self,
+        name: &str,
+    ) -> Result<Arc<StdMutex<Box<dyn Plugin>>>, PluginError> {
         let loaded = self.plugins.get(name).ok_or_else(|| {
             PluginError::Other(
-                format!("Plugin '{}' not loaded. Load it first with load_plugin.", name).into(),
+                format!(
+                    "Plugin '{}' not loaded. Load it first with load_plugin.",
+                    name
+                )
+                .into(),
             )
         })?;
 
@@ -282,20 +294,41 @@ impl PluginLoader {
             // Create a NEW instance
             let mut instance = create_fn();
 
-            // Apply config from the loaded plugin
+            // Apply latest config to the new instance
             if let Some(configurable) = instance.as_configurable() {
-                // Wrap config in [config] section before serializing
-                let mut config_toml = toml::value::Table::new();
-                config_toml.insert("config".to_string(), loaded.config.config.clone());
-                let config_str = toml::to_string(&config_toml)
-                    .expect("Failed to serialize plugin config to TOML");
+                let config_str = if let Some(ref data) = loaded.config_data {
+                    data.clone()
+                } else {
+                    // Wrap config in [config] section before serializing
+                    let mut config_toml = toml::value::Table::new();
+                    config_toml.insert("config".to_string(), loaded.config.config.clone());
+                    toml::to_string(&config_toml)
+                        .expect("Failed to serialize plugin config to TOML")
+                };
+
                 if !config_str.is_empty() {
-                    configurable.config_updated(&config_str)
-                        .map_err(|e| PluginError::Other(format!("Failed to apply plugin config: {}", e).into()))?;
+                    configurable.config_updated(&config_str).map_err(|e| {
+                        PluginError::Other(format!("Failed to apply plugin config: {}", e).into())
+                    })?;
                 }
             }
 
-            Ok(instance)
+            // Wrap instance in Arc<Mutex> for shared ownership
+            let instance_arc = Arc::new(StdMutex::new(instance));
+            let instance_weak = Arc::downgrade(&instance_arc);
+
+            // Register callback to update this instance when config changes
+            self.register_config_listener(name, move |config_data| {
+                if let Some(arc) = instance_weak.upgrade() {
+                    if let Ok(mut inst) = arc.lock() {
+                        if let Some(cfg) = inst.as_configurable() {
+                            let _ = cfg.config_updated(config_data);
+                        }
+                    }
+                }
+            });
+
+            Ok(instance_arc)
         } else {
             Err(PluginError::Other(
                 format!("Plugin '{}' has no library handle", name).into(),
@@ -525,6 +558,29 @@ impl PluginLoader {
     /// Get mutable plugin by name
     pub fn get_plugin_mut(&mut self, name: &str) -> Option<&mut LoadedPlugin> {
         self.plugins.get_mut(name)
+    }
+
+    /// Store config data for a plugin so new instances get the latest config
+    /// Also notifies all registered listeners (existing instances)
+    pub fn store_plugin_config(&mut self, name: &str, config_data: String) {
+        if let Some(plugin) = self.plugins.get_mut(name) {
+            plugin.config_data = Some(config_data.clone());
+
+            // Notify all listeners (existing plugin instances)
+            for listener in &plugin.config_listeners {
+                listener(&config_data);
+            }
+        }
+    }
+
+    /// Register a callback to be notified when this plugin's config changes
+    pub fn register_config_listener<F>(&mut self, plugin_name: &str, callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        if let Some(plugin) = self.plugins.get_mut(plugin_name) {
+            plugin.config_listeners.push(Box::new(callback));
+        }
     }
 
     /// Get plugin's dependencies as Library implementations

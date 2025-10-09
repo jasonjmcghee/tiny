@@ -11,7 +11,10 @@ use crate::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use tiny_core::tree::{Doc, Point};
+use tiny_core::{
+    plugin_loader::PluginLoader,
+    tree::{Doc, Point},
+};
 use tiny_sdk::{
     Initializable, LayoutPos, Plugin, PluginError,
     SetupContext, Updatable, UpdateContext,
@@ -73,7 +76,7 @@ impl TextEditorPlugin {
     }
 
     /// Initialize plugins for the editor (must be called after construction)
-    pub fn initialize_plugins(&mut self, plugin_loader: &tiny_core::plugin_loader::PluginLoader) -> Result<(), String> {
+    pub fn initialize_plugins(&mut self, plugin_loader: &mut PluginLoader) -> Result<(), String> {
         self.editor.initialize_plugins(plugin_loader)
     }
 

@@ -493,13 +493,19 @@ impl FontSystem {
     /// Load system emoji font (platform-specific)
     fn load_emoji_font() -> (Option<Arc<Vec<u8>>>, Option<FontRef<'static>>) {
         #[cfg(target_os = "macos")]
-        let (path, name) = ("/System/Library/Fonts/Apple Color Emoji.ttc", "Apple Color Emoji");
+        let (path, name) = (
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            "Apple Color Emoji",
+        );
 
         #[cfg(target_os = "windows")]
         let (path, name) = ("C:\\Windows\\Fonts\\seguiemj.ttf", "Segoe UI Emoji");
 
         #[cfg(target_os = "linux")]
-        let (path, name) = ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", "Noto Color Emoji");
+        let (path, name) = (
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "Noto Color Emoji",
+        );
 
         match load_font_from_path(path, 0) {
             Ok((font_data, font_ref)) => {
@@ -1391,6 +1397,20 @@ impl SharedFontSystem {
                 left = mid + 1;
             } else {
                 right = mid;
+            }
+        }
+
+        // Special case: if binary search returned position 1, check if we're actually
+        // before the first character (click could be in the left margin/bearing area)
+        // This handles cases where the first glyph has negative bearing (pos.x < 0)
+        if left == 1 && !shaped.glyphs.is_empty() {
+            let first_glyph = &shaped.glyphs[0];
+            let first_glyph_center = first_glyph.pos.x.0 + first_glyph.size.width.0 / 2.0;
+
+            // If clicking at or before the center of the first glyph, place cursor at column 0
+            // This ensures cursor can be placed at the beginning even when first glyph has negative bearing
+            if target_x_physical <= first_glyph_center {
+                return 0;
             }
         }
 

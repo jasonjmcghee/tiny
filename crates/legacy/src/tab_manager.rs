@@ -83,6 +83,66 @@ impl Tab {
     pub fn path(&self) -> Option<&PathBuf> {
         self.plugin.file_path.as_ref()
     }
+
+    /// Collect all paintable plugins from this tab (generic - works with any plugin tree)
+    pub fn collect_paint_ops<F>(
+        &self,
+        paint_ops: &mut Vec<(i32, Box<dyn FnOnce(&mut wgpu::RenderPass)>)>,
+        editor_bounds: tiny_sdk::types::LayoutRect,
+        viewport_scroll: tiny_sdk::LayoutPos,
+        make_ctx: F,
+    )
+    where
+        F: Fn(tiny_sdk::types::WidgetViewport) -> Option<tiny_sdk::PaintContext> + Copy,
+    {
+        // Editor view's plugins (cursor, selection, etc.)
+        self.plugin.editor.collect_paint_ops(paint_ops, editor_bounds, make_ctx);
+
+        // Note: Diagnostics plugin is rendered separately (see paint_diagnostics method)
+        // due to different ownership model (owned by Tab not EditableTextView)
+    }
+
+    /// Paint diagnostics plugin directly - must be called separately from collect_paint_ops
+    /// due to Rust lifetime constraints when borrowing through tab_manager
+    pub fn paint_diagnostics<F>(
+        &self,
+        pass: &mut wgpu::RenderPass,
+        editor_bounds: tiny_sdk::types::LayoutRect,
+        viewport_scroll: tiny_sdk::LayoutPos,
+        make_ctx: F,
+        font_system: &std::sync::Arc<tiny_font::SharedFontSystem>,
+    ) where
+        F: Fn(tiny_sdk::types::WidgetViewport) -> Option<tiny_sdk::PaintContext>,
+    {
+        if let Some(ref plugin_arc) = self.diagnostics.plugin() {
+            if let Ok(mut plugin) = plugin_arc.lock() {
+                let viewport = tiny_sdk::types::WidgetViewport {
+                    bounds: editor_bounds,
+                    scroll: viewport_scroll,
+                    content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                    widget_id: 3,
+                };
+
+                if let Some(ctx) = make_ctx(viewport) {
+                    // Set viewport info and font system before painting
+                    if let Some(library) = plugin.as_library_mut() {
+                        let viewport_bytes = bytemuck::bytes_of(&ctx.viewport);
+                        let _ = library.call("set_viewport_info", viewport_bytes);
+
+                        // Set font system pointer
+                        let font_ptr = font_system as *const _ as u64;
+                        let _ = library.call("set_font_system", &font_ptr.to_le_bytes());
+                    }
+
+                    if let Some(paintable) = plugin.as_paintable() {
+                        paintable.paint(&ctx, pass);
+                    }
+                }
+            }
+        } else {
+            eprintln!("[DIAG] paint_diagnostics called but plugin not initialized!");
+        }
+    }
 }
 
 pub struct TabManager {

@@ -185,7 +185,7 @@ impl AcceleratorMatcher {
         Self {
             current_sequence: Vec::new(),
             last_chord_time: None,
-            sequence_timeout: Duration::from_millis(1000),
+            sequence_timeout: Duration::from_millis(500),
         }
     }
 
@@ -207,33 +207,47 @@ impl AcceleratorMatcher {
         }
 
         // Add current chord to sequence
-        self.current_sequence.push(Chord {
+        let new_chord = Chord {
             modifiers: modifiers.clone(),
             trigger: trigger.clone(),
-        });
+        };
+        self.current_sequence.push(new_chord);
         self.last_chord_time = Some(now);
 
-        // Check for matches
-        for accelerator in candidates {
-            if self.matches_accelerator(accelerator) {
-                let matched = accelerator.clone();
+        // Try to match with progressively shorter sequences (trim oldest chords first)
+        // This handles cases like "shift cmd+s" → no match → try "cmd+s" → match!
+        loop {
+            // Check for exact matches with current sequence
+            for accelerator in candidates {
+                if self.matches_accelerator(accelerator) {
+                    let matched = accelerator.clone();
+                    self.current_sequence.clear();
+                    return Some(matched);
+                }
+            }
+
+            // Check if any accelerator could still match with more input
+            let could_match = candidates.iter().any(|acc| {
+                acc.chords.len() >= self.current_sequence.len()
+                    && acc.chords[..self.current_sequence.len()] == self.current_sequence[..]
+            });
+
+            if could_match {
+                // Keep sequence for potential future matches
+                return None;
+            }
+
+            // No match and no potential match
+            // Try eliminating the oldest chord and matching again
+            if self.current_sequence.len() > 1 {
+                let removed = self.current_sequence.remove(0);
+                // Loop back and try matching with the trimmed sequence
+            } else {
+                // Only one chord left and it doesn't match anything - clear and give up
                 self.current_sequence.clear();
-                return Some(matched);
+                return None;
             }
         }
-
-        // Check if any accelerator could still match with more input
-        let could_match = candidates.iter().any(|acc| {
-            acc.chords.len() >= self.current_sequence.len()
-                && acc.chords[..self.current_sequence.len()] == self.current_sequence[..]
-        });
-
-        // If no potential matches, reset
-        if !could_match {
-            self.current_sequence.clear();
-        }
-
-        None
     }
 
     /// Check if current sequence matches an accelerator

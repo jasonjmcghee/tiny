@@ -1,8 +1,8 @@
 //! Grep plugin - full codebase search
 
-use crate::{overlay_picker::OverlayPicker, scroll::Scrollable, Widget};
 use crate::coordinates::Viewport;
 use crate::input::{Event, EventSubscriber, PropagationControl};
+use crate::{overlay_picker::OverlayPicker, scroll::Scrollable, Widget};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tiny_core::tree::{Point, Rect};
@@ -26,6 +26,8 @@ pub struct GrepPlugin {
     // Channel for receiving search results from background thread (Mutex for Sync)
     result_rx: Arc<Mutex<std::sync::mpsc::Receiver<Vec<GrepResult>>>>,
     result_tx: std::sync::mpsc::Sender<Vec<GrepResult>>,
+    // Redraw notifier to trigger UI updates when results arrive
+    redraw_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GrepPlugin {
@@ -44,7 +46,11 @@ impl GrepPlugin {
 
         // Format function
         let format_fn = |result: &GrepResult| {
-            let name = result.file_path.file_name().and_then(|n| n.to_str()).unwrap_or("???");
+            let name = result
+                .file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("???");
             format!("{}:{}  {}", name, result.line_number, result.line_content)
         };
 
@@ -61,7 +67,13 @@ impl GrepPlugin {
             visible: false,
             result_rx: Arc::new(Mutex::new(result_rx)),
             result_tx,
+            redraw_notifier: None,
         }
+    }
+
+    /// Set the redraw notifier (called when results arrive from background thread)
+    pub fn set_redraw_notifier(&mut self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        self.redraw_notifier = Some(notifier);
     }
 
     pub fn show(&mut self, search_term: String) {
@@ -169,21 +181,35 @@ impl GrepPlugin {
         results
     }
 
-    pub fn poll_results(&mut self) {
+    pub fn poll_results(&mut self) -> bool {
         if self.searching {
             // Non-blocking receive from background thread
             if let Ok(rx) = self.result_rx.lock() {
                 if let Ok(results) = rx.try_recv() {
                     self.picker.dropdown.set_items(results);
                     self.searching = false;
+
+                    // Trigger redraw to show results immediately
+                    if let Some(ref notifier) = self.redraw_notifier {
+                        notifier();
+                    }
+
+                    return true; // Results were received, need redraw
                 }
             }
         }
+        false
     }
 
-    pub fn move_up(&mut self) { self.picker.move_up(); }
-    pub fn move_down(&mut self) { self.picker.move_down(); }
-    pub fn selected_result(&self) -> Option<&GrepResult> { self.picker.selected_item() }
+    pub fn move_up(&mut self) {
+        self.picker.move_up();
+    }
+    pub fn move_down(&mut self) {
+        self.picker.move_down();
+    }
+    pub fn selected_result(&self) -> Option<&GrepResult> {
+        self.picker.selected_item()
+    }
 
     /// Set the query and trigger search
     /// Note: Assumes input text is already set (by InputHandler)
@@ -193,7 +219,11 @@ impl GrepPlugin {
 }
 
 impl EventSubscriber for GrepPlugin {
-    fn handle_event(&mut self, event: &Event, event_bus: &mut crate::input::EventBus) -> PropagationControl {
+    fn handle_event(
+        &mut self,
+        event: &Event,
+        event_bus: &mut crate::input::EventBus,
+    ) -> PropagationControl {
         if !self.visible {
             return PropagationControl::Continue; // Not active, pass through
         }
@@ -202,13 +232,22 @@ impl EventSubscriber for GrepPlugin {
 
         // Handle events: execute logic AND stop propagation
         match event.name.as_str() {
+            // Handle Enter key specially - emit action.submit instead of inserting newline
+            "editor.insert_newline" => {
+                // Single-line input - Enter should submit, not insert newline
+                event_bus.emit("action.submit", json!({}), 10, "grep");
+                PropagationControl::Stop
+            }
             // Handle text editing events internally
             event_name if event_name.starts_with("editor.") => {
                 let input = self.input_mut();
                 let text_before = input.view.text();
 
                 // Let InputHandler handle the event
-                let _action = input.input.handle_event(event, &input.view.doc, &input.view.viewport);
+                let _action =
+                    input
+                        .input
+                        .handle_event(event, &input.view.doc, &input.view.viewport);
 
                 // Check if text changed, trigger search if so
                 let text_after = input.view.text();
@@ -238,17 +277,23 @@ impl EventSubscriber for GrepPlugin {
             "action.submit" => {
                 if let Some(result) = self.selected_result().cloned() {
                     self.hide();
-                    event_bus.emit("file.goto", json!({
-                        "file": result.file_path,
-                        "line": result.line_number.saturating_sub(1),
-                        "column": result.column
-                    }), 10, "grep");
+                    event_bus.emit(
+                        "file.goto",
+                        json!({
+                            "file": result.file_path,
+                            "line": result.line_number.saturating_sub(1),
+                            "column": result.column
+                        }),
+                        10,
+                        "grep",
+                    );
                 }
                 PropagationControl::Stop
             }
             "app.mouse.scroll" => {
                 // Handle mouse wheel scrolling
-                let delta_y = event.data
+                let delta_y = event
+                    .data
                     .get("delta_y")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0) as f32;
@@ -259,14 +304,8 @@ impl EventSubscriber for GrepPlugin {
             }
             "app.mouse.move" => {
                 // Handle mouse hover to highlight items
-                let x = event.data
-                    .get("x")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32;
-                let y = event.data
-                    .get("y")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32;
+                let x = event.data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let y = event.data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
                 // Check if mouse is over picker bounds
                 let bounds = self.picker.get_bounds();
@@ -298,8 +337,13 @@ impl EventSubscriber for GrepPlugin {
 }
 
 impl tiny_sdk::Updatable for GrepPlugin {
-    fn update(&mut self, _dt: f32, _ctx: &mut tiny_sdk::UpdateContext) -> Result<(), tiny_sdk::PluginError> {
-        // Poll background search results
+    fn update(
+        &mut self,
+        _dt: f32,
+        _ctx: &mut tiny_sdk::UpdateContext,
+    ) -> Result<(), tiny_sdk::PluginError> {
+        // Poll background search results and mark if we need a redraw
+        // The redraw will be triggered by the render loop detecting UI changes
         if self.searching {
             self.poll_results();
         }
@@ -318,12 +362,18 @@ tiny_sdk::plugin! {
 }
 
 impl Scrollable for GrepPlugin {
-    fn get_scroll(&self) -> Point { self.picker.get_scroll() }
-    fn set_scroll(&mut self, scroll: Point) { self.picker.set_scroll(scroll); }
+    fn get_scroll(&self) -> Point {
+        self.picker.get_scroll()
+    }
+    fn set_scroll(&mut self, scroll: Point) {
+        self.picker.set_scroll(scroll);
+    }
     fn handle_scroll(&mut self, delta: Point, viewport: &Viewport, widget_bounds: Rect) -> bool {
         self.picker.handle_scroll(delta, viewport, widget_bounds)
     }
-    fn get_content_bounds(&self, viewport: &Viewport) -> Rect { self.picker.get_content_bounds(viewport) }
+    fn get_content_bounds(&self, viewport: &Viewport) -> Rect {
+        self.picker.get_content_bounds(viewport)
+    }
 }
 
 tiny_ui::impl_widget_delegate!(GrepPlugin, picker);

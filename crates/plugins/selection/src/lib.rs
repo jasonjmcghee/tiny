@@ -3,7 +3,6 @@
 use ahash::AHasher;
 use serde::Deserialize;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tiny_sdk::bytemuck;
 use tiny_sdk::bytemuck::{Pod, Zeroable};
 use tiny_sdk::wgpu;
@@ -26,6 +25,7 @@ pub struct Selection {
 #[derive(Debug, Clone)]
 pub struct SelectionStyle {
     pub color: u32,
+    pub active_line_color: u32,
 }
 
 /// Configuration loaded from plugin.toml
@@ -38,7 +38,8 @@ impl Default for SelectionConfig {
     fn default() -> Self {
         Self {
             style: SelectionStyle {
-                color: 0x4080FF40, // Semi-transparent blue
+                color: 0x4080FF40,             // Semi-transparent blue
+                active_line_color: 0xFFFFFF1A, // 10% white
             },
         }
     }
@@ -113,6 +114,13 @@ impl SelectionPlugin {
         self.viewport = viewport;
     }
 
+    /// Check if selection is empty (cursor position)
+    fn is_cursor(&self, selection: &Selection) -> bool {
+        let epsilon = 0.1;
+        (selection.start.x.0 - selection.end.x.0).abs() < epsilon
+            && (selection.start.y.0 - selection.end.y.0).abs() < epsilon
+    }
+
     /// Generate a single bounding rectangle for the entire selection
     fn selection_to_bounding_rect(
         &self,
@@ -120,12 +128,16 @@ impl SelectionPlugin {
         line_height: f32,
         widget_viewport: Option<&tiny_sdk::types::WidgetViewport>,
     ) -> Option<LayoutRect> {
-        // Skip if it's just a cursor (no selection)
         let epsilon = 0.1;
-        if (selection.start.x.0 - selection.end.x.0).abs() < epsilon
-            && (selection.start.y.0 - selection.end.y.0).abs() < epsilon
-        {
-            return None;
+
+        // Handle cursor (empty selection) - highlight full line
+        if self.is_cursor(selection) {
+            let widget_vp = widget_viewport.expect("Selection plugin requires widget_viewport");
+            let left = widget_vp.bounds.x.0;
+            let width = widget_vp.bounds.width.0;
+            let y = selection.start.y.0;
+
+            return Some(LayoutRect::new(left, y, width, line_height));
         }
 
         // View positions are already in screen coordinates
@@ -166,12 +178,17 @@ impl SelectionPlugin {
         // Use viewport's scale factor and line_height, not our stored ones (which might be wrong)
         let scale = viewport.scale_factor;
         let line_height = viewport.line_height;
-        let color = self.config.style.color;
 
         for selection in selections {
             if let Some(rect) =
                 self.selection_to_bounding_rect(selection, line_height, widget_viewport)
             {
+                // Use different color for cursor line highlight vs selection
+                let color = if self.is_cursor(selection) {
+                    self.config.style.active_line_color
+                } else {
+                    self.config.style.color
+                };
                 // Rectangle is in logical view space, scale to physical pixels
                 let x = rect.x.0 * scale;
                 let y = rect.y.0 * scale;
@@ -337,8 +354,6 @@ impl Initializable for SelectionPlugin {
             ],
         ));
 
-        eprintln!("Selection plugin setup complete");
-
         Ok(())
     }
 }
@@ -444,6 +459,7 @@ impl Paintable for SelectionPlugin {
             sel.end.y.0.to_bits().hash(&mut hasher);
         }
         self.config.style.color.hash(&mut hasher);
+        self.config.style.active_line_color.hash(&mut hasher);
         let cache_key = hasher.finish();
 
         // Write vertices only if state changed - simplified to one line!
@@ -489,10 +505,16 @@ impl Configurable for SelectionPlugin {
         struct PluginConfig {
             #[serde(default = "default_color")]
             color: u32,
+            #[serde(default = "default_active_line_color")]
+            active_line_color: u32,
         }
 
         fn default_color() -> u32 {
             0x4080FF40 // Semi-transparent blue
+        }
+
+        fn default_active_line_color() -> u32 {
+            0xFFFFFF1A // 10% white
         }
 
         // Parse TOML value first (handles syntax errors gracefully)
@@ -510,15 +532,12 @@ impl Configurable for SelectionPlugin {
             let mut temp_config = PluginConfig::default();
             tiny_sdk::parse_fields!(temp_config, config_table, {
                 color: default_color(),
+                active_line_color: default_active_line_color(),
             });
 
             // Apply parsed values
             self.config.style.color = temp_config.color;
-
-            eprintln!(
-                "Selection plugin config updated: color={:#010x}",
-                self.config.style.color
-            );
+            self.config.style.active_line_color = temp_config.active_line_color;
         }
 
         Ok(())
@@ -526,7 +545,11 @@ impl Configurable for SelectionPlugin {
 
     fn get_config(&self) -> Option<String> {
         // Convert current config back to TOML
-        format!("[config]\ncolor = {:#010x}", self.config.style.color).into()
+        format!(
+            "[config]\ncolor = {:#010x}\nactive_line_color = {:#010x}",
+            self.config.style.color, self.config.style.active_line_color
+        )
+        .into()
     }
 }
 

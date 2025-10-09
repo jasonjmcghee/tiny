@@ -402,7 +402,8 @@ impl Color {
 // === Widget Viewport ===
 
 /// Widget-specific viewport for independent positioning and scrolling
-#[derive(Debug, Clone)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct WidgetViewport {
     /// Widget's bounds in window space (after global margin)
     pub bounds: LayoutRect,

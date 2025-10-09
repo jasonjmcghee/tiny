@@ -17,7 +17,11 @@ use crate::{
     input::{InputHandler, Selection},
     text_view::TextView,
 };
-use tiny_core::tree::Point;
+use std::sync::{Arc, Mutex};
+use tiny_core::{
+    plugin_loader::PluginLoader,
+    tree::{Doc, Point, Rect},
+};
 use tiny_sdk::LayoutPos;
 use tiny_ui::{ArrowDirection, TextViewCapabilities};
 
@@ -56,10 +60,10 @@ pub struct EditableTextView {
     pub id: u64,
 
     /// Cursor rendering plugin (owned by this view)
-    pub cursor_plugin: Option<Box<dyn tiny_sdk::Plugin>>,
+    pub cursor_plugin: Option<Arc<Mutex<Box<dyn tiny_sdk::Plugin>>>>,
 
     /// Selection rendering plugin (owned by this view)
-    pub selection_plugin: Option<Box<dyn tiny_sdk::Plugin>>,
+    pub selection_plugin: Option<Arc<Mutex<Box<dyn tiny_sdk::Plugin>>>>,
 }
 
 impl EditableTextView {
@@ -99,7 +103,7 @@ impl EditableTextView {
     /// Create a single-line input
     pub fn single_line(viewport: Viewport) -> Self {
         let view = TextView::with_capabilities(
-            tiny_core::tree::Doc::new(),
+            Doc::new(),
             viewport,
             TextViewCapabilities::editable(),
         )
@@ -111,7 +115,7 @@ impl EditableTextView {
     /// Create a multi-line editor
     pub fn multi_line(viewport: Viewport) -> Self {
         let view = TextView::with_capabilities(
-            tiny_core::tree::Doc::new(),
+            Doc::new(),
             viewport,
             TextViewCapabilities::editable(),
         );
@@ -127,7 +131,7 @@ impl EditableTextView {
             TextViewCapabilities::read_only()
         };
 
-        let view = TextView::with_capabilities(tiny_core::tree::Doc::new(), viewport, caps);
+        let view = TextView::with_capabilities(Doc::new(), viewport, caps);
 
         Self::new(view, EditMode::ReadOnly { allow_selection })
     }
@@ -326,7 +330,7 @@ impl EditableTextView {
     /// Call this once after creating the view, passing the global plugin loader
     pub fn initialize_plugins(
         &mut self,
-        plugin_loader: &tiny_core::plugin_loader::PluginLoader,
+        plugin_loader: &mut PluginLoader,
     ) -> Result<(), String> {
         // Skip if already initialized
         if self.has_plugins() {
@@ -357,19 +361,69 @@ impl EditableTextView {
         Ok(())
     }
 
+    /// Reinitialize a specific owned plugin (force recreation after lib reload)
+    pub fn reinitialize_single_plugin(
+        &mut self,
+        plugin_loader: &mut PluginLoader,
+        plugin_name: &str,
+    ) -> Result<(), String> {
+        match plugin_name {
+            "cursor" => {
+                // Drop old instance first
+                self.cursor_plugin = None;
+
+                // Create new instance from reloaded library
+                match plugin_loader.create_plugin_instance("cursor") {
+                    Ok(plugin) => {
+                        self.cursor_plugin = Some(plugin);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to recreate cursor plugin instance: {:?}", e);
+                        Err(format!("Failed to recreate cursor plugin: {:?}", e))
+                    }
+                }
+            }
+            "selection" => {
+                // Drop old instance first
+                self.selection_plugin = None;
+
+                // Create new instance from reloaded library
+                match plugin_loader.create_plugin_instance("selection") {
+                    Ok(plugin) => {
+                        self.selection_plugin = Some(plugin);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to recreate selection plugin instance: {:?}", e);
+                        Err(format!("Failed to recreate selection plugin: {:?}", e))
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Unknown plugin: {}", plugin_name);
+                Err(format!("Unknown plugin: {}", plugin_name))
+            }
+        }
+    }
+
     /// Setup plugins with GPU resources (must be called after initialize_plugins)
     pub fn setup_plugins(
         &mut self,
         ctx: &mut tiny_sdk::SetupContext,
     ) -> Result<(), tiny_sdk::PluginError> {
-        if let Some(ref mut plugin) = self.cursor_plugin {
-            if let Some(init) = plugin.as_initializable() {
-                init.setup(ctx)?;
+        if let Some(ref plugin_arc) = self.cursor_plugin {
+            if let Ok(mut plugin) = plugin_arc.lock() {
+                if let Some(init) = plugin.as_initializable() {
+                    init.setup(ctx)?;
+                }
             }
         }
-        if let Some(ref mut plugin) = self.selection_plugin {
-            if let Some(init) = plugin.as_initializable() {
-                init.setup(ctx)?;
+        if let Some(ref plugin_arc) = self.selection_plugin {
+            if let Ok(mut plugin) = plugin_arc.lock() {
+                if let Some(init) = plugin.as_initializable() {
+                    init.setup(ctx)?;
+                }
             }
         }
         Ok(())
@@ -380,59 +434,63 @@ impl EditableTextView {
     /// Note: Plugins get ViewportInfo from PaintContext during paint(), we just send positions
     pub fn sync_plugins(&mut self) {
         // Update cursor plugin with VIEW coordinates (layout - scroll)
-        if let Some(ref mut plugin) = self.cursor_plugin {
-            if let Some(library) = plugin.as_library_mut() {
-                if let Some(sel) = self.input.selections().first() {
-                    let tree = self.view.doc.read();
-                    let line_text = tree.line_text(sel.cursor.line);
+        if let Some(ref plugin_arc) = self.cursor_plugin {
+            if let Ok(mut plugin) = plugin_arc.lock() {
+                if let Some(library) = plugin.as_library_mut() {
+                    if let Some(sel) = self.input.selections().first() {
+                        let tree = self.view.doc.read();
+                        let line_text = tree.line_text(sel.cursor.line);
 
-                    // Get layout position (0,0 relative to content)
-                    let layout_pos = self
-                        .view
-                        .viewport
-                        .doc_to_layout_with_text(sel.cursor, &line_text);
+                        // Get layout position (0,0 relative to content)
+                        let layout_pos = self
+                            .view
+                            .viewport
+                            .doc_to_layout_with_text(sel.cursor, &line_text);
 
-                    // Convert to view coordinates (subtract scroll, add padding to match text rendering)
-                    // Text is rendered at: bounds.origin + padding + view_pos (see TextView::collect_glyphs)
-                    // So plugins should receive: padding + view_pos
-                    let view_x =
-                        layout_pos.x.0 - self.view.viewport.scroll.x.0 + self.view.padding_x;
-                    let view_y =
-                        layout_pos.y.0 - self.view.viewport.scroll.y.0 + self.view.padding_y;
+                        // Convert to view coordinates (subtract scroll, add padding to match text rendering)
+                        // Text is rendered at: bounds.origin + padding + view_pos (see TextView::collect_glyphs)
+                        // So plugins should receive: padding + view_pos
+                        let view_x =
+                            layout_pos.x.0 - self.view.viewport.scroll.x.0 + self.view.padding_x;
+                        let view_y =
+                            layout_pos.y.0 - self.view.viewport.scroll.y.0 + self.view.padding_y;
 
-                    // Send as LayoutPos type (confusing naming, but it's view coords)
-                    let view_pos = tiny_sdk::LayoutPos::new(view_x, view_y);
-                    let _ = library.call("set_position", tiny_sdk::bytemuck::bytes_of(&view_pos));
+                        // Send as LayoutPos type (confusing naming, but it's view coords)
+                        let view_pos = tiny_sdk::LayoutPos::new(view_x, view_y);
+                        let _ = library.call("set_position", tiny_sdk::bytemuck::bytes_of(&view_pos));
+                    }
                 }
             }
         }
 
         // Update selection plugin with VIEW coordinates (including padding)
-        if let Some(ref mut plugin) = self.selection_plugin {
-            if let Some(library) = plugin.as_library_mut() {
-                // Get selections in view coordinates (scroll applied, need to add padding)
-                let (_, selections) = self
-                    .input
-                    .get_selection_data(&self.view.doc, &self.view.viewport);
+        if let Some(ref plugin_arc) = self.selection_plugin {
+            if let Ok(mut plugin) = plugin_arc.lock() {
+                if let Some(library) = plugin.as_library_mut() {
+                    // Get selections in view coordinates (scroll applied, need to add padding)
+                    let (_, selections) = self
+                        .input
+                        .get_selection_data(&self.view.doc, &self.view.viewport);
 
-                // Encode selections for plugin, adding padding to match text rendering
-                let mut args = Vec::new();
-                let len = selections.len() as u32;
-                args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&len));
-                for (start, end) in selections {
-                    // Add padding to match text rendering (see TextView::collect_glyphs)
-                    let start_with_padding = tiny_sdk::ViewPos {
-                        x: tiny_sdk::LogicalPixels(start.x.0 + self.view.padding_x),
-                        y: tiny_sdk::LogicalPixels(start.y.0 + self.view.padding_y),
-                    };
-                    let end_with_padding = tiny_sdk::ViewPos {
-                        x: tiny_sdk::LogicalPixels(end.x.0 + self.view.padding_x),
-                        y: tiny_sdk::LogicalPixels(end.y.0 + self.view.padding_y),
-                    };
-                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&start_with_padding));
-                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&end_with_padding));
+                    // Encode selections for plugin, adding padding to match text rendering
+                    let mut args = Vec::new();
+                    let len = selections.len() as u32;
+                    args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&len));
+                    for (start, end) in selections {
+                        // Add padding to match text rendering (see TextView::collect_glyphs)
+                        let start_with_padding = tiny_sdk::ViewPos {
+                            x: tiny_sdk::LogicalPixels(start.x.0 + self.view.padding_x),
+                            y: tiny_sdk::LogicalPixels(start.y.0 + self.view.padding_y),
+                        };
+                        let end_with_padding = tiny_sdk::ViewPos {
+                            x: tiny_sdk::LogicalPixels(end.x.0 + self.view.padding_x),
+                            y: tiny_sdk::LogicalPixels(end.y.0 + self.view.padding_y),
+                        };
+                        args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&start_with_padding));
+                        args.extend_from_slice(tiny_sdk::bytemuck::bytes_of(&end_with_padding));
+                    }
+                    let _ = library.call("set_selections", &args);
                 }
-                let _ = library.call("set_selections", &args);
             }
         }
     }
@@ -441,17 +499,65 @@ impl EditableTextView {
     /// Call this during rendering with the appropriate PaintContext
     pub fn paint_plugins(&self, ctx: &tiny_sdk::PaintContext, render_pass: &mut wgpu::RenderPass) {
         // Paint selection first (behind text)
-        if let Some(ref plugin) = self.selection_plugin {
-            if let Some(paintable) = plugin.as_paintable() {
-                paintable.paint(ctx, render_pass);
+        if let Some(ref plugin_arc) = self.selection_plugin {
+            if let Ok(plugin) = plugin_arc.lock() {
+                if let Some(paintable) = plugin.as_paintable() {
+                    paintable.paint(ctx, render_pass);
+                }
             }
         }
 
         // Paint cursor second (in front of text)
         if self.show_cursor {
-            if let Some(ref plugin) = self.cursor_plugin {
-                if let Some(paintable) = plugin.as_paintable() {
-                    paintable.paint(ctx, render_pass);
+            if let Some(ref plugin_arc) = self.cursor_plugin {
+                if let Ok(plugin) = plugin_arc.lock() {
+                    if let Some(paintable) = plugin.as_paintable() {
+                        paintable.paint(ctx, render_pass);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collect all paintable plugins from this view (generic - works with any plugins)
+    /// This allows the renderer to sort all plugins by z_index without knowing their names
+    pub fn collect_paint_ops<F>(
+        &self,
+        paint_ops: &mut Vec<(i32, Box<dyn FnOnce(&mut wgpu::RenderPass)>)>,
+        editor_bounds: tiny_sdk::types::LayoutRect,
+        make_ctx: F,
+    )
+    where
+        F: Fn(tiny_sdk::types::WidgetViewport) -> Option<tiny_sdk::PaintContext> + Copy,
+    {
+        // Collect all plugins generically - iterate over all plugin slots
+        let plugins = [&self.selection_plugin, &self.cursor_plugin];
+
+        for plugin_arc_opt in &plugins {
+            if let Some(ref plugin_arc) = plugin_arc_opt {
+                if let Ok(plugin) = plugin_arc.lock() {
+                    if let Some(paintable) = plugin.as_paintable() {
+                        let z = paintable.z_index();
+
+                        let viewport = tiny_sdk::types::WidgetViewport {
+                            bounds: editor_bounds,
+                            scroll: tiny_sdk::LayoutPos::new(0.0, 0.0),
+                            content_margin: tiny_sdk::types::LayoutPos::new(0.0, 0.0),
+                            widget_id: 2,
+                        };
+
+                        if let Some(ctx) = make_ctx(viewport) {
+                            // Store Arc to keep plugin alive
+                            let plugin_arc_clone = plugin_arc.clone();
+                            paint_ops.push((z, Box::new(move |pass| {
+                                if let Ok(plugin) = plugin_arc_clone.lock() {
+                                    if let Some(paintable) = plugin.as_paintable() {
+                                        paintable.paint(&ctx, pass);
+                                    }
+                                }
+                            })));
+                        }
+                    }
                 }
             }
         }
@@ -635,7 +741,7 @@ impl EditableTextView {
                         self.view.viewport.bounds.y.0 + rect.y.0 - self.view.viewport.scroll.y.0;
 
                     // Convert to physical pixels
-                    let physical_rect = tiny_core::tree::Rect {
+                    let physical_rect = Rect {
                         x: tiny_sdk::LogicalPixels(screen_x * self.view.viewport.scale_factor),
                         y: tiny_sdk::LogicalPixels(screen_y * self.view.viewport.scale_factor),
                         width: tiny_sdk::LogicalPixels(

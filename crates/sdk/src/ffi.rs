@@ -48,6 +48,7 @@ extern "C" {
         vertex_count: u32,
     );
 
+
     // Shader and pipeline creation
     pub fn gpu_create_shader_module(source: *const u8, len: usize) -> ShaderModuleId;
 

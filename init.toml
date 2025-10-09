@@ -22,7 +22,7 @@ continuous_rendering = false
 # Default plugin directory
 plugin_dir = "plugins"
 # Enabled plugins - text-editor will load first, then its dependencies
-enabled = ["cursor", "selection"]
+enabled = ["cursor", "selection", "diagnostics"]
 
 # Text editor plugin configuration
 #[plugins.text-editor]
@@ -42,6 +42,12 @@ auto_reload = true
 [plugins.selection]
 lib = "crates/plugins/selection/target/debug/libselection_plugin.dylib"
 config = "crates/plugins/selection/plugin.toml"
+# Watch lib and swap it in if it changes
+auto_reload = true
+
+[plugins.diagnostics]
+lib = "crates/plugins/diagnostics/target/debug/libdiagnostics_plugin.dylib"
+config = "crates/plugins/diagnostics/plugin.toml"
 # Watch lib and swap it in if it changes
 auto_reload = true
 
