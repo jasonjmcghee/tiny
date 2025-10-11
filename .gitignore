@@ -5,3 +5,4 @@ target/
 repo_index/
 repo-map.txt
 scratch/
+.cache

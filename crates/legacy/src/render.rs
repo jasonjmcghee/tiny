@@ -285,7 +285,10 @@ impl Renderer {
 
         let plugin_dir = std::path::PathBuf::from(&app_config.plugins.plugin_dir);
         if !plugin_dir.exists() {
-            return;
+            if let Err(e) = std::fs::create_dir_all(&plugin_dir) {
+                eprintln!("Failed to create plugin directory: {}", e);
+                return;
+            }
         }
 
         let mut loader = PluginLoader::new(plugin_dir.clone());

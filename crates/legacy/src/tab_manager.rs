@@ -139,9 +139,8 @@ impl Tab {
                     }
                 }
             }
-        } else {
-            eprintln!("[DIAG] paint_diagnostics called but plugin not initialized!");
         }
+        // Plugin not initialized - silently skip (expected during startup)
     }
 }
 
